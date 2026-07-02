@@ -2,6 +2,7 @@ import contextlib
 import asyncio
 import pathlib
 import shutil
+import subprocess
 
 import config
 import event
@@ -260,6 +261,26 @@ class _HTTPOnlyStaticFiles(fastapi.staticfiles.StaticFiles):
 app.mount('/', _HTTPOnlyStaticFiles(directory='./web', html=True), name='web')
 
 
+# ========== SSL 自签名证书 ==========
+def _ensure_ssl_certs(cert_dir: str = "./certs") -> tuple[str, str]:
+    """自动生成自签名 SSL 证书（如不存在）。首次启动生成，后续复用。"""
+    cert_path = pathlib.Path(cert_dir) / "cert.pem"
+    key_path = pathlib.Path(cert_dir) / "key.pem"
+    if cert_path.exists() and key_path.exists():
+        return str(cert_path), str(key_path)
+    pathlib.Path(cert_dir).mkdir(parents=True, exist_ok=True)
+    subprocess.run([
+        "openssl", "req", "-x509", "-newkey", "rsa:2048",
+        "-keyout", str(key_path), "-out", str(cert_path),
+        "-days", "3650", "-nodes",
+        "-subj", "/CN=phanthy-motus",
+    ], check=True, capture_output=True)
+    print(f"[ssl] Generated self-signed certificate: {cert_path}")
+    return str(cert_path), str(key_path)
+
+
 # ========== 启动服务 ==========
 if __name__ == '__main__':
-    uvicorn.run(app, host='0.0.0.0', port=15678, ws_ping_interval=None)
+    cert_file, key_file = _ensure_ssl_certs()
+    uvicorn.run(app, host='0.0.0.0', port=15678, ws_ping_interval=None,
+                ssl_certfile=cert_file, ssl_keyfile=key_file)
