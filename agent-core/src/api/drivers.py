@@ -132,13 +132,20 @@ def _deploy_sync(driver: dict) -> dict:
     with open(compose_file, 'w') as f:
         yaml.dump(compose, f, default_flow_style=False, allow_unicode=True, sort_keys=False)
 
-    # Stop old container if managed outside compose (name mismatch)
+    # Remove old container if it exists (may be from legacy docker run)
     try:
         old = client.containers.get(name)
-        old.stop(timeout=5)
         old.remove(force=True)
     except docker_sdk.errors.NotFound:
         pass
+    # Also try the container_name from service.yml
+    svc_container_name = service_def[service_name].get('container_name', '')
+    if svc_container_name and svc_container_name != name:
+        try:
+            old = client.containers.get(svc_container_name)
+            old.remove(force=True)
+        except docker_sdk.errors.NotFound:
+            pass
 
     # docker compose up
     subprocess.run(
