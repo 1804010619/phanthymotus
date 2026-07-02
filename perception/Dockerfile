@@ -25,6 +25,7 @@ WORKDIR /work
 COPY main.py    /work/main.py
 COPY plugins/   /work/plugins/
 COPY config.yaml /work/config.yaml
+COPY deploy/     /deploy/
 
 EXPOSE 15720
 EXPOSE 15721

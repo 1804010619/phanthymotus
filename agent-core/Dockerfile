@@ -24,6 +24,7 @@ RUN echo "/opt/ros/humble/lib/python3.10/site-packages" >> .venv/lib/python3.10/
 COPY web/      /work/web/
 COPY src/      /work/src/
 COPY resource/ /work/resource/
+COPY deploy/   /deploy/
 
 # Bake defaults to a path immune to volume mounts (for cold-start init)
 COPY resource/memory/defaults/ /opt/defaults/memory/

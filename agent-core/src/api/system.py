@@ -107,7 +107,7 @@ def _check_update_sync() -> dict:
 
 
 def _pull_and_restart_sync(image: str) -> None:
-    """pull 新镜像，然后启动 restart helper 容器完成 stop→remove→run。"""
+    """pull 新镜像，然后启动 restart helper 容器通过 docker compose 完成切换。"""
     import docker as docker_sdk
     try:
         client = docker_sdk.from_env()
@@ -122,37 +122,6 @@ def _pull_and_restart_sync(image: str) -> None:
         _set_error(f'镜像拉取失败: {e}')
         return
 
-    container_name = os.environ.get('CONTAINER_NAME', '')
-    if not container_name:
-        # Try to resolve from /proc/self/cgroup (container ID → name lookup)
-        try:
-            container_id = None
-            with open('/proc/self/cgroup') as f:
-                for line in f:
-                    # cgroup v1: "12:devices:/docker/<id>"
-                    # cgroup v2: "0::/system.slice/docker-<id>.scope"
-                    parts = line.strip().split('/')
-                    for part in reversed(parts):
-                        if len(part) == 64 and all(c in '0123456789abcdef' for c in part):
-                            container_id = part
-                            break
-                        if part.startswith('docker-') and part.endswith('.scope'):
-                            container_id = part[7:-6]
-                            break
-                    if container_id:
-                        break
-            if container_id:
-                container_name = client.containers.get(container_id).name
-        except Exception:
-            pass
-    if not container_name:
-        # Last resort: hostname (works when container --hostname matches container name)
-        try:
-            container_name = client.containers.get(socket.gethostname()).name
-        except Exception as e:
-            _set_error(f'无法获取当前容器名: {e}')
-            return
-
     restart_image = os.environ.get('RESTART_IMAGE', '')
     if not restart_image:
         current_image = _get_current_image()
@@ -164,15 +133,20 @@ def _pull_and_restart_sync(image: str) -> None:
 
     try:
         _set_step(f'启动 restart helper，替换容器 {container_name}…')
+        compose_dir = os.environ.get('COMPOSE_DIR', '/opt/phanthy-motus')
         client.containers.run(
             restart_image,
             detach=True,
             remove=True,
             network_mode='host',
-            volumes={'/var/run/docker.sock': {'bind': '/var/run/docker.sock', 'mode': 'rw'}},
+            volumes={
+                '/var/run/docker.sock': {'bind': '/var/run/docker.sock', 'mode': 'rw'},
+                compose_dir: {'bind': compose_dir, 'mode': 'rw'},
+            },
             environment={
-                'CONTAINER_NAME': container_name,
-                'NEW_IMAGE':      image,
+                'COMPOSE_DIR': compose_dir,
+                'SERVICE':     'agent-core',
+                'NEW_IMAGE':   image,
             },
         )
         _set_step('restart helper 已启动，容器即将切换…')
