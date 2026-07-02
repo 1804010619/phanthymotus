@@ -106,10 +106,15 @@ def _deploy_sync(driver: dict) -> dict:
         service_content = tf.extractfile('service.yml').read().decode()
     except Exception:
         # Fallback: image doesn't have service.yml — use legacy docker run
-        container.remove(force=True)
+        try:
+            container.remove(force=True)
+        except Exception:
+            pass
         return _deploy_sync_legacy(driver)
-    finally:
+    try:
         container.remove(force=True)
+    except Exception:
+        pass
 
     # Parse service fragment and merge into compose
     import yaml
