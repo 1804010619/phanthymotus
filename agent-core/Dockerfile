@@ -4,7 +4,8 @@ FROM ${ROS_BASE_IMAGE}
 ARG PYPI_MIRROR
 
 RUN apt-get -o Acquire::AllowInsecureRepositories=true update && \
-    apt-get install -y --no-install-recommends --allow-unauthenticated python3-pip && \
+    apt-get install -y --no-install-recommends --allow-unauthenticated \
+        python3-pip docker.io docker-compose-v2 && \
     rm -rf /var/lib/apt/lists/*
 
 # Install uv
@@ -24,6 +25,7 @@ RUN echo "/opt/ros/humble/lib/python3.10/site-packages" >> .venv/lib/python3.10/
 COPY web/      /work/web/
 COPY src/      /work/src/
 COPY resource/ /work/resource/
+COPY deploy/   /deploy/
 
 # Bake defaults to a path immune to volume mounts (for cold-start init)
 COPY resource/memory/defaults/ /opt/defaults/memory/

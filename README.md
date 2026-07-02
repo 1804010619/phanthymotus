@@ -88,6 +88,44 @@ Deploy and manage Agent Core and hardware driver containers from the dashboard.
 
 ![Deploy](docs/images/deploy.png)
 
+## Deployment Architecture
+
+All services run as Docker containers managed by a single `docker-compose.yml` at `/opt/phanthy-motus/` on the target device.
+
+### How it works
+
+1. **Install**: The `install.sh` script pulls the Agent Core image, extracts the initial `docker-compose.yml` from the image, and starts the service
+2. **Add drivers**: When you deploy a driver via the Web Dashboard, Agent Core pulls the driver image, extracts its `deploy/service.yml` fragment, and merges it into the compose file
+3. **Unified orchestration**: All containers (core, drivers, perception) are managed by the same compose file with `docker compose up -d`
+
+### Container privileges
+
+All driver and perception containers run with `privileged: true` and `/dev:/dev` mounted to access hardware devices (cameras, USB, GPIO). Network is set to `host` mode for ROS2 DDS communication.
+
+```yaml
+# Example: how a deployed service looks in /opt/phanthy-motus/docker-compose.yml
+services:
+  agent-core:
+    image: registry/core:tag
+    network_mode: host
+    ipc: host
+    pid: host
+    privileged: true
+    volumes:
+      - /dev:/dev
+      - /opt/phanthy-motus/data:/work/resource
+    ...
+  unitree-g1:
+    image: registry/drivers/unitree/g1:tag
+    network_mode: host
+    ipc: host
+    pid: host
+    privileged: true
+    volumes:
+      - /dev:/dev
+    ...
+```
+
 ## Ports
 
 | Service | Port |

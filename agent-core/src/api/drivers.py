@@ -64,7 +64,16 @@ def _get_status_sync(driver_id: str) -> dict:
 
 
 def _deploy_sync(driver: dict) -> dict:
+    """Deploy a driver/perception container via docker compose.
+
+    Extracts service.yml from the target image and merges it into the host
+    compose file, then runs docker compose up for that service.
+    """
+    import subprocess
+    import tarfile
+    import io
     import docker as docker_sdk
+
     client = _docker()
     name = _container_name(driver['id'])
     target_image = driver['image']
@@ -76,19 +85,99 @@ def _deploy_sync(driver: dict) -> dict:
             running_image = existing.attrs.get('Config', {}).get('Image', '')
             if running_image == target_image:
                 return {'status': 'running', 'message': 'already running with same image', 'skipped': True}
-            # Different image: stop and remove
-            existing.stop(timeout=5)
-            existing.remove(force=True)
-        else:
-            existing.remove(force=True)
+    except docker_sdk.errors.NotFound:
+        pass
+
+    # Pull image
+    client.images.pull(target_image)
+
+    # Extract service.yml from image
+    compose_dir = os.environ.get('COMPOSE_DIR', '/opt/phanthy-motus')
+    compose_file = os.path.join(compose_dir, 'docker-compose.yml')
+
+    # Ensure compose dir exists (may be a host-mounted volume)
+    os.makedirs(compose_dir, exist_ok=True)
+
+    container = client.containers.create(target_image)
+    try:
+        bits, _ = container.get_archive('/deploy/service.yml')
+        tar_bytes = b''.join(bits)
+        tf = tarfile.open(fileobj=io.BytesIO(tar_bytes))
+        service_content = tf.extractfile('service.yml').read().decode()
+    except Exception:
+        # Fallback: image doesn't have service.yml — use legacy docker run
+        try:
+            container.remove(force=True)
+        except Exception:
+            pass
+        return _deploy_sync_legacy(driver)
+    try:
+        container.remove(force=True)
+    except Exception:
+        pass
+
+    # Parse service fragment and merge into compose
+    import yaml
+    service_def = yaml.safe_load(service_content)
+    if not service_def or not isinstance(service_def, dict):
+        return _deploy_sync_legacy(driver)
+
+    service_name = list(service_def.keys())[0]
+    service_def[service_name]['image'] = target_image
+
+    # Read existing compose (or create minimal)
+    try:
+        with open(compose_file) as f:
+            compose = yaml.safe_load(f) or {}
+    except FileNotFoundError:
+        compose = {'services': {}}
+
+    compose.setdefault('services', {}).update(service_def)
+
+    with open(compose_file, 'w') as f:
+        yaml.dump(compose, f, default_flow_style=False, allow_unicode=True, sort_keys=False)
+
+    # Remove old container if it exists (may be from legacy docker run)
+    try:
+        old = client.containers.get(name)
+        old.remove(force=True)
+    except docker_sdk.errors.NotFound:
+        pass
+    # Also try the container_name from service.yml
+    svc_container_name = service_def[service_name].get('container_name', '')
+    if svc_container_name and svc_container_name != name:
+        try:
+            old = client.containers.get(svc_container_name)
+            old.remove(force=True)
+        except docker_sdk.errors.NotFound:
+            pass
+
+    # docker compose up
+    subprocess.run(
+        ['docker', 'compose', '-f', compose_file, 'up', '-d', '--no-deps', '--force-recreate', service_name],
+        check=True,
+    )
+    return {'status': 'starting', 'service': service_name}
+
+
+def _deploy_sync_legacy(driver: dict) -> dict:
+    """Fallback: deploy via docker run for images without /deploy/service.yml."""
+    import docker as docker_sdk
+    client = _docker()
+    name = _container_name(driver['id'])
+    target_image = driver['image']
+
+    # Remove existing
+    try:
+        existing = client.containers.get(name)
+        existing.stop(timeout=5)
+        existing.remove(force=True)
     except docker_sdk.errors.NotFound:
         pass
 
     port = driver.get('port')
     host_port = driver.get('host_port')
-    # ROS2 topic names cannot start with a number (Docker default hostname = short container ID).
-    # Use a sanitized hostname derived from the container name.
-    ros_hostname = name.replace('-', '_')  # e.g. embodied_unitree_g1
+    ros_hostname = name.replace('-', '_')
 
     run_kwargs = dict(
         image=target_image,
@@ -99,46 +188,38 @@ def _deploy_sync(driver: dict) -> dict:
         restart_policy={'Name': 'unless-stopped'},
     )
 
-    # Jetson GPU: add nvidia runtime for images with '-jetson' tag
     if '-jetson' in target_image:
         run_kwargs['runtime'] = 'nvidia'
         env_base = {'NVIDIA_VISIBLE_DEVICES': 'all'}
     else:
         run_kwargs['privileged'] = True
         env_base = {}
+
     container_network = os.environ.get('CONTAINER_NETWORK', '')
     network_mode = driver.get('network_mode', '')
     if network_mode == 'host' or (not network_mode and not container_network):
-        # host 模式：DDS 驱动容器需要共享宿主机网络才能收发 ROS2 DDS
         run_kwargs['network_mode'] = 'host'
-        # Share host IPC + PID namespace for FastDDS Shared Memory transport
         run_kwargs['ipc_mode'] = 'host'
         run_kwargs['pid_mode'] = 'host'
     else:
         if container_network:
             run_kwargs['network'] = container_network
-        # Map host_port (explicit host→container) or port (container port same as host)
         if host_port:
             run_kwargs['ports'] = {f'{host_port}/tcp': host_port}
         elif port and not container_network:
             run_kwargs['ports'] = {f'{port}/tcp': port}
 
-    # Extra env vars from manifest
     env = dict(driver.get('environment') or {})
-    # Inject ROS2 DDS env vars (inherit from agent-core) so containers join the same domain
     for key in ('ROS_DOMAIN_ID', 'RMW_IMPLEMENTATION', 'FASTDDS_BUILTIN_TRANSPORTS'):
         if key not in env and os.environ.get(key):
             env[key] = os.environ[key]
-    # Merge with base env (e.g. NVIDIA_VISIBLE_DEVICES for Jetson)
     final_env = {**env_base, **env}
     if final_env:
         run_kwargs['environment'] = final_env
 
-    # Volume mounts from manifest
     if driver.get('volumes'):
         run_kwargs['volumes'] = driver['volumes']
 
-    # Use local logging driver to handle binary DDS output without corruption
     run_kwargs['log_config'] = {'type': 'local'}
 
     container = client.containers.run(**run_kwargs)
