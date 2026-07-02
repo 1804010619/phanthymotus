@@ -506,7 +506,11 @@ function _openToolConfigModal(mcpId, toolName, configSchema) {
         loadingOpt.value = '';
         loadingOpt.textContent = 'Loading devices...';
         input.appendChild(loadingOpt);
-        navigator.mediaDevices.enumerateDevices().then(devices => {
+        // Request mic permission first to get device labels, then enumerate
+        navigator.mediaDevices.getUserMedia({ audio: true }).then(stream => {
+          stream.getTracks().forEach(t => t.stop()); // release immediately
+          return navigator.mediaDevices.enumerateDevices();
+        }).then(devices => {
           input.innerHTML = '';
           const defaultOpt = document.createElement('option');
           defaultOpt.value = '';
@@ -742,7 +746,11 @@ export function openInstanceConfigModal(mcpId, toolName, instanceId, configSchem
         loadingOpt.value = '';
         loadingOpt.textContent = 'Loading devices...';
         input.appendChild(loadingOpt);
-        navigator.mediaDevices.enumerateDevices().then(devices => {
+        // Request mic permission first to get device labels, then enumerate
+        navigator.mediaDevices.getUserMedia({ audio: true }).then(stream => {
+          stream.getTracks().forEach(t => t.stop()); // release immediately
+          return navigator.mediaDevices.enumerateDevices();
+        }).then(devices => {
           input.innerHTML = '';
           const defaultOpt = document.createElement('option');
           defaultOpt.value = '';

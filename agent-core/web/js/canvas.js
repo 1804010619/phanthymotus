@@ -781,7 +781,8 @@ function _buildCardEl({ id, mcpId, toolName, driverName, x, y, topicIn: savedTop
         // 从 MCP url 推导驱动 WS 地址 (WS on port+1)
         const mcpUrl = new URL(liveMcp.url);
         const wsPort = parseInt(mcpUrl.port) + 1;
-        const wsUrl = `ws://${mcpUrl.hostname}:${wsPort}/ws/mic`;
+        const wsProto = location.protocol === 'https:' ? 'wss' : 'ws';
+        const wsUrl = `${wsProto}://${mcpUrl.hostname}:${wsPort}/ws/mic`;
         try {
           await toggleMicStream(wsUrl, (active) => {
             micBtn.textContent = active ? '\u23F9 停止录音' : '\uD83C\uDF99 开始录音';
