@@ -668,6 +668,32 @@ async def mcp_call_tool(mcp_id: str, req: MCPCallRequest):
     """Call a tool on an MCP server and return the result."""
     # ── Handle internal agentcore MCP (no HTTP transport) ──
     if mcp_id == 'agentcore':
+        # remote_mic and remote_message — simple internal tools
+        if req.tool == 'remote_mic':
+            action = req.arguments.get('action', 'start')
+            if action == 'start':
+                return {'code': 200, 'data': {'state': 'running', 'ws_path': '/ws/mic'}}
+            elif action == 'stop':
+                return {'code': 200, 'data': {'state': 'idle'}}
+            elif action == 'info':
+                return {'code': 200, 'data': {'state': 'running', 'ws_path': '/ws/mic', 'topic_out': [{'topic': '/remote_control/mic', 'format': 'audio/pcm-16k'}]}}
+            return {'code': 200, 'data': None}
+        if req.tool == 'remote_message':
+            action = req.arguments.get('action', 'start')
+            if action == 'start':
+                return {'code': 200, 'data': {'state': 'running'}}
+            elif action == 'stop':
+                return {'code': 200, 'data': {'state': 'idle'}}
+            elif action == 'send_message':
+                text = req.arguments.get('text', '')
+                if text:
+                    import json as _json
+                    import time as _time
+                    import ros2_bridge
+                    ros2_bridge.publish('/remote_control/message', _json.dumps({'text': text, 'ts': _time.time()}, ensure_ascii=False))
+                    return {'code': 200, 'data': {'status': 'sent', 'text': text}}
+                return {'code': 200, 'data': {'error': 'Missing text'}}
+            return {'code': 200, 'data': None}
         return await _handle_agentcore_call(req)
 
     mcps = _get_mcp_list()

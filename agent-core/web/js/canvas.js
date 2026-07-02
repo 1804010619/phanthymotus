@@ -778,18 +778,22 @@ function _buildCardEl({ id, mcpId, toolName, driverName, x, y, topicIn: savedTop
         e.stopPropagation();
         const liveMcp = _allMcps.find(m => m.id === mcpId);
         if (!liveMcp) return;
-        // 从 MCP url 推导驱动 WS 地址 (WS on port+1)
-        const mcpUrl = new URL(liveMcp.url);
-        const wsPort = parseInt(mcpUrl.port) + 1;
+        // Connect mic WebSocket to agent-core's /ws/mic proxy (same host/port as page)
         const wsProto = location.protocol === 'https:' ? 'wss' : 'ws';
-        const wsUrl = `${wsProto}://${mcpUrl.hostname}:${wsPort}/ws/mic`;
+        const wsUrl = `${wsProto}://${location.host}/ws/mic`;
         try {
+          // Ensure mic permission is granted before connecting
+          if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+            alert('麦克风不可用：需要 HTTPS 安全连接');
+            return;
+          }
           await toggleMicStream(wsUrl, (active) => {
             micBtn.textContent = active ? '\u23F9 停止录音' : '\uD83C\uDF99 开始录音';
             micBtn.classList.toggle('recording', active);
           });
         } catch (err) {
           console.error('[canvas] mic toggle failed:', err);
+          alert('麦克风启动失败: ' + err.message);
         }
       });
       footer.prepend(micBtn);

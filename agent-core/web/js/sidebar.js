@@ -93,7 +93,7 @@ export function renderSidebar(mcps, topicStatuses = {}) {
 
 // ── Section builders ──────────────────────────────────────────────────────────
 
-const _TYPE_ORDER = ['sensor', 'actuator', 'processor', 'controller', ''];
+const _TYPE_ORDER = ['controller', 'sensor', 'actuator', 'processor', ''];
 
 function _buildSection(mcp) {
   const name = mcp.server_name || mcp.name || mcp.id;

@@ -117,9 +117,41 @@ def _register_core_mcp(silent=False):
                 'topic_out': [
                     {'topic': '/decision_core', 'format': 'data/json'}
                 ],
+            },
+            {
+                'name': 'remote_mic',
+                'type': 'sensor',
+                'description': '浏览器麦克风 — 通过 WebSocket 采集本地麦克风 PCM-16k 音频流',
+                'inputSchema': {'type': 'object', 'properties': {}},
+                'configSchema': {
+                    'type': 'object',
+                    'properties': {
+                        'device_id': {
+                            'type': 'string',
+                            'description': '浏览器音频输入设备',
+                            'format': 'audio-input-device',
+                            'scope': 'instance',
+                        },
+                    },
+                },
+                'topic_out': [{'topic': '/remote_control/mic', 'format': 'audio/pcm-16k'}],
+            },
+            {
+                'name': 'remote_message',
+                'type': 'sensor',
+                'description': '远程文本消息 — 从浏览器发送文本消息到机器人',
+                'inputSchema': {
+                    'type': 'object',
+                    'properties': {
+                        'action': {'type': 'string', 'enum': ['send_message'], 'description': 'Action to perform'},
+                        'text': {'type': 'string', 'description': '消息文本'},
+                    },
+                    'required': ['action', 'text'],
+                },
+                'topic_out': [{'topic': '/remote_control/message', 'format': 'data/json'}],
             }
         ],
-        'topic_out': [{'topic': '/decision_core', 'format': 'data/json'}],
+        'topic_out': [{'topic': '/decision_core', 'format': 'data/json'}, {'topic': '/remote_control/mic', 'format': 'audio/pcm-16k'}, {'topic': '/remote_control/message', 'format': 'data/json'}],
         'topic_in': [{'format': 'data/json'}],
     })
     mcp_mgr._save_mcp_list(existing)
@@ -241,6 +273,44 @@ import api.motus_stream
 app.include_router(api.motus_stream.router)
 
 app.include_router(api.inspection.ws_router)
+
+# ── Mic WebSocket endpoint (receive browser PCM and publish to ROS2) ──────────
+_mic_pub = None
+
+@app.websocket('/ws/mic')
+async def _ws_mic(ws: fastapi.WebSocket):
+    """Receive PCM-16k audio from browser and publish to ROS2 topic."""
+    global _mic_pub
+    await ws.accept()
+    try:
+        if _mic_pub is None:
+            try:
+                from audio_msgs.msg import AudioChunk
+                import ros2_bridge
+                node = ros2_bridge._node_main
+                if node:
+                    from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
+                    qos = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT,
+                                     history=HistoryPolicy.KEEP_LAST, depth=200,
+                                     durability=DurabilityPolicy.VOLATILE)
+                    _mic_pub = node.create_publisher(AudioChunk, "/remote_control/mic", qos)
+            except Exception:
+                pass
+        while True:
+            data = await ws.receive_bytes()
+            if _mic_pub:
+                from audio_msgs.msg import AudioChunk
+                chunk_size = 1024
+                offset = 0
+                while offset < len(data):
+                    chunk = data[offset:offset + chunk_size]
+                    offset += chunk_size
+                    msg = AudioChunk()
+                    msg.format = "pcm_16k_16bit_mono"
+                    msg.data = list(chunk)
+                    _mic_pub.publish(msg)
+    except Exception:
+        pass
 
 class _HTTPOnlyStaticFiles(fastapi.staticfiles.StaticFiles):
     async def __call__(self, scope, receive, send):
