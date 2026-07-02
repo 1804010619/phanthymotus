@@ -132,7 +132,7 @@ def _pull_and_restart_sync(image: str) -> None:
         restart_image = f'{base}/restart:latest' if base else 'restart:latest'
 
     try:
-        _set_step('启动 restart helper，通过 docker compose 切换…')
+        _set_step(f'启动 restart helper，升级 agent-core → {image.rsplit(":", 1)[-1]}…')
         compose_dir = os.environ.get('COMPOSE_DIR', '/opt/phanthy-motus')
         client.containers.run(
             restart_image,
