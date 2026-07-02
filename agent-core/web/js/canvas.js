@@ -1326,6 +1326,22 @@ async function _startProject() {
       _logActivity('error', msg);
       _flashStartError(msg);
     }
+    // Auto-start mic stream when remote_mic card starts
+    if (card.toolName === 'remote_mic' && !isMicActive()) {
+      const wsProto = location.protocol === 'https:' ? 'wss' : 'ws';
+      const wsUrl = `${wsProto}://${location.host}/ws/mic`;
+      try {
+        await toggleMicStream(wsUrl, (active) => {
+          const micBtn = card.el?.querySelector('.canvas-mic-btn');
+          if (micBtn) {
+            micBtn.textContent = active ? '\u23F9 停止录音' : '\uD83C\uDF99 开始录音';
+            micBtn.classList.toggle('recording', active);
+          }
+        });
+      } catch (err) {
+        _logActivity('error', '麦克风启动失败: ' + err.message);
+      }
+    }
     // Update card.topicOut from start response (multiInstance tools return real topic paths on start)
     const parsed = _parseMcpCallResult(startResult);
     if (parsed?.topic_out?.some(t => t.topic)) {
@@ -1366,6 +1382,15 @@ function _stopProject() {
     }
     args.instance_id = card.id;
     _triggerAction(card.mcpId, card.toolName, 'stop', args);
+    // Auto-stop mic stream when remote_mic card stops
+    if (card.toolName === 'remote_mic' && isMicActive()) {
+      toggleMicStream('', () => {}).catch(() => {});
+      const micBtn = card.el?.querySelector('.canvas-mic-btn');
+      if (micBtn) {
+        micBtn.textContent = '\uD83C\uDF99 开始录音';
+        micBtn.classList.remove('recording');
+      }
+    }
   }
   // 持久化运行状态
   fetch('/api/config/project-running', {
