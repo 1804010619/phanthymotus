@@ -365,6 +365,11 @@ async def _do_ping(mcp_id: str) -> dict:
 
     if transport != 'http' or not url:
         is_internal = transport == 'internal'
+        # Register topics for internal MCPs (so inspection/monitoring works)
+        if is_internal:
+            topics = target.get('topic_out', []) + target.get('topic_in', [])
+            if topics:
+                asyncio.create_task(_notify_inspector(mcp_id, topics))
         return {
             'online':      is_internal and target.get('online', False),
             'tools':       target.get('tools', []),
