@@ -4,8 +4,14 @@ FROM ${ROS_BASE_IMAGE}
 ARG PYPI_MIRROR
 
 RUN apt-get -o Acquire::AllowInsecureRepositories=true update && \
-    apt-get install -y --no-install-recommends --allow-unauthenticated python3-pip && \
+    apt-get install -y --no-install-recommends --allow-unauthenticated python3-pip docker.io curl && \
     rm -rf /var/lib/apt/lists/*
+
+# Install docker compose plugin
+RUN mkdir -p /usr/local/lib/docker/cli-plugins && \
+    curl -fsSL "https://github.com/docker/compose/releases/download/v2.27.1/docker-compose-linux-$(dpkg --print-architecture)" \
+    -o /usr/local/lib/docker/cli-plugins/docker-compose && \
+    chmod +x /usr/local/lib/docker/cli-plugins/docker-compose
 
 # Install uv
 RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} uv

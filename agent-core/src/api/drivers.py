@@ -95,6 +95,9 @@ def _deploy_sync(driver: dict) -> dict:
     compose_dir = os.environ.get('COMPOSE_DIR', '/opt/phanthy-motus')
     compose_file = os.path.join(compose_dir, 'docker-compose.yml')
 
+    # Ensure compose dir exists (may be a host-mounted volume)
+    os.makedirs(compose_dir, exist_ok=True)
+
     container = client.containers.create(target_image)
     try:
         bits, _ = container.get_archive('/deploy/service.yml')
