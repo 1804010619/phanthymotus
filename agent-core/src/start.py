@@ -266,6 +266,9 @@ app_api.include_router(api.skills.router)
 import api.history
 app_api.include_router(api.history.router)
 
+import api.network
+app_api.include_router(api.network.router)
+
 app = fastapi.FastAPI(lifespan=lifespan)
 app.mount('/api', app_api)
 

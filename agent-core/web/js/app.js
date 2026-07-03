@@ -12,6 +12,7 @@ import { initDetailPanel }   from './detail-panel.js';
 import { initMonitorMode }   from './monitor-mode.js';
 import { initSkills }        from './skills.js';
 import { initHistory }       from './history.js';
+import { initNetwork }       from './network.js';
 import './agent-definition.js';
 
 let _allMcps   = [];
@@ -25,6 +26,7 @@ async function main() {
   initDeployPanel();
   initSkills();
   initHistory();
+  initNetwork();
 
   initActivityLog();
 
