@@ -231,8 +231,8 @@ export const SkeletonRenderer = {
         linkObj[j.childLink] = childGroup;
         this._links[j.childLink] = childGroup;
 
-        // Add visual geometry (bone segment) — only for revolute joints
-        if (j.type === 'revolute') {
+        // Add visual geometry (bone segment) for revolute joints and significant fixed joints
+        if (j.type === 'revolute' || j.type === 'fixed') {
           this._addBoneVisual(jointGroup, j);
         }
 
@@ -240,7 +240,7 @@ export const SkeletonRenderer = {
       }
     }
 
-    // Add joint spheres
+    // Add joint spheres for revolute joints
     for (const [name, obj] of Object.entries(this._joints)) {
       const isHand = name.includes('hand');
       const radius = isHand ? 0.006 : 0.012;
@@ -249,6 +249,20 @@ export const SkeletonRenderer = {
         new THREE.MeshPhongMaterial({ color: 0x00ccff, emissive: 0x003344 })
       );
       obj.add(sphere);
+    }
+
+    // Add endpoint spheres for leaf links (links with no children, e.g. feet)
+    const parentLinks = new Set(joints.map(j => j.childLink));
+    for (const [name, obj] of Object.entries(this._links)) {
+      if (name === rootLinkName) continue;
+      const hasChildren = joints.some(j => j.parentLink === name);
+      if (!hasChildren) {
+        const sphere = new THREE.Mesh(
+          new THREE.SphereGeometry(0.01, 8, 8),
+          new THREE.MeshPhongMaterial({ color: 0x44ddff, emissive: 0x002233 })
+        );
+        obj.add(sphere);
+      }
     }
 
     this._loaded = true;
