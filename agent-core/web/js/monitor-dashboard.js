@@ -107,6 +107,13 @@ async function _fetchAndBuild() {
     }
   }
 
+  // Fallback: fill _topicMcpMap from /api/topics mcp_id for any topic not yet mapped
+  for (const t of Object.values(topicDetails)) {
+    if (t.topic && t.mcp_id && !_topicMcpMap[t.topic]) {
+      _topicMcpMap[t.topic] = t.mcp_id;
+    }
+  }
+
   if (topicSet.size === 0) {
     _grid.innerHTML = `<div class="monitor-dashboard-empty">
       <div class="placeholder-icon">◎</div>
