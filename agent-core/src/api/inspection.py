@@ -76,17 +76,12 @@ def _push_factory(topic: str):
 def _ensure_primary_sub(topic: str, fmt: str, loop: asyncio.AbstractEventLoop):
     """Start primary ROS2 subscription only if not already active. Once started, stays forever."""
     if topic in _active_primary_subs:
-        import traceback
-        print(f'[inspection] SKIP duplicate sub: {topic}')
-        traceback.print_stack()
         return  # already subscribed, no DDS discovery delay
     _active_primary_subs.add(topic)  # mark immediately to prevent race
 
     key = f'__primary__#{topic}'
     ros2_bridge.subscribe(key, topic, fmt, loop, _push_factory(topic))
-    import traceback
     print(f'[inspection] started primary sub: {topic}')
-    traceback.print_stack()
 
 
 # ── Internal API (called by mcp_manage directly) ───────────────────────────────
