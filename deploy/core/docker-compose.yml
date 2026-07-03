@@ -10,6 +10,7 @@ services:
     env_file: .env
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
+      - /var/run/dbus/system_bus_socket:/var/run/dbus/system_bus_socket  # NetworkManager D-Bus
       - ./data/data.db:/work/resource/data.db                          # SQLite 配置
       - ./data/prompt_memory.md:/work/resource/memory/prompt_memory.md  # LLM 长期记忆
       - ./data/world:/work/resource/world                              # 世界模型

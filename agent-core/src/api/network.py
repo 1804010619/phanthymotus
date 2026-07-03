@@ -14,7 +14,7 @@ from pydantic import BaseModel
 
 import config
 
-# dbus-python 安装在系统 dist-packages，venv 中不可见，需手动加入路径
+# dbus-python 安装在系统 dist-packages，若 venv 无 system.pth 则手动加入
 if '/usr/lib/python3/dist-packages' not in sys.path:
     sys.path.append('/usr/lib/python3/dist-packages')
 

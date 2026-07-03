@@ -5,7 +5,7 @@ ARG PYPI_MIRROR
 
 RUN apt-get -o Acquire::AllowInsecureRepositories=true update && \
     apt-get install -y --no-install-recommends --allow-unauthenticated \
-        python3-pip docker.io docker-compose-v2 && \
+        python3-pip docker.io docker-compose-v2 python3-dbus && \
     rm -rf /var/lib/apt/lists/*
 
 # Install uv
@@ -20,7 +20,8 @@ RUN uv lock && uv sync --no-dev --no-install-project
 # Link system ROS2 packages into venv so sensor_msgs/rclpy are importable
 RUN echo "/opt/ros/humble/lib/python3.10/site-packages" >> .venv/lib/python3.10/site-packages/ros2.pth && \
     echo "/opt/ros/humble/local/lib/python3.10/dist-packages" >> .venv/lib/python3.10/site-packages/ros2.pth && \
-    echo "/ros_ws/install/audio_msgs/local/lib/python3.10/dist-packages" >> .venv/lib/python3.10/site-packages/ros2.pth
+    echo "/ros_ws/install/audio_msgs/local/lib/python3.10/dist-packages" >> .venv/lib/python3.10/site-packages/ros2.pth && \
+    echo "/usr/lib/python3/dist-packages" >> .venv/lib/python3.10/site-packages/system.pth
 
 COPY web/      /work/web/
 COPY src/      /work/src/
