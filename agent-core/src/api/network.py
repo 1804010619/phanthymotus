@@ -125,6 +125,13 @@ def _get_devices_sync() -> list[dict]:
         state = int(props.get('State', 0))
         iface_name = str(props.get('Interface', ''))
         mac = str(props.get('HwAddress', ''))
+        # Fallback: read MAC from sysfs (NM < 1.24 may return empty HwAddress)
+        if not mac:
+            try:
+                with open(f'/sys/class/net/{iface_name}/address') as f:
+                    mac = f.read().strip()
+            except Exception:
+                pass
 
         # Get active connection name
         connection_name = ''
