@@ -332,7 +332,7 @@ app.mount('/', _HTTPOnlyStaticFiles(directory='./web', html=True), name='web')
 
 
 # ========== SSL 自签名证书 ==========
-def _ensure_ssl_certs(cert_dir: str = "./certs") -> tuple[str, str]:
+def _ensure_ssl_certs(cert_dir: str = "./resource/certs") -> tuple[str, str]:
     """自动生成自签名 SSL 证书（如不存在）。首次启动生成，后续复用。"""
     cert_path = pathlib.Path(cert_dir) / "cert.pem"
     key_path = pathlib.Path(cert_dir) / "key.pem"

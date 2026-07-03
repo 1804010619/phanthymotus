@@ -225,6 +225,7 @@ async function _doUpdate(image, tag) {
 function _startReconnectLoop(expectedTag) {
   const text = document.getElementById('update-banner-text');
   let elapsed = 0;
+  let attempts = 0;
   text.textContent = `容器切换中（0s），请稍后…`;
 
   const timer = setInterval(() => {
@@ -233,6 +234,7 @@ function _startReconnectLoop(expectedTag) {
   }, 10000);
 
   const reconnect = setInterval(async () => {
+    attempts++;
     try {
       const res  = await fetch('/api/system/update-check');
       const json = await res.json();
@@ -243,7 +245,14 @@ function _startReconnectLoop(expectedTag) {
         text.textContent = `升级成功，版本：${newTag}`;
         setTimeout(() => location.reload(), 1500);
       }
-    } catch { /* 服务还没起来，继续等 */ }
+    } catch {
+      // Server might be down OR SSL cert changed after restart — force reload after 60s
+      if (attempts >= 6) {
+        clearInterval(timer);
+        clearInterval(reconnect);
+        location.reload();
+      }
+    }
   }, 10000);
 }
 
