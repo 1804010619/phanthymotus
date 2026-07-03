@@ -45,12 +45,12 @@ async function _loadInterfaces() {
           <span class="network-iface-state ${i.state === 'connected' ? 'connected' : ''}">${_stateLabel(i.state)}</span>
           ${i.connection ? `<span class="network-iface-conn">${_esc(i.connection)}</span>` : ''}
         </div>
-        <div class="network-iface-details">
-          ${i.mac ? `<span class="network-iface-detail"><b>MAC</b> ${_esc(i.mac)}</span>` : ''}
-          ${i.ip ? `<span class="network-iface-detail"><b>IP</b> ${_esc(i.ip)}</span>` : ''}
-          ${i.mask ? `<span class="network-iface-detail"><b>掩码</b> ${_esc(i.mask)}</span>` : ''}
-          ${i.gateway ? `<span class="network-iface-detail"><b>网关</b> ${_esc(i.gateway)}</span>` : ''}
-        </div>
+        ${i.state === 'connected' ? `<div class="network-iface-grid">
+          ${i.ip ? `<div class="network-iface-cell"><span class="network-iface-label">IP</span><span class="network-iface-value">${_esc(i.ip)}</span></div>` : ''}
+          ${i.mask ? `<div class="network-iface-cell"><span class="network-iface-label">掩码</span><span class="network-iface-value">${_esc(i.mask)}</span></div>` : ''}
+          ${i.gateway ? `<div class="network-iface-cell"><span class="network-iface-label">网关</span><span class="network-iface-value">${_esc(i.gateway)}</span></div>` : ''}
+          ${i.mac ? `<div class="network-iface-cell"><span class="network-iface-label">MAC</span><span class="network-iface-value">${_esc(i.mac)}</span></div>` : ''}
+        </div>` : ''}
       </div>
     `).join('');
   } catch {
