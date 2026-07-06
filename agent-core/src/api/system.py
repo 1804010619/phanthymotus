@@ -134,6 +134,7 @@ def _pull_and_restart_sync(image: str) -> None:
     try:
         _set_step(f'启动 restart helper，升级 agent-core → {image.rsplit(":", 1)[-1]}…')
         compose_dir = os.environ.get('COMPOSE_DIR', '/opt/phanthy-motus')
+        container_name = os.environ.get('CONTAINER_NAME', 'phanthy-motus-agent-core-1')
         client.containers.run(
             restart_image,
             detach=True,
@@ -144,9 +145,11 @@ def _pull_and_restart_sync(image: str) -> None:
                 compose_dir: {'bind': compose_dir, 'mode': 'rw'},
             },
             environment={
-                'COMPOSE_DIR': compose_dir,
-                'SERVICE':     'agent-core',
-                'NEW_IMAGE':   image,
+                # 兼容新旧两版 restart helper entrypoint
+                'COMPOSE_DIR':    compose_dir,
+                'SERVICE':        'agent-core',
+                'NEW_IMAGE':      image,
+                'CONTAINER_NAME': container_name,
             },
         )
         _set_step('restart helper 已启动，容器即将切换…')
