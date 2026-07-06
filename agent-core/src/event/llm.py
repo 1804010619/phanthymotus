@@ -343,6 +343,9 @@ class Event:
         print(f'[decision] compressed: kept {len(recent_turns)} recent turns, summary={len(summary)} chars')
 
     async def _one_turn(self, trigger_event: dict):
+        import time as _time
+        _turn_t0 = _time.perf_counter()
+
         # Log incoming event
         print(f'[decision] received event: source={trigger_event.get("source", "?")} text={trigger_event.get("text", "")[:100]}')
 
@@ -408,10 +411,13 @@ class Event:
             # Log LLM request summary
             msg_count = len(messages)
             tool_count = len(all_tool_list)
+            # Estimate prompt size (rough: 1 token ≈ 3 chars for CJK)
+            prompt_chars = sum(len(m.get('content', '')) for m in messages)
             last_user = next((m.get('content', '')[:80] for m in reversed(messages) if m.get('role') == 'user'), '')
-            print(f'[decision] llm request: round={round_idx} messages={msg_count} tools={tool_count} last_user={last_user}')
+            print(f'[decision] llm request: round={round_idx} messages={msg_count} tools={tool_count} ~chars={prompt_chars} last_user={last_user}')
 
             # ── 调用 LLM（含上下文溢出恢复）───────────────────────────────
+            _round_t0 = _time.perf_counter()
             try:
                 response = await client.llm(
                     message_list = messages,
@@ -450,9 +456,10 @@ class Event:
             turn_messages.append(response)
 
             # Log LLM response
+            _round_elapsed = _time.perf_counter() - _round_t0
             resp_text = (response.get('content') or '')[:100]
             resp_tools = [c['function']['name'] for c in (response.get('tool_calls') or [])]
-            print(f'[decision] llm response: text={resp_text!r} tool_calls={resp_tools}')
+            print(f'[decision] llm response: round_time={_round_elapsed:.2f}s text={resp_text!r} tool_calls={resp_tools}')
 
             # ── 文字输出 ──────────────────────────────────────────────────
             text = response.get('content') or ''
@@ -552,3 +559,5 @@ class Event:
         ros2_bridge.publish('/decision_core', json.dumps(decision, ensure_ascii=False))
 
         await push_event({'type': 'turn_end', 'payload': {}})
+        _turn_elapsed = _time.perf_counter() - _turn_t0
+        print(f'[decision] turn complete: {_turn_elapsed:.2f}s total, {round_idx + 1} rounds')

@@ -109,6 +109,7 @@ class Client():
 
         async def _go(client, model) -> dict:
             url = str(client.base_url)
+            t0 = time.perf_counter()
             try:
                 response = await client.chat.completions.create(
                     model=model,
@@ -118,14 +119,27 @@ class Client():
                     stream=False,
                     extra_body={"thinking": {"type": "disabled"}, "enable_thinking": False},
                 )
-                print(f'[llm] {model} ok ({time.perf_counter():.1f}s)')
+                elapsed = time.perf_counter() - t0
+                # Performance log: latency + token usage
+                usage = response.usage
+                if usage:
+                    cached = getattr(usage, 'prompt_tokens_details', None)
+                    cached_tokens = getattr(cached, 'cached_tokens', 0) if cached else 0
+                    print(
+                        f'[llm] {model} ok {elapsed:.2f}s | '
+                        f'prompt={usage.prompt_tokens} completion={usage.completion_tokens} '
+                        f'total={usage.total_tokens} cached={cached_tokens}'
+                    )
+                else:
+                    print(f'[llm] {model} ok {elapsed:.2f}s | usage=N/A')
                 msg = response.choices[0].message.to_dict()
                 # 清理模型泄漏的 think 标签残留
                 if msg.get('content'):
                     msg['content'] = re.sub(r'</?think>', '', msg['content']).strip()
                 return msg
             except Exception as e:
-                print(f'[llm] {model} @ {url} failed: {type(e).__name__}: {e}')
+                elapsed = time.perf_counter() - t0
+                print(f'[llm] {model} @ {url} failed after {elapsed:.2f}s: {type(e).__name__}: {e}')
                 raise
 
         configs = config.main['client']['llm']
