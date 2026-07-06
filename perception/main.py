@@ -28,7 +28,7 @@ import yaml
 import rclpy
 import rclpy.executors
 
-logging.basicConfig(level=logging.DEBUG, format='%(asctime)s [%(name)s] %(levelname)s %(message)s',
+logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(name)s] %(levelname)s %(message)s',
                     datefmt='%H:%M:%S')
 log = logging.getLogger(__name__)
 # suppress noisy third-party loggers
@@ -115,7 +115,7 @@ def make_handler():
         def log_message(self, fmt, *args):
             if args and "/sse" in str(args[0]):
                 return
-            log.info(f"{self.address_string()} {fmt % args}")
+            log.debug(f"{self.address_string()} {fmt % args}")
 
         def _send(self, status: int, body: str):
             encoded = body.encode()
@@ -232,7 +232,7 @@ def make_handler():
 
             try:
                 if method == "initialize":
-                    log.info(f"[mcp] initialize request from client")
+                    log.debug(f"[mcp] initialize request from client")
                     ok({"protocolVersion": "2024-11-05", "capabilities": {"tools": {}},
                         "serverInfo": {"name": "perception-bundle", "version": "1.0.0"}})
                 elif method == "tools/list":
@@ -240,12 +240,16 @@ def make_handler():
                 elif method == "tools/call":
                     name   = params.get("name", "")
                     args   = params.get("arguments") or {}
-                    log.info(f"[mcp] tools/call: {name}({args})")
+                    # info action is heartbeat probe — log at DEBUG to reduce noise
+                    is_info = (args.get('action') == 'info')
+                    if not is_info:
+                        log.info(f"[mcp] tools/call: {name}({args})")
                     result = _bundle.dispatch(name, args)
                     if result is None:
                         err(-32601, f"Unknown tool: {name}")
                     else:
-                        log.info(f"[mcp] tools/call result: {json.dumps(result)[:200]}")
+                        if not is_info:
+                            log.info(f"[mcp] tools/call result: {json.dumps(result)[:200]}")
                         ok({"content": [{"type": "text", "text": json.dumps(result)}]})
                 else:
                     err(-32601, f"Method not found: {method}")
