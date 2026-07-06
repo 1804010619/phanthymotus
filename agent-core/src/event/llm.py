@@ -362,6 +362,9 @@ class Event:
         # 绑定工具全名集合，用于 L2 环境快照过滤
         bound_tool_names = {s['name'] for s in bound_schemas}
 
+        # ── 冻结 system message（turn 内复用，保证 prefix caching 命中）────
+        frozen_system = prompt_mod.build_system(mcp_client.registry, bound_tool_names)
+
         finish_tool = 'finish'
         max_rounds  = 20
         response    = None
@@ -375,22 +378,20 @@ class Event:
             current_history = history + _sanitize(turn_messages)
 
             if round_idx == 0:
-                # 首轮：加入 L4 触发事件
+                # 首轮：加入 L4 触发事件（含 L2 动态快照）
                 messages = prompt_mod.build(
+                    system_msg    = frozen_system,
                     message_list  = current_history,
                     trigger_event = trigger_event,
-                    mcp_registry  = mcp_client.registry,
-                    bound_tools   = bound_tool_names,
                 )
                 # 把 trigger user message 记入 turn_messages，后续轮次能看到
                 trigger_user_msg = messages[-1]  # build() 最后一条是 L4 user
                 turn_messages.append(trigger_user_msg)
             else:
-                # 后续轮：不加新的 user message，LLM 直接看 tool result 决策
+                # 后续轮：不加新的 user message，复用冻结的 system
                 messages = prompt_mod.build_continuation(
+                    system_msg   = frozen_system,
                     message_list = current_history,
-                    mcp_registry = mcp_client.registry,
-                    bound_tools  = bound_tool_names,
                 )
 
             await push_event({'type': 'llm_request', 'payload': {'round': round_idx}})
@@ -427,14 +428,13 @@ class Event:
                         summary = await _compress_turns(old)
                         self._summary = (self._summary + '\n\n' + summary) if self._summary else summary
                         self._turns = self._turns[-2:]
-                        # 重建 history 并重试
+                        # 重建 history 并重试（复用冻结的 system）
                         history = self._build_history()
                         current_history = history + _sanitize(turn_messages)
                         messages = prompt_mod.build(
+                            system_msg    = frozen_system,
                             message_list  = current_history,
                             trigger_event = trigger_event,
-                            mcp_registry  = mcp_client.registry,
-                            bound_tools   = bound_tool_names,
                         )
                         trigger_user_msg = messages[-1]
                         turn_messages.clear()
