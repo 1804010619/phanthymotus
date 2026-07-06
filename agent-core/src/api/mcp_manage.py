@@ -351,6 +351,42 @@ async def mcp_delete(mcp_id: str):
     return {'code': 200}
 
 
+async def _restore_saved_configs(mcp_id: str, url: str, tools: list) -> None:
+    """Re-send saved tool configs to a device that just came online.
+
+    Only sends shared (non-instance) configs for tools that have configSchema.
+    Called once when a device transitions from offline → online.
+    """
+    headers = {'Content-Type': 'application/json'}
+    timeout = aiohttp.ClientTimeout(total=5)
+    sent = []
+
+    try:
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            for tool in tools:
+                if not isinstance(tool, dict):
+                    continue
+                tool_name = tool.get('name', '')
+                if not tool.get('configSchema'):
+                    continue
+                saved_cfg = config.main.get(f'tool_config:{mcp_id}:{tool_name}', None)
+                if not saved_cfg:
+                    continue
+                cfg_payload = {
+                    'jsonrpc': '2.0', 'id': 99,
+                    'method': 'tools/call',
+                    'params': {'name': tool_name, 'arguments': {'action': 'config', **saved_cfg}},
+                }
+                await session.post(url, json=cfg_payload, headers=headers)
+                sent.append(tool_name)
+    except Exception as e:
+        print(f'[mcp/config-restore] {mcp_id} error: {e}')
+        return
+
+    if sent:
+        print(f'[mcp/config-restore] {mcp_id}: restored config for {sent}')
+
+
 async def _do_ping(mcp_id: str) -> dict:
     """Core ping logic — fetch capabilities, persist, notify inspector.
     Returns the same dict as the ping endpoint's data field.
@@ -379,6 +415,9 @@ async def _do_ping(mcp_id: str) -> dict:
             'topic_out':   target.get('topic_out', []),
             'topic_in':    target.get('topic_in', []),
         }
+
+    # 记录 ping 前的 online 状态，用于判断是否需要重新下发 config
+    was_online = mcp_client.registry.get(mcp_id, {}).get('online', False)
 
     try:
         caps = await _ping_mcp_http(url)
@@ -518,6 +557,10 @@ async def _do_ping(mcp_id: str) -> dict:
 
     # Notify inspection module about all topics from this device
     asyncio.create_task(_notify_inspector(mcp_id, topic_out + topic_in))
+
+    # Auto-restore saved configs when device comes online (first ping or after offline)
+    if not was_online:
+        asyncio.create_task(_restore_saved_configs(mcp_id, url, caps['tools']))
 
     ws_path = ('/ws/bus' + topic_out[0].get('topic', '')) if topic_out else ''
     return {
