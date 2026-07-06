@@ -27,6 +27,9 @@ import pathlib
 import config
 import event_bus
 
+# UTC+8 时区
+_TZ_CN = datetime.timezone(datetime.timedelta(hours=8))
+
 
 # ── L1 缓存 ──────────────────────────────────────────────────────────────────
 
@@ -174,7 +177,7 @@ def _env_dynamic() -> str:
     每次调用都重新生成，但作为 user message 放在历史之后，
     不影响 system message 的缓存命中。
     """
-    now = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    now = datetime.datetime.now(_TZ_CN).strftime('%Y-%m-%d %H:%M:%S')
 
     # 最近事件来源统计
     recents = event_bus.recent(10)
@@ -221,7 +224,7 @@ def _trigger_message(event: dict) -> str:
     """
     if event.get('source') == 'collector':
         return event['text']
-    ts = datetime.datetime.fromtimestamp(event['ts']).strftime('%Y-%m-%dT%H:%M:%S')
+    ts = datetime.datetime.fromtimestamp(event['ts'], tz=_TZ_CN).strftime('%Y-%m-%dT%H:%M:%S')
     src = event['source']
     txt = event['text']
     return f'<event source="{src}" ts="{ts}">\n{txt}\n</event>'

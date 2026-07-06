@@ -457,9 +457,16 @@ class Event:
 
             # Log LLM response
             _round_elapsed = _time.perf_counter() - _round_t0
-            resp_text = (response.get('content') or '')[:100]
-            resp_tools = [c['function']['name'] for c in (response.get('tool_calls') or [])]
-            print(f'[decision] llm response: round_time={_round_elapsed:.2f}s text={resp_text!r} tool_calls={resp_tools}')
+            resp_text = (response.get('content') or '')[:200]
+            resp_tools = []
+            for c in (response.get('tool_calls') or []):
+                name = c['function']['name']
+                args_str = c['function'].get('arguments', '')[:150]
+                resp_tools.append(f'{name}({args_str})')
+            print(f'[decision] llm response: round_time={_round_elapsed:.2f}s text={resp_text!r}')
+            if resp_tools:
+                for t in resp_tools:
+                    print(f'[decision]   tool_call: {t}')
 
             # ── 文字输出 ──────────────────────────────────────────────────
             text = response.get('content') or ''
