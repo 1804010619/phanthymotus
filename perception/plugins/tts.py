@@ -456,12 +456,12 @@ class TTSPlugin:
                 }
             if instance_id:
                 # Instance requested but not running — return inferred topics for this instance only.
-                inferred_out = f"{input_topic}/tts" if input_topic else ""
+                inferred_out = f"{input_topic}/tts" if input_topic else "/perception/tts"
                 return {
                     "name": "TTS", "manufacture": "Embodied", "model": "tts",
                     "state": "idle",
                     "topic_in":  [{"topic": input_topic,  "format": "data/json",     "desc": ""}] if input_topic else [],
-                    "topic_out": [{"topic": inferred_out, "format": "audio/pcm-16k", "desc": ""}] if inferred_out else [],
+                    "topic_out": [{"topic": inferred_out, "format": "audio/pcm-16k", "desc": ""}],
                     "desc": "TTS service — converts text to audio/pcm-16k",
                 }
             # Aggregate info (no instance_id = ping/overview only)
@@ -471,7 +471,7 @@ class TTSPlugin:
                 states = list(set(n.state for n in self._nodes.values()))
                 state = "running" if "running" in states else states[0] if states else "idle"
             else:
-                inferred_out = f"{input_topic}/tts" if input_topic else ""
+                inferred_out = f"{input_topic}/tts" if input_topic else "/perception/tts"
                 topics_in = [{"topic": input_topic, "format": "data/json", "desc": ""}]
                 topics_out = [{"topic": inferred_out, "format": "audio/pcm-16k", "desc": ""}]
                 state = "idle"
@@ -532,13 +532,20 @@ class TTSPlugin:
             if not text:
                 raise ValueError("text is required")
             node_key = instance_id or '_default'
+            # Prefer reusing any existing running node if no specific instance requested
+            if node_key == '_default' and self._nodes:
+                for k, n in self._nodes.items():
+                    if n.state == "running":
+                        node_key = k
+                        break
             if node_key not in self._nodes:
+                input_topic = args.get("input_topic") or None
                 adapter = self._adapter
                 if instance_id and instance_id in self._instance_configs:
                     inst_adapter = _build_tts_adapter(self._instance_configs[instance_id])
                     if inst_adapter:
                         adapter = inst_adapter
-                node = _TTSNode(None, adapter,
+                node = _TTSNode(input_topic, adapter,
                                 node_suffix=node_key.replace('/', '_').replace('-', '_'))
                 self._executor.add_node(node)
                 self._nodes[node_key] = node
