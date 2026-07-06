@@ -14,17 +14,12 @@ LOG_PATH = pathlib.Path('./resource/log')
 
 
 async def _log_request(request: httpx.Request):
-    """httpx event hook: dump the real HTTP request body to disk."""
+    """httpx event hook: dump the real HTTP request body to disk for debugging."""
     if request.content:
         body = json.loads(request.content)
         model = body.get('model', 'unknown')
         path = LOG_PATH / f'llm_request_{model}.json'
         path.write_text(json.dumps(body, ensure_ascii=False, indent=2))
-        # Print curl equivalent for debugging
-        headers = ' '.join(f"-H '{k}: {v}'" for k, v in request.headers.items()
-                          if k.lower() not in ('host', 'content-length'))
-        curl = f"curl -X {request.method} '{request.url}' {headers} -d @{path}"
-        print(f'[llm-curl] {curl}')
 
 
 # ── 错误分类 ──────────────────────────────────────────────────────────────────
