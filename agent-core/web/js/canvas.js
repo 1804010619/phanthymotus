@@ -79,6 +79,19 @@ export async function initCanvas(initialMcps) {
     );
     _resolveAllTopics();
     _redrawConnections();
+
+    // Fetch driver-inferred output topics for processor cards with empty outputs
+    for (const card of _cards) {
+      const outPorts = [...card.el.querySelectorAll('.canvas-port.out')];
+      const hasEmptyOut = outPorts.some(p => !p.dataset.topic);
+      if (!hasEmptyOut) continue;
+      const hasOutConn = _connections.some(c => c.fromCardId === card.id);
+      if (!hasOutConn) continue;
+      const inConn = _connections.find(c => c.toCardId === card.id && c.fromTopic);
+      const inputTopic = inConn?.fromTopic || '';
+      _fetchTopicsFromDriver(card, inputTopic);
+    }
+
     // Restore viewport transform if saved
     if (layoutJson.data?.transform) {
       _zoom = layoutJson.data.transform.zoom ?? 1;
@@ -1299,9 +1312,7 @@ async function _startProject() {
     // Get input topic from inbound connection
     const inConn = _connections.find(c => c.toCardId === card.id);
     const inputTopic = inConn?.fromTopic || '';
-    if (inputTopic) {
-      await _fetchTopicsFromDriver(card, inputTopic);
-    }
+    await _fetchTopicsFromDriver(card, inputTopic);
   }
   _resolveAllTopics();
 
