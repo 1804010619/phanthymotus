@@ -1285,6 +1285,26 @@ async function _startProject() {
     return;
   }
 
+  // Resolve all topics before validation (ensures correctness after page reload)
+  _resolveAllTopics();
+
+  // For processor cards with empty output topics, fetch from driver using input topic
+  for (const card of _cards) {
+    const outPorts = [...card.el.querySelectorAll('.canvas-port.out')];
+    const hasEmptyOut = outPorts.some(p => !p.dataset.topic);
+    if (!hasEmptyOut) continue;
+    // Only for cards that have outgoing connections (otherwise irrelevant)
+    const hasOutConn = _connections.some(c => c.fromCardId === card.id);
+    if (!hasOutConn) continue;
+    // Get input topic from inbound connection
+    const inConn = _connections.find(c => c.toCardId === card.id);
+    const inputTopic = inConn?.fromTopic || '';
+    if (inputTopic) {
+      await _fetchTopicsFromDriver(card, inputTopic);
+    }
+  }
+  _resolveAllTopics();
+
   // Validate topic connections: every connection must have a fromTopic
   for (const conn of _connections) {
     if (!conn.fromTopic) {
@@ -1301,9 +1321,6 @@ async function _startProject() {
   _syncProjectBtn();
   // Enable execute buttons
   document.querySelectorAll('.canvas-exec-btn').forEach(btn => btn.classList.remove('locked'));
-
-  // Resolve all topics before starting (ensures correctness after page reload)
-  _resolveAllTopics();
 
   // Start all cards on canvas, resolving input_topic(s) from connections
   for (const card of _cards) {
