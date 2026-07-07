@@ -64,7 +64,7 @@ TOOLS = [
             "type": "object",
             "properties": {
                 "model_dir":      {"type": "string", "description": "sherpa-onnx KWS 模型目录路径", "scope": "shared"},
-                "keywords":       {"type": "array", "items": {"type": "string"}, "description": "唤醒词列表，拼音格式 (如 'nǐ hǎo xiǎo huàn @你好小幻')", "scope": "shared"},
+                "keywords":       {"type": "array", "items": {"type": "string"}, "description": "唤醒词列表，声母韵母分开 (如 'x iǎo f àn x iǎo f àn @小范小范')", "scope": "shared"},
                 "hw_provider":    {"type": "string", "enum": ["cuda", "cpu"], "default": "cpu", "description": "推理后端", "scope": "shared"},
                 "num_threads":    {"type": "integer", "description": "推理线程数", "default": 2, "scope": "shared"},
             },
