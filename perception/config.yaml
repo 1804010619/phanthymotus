@@ -40,8 +40,7 @@ plugins:
     enabled: true
     model_dir: /work/models/sherpa-onnx/kws
     keywords:
-      - "nǐ hǎo xiǎo huàn @你好小幻"
-      - "xiǎo huàn xiǎo huàn @小幻小幻"
+      - "x iǎo f àn x iǎo f àn @小范小范"
     hw_provider: cpu
     num_threads: 2
 
