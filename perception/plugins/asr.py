@@ -297,28 +297,19 @@ def _vad_worker(pcm_q: multiprocessing.Queue, result_q: multiprocessing.Queue,
                     if now >= kws_cooldown_until:
                         kws_cooldown_until = now + 2.0
                         _log.info(f"[vad-worker] WAKE WORD detected: {kw.strip()}")
-                        # Transition to listening — wait for next speech segment
+                        # Transition to listening — start recording immediately
                         state = 'listening'
-                        speech_buf = b''
-                        start_ts = None
-                        end_ts = None
+                        speech_buf = pcm  # include current frame (user may already be speaking)
+                        start_ts = ts
+                        end_ts = ts
                         # Reset KWS stream for next wake
                         kws_stream = kws_spotter.create_stream()
-                        # Reset VAD to discard wake word audio
-                        vad.reset()
             # Drain any completed VAD segments (discard in wake-wait mode)
             while not vad.empty():
                 vad.pop()
 
         elif state == 'listening':
-            # Accumulate speech from raw PCM
-            if vad.is_speech_detected():
-                if not start_ts:
-                    start_ts = ts
-                speech_buf += pcm
-                end_ts = ts
-
-            # Also collect from completed VAD segments
+            # Collect completed VAD segments (speech that ended)
             while not vad.empty():
                 seg = vad.front
                 seg_pcm = _struct.pack(f'<{len(seg.samples)}h',
@@ -329,16 +320,16 @@ def _vad_worker(pcm_q: multiprocessing.Queue, result_q: multiprocessing.Queue,
                 end_ts = ts
                 vad.pop()
 
-            # Speech ended — output if we have meaningful audio (>500ms)
-            if not vad.is_speech_detected() and speech_buf and len(speech_buf) > SAMPLE_RATE:
-                _log.info(f"[vad-worker] utterance complete, len={len(speech_buf)} bytes")
-                result_q.put((speech_buf, start_ts or ts, end_ts or ts))
-                speech_buf = b''
-                start_ts = None
-                end_ts = None
-                # Return to waiting for wake word (if KWS enabled)
-                if kws_enabled:
-                    state = 'waiting_wake'
+                # Output the segment as an utterance
+                if len(speech_buf) > SAMPLE_RATE:  # >500ms
+                    _log.info(f"[vad-worker] utterance complete, len={len(speech_buf)} bytes")
+                    result_q.put((speech_buf, start_ts or ts, end_ts or ts))
+                    speech_buf = b''
+                    start_ts = None
+                    end_ts = None
+                    # Return to waiting for wake word (if KWS enabled)
+                    if kws_enabled:
+                        state = 'waiting_wake'
 
     _log.info("[vad-worker] process exiting")
 
