@@ -66,7 +66,6 @@ TOOLS = [
                 "url":         {"type": "string", "description": "自定义 URL (可选)", "scope": "shared", "x-hide-when": {"provider": "sherpa_onnx"}},
                 "model":       {"type": "string", "description": "模型名称", "scope": "instance", "x-hide-when": {"provider": "sherpa_onnx"}},
                 "voice":       {"type": "string", "description": "音色名称", "scope": "instance", "x-hide-when": {"provider": "sherpa_onnx"}},
-                "model_dir":   {"type": "string", "description": "sherpa-onnx 模型目录路径", "scope": "shared", "x-show-when": {"provider": "sherpa_onnx"}},
                 "speaker_id":  {"type": "integer", "description": "说话人 ID", "default": 0, "scope": "instance", "x-show-when": {"provider": "sherpa_onnx"}},
                 "speed":       {"type": "number", "description": "语速 (1.0=正常)", "default": 1.0, "scope": "instance", "x-show-when": {"provider": "sherpa_onnx"}},
             },
