@@ -19,21 +19,9 @@ plugins:
 
   tts:
     enabled: true
-    provider: sherpa_onnx   # aliyun | sherpa_onnx
-    # sherpa_onnx settings
     model_dir: /work/models/sherpa-onnx/tts
     speaker_id: 0
     speed: 1.0
-    # aliyun settings
-    app_key: ""
-    ak_id: ""
-    ak_secret: ""
-    voice: ""
-    rate: 0
-    pitch: 0
-    api_key: ""
-    api_secret: ""
-    cluster: ""
 
   htmsg:
     enabled: true
