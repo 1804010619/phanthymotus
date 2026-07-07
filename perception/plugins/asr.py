@@ -71,6 +71,8 @@ TOOLS = [
                 "language":      {"type": "string", "description": "Language", "default": "zh-CN", "scope": "shared"},
                 "vad_threshold": {"type": "number", "description": "VAD speech threshold (0-1, higher = stricter)", "default": 0.5, "scope": "shared"},
                 "vad_silence_ms":{"type": "integer", "description": "Silence duration (ms) before sentence end", "default": 400, "scope": "shared"},
+                "kws_enabled":   {"type": "boolean", "description": "Enable wake word detection", "default": true, "scope": "shared"},
+                "kws_keywords":  {"type": "string", "description": "Wake word (pinyin format, e.g. 'x iǎo f àn x iǎo f àn @小范小范')", "scope": "shared"},
             },
             "required": []
         },
@@ -239,6 +241,8 @@ def _vad_worker(pcm_q: multiprocessing.Queue, result_q: multiprocessing.Queue,
                     keywords_file=kws_keywords_file,
                     num_threads=1,
                     provider="cpu",
+                    keywords_score=1.5,
+                    keywords_threshold=0.1,
                 )
                 kws_stream = kws_spotter.create_stream()
                 _log.info(f"[vad-worker] KWS initialized, keywords={keywords}")
@@ -282,8 +286,8 @@ def _vad_worker(pcm_q: multiprocessing.Queue, result_q: multiprocessing.Queue,
         vad.accept_waveform(float_samples)
 
         if state == 'waiting_wake':
-            # Only process KWS when VAD detects speech
-            if vad.is_speech_detected() and kws_spotter:
+            # Feed KWS continuously (not gated by VAD) to avoid missing wake word onset
+            if kws_spotter:
                 kws_stream.accept_waveform(SAMPLE_RATE, float_samples)
                 while kws_spotter.is_ready(kws_stream):
                     kws_spotter.decode_stream(kws_stream)
