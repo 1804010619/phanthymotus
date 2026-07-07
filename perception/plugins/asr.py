@@ -134,8 +134,8 @@ class SherpaOnnxASRAdapter(ASRAdapter):
         n = len(pcm) // 2
         samples = struct.unpack(f'<{n}h', pcm)
         float_samples = [s / 32768.0 for s in samples]
-        # Pad 300ms silence at the end to avoid last-token truncation
-        float_samples += [0.0] * int(SAMPLE_RATE * 0.3)
+        # Pad 500ms silence at the end to avoid last-token truncation
+        float_samples += [0.0] * int(SAMPLE_RATE * 0.5)
 
         stream = self._recognizer.create_stream()
         stream.accept_waveform(SAMPLE_RATE, float_samples)
@@ -186,6 +186,7 @@ def _vad_worker(pcm_q: multiprocessing.Queue, result_q: multiprocessing.Queue,
             min_silence_duration=silence_ms / 1000.0,
             min_speech_duration=0.1,
             window_size=512,
+            max_speech_duration=30,
         ),
         sample_rate=SAMPLE_RATE,
         num_threads=1,
