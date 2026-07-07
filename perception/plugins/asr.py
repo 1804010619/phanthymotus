@@ -73,10 +73,13 @@ TOOLS = [
         "configSchema": {
             "type": "object",
             "properties": {
-                "provider":      {"type": "string", "enum": ["openai", "openai_omni"], "description": "ASR 服务商", "scope": "shared"},
+                "provider":      {"type": "string", "enum": ["openai", "openai_omni", "sherpa_onnx"], "description": "ASR 服务商", "scope": "shared"},
                 "url":           {"type": "string", "description": "API URL", "scope": "shared"},
                 "key":           {"type": "string", "description": "API Key", "format": "password", "scope": "shared"},
                 "model":         {"type": "string", "description": "模型名称", "scope": "instance"},
+                "model_dir":     {"type": "string", "description": "sherpa-onnx 模型目录路径", "scope": "shared"},
+                "hw_provider":   {"type": "string", "enum": ["cuda", "cpu"], "description": "sherpa-onnx 推理后端", "default": "cuda", "scope": "shared"},
+                "num_threads":   {"type": "integer", "description": "sherpa-onnx 推理线程数", "default": 2, "scope": "shared"},
                 "language":      {"type": "string", "description": "语言", "default": "zh-CN", "scope": "instance"},
                 "vad_threshold": {"type": "number", "description": "VAD 语音判断阈值 (0–1，越高越严格，噪声大时调高)", "default": 0.5, "scope": "instance"},
                 "vad_silence_ms":{"type": "integer", "description": "静音判断时长 (ms)，超过此时长才认为句子结束", "default": 400, "scope": "instance"},
@@ -319,6 +322,44 @@ class OpenAIOmniASRAdapter(ASRAdapter):
         return "".join(parts).strip()
 
 
+class SherpaOnnxASRAdapter(ASRAdapter):
+    """On-device streaming ASR using sherpa-onnx paraformer (no network required)."""
+
+    def __init__(self, model_dir: str, hw_provider: str = "cuda", num_threads: int = 2):
+        from utils.model_downloader import ensure_model
+        ensure_model("asr", model_dir)
+
+        import sherpa_onnx
+        model_path = os.path.join(model_dir, "model.int8.onnx")
+        if not os.path.exists(model_path):
+            model_path = os.path.join(model_dir, "model.onnx")
+        tokens_path = os.path.join(model_dir, "tokens.txt")
+        self._recognizer = sherpa_onnx.OnlineRecognizer.from_paraformer(
+            paraformer=model_path,
+            tokens=tokens_path,
+            num_threads=num_threads,
+            provider=hw_provider,
+            sample_rate=SAMPLE_RATE,
+        )
+        log.info(f"[asr] sherpa-onnx adapter loaded: model={model_path}, provider={hw_provider}")
+
+    def transcribe(self, wav_bytes: bytes, language: str) -> str:
+        import io as _io, wave as _wave
+        with _wave.open(_io.BytesIO(wav_bytes)) as wf:
+            pcm = wf.readframes(wf.getnframes())
+        n = len(pcm) // 2
+        samples = struct.unpack(f'<{n}h', pcm)
+        float_samples = [s / 32768.0 for s in samples]
+
+        stream = self._recognizer.create_stream()
+        stream.accept_waveform(SAMPLE_RATE, float_samples)
+        stream.input_finished()
+        while self._recognizer.is_ready(stream):
+            self._recognizer.decode_streams([stream])
+        result = self._recognizer.get_result(stream)
+        return result.text.strip()
+
+
 def _build_asr_adapter(cfg: dict) -> Optional[ASRAdapter]:
     provider = cfg.get('provider', 'openai')
     if provider == 'openai':
@@ -329,6 +370,11 @@ def _build_asr_adapter(cfg: dict) -> Optional[ASRAdapter]:
         url, key = cfg.get('url',''), cfg.get('key','')
         if not url and not key: return None
         return OpenAIOmniASRAdapter(url, key, cfg.get('model',''))
+    elif provider == 'sherpa_onnx':
+        model_dir = cfg.get('model_dir', '/work/models/sherpa-onnx/asr')
+        hw_provider = cfg.get('hw_provider', 'cuda')
+        num_threads = int(cfg.get('num_threads', 2))
+        return SherpaOnnxASRAdapter(model_dir, hw_provider, num_threads)
     return None
 
 

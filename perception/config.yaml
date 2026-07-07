@@ -3,7 +3,12 @@ mcp_port: 15720
 plugins:
   asr:
     enabled: true
-    provider: openai    # openai | openai_omni
+    provider: sherpa_onnx    # openai | openai_omni | sherpa_onnx
+    # sherpa_onnx settings
+    model_dir: /work/models/sherpa-onnx/asr
+    hw_provider: cuda        # cuda | cpu
+    num_threads: 2
+    # openai/openai_omni settings
     url: ""
     key: ""
     model: ""
@@ -15,18 +20,30 @@ plugins:
 
   tts:
     enabled: true
-    provider: aliyun    # aliyun | doubao
-    # Aliyun
+    provider: sherpa_onnx   # aliyun | sherpa_onnx
+    # sherpa_onnx settings
+    model_dir: /work/models/sherpa-onnx/tts
+    speaker_id: 0
+    speed: 1.0
+    # aliyun settings
     app_key: ""
     ak_id: ""
     ak_secret: ""
     voice: ""
     rate: 0
     pitch: 0
-    # Doubao
     api_key: ""
     api_secret: ""
     cluster: ""
+
+  kws:
+    enabled: true
+    model_dir: /work/models/sherpa-onnx/kws
+    keywords:
+      - "你好小幻"
+      - "小幻小幻"
+    hw_provider: cpu
+    num_threads: 2
 
   htmsg:
     enabled: true

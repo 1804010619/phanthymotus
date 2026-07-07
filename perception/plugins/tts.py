@@ -61,12 +61,16 @@ TOOLS = [
         "configSchema": {
             "type": "object",
             "properties": {
-                "api_key": {"type": "string", "description": "API Key", "format": "password", "scope": "shared"},
-                "url":     {"type": "string", "description": "自定义 URL (可选)", "scope": "shared"},
-                "model":   {"type": "string", "description": "模型名称", "scope": "instance"},
-                "voice":   {"type": "string", "description": "音色名称", "scope": "instance"},
+                "provider":    {"type": "string", "enum": ["aliyun", "sherpa_onnx"], "description": "TTS 服务商", "scope": "shared"},
+                "api_key":     {"type": "string", "description": "API Key (aliyun)", "format": "password", "scope": "shared"},
+                "url":         {"type": "string", "description": "自定义 URL (可选)", "scope": "shared"},
+                "model":       {"type": "string", "description": "模型名称", "scope": "instance"},
+                "voice":       {"type": "string", "description": "音色名称", "scope": "instance"},
+                "model_dir":   {"type": "string", "description": "sherpa-onnx 模型目录路径", "scope": "shared"},
+                "speaker_id":  {"type": "integer", "description": "说话人 ID (sherpa-onnx)", "default": 0, "scope": "instance"},
+                "speed":       {"type": "number", "description": "语速 (1.0=正常)", "default": 1.0, "scope": "instance"},
             },
-            "required": ["api_key"]
+            "required": []
         },
         "topic_in":  [{"format": "data/json",     "desc": "text to synthesize"}],
         "topic_out": [{"format": "audio/pcm-16k", "desc": "synthesized PCM audio"}],
@@ -238,6 +242,97 @@ def _resample_24k_to_16k(data: bytes) -> bytes:
     return out.tobytes()
 
 
+class SherpaOnnxTTSAdapter(TTSAdapter):
+    """On-device TTS using sherpa-onnx VITS (MeloTTS zh_en, no network required)."""
+
+    def __init__(self, model_dir: str, speaker_id: int = 0, speed: float = 1.0):
+        import os
+        from utils.model_downloader import ensure_model
+        ensure_model("tts", model_dir)
+
+        import sherpa_onnx
+        model_path = os.path.join(model_dir, "model.onnx")
+        lexicon_path = os.path.join(model_dir, "lexicon.txt")
+        tokens_path = os.path.join(model_dir, "tokens.txt")
+        dict_dir = os.path.join(model_dir, "dict")
+        if not os.path.isdir(dict_dir):
+            dict_dir = ""
+
+        # Gather rule FSTs (date.fst, number.fst, phone.fst)
+        rule_fsts = []
+        for name in ("date.fst", "number.fst", "phone.fst"):
+            p = os.path.join(model_dir, name)
+            if os.path.exists(p):
+                rule_fsts.append(p)
+
+        tts_config = sherpa_onnx.OfflineTtsConfig(
+            model=sherpa_onnx.OfflineTtsModelConfig(
+                vits=sherpa_onnx.OfflineTtsVitsModelConfig(
+                    model=model_path,
+                    lexicon=lexicon_path if os.path.exists(lexicon_path) else "",
+                    tokens=tokens_path,
+                    dict_dir=dict_dir,
+                ),
+                num_threads=2,
+                provider="cpu",
+            ),
+            rule_fsts=",".join(rule_fsts) if rule_fsts else "",
+        )
+        self._tts = sherpa_onnx.OfflineTts(tts_config)
+        self._sid = speaker_id
+        self._speed = speed
+        self._native_rate = 44100  # MeloTTS outputs 44100Hz
+        log.info(f"[tts] sherpa-onnx VITS loaded: model_dir={model_dir}, "
+                 f"speaker_id={speaker_id}, speed={speed}")
+
+    def synthesize(self, text: str) -> bytes:
+        return b''.join(self.synthesize_stream(text))
+
+    def synthesize_stream(self, text: str):
+        import struct
+        audio = self._tts.generate(text, sid=self._sid, speed=self._speed)
+        float_samples = audio.samples
+        src_rate = audio.sample_rate
+
+        # Resample to 16kHz using scipy if available, else linear interpolation
+        resampled = self._resample(float_samples, src_rate, SAMPLE_RATE)
+
+        # Convert float32 -> int16 PCM bytes and yield in chunks
+        pcm = struct.pack(f'<{len(resampled)}h',
+                         *[int(max(-32768, min(32767, s * 32767))) for s in resampled])
+        for i in range(0, len(pcm), CHUNK_BYTES):
+            yield pcm[i:i + CHUNK_BYTES]
+
+    @staticmethod
+    def _resample(samples, src_rate: int, dst_rate: int):
+        if src_rate == dst_rate:
+            return samples
+        try:
+            import numpy as np
+            from scipy.signal import resample_poly
+            from math import gcd
+            g = gcd(src_rate, dst_rate)
+            up, down = dst_rate // g, src_rate // g
+            arr = np.array(samples, dtype=np.float32)
+            resampled = resample_poly(arr, up, down).tolist()
+            return resampled
+        except ImportError:
+            # Fallback: linear interpolation
+            ratio = dst_rate / src_rate
+            n_out = int(len(samples) * ratio)
+            out = []
+            for i in range(n_out):
+                pos = i / ratio
+                idx = int(pos)
+                frac = pos - idx
+                if idx + 1 < len(samples):
+                    s = samples[idx] + (samples[idx + 1] - samples[idx]) * frac
+                else:
+                    s = samples[idx] if idx < len(samples) else 0.0
+                out.append(s)
+            return out
+
+
 def _decode_to_pcm16k(encoded: bytes, input_fmt: str = None, input_rate: int = None) -> bytes:
     """Convert audio to PCM 16 kHz mono s16le via ffmpeg.
 
@@ -259,6 +354,14 @@ def _decode_to_pcm16k(encoded: bytes, input_fmt: str = None, input_rate: int = N
 
 
 def _build_tts_adapter(cfg: dict) -> Optional[TTSAdapter]:
+    provider = cfg.get('provider', 'aliyun')
+    if provider == 'sherpa_onnx':
+        import os
+        model_dir = cfg.get('model_dir', '/work/models/sherpa-onnx/tts')
+        speaker_id = int(cfg.get('speaker_id', 0))
+        speed = float(cfg.get('speed', 1.0))
+        return SherpaOnnxTTSAdapter(model_dir, speaker_id, speed)
+    # Default: aliyun
     api_key = cfg.get('api_key', '')
     if not api_key:
         return None

@@ -76,10 +76,14 @@ RUN mkdir -p /work/weights/clip && \
 # Set YOLO_CONFIG_DIR so WEIGHTS_DIR resolves to /work/weights
 ENV YOLO_CONFIG_DIR=/work
 
+# ── sherpa-onnx (on-device ASR/TTS/KWS) ──────────────────────────
+RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} sherpa-onnx
+
 # ── Application code ───────────────────────────────────────────────
 WORKDIR /work
 COPY perception/main.py    /work/main.py
 COPY perception/plugins/   /work/plugins/
+COPY perception/utils/     /work/utils/
 COPY perception/config.yaml /work/config.yaml
 
 EXPOSE 15720
