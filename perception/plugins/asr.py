@@ -361,7 +361,9 @@ class SherpaOnnxASRAdapter(ASRAdapter):
         while self._recognizer.is_ready(stream):
             self._recognizer.decode_streams([stream])
         result = self._recognizer.get_result(stream)
-        return result.text.strip()
+        # result may be a string directly or an object with .text
+        text = result.text if hasattr(result, 'text') else str(result)
+        return text.strip()
 
 
 def _build_asr_adapter(cfg: dict) -> Optional[ASRAdapter]:
