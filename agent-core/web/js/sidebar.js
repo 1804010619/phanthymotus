@@ -437,6 +437,11 @@ function _openToolConfigModal(mcpId, toolName, configSchema) {
   for (const [key, def] of Object.entries(props)) {
     // Skip instance-scope fields only if there are also shared fields
     if (hasSharedFields && def.scope === 'instance') continue;
+    const fieldWrapper = document.createElement('div');
+    fieldWrapper.className = 'tool-config-field';
+    if (def['x-show-when']) fieldWrapper.dataset.showWhen = JSON.stringify(def['x-show-when']);
+    if (def['x-hide-when']) fieldWrapper.dataset.hideWhen = JSON.stringify(def['x-hide-when']);
+
     const label = document.createElement('label');
     label.className = 'tool-config-label';
     label.textContent = `${def.title || def.description || key}${required.includes(key) ? ' *' : ''}`;
@@ -542,9 +547,47 @@ function _openToolConfigModal(mcpId, toolName, configSchema) {
       input.value = savedValues[key] != null ? savedValues[key] : (def.default != null ? def.default : '');
     }
 
-    bodyEl.appendChild(label);
-    bodyEl.appendChild(input);
+    fieldWrapper.appendChild(label);
+    fieldWrapper.appendChild(input);
+    bodyEl.appendChild(fieldWrapper);
   }
+
+  // x-show-when / x-hide-when: toggle field visibility based on controlling field value
+  function _applyShowWhen() {
+    bodyEl.querySelectorAll('.tool-config-field[data-show-when]').forEach(el => {
+      const cond = JSON.parse(el.dataset.showWhen);
+      let visible = true;
+      for (const [condKey, condVal] of Object.entries(cond)) {
+        const ctrl = bodyEl.querySelector(`[data-key="${condKey}"]`);
+        if (ctrl && ctrl.value !== condVal) { visible = false; break; }
+      }
+      el.style.display = visible ? '' : 'none';
+    });
+    bodyEl.querySelectorAll('.tool-config-field[data-hide-when]').forEach(el => {
+      const cond = JSON.parse(el.dataset.hideWhen);
+      let hidden = false;
+      for (const [condKey, condVal] of Object.entries(cond)) {
+        const ctrl = bodyEl.querySelector(`[data-key="${condKey}"]`);
+        if (ctrl && ctrl.value === condVal) { hidden = true; break; }
+      }
+      el.style.display = hidden ? 'none' : '';
+    });
+  }
+  // Attach change listeners to controlling fields
+  const showWhenKeys = new Set();
+  bodyEl.querySelectorAll('.tool-config-field[data-show-when]').forEach(el => {
+    const cond = JSON.parse(el.dataset.showWhen);
+    Object.keys(cond).forEach(k => showWhenKeys.add(k));
+  });
+  bodyEl.querySelectorAll('.tool-config-field[data-hide-when]').forEach(el => {
+    const cond = JSON.parse(el.dataset.hideWhen);
+    Object.keys(cond).forEach(k => showWhenKeys.add(k));
+  });
+  for (const k of showWhenKeys) {
+    const ctrl = bodyEl.querySelector(`[data-key="${k}"]`);
+    if (ctrl) ctrl.addEventListener('change', _applyShowWhen);
+  }
+  _applyShowWhen();
 
   // Handlers
   const close = () => { overlay.classList.add('hidden'); };

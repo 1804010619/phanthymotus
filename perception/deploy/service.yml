@@ -7,6 +7,7 @@ perception:
   privileged: true
   volumes:
     - /dev:/dev
+    - /opt/embodied/models:/models
   environment:
     - ROS_DOMAIN_ID=42
     - RMW_IMPLEMENTATION=rmw_fastrtps_cpp

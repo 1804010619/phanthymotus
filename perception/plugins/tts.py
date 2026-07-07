@@ -1,14 +1,12 @@
 #!/usr/bin/env python3
 """
-plugins/tts.py — TTSPlugin: TTS 感知封装。
+plugins/tts.py — TTSPlugin: sherpa-onnx VITS TTS.
 
-从 perception/tts/main.py 提取，作为 PerceptionBundle 的插件。
-核心逻辑（TTSAdapter、TTSNode）不变，去掉独立 main/MCP server。
+On-device text-to-speech using sherpa-onnx MeloTTS (Chinese + English).
 """
 
 from __future__ import annotations
 
-import base64
 import json
 import logging
 import queue
@@ -61,12 +59,10 @@ TOOLS = [
         "configSchema": {
             "type": "object",
             "properties": {
-                "api_key": {"type": "string", "description": "API Key", "format": "password", "scope": "shared"},
-                "url":     {"type": "string", "description": "自定义 URL (可选)", "scope": "shared"},
-                "model":   {"type": "string", "description": "模型名称", "scope": "instance"},
-                "voice":   {"type": "string", "description": "音色名称", "scope": "instance"},
+                "speaker_id": {"type": "integer", "description": "Speaker ID", "default": 0, "scope": "shared"},
+                "speed":      {"type": "number", "description": "Speech speed (1.0 = normal)", "default": 1.0, "scope": "shared"},
             },
-            "required": ["api_key"]
+            "required": []
         },
         "topic_in":  [{"format": "data/json",     "desc": "text to synthesize"}],
         "topic_out": [{"format": "audio/pcm-16k", "desc": "synthesized PCM audio"}],
@@ -74,10 +70,7 @@ TOOLS = [
 ]
 
 
-# ── TTS Adapters ──────────────────────────────────────────────────────────────
-
-_DASHSCOPE_WS_URL      = 'wss://dashscope.aliyuncs.com/api-ws/v1/inference'
-_DASHSCOPE_REALTIME_URL = 'wss://dashscope.aliyuncs.com/api-ws/v1/realtime'
+# ── TTS Adapter ──────────────────────────────────────────────────────────────
 
 class TTSAdapter(ABC):
     @abstractmethod
@@ -88,186 +81,75 @@ class TTSAdapter(ABC):
         yield self.synthesize(text)
 
 
-class AliyunDashScopeTTSAdapter(TTSAdapter):
-    """Aliyun DashScope TTS via dashscope SDK.
+class SherpaOnnxTTSAdapter(TTSAdapter):
+    """On-device TTS using sherpa-onnx Matcha (flow-matching, fast non-autoregressive)."""
 
-    - cosyvoice-* models  → tts_v2.SpeechSynthesizer (WS streaming)
-    - qwen*-tts-* models  → qwen_tts_realtime.QwenTtsRealtime (realtime WS)
-    """
+    def __init__(self, model_dir: str, speaker_id: int = 0, speed: float = 1.0):
+        import os
+        from utils.model_downloader import ensure_model
+        ensure_model("tts", model_dir)
+        ensure_model("tts_vocoder", model_dir)
 
-    def __init__(self, api_key: str, model: str, voice: str, url: str = ''):
-        self.api_key = api_key
-        self.model   = model or 'qwen3-tts-flash-realtime'
-        self.voice   = voice or 'Ethan'
-        self.url     = url
+        import sherpa_onnx
+        # Matcha model files
+        acoustic_model = os.path.join(model_dir, "model-steps-3.onnx")
+        vocoder = os.path.join(model_dir, "vocos-16khz-univ.onnx")
+        lexicon_path = os.path.join(model_dir, "lexicon.txt")
+        tokens_path = os.path.join(model_dir, "tokens.txt")
+        data_dir = os.path.join(model_dir, "espeak-ng-data")
+        if not os.path.isdir(data_dir):
+            data_dir = ""
 
-    def _is_qwen(self) -> bool:
-        return 'qwen' in self.model.lower()
+        # Gather rule FSTs
+        rule_fsts = []
+        for name in ("date-zh.fst", "number-zh.fst", "phone-zh.fst"):
+            p = os.path.join(model_dir, name)
+            if os.path.exists(p):
+                rule_fsts.append(p)
+
+        tts_config = sherpa_onnx.OfflineTtsConfig(
+            model=sherpa_onnx.OfflineTtsModelConfig(
+                matcha=sherpa_onnx.OfflineTtsMatchaModelConfig(
+                    acoustic_model=acoustic_model,
+                    vocoder=vocoder,
+                    lexicon=lexicon_path if os.path.exists(lexicon_path) else "",
+                    tokens=tokens_path,
+                    data_dir=data_dir,
+                    length_scale=1.0 / speed if speed else 1.0,
+                ),
+                num_threads=2,
+                provider="cpu",
+            ),
+            rule_fsts=",".join(rule_fsts) if rule_fsts else "",
+        )
+        self._tts = sherpa_onnx.OfflineTts(tts_config)
+        self._sid = speaker_id
+        self._speed = speed
+        log.info(f"[tts] sherpa-onnx Matcha loaded: model_dir={model_dir}, "
+                 f"speaker_id={speaker_id}, speed={speed}")
 
     def synthesize(self, text: str) -> bytes:
         return b''.join(self.synthesize_stream(text))
 
     def synthesize_stream(self, text: str):
-        if self._is_qwen():
-            yield from self._stream_qwen(text)
-        else:
-            yield from self._stream_cosyvoice(text)
-
-    def _stream_cosyvoice(self, text: str):
-        import dashscope
-        from dashscope.audio.tts_v2 import SpeechSynthesizer, ResultCallback, AudioFormat
-        import queue as _queue
-
-        pcm_q = _queue.Queue()
-        _DONE = object()
-        error = [None]
-
-        class _Cb(ResultCallback):
-            def on_data(self_cb, data: bytes) -> None:
-                pcm_q.put(data)
-            def on_complete(self_cb) -> None:
-                pcm_q.put(_DONE)
-            def on_error(self_cb, message) -> None:
-                error[0] = message
-                pcm_q.put(_DONE)
-            def on_close(self_cb) -> None:
-                pass
-
-        dashscope.api_key = self.api_key
-        if self.url:
-            dashscope.base_websocket_api_url = self.url
-
-        synth = SpeechSynthesizer(
-            model=self.model,
-            voice=self.voice,
-            format=AudioFormat.PCM_16000HZ_MONO_16BIT,
-            callback=_Cb(),
-        )
-        synth.call(text)  # async_call=True with callback, returns immediately
-
-        while True:
-            item = pcm_q.get(timeout=120)
-            if item is _DONE:
-                break
-            yield item
-
-        if error[0]:
-            raise RuntimeError(f'DashScope CosyVoice TTS error: {error[0]}')
-
-    def _stream_qwen(self, text: str):
-        import base64 as _b64, dashscope
-        from dashscope.audio.qwen_tts_realtime import (
-            QwenTtsRealtime, QwenTtsRealtimeCallback,
-        )
-        import queue as _queue
-        pcm_q = _queue.Queue()
-        _DONE  = object()
-        error  = [None]
-
-        # use realtime endpoint; ignore any inference-URL override (CosyVoice URL)
-        if self.url and 'realtime' in self.url:
-            url = self.url
-        else:
-            url = _DASHSCOPE_REALTIME_URL
-            if self.url:
-                log.warning(f'[tts/qwen] ignoring non-realtime url={self.url!r}, using default')
-
-        class _Cb(QwenTtsRealtimeCallback):
-            def on_open(self_cb): pass
-            def on_close(self_cb, code, msg):
-                pcm_q.put(_DONE)
-            def on_event(self_cb, response):
-                t = response.get('type', '') if isinstance(response, dict) else ''
-                if t == 'response.audio.delta':
-                    raw = response.get('delta', '')
-                    data = _b64.b64decode(raw) if raw else b''
-                    if data:
-                        pcm_q.put(data)
-                elif t == 'session.finished':
-                    pcm_q.put(_DONE)
-                elif t == 'error':
-                    error[0] = repr(response)
-                    pcm_q.put(_DONE)
-
-        dashscope.api_key = self.api_key
-        cb  = _Cb()
-        cli = QwenTtsRealtime(model=self.model, callback=cb, url=url)
-        cli.connect()
-        cli.update_session(voice=self.voice, mode='server_commit')
-        cli.append_text(text)
-        cli.finish()
-
-        total = 0
-        while True:
-            item = pcm_q.get(timeout=60)
-            if item is _DONE:
-                break
-            total += len(item)
-            # 24kHz s16le → 16kHz s16le: 每3个样本取2个（简单线性插值）
-            yield _resample_24k_to_16k(item)
-
-        log.info(f'[tts] qwen spoke {len(text)} chars → {total} bytes (streamed)')
-
-        if error[0]:
-            raise RuntimeError(f'DashScope Qwen TTS error: {error[0]}')
+        import struct
+        audio = self._tts.generate(text, sid=self._sid, speed=self._speed)
+        float_samples = audio.samples
+        # Matcha + vocos-16khz outputs 16kHz directly, no resampling needed
+        pcm = struct.pack(f'<{len(float_samples)}h',
+                         *[int(max(-32768, min(32767, s * 32767))) for s in float_samples])
+        for i in range(0, len(pcm), CHUNK_BYTES):
+            yield pcm[i:i + CHUNK_BYTES]
 
 
-def _resample_24k_to_16k(data: bytes) -> bytes:
-    """Resample PCM s16le from 24kHz to 16kHz using linear interpolation.
-
-    Ratio: 16000/24000 = 2/3, so for every 3 input samples we produce 2 output samples.
-    Uses array module for ~10x speedup over struct.unpack loop.
-    """
-    import array
-    n_samples = len(data) // 2
-    if n_samples == 0:
-        return b''
-    samples = array.array('h')
-    samples.frombytes(data)
-    n_out = int(n_samples * 2 / 3)
-    out = array.array('h', bytes(n_out * 2))
-    for i in range(n_out):
-        pos = i * 1.5
-        idx = int(pos)
-        frac = pos - idx
-        if idx + 1 < n_samples:
-            s = samples[idx] + (samples[idx + 1] - samples[idx]) * frac
-        else:
-            s = samples[idx] if idx < n_samples else 0
-        out[i] = int(max(-32768, min(32767, s)))
-    return out.tobytes()
 
 
-def _decode_to_pcm16k(encoded: bytes, input_fmt: str = None, input_rate: int = None) -> bytes:
-    """Convert audio to PCM 16 kHz mono s16le via ffmpeg.
-
-    If input_fmt/input_rate are given, treat input as raw PCM with those params.
-    Otherwise auto-detect (mp3/wav/opus/…).
-    """
-    import subprocess
-    if input_fmt and input_rate:
-        cmd = ['ffmpeg', '-y',
-               '-f', input_fmt, '-ar', str(input_rate), '-ac', '1', '-i', 'pipe:0',
-               '-ar', '16000', '-ac', '1', '-f', 's16le', 'pipe:1']
-    else:
-        cmd = ['ffmpeg', '-y', '-i', 'pipe:0',
-               '-ar', '16000', '-ac', '1', '-f', 's16le', 'pipe:1']
-    result = subprocess.run(cmd, input=encoded, capture_output=True, timeout=30)
-    if result.returncode != 0:
-        raise RuntimeError(f'ffmpeg decode failed: {result.stderr.decode(errors="ignore")[-300:]}')
-    return result.stdout
-
-
-def _build_tts_adapter(cfg: dict) -> Optional[TTSAdapter]:
-    api_key = cfg.get('api_key', '')
-    if not api_key:
-        return None
-    return AliyunDashScopeTTSAdapter(
-        api_key=api_key,
-        model=cfg.get('model', ''),
-        voice=cfg.get('voice', ''),
-        url=cfg.get('url', ''),
-    )
+def _build_tts_adapter(cfg: dict) -> TTSAdapter:
+    import os
+    model_dir = cfg.get('model_dir', '/models/sherpa-onnx/tts')
+    speaker_id = int(cfg.get('speaker_id', 0))
+    speed = float(cfg.get('speed', 1.0))
+    return SherpaOnnxTTSAdapter(model_dir, speaker_id, speed)
 
 
 # ── ROS2 Node ─────────────────────────────────────────────────────────────────
@@ -341,6 +223,8 @@ class _TTSNode(Node):
             except queue.Empty:
                 continue
             try:
+                import time as _time
+                t_start = _time.monotonic()
                 total = 0
                 buf   = b''
                 t0    = None  # wall-clock start of playback
@@ -408,7 +292,7 @@ class _TTSNode(Node):
                     msg.format = "audio/pcm-16k"
                     msg.data   = list(buf)
                     self._pub.publish(msg)
-                log.info(f"[tts] spoke {len(text)} chars → {total} bytes ({frames_sent} frames, streaming)")
+                log.info(f"[tts] spoke {len(text)} chars → {total} bytes ({frames_sent} frames) in {_time.monotonic() - t_start:.2f}s")
             except Exception as e:
                 log.error(f"[tts] synthesis error: {e}", exc_info=True)
 
@@ -427,14 +311,11 @@ class TTSPlugin:
 
     def __init__(self, plugin_cfg: dict, executor):
         self._adapter  = _build_tts_adapter(plugin_cfg)
-        self._nodes: dict[str, _TTSNode] = {}           # key = instance_id
-        self._instance_configs: dict[str, dict] = {}    # key = instance_id → per-instance config
+        self._cfg      = plugin_cfg
+        self._nodes: dict[str, _TTSNode] = {}
         self._executor = executor
-        log.info(f"[tts] plugin init: provider={plugin_cfg.get('provider')}, "
-                 f"model={plugin_cfg.get('model','') or '(default)'}, "
-                 f"api_key={'set' if plugin_cfg.get('api_key') else 'MISSING'}")
-        if not self._adapter:
-            log.warning("[tts] adapter not configured (missing API key)")
+        log.info(f"[tts] plugin init: sherpa-onnx VITS, "
+                 f"speaker_id={plugin_cfg.get('speaker_id', 0)}, speed={plugin_cfg.get('speed', 1.0)}")
 
     def get_tools(self) -> list:
         return TOOLS
@@ -494,12 +375,7 @@ class TTSPlugin:
                     self._executor.remove_node(default_node)
                     del self._nodes['_default']
             if node_key not in self._nodes:
-                adapter = self._adapter
-                if instance_id and instance_id in self._instance_configs:
-                    inst_adapter = _build_tts_adapter(self._instance_configs[instance_id])
-                    if inst_adapter:
-                        adapter = inst_adapter
-                node = _TTSNode(input_topic or None, adapter,
+                node = _TTSNode(input_topic or None, self._adapter,
                                 node_suffix=node_key.replace('/', '_').replace('-', '_'))
                 self._executor.add_node(node)
                 self._nodes[node_key] = node
@@ -508,12 +384,7 @@ class TTSPlugin:
                 old_node = self._nodes[node_key]
                 old_node.stop()
                 self._executor.remove_node(old_node)
-                adapter = self._adapter
-                if instance_id and instance_id in self._instance_configs:
-                    inst_adapter = _build_tts_adapter(self._instance_configs[instance_id])
-                    if inst_adapter:
-                        adapter = inst_adapter
-                node = _TTSNode(input_topic, adapter,
+                node = _TTSNode(input_topic, self._adapter,
                                 node_suffix=node_key.replace('/', '_').replace('-', '_'))
                 self._executor.add_node(node)
                 self._nodes[node_key] = node
@@ -567,20 +438,18 @@ class TTSPlugin:
 
         elif action == "config":
             cfg = {k: v for k, v in args.items() if k not in ('action', 'instance_id') and v}
-            if instance_id:
-                self._instance_configs[instance_id] = cfg
-                if instance_id in self._nodes:
-                    self._nodes[instance_id].stop()
-                    self._executor.remove_node(self._nodes[instance_id])
-                    del self._nodes[instance_id]
-                return {"status": "configured", "instance_id": instance_id}
-            else:
-                self._adapter = _build_tts_adapter(cfg)
-                for key in list(self._nodes.keys()):
-                    self._nodes[key].stop()
-                    self._executor.remove_node(self._nodes[key])
-                    del self._nodes[key]
-                return {"status": "configured", "adapter_ok": self._adapter is not None}
+            # Update config and rebuild adapter
+            if 'speaker_id' in cfg:
+                self._cfg['speaker_id'] = int(cfg['speaker_id'])
+            if 'speed' in cfg:
+                self._cfg['speed'] = float(cfg['speed'])
+            self._adapter = _build_tts_adapter(self._cfg)
+            # Stop all nodes (they'll use new adapter on next start)
+            for key in list(self._nodes.keys()):
+                self._nodes[key].stop()
+                self._executor.remove_node(self._nodes[key])
+                del self._nodes[key]
+            return {"status": "configured"}
 
         return None
 

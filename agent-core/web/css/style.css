@@ -504,6 +504,15 @@ html, body {
 }
 .chip-config-btn:hover { background: var(--bg-secondary); color: var(--text-primary); }
 
+.tool-config-field {
+  margin-bottom: 16px;
+}
+.tool-config-field:last-child {
+  margin-bottom: 0;
+}
+.tool-config-field .tool-config-label {
+  margin-top: 0;
+}
 .tool-config-label {
   display: block;
   font-size: 12px;
@@ -525,6 +534,9 @@ html, body {
   font-size: 13px;
   font-family: var(--font-mono);
   transition: border-color 0.15s, box-shadow 0.15s;
+  -webkit-appearance: none;
+  appearance: none;
+  height: 40px;
 }
 .tool-config-input:focus {
   outline: none;

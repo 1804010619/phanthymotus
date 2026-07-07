@@ -20,10 +20,13 @@ RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} \
     kiss-icp scipy
 RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} \
     ultralytics
+RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} \
+    sherpa-onnx
 
 WORKDIR /work
 COPY main.py    /work/main.py
 COPY plugins/   /work/plugins/
+COPY utils/     /work/utils/
 COPY config.yaml /work/config.yaml
 COPY deploy/     /deploy/
 
