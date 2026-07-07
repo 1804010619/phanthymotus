@@ -198,11 +198,7 @@ def _vad_worker(pcm_q: multiprocessing.Queue, result_q: multiprocessing.Queue,
     # ── Initialize KWS (optional) ──
     kws_spotter = None
     kws_stream = None
-    kws_enabled = kws_cfg.get('trigger_mode', kws_cfg.get('enabled', 'kws')) if kws_cfg else False
-    if kws_enabled == 'vad' or kws_enabled is False:
-        kws_enabled = False
-    else:
-        kws_enabled = True
+    kws_enabled = (kws_cfg.get('trigger_mode', 'kws') == 'kws') if kws_cfg else False
     if kws_enabled:
         kws_model_dir = kws_cfg.get('model_dir', '/work/models/sherpa-onnx/kws')
         ensure_model("kws", kws_model_dir)
