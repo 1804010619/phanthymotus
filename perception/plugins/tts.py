@@ -82,35 +82,40 @@ class TTSAdapter(ABC):
 
 
 class SherpaOnnxTTSAdapter(TTSAdapter):
-    """On-device TTS using sherpa-onnx VITS (MeloTTS zh_en, no network required)."""
+    """On-device TTS using sherpa-onnx Matcha (flow-matching, fast non-autoregressive)."""
 
     def __init__(self, model_dir: str, speaker_id: int = 0, speed: float = 1.0):
         import os
         from utils.model_downloader import ensure_model
         ensure_model("tts", model_dir)
+        ensure_model("tts_vocoder", model_dir)
 
         import sherpa_onnx
-        model_path = os.path.join(model_dir, "model.onnx")
+        # Matcha model files
+        acoustic_model = os.path.join(model_dir, "model-steps-3.onnx")
+        vocoder = os.path.join(model_dir, "vocos-16khz-univ.onnx")
         lexicon_path = os.path.join(model_dir, "lexicon.txt")
         tokens_path = os.path.join(model_dir, "tokens.txt")
-        dict_dir = os.path.join(model_dir, "dict")
-        if not os.path.isdir(dict_dir):
-            dict_dir = ""
+        data_dir = os.path.join(model_dir, "espeak-ng-data")
+        if not os.path.isdir(data_dir):
+            data_dir = ""
 
-        # Gather rule FSTs (date.fst, number.fst, phone.fst)
+        # Gather rule FSTs
         rule_fsts = []
-        for name in ("date.fst", "number.fst", "phone.fst"):
+        for name in ("date-zh.fst", "number-zh.fst", "phone-zh.fst"):
             p = os.path.join(model_dir, name)
             if os.path.exists(p):
                 rule_fsts.append(p)
 
         tts_config = sherpa_onnx.OfflineTtsConfig(
             model=sherpa_onnx.OfflineTtsModelConfig(
-                vits=sherpa_onnx.OfflineTtsVitsModelConfig(
-                    model=model_path,
+                matcha=sherpa_onnx.OfflineTtsMatchaModelConfig(
+                    acoustic_model=acoustic_model,
+                    vocoder=vocoder,
                     lexicon=lexicon_path if os.path.exists(lexicon_path) else "",
                     tokens=tokens_path,
-                    dict_dir=dict_dir,
+                    data_dir=data_dir,
+                    length_scale=1.0 / speed if speed else 1.0,
                 ),
                 num_threads=2,
                 provider="cpu",
@@ -120,8 +125,7 @@ class SherpaOnnxTTSAdapter(TTSAdapter):
         self._tts = sherpa_onnx.OfflineTts(tts_config)
         self._sid = speaker_id
         self._speed = speed
-        self._native_rate = 44100  # MeloTTS outputs 44100Hz
-        log.info(f"[tts] sherpa-onnx VITS loaded: model_dir={model_dir}, "
+        log.info(f"[tts] sherpa-onnx Matcha loaded: model_dir={model_dir}, "
                  f"speaker_id={speaker_id}, speed={speed}")
 
     def synthesize(self, text: str) -> bytes:
@@ -131,45 +135,13 @@ class SherpaOnnxTTSAdapter(TTSAdapter):
         import struct
         audio = self._tts.generate(text, sid=self._sid, speed=self._speed)
         float_samples = audio.samples
-        src_rate = audio.sample_rate
-
-        # Resample to 16kHz using scipy if available, else linear interpolation
-        resampled = self._resample(float_samples, src_rate, SAMPLE_RATE)
-
-        # Convert float32 -> int16 PCM bytes and yield in chunks
-        pcm = struct.pack(f'<{len(resampled)}h',
-                         *[int(max(-32768, min(32767, s * 32767))) for s in resampled])
+        # Matcha + vocos-16khz outputs 16kHz directly, no resampling needed
+        pcm = struct.pack(f'<{len(float_samples)}h',
+                         *[int(max(-32768, min(32767, s * 32767))) for s in float_samples])
         for i in range(0, len(pcm), CHUNK_BYTES):
             yield pcm[i:i + CHUNK_BYTES]
 
-    @staticmethod
-    def _resample(samples, src_rate: int, dst_rate: int):
-        if src_rate == dst_rate:
-            return samples
-        try:
-            import numpy as np
-            from scipy.signal import resample_poly
-            from math import gcd
-            g = gcd(src_rate, dst_rate)
-            up, down = dst_rate // g, src_rate // g
-            arr = np.array(samples, dtype=np.float32)
-            resampled = resample_poly(arr, up, down).tolist()
-            return resampled
-        except ImportError:
-            # Fallback: linear interpolation
-            ratio = dst_rate / src_rate
-            n_out = int(len(samples) * ratio)
-            out = []
-            for i in range(n_out):
-                pos = i / ratio
-                idx = int(pos)
-                frac = pos - idx
-                if idx + 1 < len(samples):
-                    s = samples[idx] + (samples[idx + 1] - samples[idx]) * frac
-                else:
-                    s = samples[idx] if idx < len(samples) else 0.0
-                out.append(s)
-            return out
+
 
 
 def _build_tts_adapter(cfg: dict) -> TTSAdapter:

@@ -21,8 +21,13 @@ MODELS = {
         "check_file": "tokens.txt",
     },
     "tts": {
-        "url": f"{COS_BASE}/vits-melo-tts-zh_en.tar.bz2",
-        "check_file": "model.onnx",
+        "url": f"{COS_BASE}/matcha-icefall-zh-en.tar.bz2",
+        "check_file": "model-steps-3.onnx",
+    },
+    "tts_vocoder": {
+        "url": f"{COS_BASE}/vocos-16khz-univ.onnx",
+        "check_file": "vocos-16khz-univ.onnx",
+        "single_file": True,
     },
     "kws": {
         "url": f"{COS_BASE}/sherpa-onnx-kws-zipformer-zh-en-3M-2025-12-20.tar.bz2",
