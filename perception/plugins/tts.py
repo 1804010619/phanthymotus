@@ -251,6 +251,8 @@ class _TTSNode(Node):
             except queue.Empty:
                 continue
             try:
+                import time as _time
+                t_start = _time.monotonic()
                 total = 0
                 buf   = b''
                 t0    = None  # wall-clock start of playback
@@ -318,7 +320,7 @@ class _TTSNode(Node):
                     msg.format = "audio/pcm-16k"
                     msg.data   = list(buf)
                     self._pub.publish(msg)
-                log.info(f"[tts] spoke {len(text)} chars → {total} bytes ({frames_sent} frames, streaming)")
+                log.info(f"[tts] spoke {len(text)} chars → {total} bytes ({frames_sent} frames) in {_time.monotonic() - t_start:.2f}s")
             except Exception as e:
                 log.error(f"[tts] synthesis error: {e}", exc_info=True)
 
