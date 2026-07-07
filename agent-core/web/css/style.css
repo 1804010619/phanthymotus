@@ -534,6 +534,9 @@ html, body {
   font-size: 13px;
   font-family: var(--font-mono);
   transition: border-color 0.15s, box-shadow 0.15s;
+  -webkit-appearance: none;
+  appearance: none;
+  height: 40px;
 }
 .tool-config-input:focus {
   outline: none;
