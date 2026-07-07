@@ -68,7 +68,6 @@ TOOLS = [
         "configSchema": {
             "type": "object",
             "properties": {
-                "language":      {"type": "string", "description": "Language", "default": "zh-CN", "scope": "shared"},
                 "trigger_mode":  {"type": "string", "enum": ["vad", "kws"], "description": "Trigger mode (vad = always listen, kws = wake word first)", "default": "kws", "scope": "shared"},
                 "kws_keywords":  {"type": "string", "description": "Wake word (pinyin format, e.g. 'x iǎo f àn x iǎo f àn @小范小范')", "scope": "shared", "x-show-when": {"trigger_mode": "kws"}},
                 "vad_threshold": {"type": "number", "description": "VAD speech threshold (0-1, higher = stricter)", "default": 0.5, "scope": "shared"},
@@ -298,33 +297,40 @@ def _vad_worker(pcm_q: multiprocessing.Queue, result_q: multiprocessing.Queue,
                     if now >= kws_cooldown_until:
                         kws_cooldown_until = now + 2.0
                         _log.info(f"[vad-worker] WAKE WORD detected: {kw.strip()}")
-                        # Transition to listening — start recording
+                        # Transition to listening — wait for next speech segment
                         state = 'listening'
                         speech_buf = b''
-                        start_ts = ts
+                        start_ts = None
+                        end_ts = None
                         # Reset KWS stream for next wake
                         kws_stream = kws_spotter.create_stream()
+                        # Reset VAD to discard wake word audio
+                        vad.reset()
             # Drain any completed VAD segments (discard in wake-wait mode)
             while not vad.empty():
                 vad.pop()
 
         elif state == 'listening':
-            # Accumulate speech
+            # Accumulate speech from raw PCM
             if vad.is_speech_detected():
+                if not start_ts:
+                    start_ts = ts
                 speech_buf += pcm
                 end_ts = ts
-            # Check for completed segments (speech ended)
+
+            # Also collect from completed VAD segments
             while not vad.empty():
                 seg = vad.front
-                # seg.samples contains the speech audio as float
                 seg_pcm = _struct.pack(f'<{len(seg.samples)}h',
                                        *[int(max(-32768, min(32767, s * 32768))) for s in seg.samples])
+                if not start_ts:
+                    start_ts = ts
                 speech_buf += seg_pcm
                 end_ts = ts
                 vad.pop()
 
-            # If VAD was speaking but now stopped, and we have buffered audio
-            if not vad.is_speech_detected() and speech_buf:
+            # Speech ended — output if we have meaningful audio (>500ms)
+            if not vad.is_speech_detected() and speech_buf and len(speech_buf) > SAMPLE_RATE:
                 _log.info(f"[vad-worker] utterance complete, len={len(speech_buf)} bytes")
                 result_q.put((speech_buf, start_ts or ts, end_ts or ts))
                 speech_buf = b''
