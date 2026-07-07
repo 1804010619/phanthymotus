@@ -18,7 +18,7 @@ COS_BASE = "https://agi-phanthy-dev-1252788780.cos.ap-beijing.myqcloud.com/publi
 MODELS = {
     "asr": {
         "url": f"{COS_BASE}/sherpa-onnx-streaming-paraformer-bilingual-zh-en.zip",
-        "check_file": "model.int8.onnx",
+        "check_file": "tokens.txt",
     },
     "tts": {
         "url": f"{COS_BASE}/vits-melo-tts-zh_en.tar.bz2",
@@ -80,7 +80,9 @@ def ensure_model(name: str, model_dir: str) -> None:
 def _extract_zip(zip_path: str, model_dir: str) -> None:
     """Extract zip, stripping common top-level directory prefix."""
     with zipfile.ZipFile(zip_path, 'r') as zf:
-        names = [n for n in zf.namelist() if not n.endswith('/')]
+        # Filter out __MACOSX and directory entries
+        names = [n for n in zf.namelist()
+                 if not n.endswith('/') and not n.startswith('__MACOSX')]
         if not names:
             raise RuntimeError(f"Empty archive: {zip_path}")
 

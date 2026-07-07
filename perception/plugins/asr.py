@@ -330,18 +330,24 @@ class SherpaOnnxASRAdapter(ASRAdapter):
         ensure_model("asr", model_dir)
 
         import sherpa_onnx
-        model_path = os.path.join(model_dir, "model.int8.onnx")
-        if not os.path.exists(model_path):
-            model_path = os.path.join(model_dir, "model.onnx")
+        # Streaming paraformer uses encoder + decoder (not a single model file)
+        encoder_path = os.path.join(model_dir, "encoder.int8.onnx")
+        if not os.path.exists(encoder_path):
+            encoder_path = os.path.join(model_dir, "encoder.onnx")
+        decoder_path = os.path.join(model_dir, "decoder.int8.onnx")
+        if not os.path.exists(decoder_path):
+            decoder_path = os.path.join(model_dir, "decoder.onnx")
         tokens_path = os.path.join(model_dir, "tokens.txt")
+
         self._recognizer = sherpa_onnx.OnlineRecognizer.from_paraformer(
-            paraformer=model_path,
+            paraformer=encoder_path,
             tokens=tokens_path,
             num_threads=num_threads,
             provider=hw_provider,
             sample_rate=SAMPLE_RATE,
+            decoding_method="greedy_search",
         )
-        log.info(f"[asr] sherpa-onnx adapter loaded: model={model_path}, provider={hw_provider}")
+        log.info(f"[asr] sherpa-onnx adapter loaded: encoder={encoder_path}, provider={hw_provider}")
 
     def transcribe(self, wav_bytes: bytes, language: str) -> str:
         import io as _io, wave as _wave
