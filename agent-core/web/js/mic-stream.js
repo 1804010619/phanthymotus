@@ -82,7 +82,11 @@ export async function toggleMicStream(wsUrl, onStateChange) {
     };
 
     source.connect(processor);
-    processor.connect(_audioCtx.destination);
+    // Connect to a silent destination (processor must be connected to stay alive, but we don't want playback)
+    const silentGain = _audioCtx.createGain();
+    silentGain.gain.value = 0;
+    processor.connect(silentGain);
+    silentGain.connect(_audioCtx.destination);
 
     _workletNode = processor;
     _active = true;

@@ -119,6 +119,8 @@ export const SkeletonRenderer = {
       const data = JSON.parse(content);
       if (data.urdf) {
         this._parseAndBuild(data.urdf);
+      } else if (data.type === 'quadruped') {
+        this._buildQuadrupedSkeleton(data);
       } else {
         this._buildFallbackSkeleton();
       }
@@ -229,8 +231,8 @@ export const SkeletonRenderer = {
         linkObj[j.childLink] = childGroup;
         this._links[j.childLink] = childGroup;
 
-        // Add visual geometry (bone segment) — only for revolute joints
-        if (j.type === 'revolute') {
+        // Add visual geometry (bone segment) for revolute joints and significant fixed joints
+        if (j.type === 'revolute' || j.type === 'fixed') {
           this._addBoneVisual(jointGroup, j);
         }
 
@@ -238,7 +240,7 @@ export const SkeletonRenderer = {
       }
     }
 
-    // Add joint spheres
+    // Add joint spheres for revolute joints
     for (const [name, obj] of Object.entries(this._joints)) {
       const isHand = name.includes('hand');
       const radius = isHand ? 0.006 : 0.012;
@@ -247,6 +249,20 @@ export const SkeletonRenderer = {
         new THREE.MeshPhongMaterial({ color: 0x00ccff, emissive: 0x003344 })
       );
       obj.add(sphere);
+    }
+
+    // Add endpoint spheres for leaf links (links with no children, e.g. feet)
+    const parentLinks = new Set(joints.map(j => j.childLink));
+    for (const [name, obj] of Object.entries(this._links)) {
+      if (name === rootLinkName) continue;
+      const hasChildren = joints.some(j => j.parentLink === name);
+      if (!hasChildren) {
+        const sphere = new THREE.Mesh(
+          new THREE.SphereGeometry(0.01, 8, 8),
+          new THREE.MeshPhongMaterial({ color: 0x44ddff, emissive: 0x002233 })
+        );
+        obj.add(sphere);
+      }
     }
 
     this._loaded = true;
@@ -275,6 +291,103 @@ export const SkeletonRenderer = {
 
     // Add to parent link (static linkage, doesn't rotate with joint)
     jointGroup.parent?.add(bone);
+  },
+
+  _buildQuadrupedSkeleton(data) {
+    // Quadruped stick figure (Go2 proportions: ~0.6m long, ~0.3m tall)
+    const boneMat = new THREE.MeshPhongMaterial({ color: 0xaabbcc });
+    const jointMat = new THREE.MeshPhongMaterial({ color: 0x00ccff, emissive: 0x003344 });
+    const bodyMat = new THREE.MeshPhongMaterial({ color: 0x889999 });
+
+    const root = new THREE.Group();
+    this._scene.add(root);
+
+    const addJoint = (name, pos, r = 0.012) => {
+      const s = new THREE.Mesh(new THREE.SphereGeometry(r, 8, 8), jointMat);
+      s.position.copy(pos);
+      root.add(s);
+      if (name) {
+        this._joints[name] = s;
+        // Default rotation axis (pitch = X-axis for most quadruped joints)
+        s.userData.axis = new THREE.Vector3(1, 0, 0);
+      }
+      return s;
+    };
+    const addBone = (from, to, r = 0.008) => {
+      const dir = new THREE.Vector3().subVectors(to, from);
+      const len = dir.length();
+      if (len < 0.005) return;
+      const geom = new THREE.CylinderGeometry(r, r, len, 6);
+      geom.translate(0, len / 2, 0);
+      const bone = new THREE.Mesh(geom, boneMat);
+      bone.position.copy(from);
+      bone.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), dir.normalize());
+      root.add(bone);
+    };
+
+    // Body frame (Y-up, Z-forward in Three.js view)
+    const bodyLen = 0.36;  // half-length front-to-back
+    const bodyH = 0.30;    // hip height
+    const shoulderW = 0.10; // half-width
+    const thighLen = 0.20;
+    const calfLen = 0.20;
+
+    // Torso (front-back spine)
+    const front = new THREE.Vector3(0, bodyH, bodyLen);
+    const rear = new THREE.Vector3(0, bodyH, -bodyLen);
+    const mid = new THREE.Vector3(0, bodyH, 0);
+
+    // Body spine
+    addBone(rear, front, 0.012);
+
+    // Head
+    const headPos = new THREE.Vector3(0, bodyH + 0.05, bodyLen + 0.12);
+    addBone(front, headPos, 0.008);
+    addJoint(null, headPos, 0.03);
+
+    // Tail stub
+    const tailPos = new THREE.Vector3(0, bodyH + 0.03, -bodyLen - 0.06);
+    addBone(rear, tailPos, 0.005);
+
+    // Legs: FR, FL, RR, RL
+    const legDefs = [
+      { prefix: 'FR', x:  shoulderW, z:  bodyLen },
+      { prefix: 'FL', x: -shoulderW, z:  bodyLen },
+      { prefix: 'RR', x:  shoulderW, z: -bodyLen },
+      { prefix: 'RL', x: -shoulderW, z: -bodyLen },
+    ];
+
+    for (const leg of legDefs) {
+      const hip = new THREE.Vector3(leg.x, bodyH, leg.z);
+      const knee = new THREE.Vector3(leg.x, bodyH - thighLen, leg.z);
+      const foot = new THREE.Vector3(leg.x, bodyH - thighLen - calfLen, leg.z);
+
+      addBone(hip, knee);
+      addBone(knee, foot);
+
+      // Hip joint rotates around Y for abduction (hip), X for pitch (thigh/calf)
+      const hipJoint = addJoint(`${leg.prefix}_hip`, hip);
+      hipJoint.userData.axis = new THREE.Vector3(0, 1, 0); // abduction
+      addJoint(`${leg.prefix}_thigh`, knee);  // default X-axis (pitch)
+      addJoint(`${leg.prefix}_calf`, foot);
+
+      // Shoulder attachment to spine
+      addBone(new THREE.Vector3(0, bodyH, leg.z), hip, 0.006);
+    }
+
+    // Body center joint (for IMU orientation)
+    addJoint(null, mid, 0.018);
+
+    // Adjust camera for quadruped view
+    this._camera.position.set(0.8, 0.6, 1.0);
+    this._camera.lookAt(0, 0.2, 0);
+
+    // Move grid down to foot level
+    this._scene.children.forEach(c => {
+      if (c.isGridHelper) c.position.y = bodyH - thighLen - calfLen - 0.02;
+    });
+
+    this._loaded = true;
   },
 
   _buildFallbackSkeleton() {

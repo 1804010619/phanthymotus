@@ -79,6 +79,19 @@ export async function initCanvas(initialMcps) {
     );
     _resolveAllTopics();
     _redrawConnections();
+
+    // Fetch driver-inferred output topics for processor cards with empty outputs
+    for (const card of _cards) {
+      const outPorts = [...card.el.querySelectorAll('.canvas-port.out')];
+      const hasEmptyOut = outPorts.some(p => !p.dataset.topic);
+      if (!hasEmptyOut) continue;
+      const hasOutConn = _connections.some(c => c.fromCardId === card.id);
+      if (!hasOutConn) continue;
+      const inConn = _connections.find(c => c.toCardId === card.id && c.fromTopic);
+      const inputTopic = inConn?.fromTopic || '';
+      _fetchTopicsFromDriver(card, inputTopic);
+    }
+
     // Restore viewport transform if saved
     if (layoutJson.data?.transform) {
       _zoom = layoutJson.data.transform.zoom ?? 1;
@@ -778,17 +791,22 @@ function _buildCardEl({ id, mcpId, toolName, driverName, x, y, topicIn: savedTop
         e.stopPropagation();
         const liveMcp = _allMcps.find(m => m.id === mcpId);
         if (!liveMcp) return;
-        // 从 MCP url 推导驱动 WS 地址 (WS on port+1)
-        const mcpUrl = new URL(liveMcp.url);
-        const wsPort = parseInt(mcpUrl.port) + 1;
-        const wsUrl = `ws://${mcpUrl.hostname}:${wsPort}/ws/mic`;
+        // Connect mic WebSocket to agent-core's /ws/mic proxy (same host/port as page)
+        const wsProto = location.protocol === 'https:' ? 'wss' : 'ws';
+        const wsUrl = `${wsProto}://${location.host}/ws/mic`;
         try {
+          // Ensure mic permission is granted before connecting
+          if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+            alert('麦克风不可用：需要 HTTPS 安全连接');
+            return;
+          }
           await toggleMicStream(wsUrl, (active) => {
             micBtn.textContent = active ? '\u23F9 停止录音' : '\uD83C\uDF99 开始录音';
             micBtn.classList.toggle('recording', active);
           });
         } catch (err) {
           console.error('[canvas] mic toggle failed:', err);
+          alert('麦克风启动失败: ' + err.message);
         }
       });
       footer.prepend(micBtn);
@@ -1280,6 +1298,24 @@ async function _startProject() {
     return;
   }
 
+  // Resolve all topics before validation (ensures correctness after page reload)
+  _resolveAllTopics();
+
+  // For processor cards with empty output topics, fetch from driver using input topic
+  for (const card of _cards) {
+    const outPorts = [...card.el.querySelectorAll('.canvas-port.out')];
+    const hasEmptyOut = outPorts.some(p => !p.dataset.topic);
+    if (!hasEmptyOut) continue;
+    // Only for cards that have outgoing connections (otherwise irrelevant)
+    const hasOutConn = _connections.some(c => c.fromCardId === card.id);
+    if (!hasOutConn) continue;
+    // Get input topic from inbound connection
+    const inConn = _connections.find(c => c.toCardId === card.id);
+    const inputTopic = inConn?.fromTopic || '';
+    await _fetchTopicsFromDriver(card, inputTopic);
+  }
+  _resolveAllTopics();
+
   // Validate topic connections: every connection must have a fromTopic
   for (const conn of _connections) {
     if (!conn.fromTopic) {
@@ -1296,9 +1332,6 @@ async function _startProject() {
   _syncProjectBtn();
   // Enable execute buttons
   document.querySelectorAll('.canvas-exec-btn').forEach(btn => btn.classList.remove('locked'));
-
-  // Resolve all topics before starting (ensures correctness after page reload)
-  _resolveAllTopics();
 
   // Start all cards on canvas, resolving input_topic(s) from connections
   for (const card of _cards) {
@@ -1320,6 +1353,22 @@ async function _startProject() {
       const msg = `${card.toolName} 启动失败: ${startResult.message || '未知错误'}`;
       _logActivity('error', msg);
       _flashStartError(msg);
+    }
+    // Auto-start mic stream when remote_mic card starts
+    if (card.toolName === 'remote_mic' && !isMicActive()) {
+      const wsProto = location.protocol === 'https:' ? 'wss' : 'ws';
+      const wsUrl = `${wsProto}://${location.host}/ws/mic`;
+      try {
+        await toggleMicStream(wsUrl, (active) => {
+          const micBtn = card.el?.querySelector('.canvas-mic-btn');
+          if (micBtn) {
+            micBtn.textContent = active ? '\u23F9 停止录音' : '\uD83C\uDF99 开始录音';
+            micBtn.classList.toggle('recording', active);
+          }
+        });
+      } catch (err) {
+        _logActivity('error', '麦克风启动失败: ' + err.message);
+      }
     }
     // Update card.topicOut from start response (multiInstance tools return real topic paths on start)
     const parsed = _parseMcpCallResult(startResult);
@@ -1361,6 +1410,15 @@ function _stopProject() {
     }
     args.instance_id = card.id;
     _triggerAction(card.mcpId, card.toolName, 'stop', args);
+    // Auto-stop mic stream when remote_mic card stops
+    if (card.toolName === 'remote_mic' && isMicActive()) {
+      toggleMicStream('', () => {}).catch(() => {});
+      const micBtn = card.el?.querySelector('.canvas-mic-btn');
+      if (micBtn) {
+        micBtn.textContent = '\uD83C\uDF99 开始录音';
+        micBtn.classList.remove('recording');
+      }
+    }
   }
   // 持久化运行状态
   fetch('/api/config/project-running', {

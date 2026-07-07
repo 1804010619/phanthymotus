@@ -36,6 +36,7 @@
         <span id="update-banner-text"></span>
         <button class="btn-update" id="btn-update">更新</button>
       </div>
+      <button class="btn-ghost topbar-btn" id="btn-network">网络</button>
       <button class="btn-ghost topbar-btn" id="btn-history">历史日志</button>
       <button class="btn-ghost topbar-btn" id="btn-agent-def">智能体定义</button>
       <button class="btn-ghost topbar-btn" id="btn-skills">技能</button>
@@ -291,6 +292,35 @@
       </div>
       <div class="history-chat" id="history-chat">
         <div class="history-placeholder">选择一个会话查看对话记录</div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Network Settings Modal -->
+<div class="modal-overlay hidden" id="network-overlay">
+  <div class="modal network-modal">
+    <div class="modal-header">
+      <span class="modal-title">网络设置</span>
+      <button class="btn-icon" id="network-close">✕</button>
+    </div>
+    <div class="modal-body network-body">
+      <div class="network-section" id="network-interfaces-section">
+        <div class="network-section-header">网络接口</div>
+        <div class="network-interfaces-list" id="network-interfaces-list"></div>
+      </div>
+      <div class="network-section">
+        <div class="network-section-header">
+          <span>WiFi 网络</span>
+          <button class="btn-ghost btn-sm" id="network-wifi-scan">扫描</button>
+        </div>
+        <div class="network-wifi-list" id="network-wifi-list">
+          <div class="network-loading">扫描中…</div>
+        </div>
+      </div>
+      <div class="network-section">
+        <div class="network-section-header">已保存的网络</div>
+        <div class="network-saved-list" id="network-saved-list"></div>
       </div>
     </div>
   </div>

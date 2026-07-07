@@ -343,6 +343,9 @@ class Event:
         print(f'[decision] compressed: kept {len(recent_turns)} recent turns, summary={len(summary)} chars')
 
     async def _one_turn(self, trigger_event: dict):
+        import time as _time
+        _turn_t0 = _time.perf_counter()
+
         # Log incoming event
         print(f'[decision] received event: source={trigger_event.get("source", "?")} text={trigger_event.get("text", "")[:100]}')
 
@@ -362,6 +365,9 @@ class Event:
         # 绑定工具全名集合，用于 L2 环境快照过滤
         bound_tool_names = {s['name'] for s in bound_schemas}
 
+        # ── 冻结 system message（turn 内复用，保证 prefix caching 命中）────
+        frozen_system = prompt_mod.build_system(mcp_client.registry, bound_tool_names)
+
         finish_tool = 'finish'
         max_rounds  = 20
         response    = None
@@ -375,22 +381,20 @@ class Event:
             current_history = history + _sanitize(turn_messages)
 
             if round_idx == 0:
-                # 首轮：加入 L4 触发事件
+                # 首轮：加入 L4 触发事件（含 L2 动态快照）
                 messages = prompt_mod.build(
+                    system_msg    = frozen_system,
                     message_list  = current_history,
                     trigger_event = trigger_event,
-                    mcp_registry  = mcp_client.registry,
-                    bound_tools   = bound_tool_names,
                 )
                 # 把 trigger user message 记入 turn_messages，后续轮次能看到
                 trigger_user_msg = messages[-1]  # build() 最后一条是 L4 user
                 turn_messages.append(trigger_user_msg)
             else:
-                # 后续轮：不加新的 user message，LLM 直接看 tool result 决策
+                # 后续轮：不加新的 user message，复用冻结的 system
                 messages = prompt_mod.build_continuation(
+                    system_msg   = frozen_system,
                     message_list = current_history,
-                    mcp_registry = mcp_client.registry,
-                    bound_tools  = bound_tool_names,
                 )
 
             await push_event({'type': 'llm_request', 'payload': {'round': round_idx}})
@@ -407,10 +411,13 @@ class Event:
             # Log LLM request summary
             msg_count = len(messages)
             tool_count = len(all_tool_list)
+            # Estimate prompt size (rough: 1 token ≈ 3 chars for CJK)
+            prompt_chars = sum(len(m.get('content', '')) for m in messages)
             last_user = next((m.get('content', '')[:80] for m in reversed(messages) if m.get('role') == 'user'), '')
-            print(f'[decision] llm request: round={round_idx} messages={msg_count} tools={tool_count} last_user={last_user}')
+            print(f'[decision] llm request: round={round_idx} messages={msg_count} tools={tool_count} ~chars={prompt_chars} last_user={last_user}')
 
             # ── 调用 LLM（含上下文溢出恢复）───────────────────────────────
+            _round_t0 = _time.perf_counter()
             try:
                 response = await client.llm(
                     message_list = messages,
@@ -427,14 +434,13 @@ class Event:
                         summary = await _compress_turns(old)
                         self._summary = (self._summary + '\n\n' + summary) if self._summary else summary
                         self._turns = self._turns[-2:]
-                        # 重建 history 并重试
+                        # 重建 history 并重试（复用冻结的 system）
                         history = self._build_history()
                         current_history = history + _sanitize(turn_messages)
                         messages = prompt_mod.build(
+                            system_msg    = frozen_system,
                             message_list  = current_history,
                             trigger_event = trigger_event,
-                            mcp_registry  = mcp_client.registry,
-                            bound_tools   = bound_tool_names,
                         )
                         trigger_user_msg = messages[-1]
                         turn_messages.clear()
@@ -450,9 +456,17 @@ class Event:
             turn_messages.append(response)
 
             # Log LLM response
-            resp_text = (response.get('content') or '')[:100]
-            resp_tools = [c['function']['name'] for c in (response.get('tool_calls') or [])]
-            print(f'[decision] llm response: text={resp_text!r} tool_calls={resp_tools}')
+            _round_elapsed = _time.perf_counter() - _round_t0
+            resp_text = (response.get('content') or '')[:200]
+            resp_tools = []
+            for c in (response.get('tool_calls') or []):
+                name = c['function']['name']
+                args_str = c['function'].get('arguments', '')[:150]
+                resp_tools.append(f'{name}({args_str})')
+            print(f'[decision] llm response: round_time={_round_elapsed:.2f}s text={resp_text!r}')
+            if resp_tools:
+                for t in resp_tools:
+                    print(f'[decision]   tool_call: {t}')
 
             # ── 文字输出 ──────────────────────────────────────────────────
             text = response.get('content') or ''
@@ -552,3 +566,5 @@ class Event:
         ros2_bridge.publish('/decision_core', json.dumps(decision, ensure_ascii=False))
 
         await push_event({'type': 'turn_end', 'payload': {}})
+        _turn_elapsed = _time.perf_counter() - _turn_t0
+        print(f'[decision] turn complete: {_turn_elapsed:.2f}s total, {round_idx + 1} rounds')

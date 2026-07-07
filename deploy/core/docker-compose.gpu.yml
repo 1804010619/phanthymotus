@@ -1,8 +1,0 @@
-# docker-compose.gpu.yml — Jetson GPU overlay
-# Usage: docker-compose -f docker-compose.yml -f docker-compose.gpu.yml --profile perception up -d
-services:
-  perception-stack:
-    runtime: nvidia
-    pid: host              # FastDDS SHM transport 需要共享 PID namespace
-    environment:
-      - NVIDIA_VISIBLE_DEVICES=all

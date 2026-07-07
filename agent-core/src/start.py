@@ -2,6 +2,7 @@ import contextlib
 import asyncio
 import pathlib
 import shutil
+import subprocess
 
 import config
 import event
@@ -116,9 +117,41 @@ def _register_core_mcp(silent=False):
                 'topic_out': [
                     {'topic': '/decision_core', 'format': 'data/json'}
                 ],
+            },
+            {
+                'name': 'remote_mic',
+                'type': 'sensor',
+                'description': '浏览器麦克风 — 通过 WebSocket 采集本地麦克风 PCM-16k 音频流',
+                'inputSchema': {'type': 'object', 'properties': {}},
+                'configSchema': {
+                    'type': 'object',
+                    'properties': {
+                        'device_id': {
+                            'type': 'string',
+                            'description': '浏览器音频输入设备',
+                            'format': 'audio-input-device',
+                            'scope': 'instance',
+                        },
+                    },
+                },
+                'topic_out': [{'topic': '/remote_control/mic', 'format': 'audio/pcm-16k'}],
+            },
+            {
+                'name': 'remote_message',
+                'type': 'sensor',
+                'description': '远程文本消息 — 从浏览器发送文本消息到机器人',
+                'inputSchema': {
+                    'type': 'object',
+                    'properties': {
+                        'action': {'type': 'string', 'enum': ['send_message'], 'description': 'Action to perform'},
+                        'text': {'type': 'string', 'description': '消息文本'},
+                    },
+                    'required': ['action', 'text'],
+                },
+                'topic_out': [{'topic': '/remote_control/message', 'format': 'data/json'}],
             }
         ],
-        'topic_out': [{'topic': '/decision_core', 'format': 'data/json'}],
+        'topic_out': [{'topic': '/decision_core', 'format': 'data/json'}, {'topic': '/remote_control/mic', 'format': 'audio/pcm-16k'}, {'topic': '/remote_control/message', 'format': 'data/json'}],
         'topic_in': [{'format': 'data/json'}],
     })
     mcp_mgr._save_mcp_list(existing)
@@ -233,6 +266,9 @@ app_api.include_router(api.skills.router)
 import api.history
 app_api.include_router(api.history.router)
 
+import api.network
+app_api.include_router(api.network.router)
+
 app = fastapi.FastAPI(lifespan=lifespan)
 app.mount('/api', app_api)
 
@@ -240,6 +276,44 @@ import api.motus_stream
 app.include_router(api.motus_stream.router)
 
 app.include_router(api.inspection.ws_router)
+
+# ── Mic WebSocket endpoint (receive browser PCM and publish to ROS2) ──────────
+_mic_pub = None
+
+@app.websocket('/ws/mic')
+async def _ws_mic(ws: fastapi.WebSocket):
+    """Receive PCM-16k audio from browser and publish to ROS2 topic."""
+    global _mic_pub
+    await ws.accept()
+    try:
+        if _mic_pub is None:
+            try:
+                from audio_msgs.msg import AudioChunk
+                import ros2_bridge
+                node = ros2_bridge._node_main
+                if node:
+                    from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
+                    qos = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT,
+                                     history=HistoryPolicy.KEEP_LAST, depth=200,
+                                     durability=DurabilityPolicy.VOLATILE)
+                    _mic_pub = node.create_publisher(AudioChunk, "/remote_control/mic", qos)
+            except Exception:
+                pass
+        while True:
+            data = await ws.receive_bytes()
+            if _mic_pub:
+                from audio_msgs.msg import AudioChunk
+                chunk_size = 1024
+                offset = 0
+                while offset < len(data):
+                    chunk = data[offset:offset + chunk_size]
+                    offset += chunk_size
+                    msg = AudioChunk()
+                    msg.format = "pcm_16k_16bit_mono"
+                    msg.data = list(chunk)
+                    _mic_pub.publish(msg)
+    except Exception:
+        pass
 
 class _HTTPOnlyStaticFiles(fastapi.staticfiles.StaticFiles):
     async def __call__(self, scope, receive, send):
@@ -260,6 +334,26 @@ class _HTTPOnlyStaticFiles(fastapi.staticfiles.StaticFiles):
 app.mount('/', _HTTPOnlyStaticFiles(directory='./web', html=True), name='web')
 
 
+# ========== SSL 自签名证书 ==========
+def _ensure_ssl_certs(cert_dir: str = "./resource/certs") -> tuple[str, str]:
+    """自动生成自签名 SSL 证书（如不存在）。首次启动生成，后续复用。"""
+    cert_path = pathlib.Path(cert_dir) / "cert.pem"
+    key_path = pathlib.Path(cert_dir) / "key.pem"
+    if cert_path.exists() and key_path.exists():
+        return str(cert_path), str(key_path)
+    pathlib.Path(cert_dir).mkdir(parents=True, exist_ok=True)
+    subprocess.run([
+        "openssl", "req", "-x509", "-newkey", "rsa:2048",
+        "-keyout", str(key_path), "-out", str(cert_path),
+        "-days", "3650", "-nodes",
+        "-subj", "/CN=phanthy-motus",
+    ], check=True, capture_output=True)
+    print(f"[ssl] Generated self-signed certificate: {cert_path}")
+    return str(cert_path), str(key_path)
+
+
 # ========== 启动服务 ==========
 if __name__ == '__main__':
-    uvicorn.run(app, host='0.0.0.0', port=15678, ws_ping_interval=None)
+    cert_file, key_file = _ensure_ssl_certs()
+    uvicorn.run(app, host='0.0.0.0', port=15678, ws_ping_interval=None,
+                ssl_certfile=cert_file, ssl_keyfile=key_file)

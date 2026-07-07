@@ -456,12 +456,12 @@ class TTSPlugin:
                 }
             if instance_id:
                 # Instance requested but not running — return inferred topics for this instance only.
-                inferred_out = f"{input_topic}/tts" if input_topic else ""
+                inferred_out = f"{input_topic}/tts" if input_topic else "/perception/tts"
                 return {
                     "name": "TTS", "manufacture": "Embodied", "model": "tts",
                     "state": "idle",
                     "topic_in":  [{"topic": input_topic,  "format": "data/json",     "desc": ""}] if input_topic else [],
-                    "topic_out": [{"topic": inferred_out, "format": "audio/pcm-16k", "desc": ""}] if inferred_out else [],
+                    "topic_out": [{"topic": inferred_out, "format": "audio/pcm-16k", "desc": ""}],
                     "desc": "TTS service — converts text to audio/pcm-16k",
                 }
             # Aggregate info (no instance_id = ping/overview only)
@@ -471,7 +471,7 @@ class TTSPlugin:
                 states = list(set(n.state for n in self._nodes.values()))
                 state = "running" if "running" in states else states[0] if states else "idle"
             else:
-                inferred_out = f"{input_topic}/tts" if input_topic else ""
+                inferred_out = f"{input_topic}/tts" if input_topic else "/perception/tts"
                 topics_in = [{"topic": input_topic, "format": "data/json", "desc": ""}]
                 topics_out = [{"topic": inferred_out, "format": "audio/pcm-16k", "desc": ""}]
                 state = "idle"
@@ -486,6 +486,13 @@ class TTSPlugin:
         elif action == "start":
             input_topic = args.get("input_topic") or ''
             node_key = instance_id or input_topic or '_default'
+            # Clean up _default node if it would conflict with this instance
+            if '_default' in self._nodes and node_key != '_default':
+                default_node = self._nodes['_default']
+                if default_node._input_topic == input_topic or default_node._output_topic == (f"{input_topic}/tts" if input_topic else '/perception/tts'):
+                    default_node.stop()
+                    self._executor.remove_node(default_node)
+                    del self._nodes['_default']
             if node_key not in self._nodes:
                 adapter = self._adapter
                 if instance_id and instance_id in self._instance_configs:
@@ -531,20 +538,30 @@ class TTSPlugin:
             text = args.get("text", "")
             if not text:
                 raise ValueError("text is required")
-            node_key = instance_id or '_default'
-            if node_key not in self._nodes:
-                adapter = self._adapter
-                if instance_id and instance_id in self._instance_configs:
-                    inst_adapter = _build_tts_adapter(self._instance_configs[instance_id])
-                    if inst_adapter:
-                        adapter = inst_adapter
-                node = _TTSNode(None, adapter,
-                                node_suffix=node_key.replace('/', '_').replace('-', '_'))
-                self._executor.add_node(node)
-                self._nodes[node_key] = node
-            node = self._nodes[node_key]
-            if node.state != "running":
-                node.start()
+            # Find any existing running node to reuse
+            node = None
+            for n in self._nodes.values():
+                if n.state == "running":
+                    node = n
+                    break
+            if node is None:
+                # No running node — use instance key or fallback
+                node_key = instance_id or '_default'
+                if node_key not in self._nodes:
+                    input_topic = args.get("input_topic") or None
+                    adapter = self._adapter
+                    if instance_id and instance_id in self._instance_configs:
+                        inst_adapter = _build_tts_adapter(self._instance_configs[instance_id])
+                        if inst_adapter:
+                            adapter = inst_adapter
+                    node = _TTSNode(input_topic, adapter,
+                                    node_suffix=node_key.replace('/', '_').replace('-', '_'))
+                    self._executor.add_node(node)
+                    self._nodes[node_key] = node
+                else:
+                    node = self._nodes[node_key]
+                if node.state != "running":
+                    node.start()
             node.enqueue(text)
             return {"status": "queued", "text": text}
 

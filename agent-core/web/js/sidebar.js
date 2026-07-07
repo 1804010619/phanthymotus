@@ -93,7 +93,7 @@ export function renderSidebar(mcps, topicStatuses = {}) {
 
 // ── Section builders ──────────────────────────────────────────────────────────
 
-const _TYPE_ORDER = ['sensor', 'actuator', 'processor', 'controller', ''];
+const _TYPE_ORDER = ['controller', 'sensor', 'actuator', 'processor', ''];
 
 function _buildSection(mcp) {
   const name = mcp.server_name || mcp.name || mcp.id;
@@ -488,6 +488,50 @@ function _openToolConfigModal(mcpId, toolName, configSchema) {
       input.appendChild(optTrue);
       input.appendChild(optFalse);
       input.value = (savedValues[key] != null ? String(savedValues[key]) : String(def.default ?? 'false'));
+    } else if (def.format === 'audio-input-device') {
+      input = document.createElement('select');
+      input.className = 'tool-config-input';
+      input.dataset.key = key;
+      const saved = savedValues[key] || '';
+      if (!navigator.mediaDevices || !navigator.mediaDevices.enumerateDevices) {
+        // Non-secure context (HTTP) — fall back to text input
+        input = document.createElement('input');
+        input.className = 'tool-config-input';
+        input.dataset.key = key;
+        input.type = 'text';
+        input.placeholder = 'Requires HTTPS or localhost';
+        input.value = saved;
+      } else {
+        const loadingOpt = document.createElement('option');
+        loadingOpt.value = '';
+        loadingOpt.textContent = 'Loading devices...';
+        input.appendChild(loadingOpt);
+        // Request mic permission first to get device labels, then enumerate
+        navigator.mediaDevices.getUserMedia({ audio: true }).then(stream => {
+          stream.getTracks().forEach(t => t.stop()); // release immediately
+          return navigator.mediaDevices.enumerateDevices();
+        }).then(devices => {
+          input.innerHTML = '';
+          const defaultOpt = document.createElement('option');
+          defaultOpt.value = '';
+          defaultOpt.textContent = '-- Default --';
+          input.appendChild(defaultOpt);
+          for (const d of devices.filter(d => d.kind === 'audioinput')) {
+            const opt = document.createElement('option');
+            opt.value = d.deviceId;
+            opt.textContent = d.label || `Microphone ${d.deviceId.slice(0, 8)}`;
+            if (saved === d.deviceId) opt.selected = true;
+            input.appendChild(opt);
+          }
+          if (saved) input.value = saved;
+        }).catch(() => {
+          input.innerHTML = '';
+          const errOpt = document.createElement('option');
+          errOpt.value = '';
+          errOpt.textContent = 'Permission denied';
+          input.appendChild(errOpt);
+        });
+      }
     } else {
       input = document.createElement('input');
       input.className = 'tool-config-input';
@@ -684,6 +728,50 @@ export function openInstanceConfigModal(mcpId, toolName, instanceId, configSchem
       input.appendChild(optTrue);
       input.appendChild(optFalse);
       input.value = (savedValues[key] != null ? String(savedValues[key]) : String(def.default ?? 'false'));
+    } else if (def.format === 'audio-input-device') {
+      input = document.createElement('select');
+      input.className = 'tool-config-input';
+      input.dataset.key = key;
+      const saved = savedValues[key] || '';
+      if (!navigator.mediaDevices || !navigator.mediaDevices.enumerateDevices) {
+        // Non-secure context (HTTP) — fall back to text input
+        input = document.createElement('input');
+        input.className = 'tool-config-input';
+        input.dataset.key = key;
+        input.type = 'text';
+        input.placeholder = 'Requires HTTPS or localhost';
+        input.value = saved;
+      } else {
+        const loadingOpt = document.createElement('option');
+        loadingOpt.value = '';
+        loadingOpt.textContent = 'Loading devices...';
+        input.appendChild(loadingOpt);
+        // Request mic permission first to get device labels, then enumerate
+        navigator.mediaDevices.getUserMedia({ audio: true }).then(stream => {
+          stream.getTracks().forEach(t => t.stop()); // release immediately
+          return navigator.mediaDevices.enumerateDevices();
+        }).then(devices => {
+          input.innerHTML = '';
+          const defaultOpt = document.createElement('option');
+          defaultOpt.value = '';
+          defaultOpt.textContent = '-- Default --';
+          input.appendChild(defaultOpt);
+          for (const d of devices.filter(d => d.kind === 'audioinput')) {
+            const opt = document.createElement('option');
+            opt.value = d.deviceId;
+            opt.textContent = d.label || `Microphone ${d.deviceId.slice(0, 8)}`;
+            if (saved === d.deviceId) opt.selected = true;
+            input.appendChild(opt);
+          }
+          if (saved) input.value = saved;
+        }).catch(() => {
+          input.innerHTML = '';
+          const errOpt = document.createElement('option');
+          errOpt.value = '';
+          errOpt.textContent = 'Permission denied';
+          input.appendChild(errOpt);
+        });
+      }
     } else {
       input = document.createElement('input');
       input.className = 'tool-config-input';

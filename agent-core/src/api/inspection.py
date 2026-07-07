@@ -57,10 +57,14 @@ def _topic_status(topic: str) -> str:
 
 def _push_factory(topic: str):
     """Create a push callback for a topic that fans out to all WS consumers."""
+    _push_count = [0]
     async def _push(data: bytes, msg_fmt: str):
         # Cache latest frame for snapshot push on new connections
         _last_frame[topic] = data
         queues = _topic_queues.get(topic, [])
+        _push_count[0] += 1
+        if topic == '/remote_control/mic' and _push_count[0] <= 5:
+            print(f'[inspection] DEBUG push #{_push_count[0]} to {topic}: {len(data)}B, {len(queues)} consumers')
         for q in list(queues):
             try:
                 q.put_nowait(data)
@@ -73,10 +77,10 @@ def _ensure_primary_sub(topic: str, fmt: str, loop: asyncio.AbstractEventLoop):
     """Start primary ROS2 subscription only if not already active. Once started, stays forever."""
     if topic in _active_primary_subs:
         return  # already subscribed, no DDS discovery delay
+    _active_primary_subs.add(topic)  # mark immediately to prevent race
 
     key = f'__primary__#{topic}'
     ros2_bridge.subscribe(key, topic, fmt, loop, _push_factory(topic))
-    _active_primary_subs.add(topic)
     print(f'[inspection] started primary sub: {topic}')
 
 

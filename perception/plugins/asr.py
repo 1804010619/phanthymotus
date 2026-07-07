@@ -417,11 +417,20 @@ class _ASRNode(Node):
         return self._status_dict()
 
     def stop(self) -> dict:
+        # Stop subscription first to prevent new audio_cb calls
         if self._sub:
             self.destroy_subscription(self._sub); self._sub = None
         self._stop_event.set()
         if self._vad_stop:
             self._vad_stop.set()
+        # Cancel feeder threads immediately — avoids BrokenPipeError spam
+        for q in (self._pcm_queue, self._utterance_queue):
+            if q:
+                try:
+                    q.cancel_join_thread()
+                    q.close()
+                except Exception:
+                    pass
         if self._vad_proc and self._vad_proc.is_alive():
             self._vad_proc.join(timeout=5)
             if self._vad_proc.is_alive():

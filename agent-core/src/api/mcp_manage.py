@@ -351,6 +351,42 @@ async def mcp_delete(mcp_id: str):
     return {'code': 200}
 
 
+async def _restore_saved_configs(mcp_id: str, url: str, tools: list) -> None:
+    """Re-send saved tool configs to a device that just came online.
+
+    Only sends shared (non-instance) configs for tools that have configSchema.
+    Called once when a device transitions from offline → online.
+    """
+    headers = {'Content-Type': 'application/json'}
+    timeout = aiohttp.ClientTimeout(total=5)
+    sent = []
+
+    try:
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            for tool in tools:
+                if not isinstance(tool, dict):
+                    continue
+                tool_name = tool.get('name', '')
+                if not tool.get('configSchema'):
+                    continue
+                saved_cfg = config.main.get(f'tool_config:{mcp_id}:{tool_name}', None)
+                if not saved_cfg:
+                    continue
+                cfg_payload = {
+                    'jsonrpc': '2.0', 'id': 99,
+                    'method': 'tools/call',
+                    'params': {'name': tool_name, 'arguments': {'action': 'config', **saved_cfg}},
+                }
+                await session.post(url, json=cfg_payload, headers=headers)
+                sent.append(tool_name)
+    except Exception as e:
+        print(f'[mcp/config-restore] {mcp_id} error: {e}')
+        return
+
+    if sent:
+        print(f'[mcp/config-restore] {mcp_id}: restored config for {sent}')
+
+
 async def _do_ping(mcp_id: str) -> dict:
     """Core ping logic — fetch capabilities, persist, notify inspector.
     Returns the same dict as the ping endpoint's data field.
@@ -365,6 +401,11 @@ async def _do_ping(mcp_id: str) -> dict:
 
     if transport != 'http' or not url:
         is_internal = transport == 'internal'
+        # Register topics for internal MCPs (so inspection/monitoring works)
+        if is_internal:
+            topics = target.get('topic_out', []) + target.get('topic_in', [])
+            if topics:
+                asyncio.create_task(_notify_inspector(mcp_id, topics))
         return {
             'online':      is_internal and target.get('online', False),
             'tools':       target.get('tools', []),
@@ -374,6 +415,9 @@ async def _do_ping(mcp_id: str) -> dict:
             'topic_out':   target.get('topic_out', []),
             'topic_in':    target.get('topic_in', []),
         }
+
+    # 记录 ping 前的 online 状态，用于判断是否需要重新下发 config
+    was_online = mcp_client.registry.get(mcp_id, {}).get('online', False)
 
     try:
         caps = await _ping_mcp_http(url)
@@ -513,6 +557,10 @@ async def _do_ping(mcp_id: str) -> dict:
 
     # Notify inspection module about all topics from this device
     asyncio.create_task(_notify_inspector(mcp_id, topic_out + topic_in))
+
+    # Auto-restore saved configs when device comes online (first ping or after offline)
+    if not was_online:
+        asyncio.create_task(_restore_saved_configs(mcp_id, url, caps['tools']))
 
     ws_path = ('/ws/bus' + topic_out[0].get('topic', '')) if topic_out else ''
     return {
@@ -668,6 +716,32 @@ async def mcp_call_tool(mcp_id: str, req: MCPCallRequest):
     """Call a tool on an MCP server and return the result."""
     # ── Handle internal agentcore MCP (no HTTP transport) ──
     if mcp_id == 'agentcore':
+        # remote_mic and remote_message — simple internal tools
+        if req.tool == 'remote_mic':
+            action = req.arguments.get('action', 'start')
+            if action == 'start':
+                return {'code': 200, 'data': {'state': 'running', 'ws_path': '/ws/mic'}}
+            elif action == 'stop':
+                return {'code': 200, 'data': {'state': 'idle'}}
+            elif action == 'info':
+                return {'code': 200, 'data': {'state': 'running', 'ws_path': '/ws/mic', 'topic_out': [{'topic': '/remote_control/mic', 'format': 'audio/pcm-16k'}]}}
+            return {'code': 200, 'data': None}
+        if req.tool == 'remote_message':
+            action = req.arguments.get('action', 'start')
+            if action == 'start':
+                return {'code': 200, 'data': {'state': 'running'}}
+            elif action == 'stop':
+                return {'code': 200, 'data': {'state': 'idle'}}
+            elif action == 'send_message':
+                text = req.arguments.get('text', '')
+                if text:
+                    import json as _json
+                    import time as _time
+                    import ros2_bridge
+                    ros2_bridge.publish('/remote_control/message', _json.dumps({'text': text, 'ts': _time.time()}, ensure_ascii=False))
+                    return {'code': 200, 'data': {'status': 'sent', 'text': text}}
+                return {'code': 200, 'data': {'error': 'Missing text'}}
+            return {'code': 200, 'data': None}
         return await _handle_agentcore_call(req)
 
     mcps = _get_mcp_list()
