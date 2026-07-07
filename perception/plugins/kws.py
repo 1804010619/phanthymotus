@@ -171,25 +171,22 @@ class KWSPlugin:
         log.info(f"[kws] loading models: encoder={os.path.basename(encoder)}, "
                  f"decoder={os.path.basename(decoder)}, joiner={os.path.basename(joiner)}")
 
-        # Build keywords buffer: each line is "keyword @keyword_display"
-        keywords_buf = "\n".join(f"{kw} @{kw}" for kw in self._keywords)
-        log.info(f"[kws] keywords_buf: {keywords_buf!r}")
+        # Write keywords to a temp file (sherpa-onnx requires a file path)
+        keywords_file = os.path.join(self._model_dir, "keywords.txt")
+        with open(keywords_file, 'w', encoding='utf-8') as f:
+            for kw in self._keywords:
+                f.write(f"{kw} @{kw}\n")
+        log.info(f"[kws] keywords written to {keywords_file}: {self._keywords}")
 
-        config = sherpa_onnx.KeywordSpotterConfig(
-            feat_config=sherpa_onnx.FeatureExtractorConfig(sample_rate=SAMPLE_RATE),
-            model_config=sherpa_onnx.OnlineModelConfig(
-                transducer=sherpa_onnx.OnlineTransducerModelConfig(
-                    encoder=encoder,
-                    decoder=decoder,
-                    joiner=joiner,
-                ),
-                tokens=tokens,
-                num_threads=self._num_threads,
-                provider=self._hw_provider,
-            ),
-            keywords_buf=keywords_buf,
+        return sherpa_onnx.KeywordSpotter(
+            tokens=tokens,
+            encoder=encoder,
+            decoder=decoder,
+            joiner=joiner,
+            keywords_file=keywords_file,
+            num_threads=self._num_threads,
+            provider=self._hw_provider,
         )
-        return sherpa_onnx.KeywordSpotter(config)
 
     def _find_model_file(self, prefix: str, prefer_int8: bool = True, prefer_chunk: int = 8) -> str:
         """Find the best matching model file for a given prefix (encoder/decoder/joiner)."""
