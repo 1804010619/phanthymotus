@@ -6,7 +6,7 @@ plugins:
     provider: sherpa_onnx    # openai | openai_omni | sherpa_onnx
     # sherpa_onnx settings
     model_dir: /work/models/sherpa-onnx/asr
-    hw_provider: cuda        # cuda | cpu
+    hw_provider: cpu         # cuda | cpu (pip版本不含GPU，用cpu)
     num_threads: 2
     # openai/openai_omni settings
     url: ""
@@ -40,8 +40,8 @@ plugins:
     enabled: true
     model_dir: /work/models/sherpa-onnx/kws
     keywords:
-      - "你好小幻"
-      - "小幻小幻"
+      - "nǐ hǎo xiǎo huàn @你好小幻"
+      - "xiǎo huàn xiǎo huàn @小幻小幻"
     hw_provider: cpu
     num_threads: 2
 

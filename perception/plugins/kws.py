@@ -64,7 +64,7 @@ TOOLS = [
             "type": "object",
             "properties": {
                 "model_dir":      {"type": "string", "description": "sherpa-onnx KWS 模型目录路径", "scope": "shared"},
-                "keywords":       {"type": "array", "items": {"type": "string"}, "description": "唤醒词列表 (如 ['你好小幻', '小幻小幻'])", "scope": "shared"},
+                "keywords":       {"type": "array", "items": {"type": "string"}, "description": "唤醒词列表，拼音格式 (如 'nǐ hǎo xiǎo huàn @你好小幻')", "scope": "shared"},
                 "hw_provider":    {"type": "string", "enum": ["cuda", "cpu"], "default": "cpu", "description": "推理后端", "scope": "shared"},
                 "num_threads":    {"type": "integer", "description": "推理线程数", "default": 2, "scope": "shared"},
             },
@@ -171,11 +171,11 @@ class KWSPlugin:
         log.info(f"[kws] loading models: encoder={os.path.basename(encoder)}, "
                  f"decoder={os.path.basename(decoder)}, joiner={os.path.basename(joiner)}")
 
-        # Write keywords to a temp file (sherpa-onnx requires a file path)
+        # Write keywords to file (format: "pinyin_tokens @display_name" per line)
         keywords_file = os.path.join(self._model_dir, "keywords.txt")
         with open(keywords_file, 'w', encoding='utf-8') as f:
             for kw in self._keywords:
-                f.write(f"{kw} @{kw}\n")
+                f.write(f"{kw}\n")
         log.info(f"[kws] keywords written to {keywords_file}: {self._keywords}")
 
         return sherpa_onnx.KeywordSpotter(
