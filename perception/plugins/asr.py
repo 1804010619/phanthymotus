@@ -311,7 +311,7 @@ def _vad_worker(pcm_q: multiprocessing.Queue, result_q: multiprocessing.Queue,
                 end_ts = ts
             # Check for completed segments (speech ended)
             while not vad.empty():
-                seg = vad.front()
+                seg = vad.front
                 # seg.samples contains the speech audio as float
                 seg_pcm = _struct.pack(f'<{len(seg.samples)}h',
                                        *[int(max(-32768, min(32767, s * 32768))) for s in seg.samples])
