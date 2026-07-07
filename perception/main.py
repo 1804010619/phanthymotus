@@ -21,6 +21,11 @@ import os
 import signal
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from socketserver import ThreadingMixIn
+
+
+class ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
+    daemon_threads = True
 from pathlib import Path
 
 import yaml
@@ -253,9 +258,14 @@ def make_handler():
                         ok({"content": [{"type": "text", "text": json.dumps(result)}]})
                 else:
                     err(-32601, f"Method not found: {method}")
+            except BrokenPipeError:
+                log.debug(f"Client disconnected before response")
             except Exception as e:
                 log.error(f"RPC error: {e}", exc_info=True)
-                err(-32603, str(e))
+                try:
+                    err(-32603, str(e))
+                except BrokenPipeError:
+                    pass
 
     return Handler
 
@@ -411,7 +421,7 @@ def main():
 
     _start_registration(mcp_port, "Perception Stack", "perception")
 
-    server = HTTPServer(("", mcp_port), make_handler())
+    server = ThreadingHTTPServer(("", mcp_port), make_handler())
     log.info(f"MCP server → http://0.0.0.0:{mcp_port}")
 
     def _shutdown(signum, frame):

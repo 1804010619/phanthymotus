@@ -5,6 +5,7 @@ Stores the orchestration canvas layout (card positions) and per-tool
 configuration in the SQLite config table.
 """
 
+import asyncio
 import json
 import fastapi
 from pydantic import BaseModel
@@ -70,13 +71,15 @@ async def save_tool_config(mcp_id: str, tool_name: str, body: Any = fastapi.Body
     """Save config for a tool and apply it to the MCP plugin."""
     config.main[f'{_TOOL_CONFIG_PREFIX}{mcp_id}:{tool_name}'] = body
 
-    # Apply config to the MCP plugin
+    # Apply config to the MCP plugin (fire-and-forget, don't block response)
     from api.mcp_manage import mcp_call_tool, MCPCallRequest
-    try:
-        req = MCPCallRequest(tool=tool_name, arguments={'action': 'config', **body})
-        await mcp_call_tool(mcp_id, req)
-    except Exception:
-        pass  # Config saved even if apply fails (MCP may be offline)
+    async def _apply():
+        try:
+            req = MCPCallRequest(tool=tool_name, arguments={'action': 'config', **body})
+            await mcp_call_tool(mcp_id, req)
+        except Exception:
+            pass
+    asyncio.create_task(_apply())
 
     return {'code': 200}
 
@@ -108,13 +111,15 @@ async def save_instance_config(mcp_id: str, tool_name: str, instance_id: str, bo
     """Save config for a specific tool instance and apply it."""
     config.main[f'{_TOOL_CONFIG_PREFIX}{mcp_id}:{tool_name}:{instance_id}'] = body
 
-    # Apply instance config to the MCP plugin
+    # Apply instance config to the MCP plugin (fire-and-forget)
     from api.mcp_manage import mcp_call_tool, MCPCallRequest
-    try:
-        req = MCPCallRequest(tool=tool_name, arguments={'action': 'config', 'instance_id': instance_id, **body})
-        await mcp_call_tool(mcp_id, req)
-    except Exception:
-        pass
+    async def _apply():
+        try:
+            req = MCPCallRequest(tool=tool_name, arguments={'action': 'config', 'instance_id': instance_id, **body})
+            await mcp_call_tool(mcp_id, req)
+        except Exception:
+            pass
+    asyncio.create_task(_apply())
     return {'code': 200}
 
 
