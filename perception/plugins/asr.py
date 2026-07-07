@@ -198,7 +198,11 @@ def _vad_worker(pcm_q: multiprocessing.Queue, result_q: multiprocessing.Queue,
     # ── Initialize KWS (optional) ──
     kws_spotter = None
     kws_stream = None
-    kws_enabled = kws_cfg.get('enabled', False) if kws_cfg else False
+    kws_enabled = kws_cfg.get('trigger_mode', kws_cfg.get('enabled', 'kws')) if kws_cfg else False
+    if kws_enabled == 'vad' or kws_enabled is False:
+        kws_enabled = False
+    else:
+        kws_enabled = True
     if kws_enabled:
         kws_model_dir = kws_cfg.get('model_dir', '/work/models/sherpa-onnx/kws')
         ensure_model("kws", kws_model_dir)
@@ -561,6 +565,10 @@ class ASRPlugin:
                 self._vad_threshold = float(cfg['vad_threshold'])
             if 'vad_silence_ms' in cfg:
                 self._vad_silence_ms = int(cfg['vad_silence_ms'])
+            if 'trigger_mode' in cfg:
+                self._kws_cfg['trigger_mode'] = cfg['trigger_mode']
+            if 'kws_keywords' in cfg:
+                self._kws_cfg['keywords'] = [cfg['kws_keywords']]
             # Stop all nodes (they'll use new config on next start)
             for key in list(self._nodes.keys()):
                 self._nodes[key].stop()
