@@ -174,7 +174,7 @@ class SherpaOnnxTTSAdapter(TTSAdapter):
 
 def _build_tts_adapter(cfg: dict) -> TTSAdapter:
     import os
-    model_dir = cfg.get('model_dir', '/work/models/sherpa-onnx/tts')
+    model_dir = cfg.get('model_dir', '/models/sherpa-onnx/tts')
     speaker_id = int(cfg.get('speaker_id', 0))
     speed = float(cfg.get('speed', 1.0))
     return SherpaOnnxTTSAdapter(model_dir, speaker_id, speed)

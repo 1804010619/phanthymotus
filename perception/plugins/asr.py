@@ -149,7 +149,7 @@ class SherpaOnnxASRAdapter(ASRAdapter):
 
 
 def _build_asr_adapter(cfg: dict) -> Optional[ASRAdapter]:
-    model_dir = cfg.get('model_dir', '/work/models/sherpa-onnx/asr')
+    model_dir = cfg.get('model_dir', '/models/sherpa-onnx/asr')
     hw_provider = cfg.get('hw_provider', 'cpu')
     num_threads = int(cfg.get('num_threads', 2))
     return SherpaOnnxASRAdapter(model_dir, hw_provider, num_threads)
@@ -175,7 +175,7 @@ def _vad_worker(pcm_q: multiprocessing.Queue, result_q: multiprocessing.Queue,
     import sherpa_onnx
     from utils.model_downloader import ensure_model
 
-    vad_model_dir = '/work/models/sherpa-onnx/vad'
+    vad_model_dir = '/models/sherpa-onnx/vad'
     ensure_model("vad", vad_model_dir)
     vad_model_path = os.path.join(vad_model_dir, "silero_vad.onnx")
 
@@ -200,7 +200,7 @@ def _vad_worker(pcm_q: multiprocessing.Queue, result_q: multiprocessing.Queue,
     kws_stream = None
     kws_enabled = (kws_cfg.get('trigger_mode', 'kws') == 'kws') if kws_cfg else False
     if kws_enabled:
-        kws_model_dir = kws_cfg.get('model_dir', '/work/models/sherpa-onnx/kws')
+        kws_model_dir = kws_cfg.get('model_dir', '/models/sherpa-onnx/kws')
         ensure_model("kws", kws_model_dir)
         keywords = kws_cfg.get('keywords', [])
         if keywords:

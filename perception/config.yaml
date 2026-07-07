@@ -3,7 +3,7 @@ mcp_port: 15720
 plugins:
   asr:
     enabled: true
-    model_dir: /work/models/sherpa-onnx/asr
+    model_dir: /models/sherpa-onnx/asr
     hw_provider: cpu
     num_threads: 2
     language: zh-CN
@@ -13,13 +13,13 @@ plugins:
       silence_ms: 400
     kws:
       enabled: true
-      model_dir: /work/models/sherpa-onnx/kws
+      model_dir: /models/sherpa-onnx/kws
       keywords:
         - "x iǎo f àn x iǎo f àn @小范小范"
 
   tts:
     enabled: true
-    model_dir: /work/models/sherpa-onnx/tts
+    model_dir: /models/sherpa-onnx/tts
     speaker_id: 0
     speed: 1.0
 
