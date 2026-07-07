@@ -28,6 +28,11 @@ MODELS = {
         "url": f"{COS_BASE}/sherpa-onnx-kws-zipformer-zh-en-3M-2025-12-20.tar.bz2",
         "check_file": "tokens.txt",
     },
+    "vad": {
+        "url": f"{COS_BASE}/silero_vad.onnx",
+        "check_file": "silero_vad.onnx",
+        "single_file": True,  # Not an archive, just a single file download
+    },
 }
 
 
@@ -45,6 +50,13 @@ def ensure_model(name: str, model_dir: str) -> None:
     url = info["url"]
     os.makedirs(model_dir, exist_ok=True)
     log.info(f"[model_downloader] {name}: downloading from {url} ...")
+
+    if info.get("single_file"):
+        # Direct file download (not an archive)
+        dest = os.path.join(model_dir, info["check_file"])
+        urlretrieve(url, dest)
+        log.info(f"[model_downloader] {name}: done.")
+        return
 
     # Determine suffix from URL
     if url.endswith(".zip"):

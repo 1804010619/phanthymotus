@@ -14,9 +14,14 @@ plugins:
     model: ""
     language: zh-CN
     vad:
-      model: silero       # silero | webrtc | ""(disabled)
+      model: sherpa_onnx    # sherpa_onnx (ONNX, lightweight) | silero (PyTorch) | webrtc
       threshold: 0.5
       silence_ms: 400
+    kws:
+      enabled: true
+      model_dir: /work/models/sherpa-onnx/kws
+      keywords:
+        - "x iǎo f àn x iǎo f àn @小范小范"
 
   tts:
     enabled: true
@@ -35,14 +40,6 @@ plugins:
     api_key: ""
     api_secret: ""
     cluster: ""
-
-  kws:
-    enabled: true
-    model_dir: /work/models/sherpa-onnx/kws
-    keywords:
-      - "x iǎo f àn x iǎo f àn @小范小范"
-    hw_provider: cpu
-    num_threads: 2
 
   htmsg:
     enabled: true

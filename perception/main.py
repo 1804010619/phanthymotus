@@ -87,11 +87,6 @@ class PerceptionBundle:
             self._plugins.append(plugin)
             log.info("VideoObjectPerceptionPlugin loaded (namespace=%s)", namespace)
 
-        if plugins_cfg.get("kws", {}).get("enabled", False):
-            from plugins.kws import KWSPlugin
-            self._plugins.append(KWSPlugin(plugins_cfg["kws"], executor))
-            log.info("KWSPlugin loaded")
-
     def get_all_tools(self) -> list:
         tools = []
         for p in self._plugins:

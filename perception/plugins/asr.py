@@ -390,29 +390,178 @@ def _build_asr_adapter(cfg: dict) -> Optional[ASRAdapter]:
 
 def _vad_worker(pcm_q: multiprocessing.Queue, result_q: multiprocessing.Queue,
                 stop_evt: multiprocessing.Event,
-                backend: str, threshold: float, silence_ms: int):
-    """Runs in a child process — owns VadSession + silero model, no GIL contention."""
+                backend: str, threshold: float, silence_ms: int,
+                kws_cfg: dict = None):
+    """Runs in a child process — sherpa-onnx ONNX VAD + optional KWS gate.
+
+    Pipeline: Audio → VAD → (KWS gate) → utterance output
+    - If kws_cfg is provided and enabled, only output utterances after keyword detected
+    - Otherwise (kws disabled), output all utterances (backward compat)
+    """
     logging.basicConfig(level=logging.DEBUG, format='%(asctime)s [%(name)s] %(levelname)s %(message)s',
                         datefmt='%H:%M:%S')
     _log = logging.getLogger("asr.vad_worker")
-    vad = VadSession(backend=backend, threshold=threshold, silence_ms=silence_ms)
-    vad.init()
-    _log.info(f"[vad-worker] process started (pid={os.getpid()}, backend={backend})")
+
+    # ── Initialize VAD ──
+    import sherpa_onnx
+    from utils.model_downloader import ensure_model
+
+    vad_model_dir = '/work/models/sherpa-onnx/vad'
+    ensure_model("vad", vad_model_dir)
+    vad_model_path = os.path.join(vad_model_dir, "silero_vad.onnx")
+
+    vad_config = sherpa_onnx.VadModelConfig(
+        silero_vad=sherpa_onnx.SileroVadModelConfig(
+            model=vad_model_path,
+            threshold=threshold,
+            min_silence_duration=silence_ms / 1000.0,
+            min_speech_duration=0.1,
+            window_size=512,
+        ),
+        sample_rate=SAMPLE_RATE,
+        num_threads=1,
+        provider="cpu",
+    )
+    vad = sherpa_onnx.VoiceActivityDetector(vad_config, buffer_size_in_seconds=30)
+    _log.info(f"[vad-worker] sherpa-onnx VAD initialized (threshold={threshold}, silence_ms={silence_ms})")
+
+    # ── Initialize KWS (optional) ──
+    kws_spotter = None
+    kws_stream = None
+    kws_enabled = kws_cfg.get('enabled', False) if kws_cfg else False
+    if kws_enabled:
+        kws_model_dir = kws_cfg.get('model_dir', '/work/models/sherpa-onnx/kws')
+        ensure_model("kws", kws_model_dir)
+        keywords = kws_cfg.get('keywords', [])
+        if keywords:
+            import glob as _glob
+            # Find model files (prefer int8 + chunk-8)
+            def _find(prefix, prefer_int8=True):
+                pattern = os.path.join(kws_model_dir, f"{prefix}-*.onnx")
+                files = _glob.glob(pattern)
+                if not files:
+                    return ""
+                chunk8 = [f for f in files if "chunk-8" in f]
+                cands = chunk8 if chunk8 else files
+                if prefer_int8:
+                    int8f = [f for f in cands if "int8" in f]
+                    if int8f: return int8f[0]
+                else:
+                    fp32f = [f for f in cands if "int8" not in f]
+                    if fp32f: return fp32f[0]
+                return cands[0]
+
+            encoder = _find("encoder", prefer_int8=True)
+            decoder = _find("decoder", prefer_int8=False)
+            joiner = _find("joiner", prefer_int8=True)
+            tokens = os.path.join(kws_model_dir, "tokens.txt")
+
+            if encoder and decoder and joiner and os.path.exists(tokens):
+                # Write keywords file
+                kws_keywords_file = os.path.join(kws_model_dir, "keywords.txt")
+                with open(kws_keywords_file, 'w', encoding='utf-8') as f:
+                    for kw in keywords:
+                        f.write(f"{kw}\n")
+
+                kws_spotter = sherpa_onnx.KeywordSpotter(
+                    tokens=tokens,
+                    encoder=encoder,
+                    decoder=decoder,
+                    joiner=joiner,
+                    keywords_file=kws_keywords_file,
+                    num_threads=1,
+                    provider="cpu",
+                )
+                kws_stream = kws_spotter.create_stream()
+                _log.info(f"[vad-worker] KWS initialized, keywords={keywords}")
+            else:
+                _log.warning(f"[vad-worker] KWS model files not found in {kws_model_dir}, disabling KWS")
+                kws_enabled = False
+        else:
+            _log.info("[vad-worker] KWS enabled but no keywords configured, disabling")
+            kws_enabled = False
+
+    # ── State machine ──
+    # States: 'waiting_wake' (KWS mode) or 'listening' (direct mode / post-wake)
+    state = 'waiting_wake' if kws_enabled else 'listening'
+    speech_buf = b''
+    start_ts = None
+    end_ts = None
+    kws_cooldown_until = 0.0
+
+    _log.info(f"[vad-worker] process started (pid={os.getpid()}, backend=sherpa_onnx, kws={kws_enabled})")
     audio_count = 0
+
     while not stop_evt.is_set():
         try:
             pcm, ts = pcm_q.get(timeout=1)
         except Exception:
             continue
+
         audio_count += 1
         if audio_count == 1:
             _log.info(f"[vad-worker] first audio chunk received! len={len(pcm)}")
-        elif audio_count % 500 == 0:
-            _log.debug(f"[vad-worker] processed {audio_count} audio chunks so far")
-        seg = vad.process_chunk(pcm, ts)
-        if seg:
-            _log.info(f"[vad-worker] utterance detected, len={len(seg[0])} bytes")
-            result_q.put(seg)
+
+        # Convert PCM bytes to float samples
+        n = len(pcm) // 2
+        if n < 160:
+            continue
+        import struct as _struct
+        samples = _struct.unpack(f'<{n}h', pcm)
+        float_samples = [s / 32768.0 for s in samples]
+
+        # Feed VAD
+        vad.accept_waveform(float_samples)
+
+        if state == 'waiting_wake':
+            # Only process KWS when VAD detects speech
+            if vad.is_speech_detected() and kws_spotter:
+                kws_stream.accept_waveform(SAMPLE_RATE, float_samples)
+                while kws_spotter.is_ready(kws_stream):
+                    kws_spotter.decode_stream(kws_stream)
+                result = kws_spotter.get_result(kws_stream)
+                kw = result.keyword if hasattr(result, 'keyword') else str(result)
+                if kw and kw.strip():
+                    now = time.time()
+                    if now >= kws_cooldown_until:
+                        kws_cooldown_until = now + 2.0
+                        _log.info(f"[vad-worker] WAKE WORD detected: {kw.strip()}")
+                        # Transition to listening — start recording
+                        state = 'listening'
+                        speech_buf = b''
+                        start_ts = ts
+                        # Reset KWS stream for next wake
+                        kws_stream = kws_spotter.create_stream()
+            # Drain any completed VAD segments (discard in wake-wait mode)
+            while not vad.empty():
+                vad.pop()
+
+        elif state == 'listening':
+            # Accumulate speech
+            if vad.is_speech_detected():
+                speech_buf += pcm
+                end_ts = ts
+            # Check for completed segments (speech ended)
+            while not vad.empty():
+                seg = vad.front()
+                # seg.samples contains the speech audio as float
+                seg_pcm = _struct.pack(f'<{len(seg.samples)}h',
+                                       *[int(max(-32768, min(32767, s * 32768))) for s in seg.samples])
+                speech_buf += seg_pcm
+                end_ts = ts
+                vad.pop()
+
+            # If VAD was speaking but now stopped, and we have buffered audio
+            if not vad.is_speech_detected() and speech_buf:
+                _log.info(f"[vad-worker] utterance complete, len={len(speech_buf)} bytes")
+                result_q.put((speech_buf, start_ts or ts, end_ts or ts))
+                speech_buf = b''
+                start_ts = None
+                end_ts = None
+                # Return to waiting for wake word (if KWS enabled)
+                if kws_enabled:
+                    state = 'waiting_wake'
+
     _log.info("[vad-worker] process exiting")
 
 
@@ -420,8 +569,8 @@ def _vad_worker(pcm_q: multiprocessing.Queue, result_q: multiprocessing.Queue,
 
 class _ASRNode(Node):
     def __init__(self, input_topic: str, adapter: Optional[ASRAdapter], language: str,
-                 vad_backend: str = 'silero', vad_threshold: float = SPEECH_THRESH, vad_silence_ms: int = 400,
-                 node_suffix: str = ''):
+                 vad_backend: str = 'sherpa_onnx', vad_threshold: float = SPEECH_THRESH, vad_silence_ms: int = 400,
+                 kws_cfg: dict = None, node_suffix: str = ''):
         node_name = f"asr_{node_suffix}" if node_suffix else "asr"
         super().__init__(node_name)
         self._input_topic  = input_topic
@@ -435,6 +584,7 @@ class _ASRNode(Node):
         self._vad_backend = vad_backend
         self._vad_threshold = vad_threshold
         self._vad_silence_ms = vad_silence_ms
+        self._kws_cfg = kws_cfg or {}
         self._pcm_queue: Optional[multiprocessing.Queue] = None
         self._utterance_queue: Optional[multiprocessing.Queue] = None
         self._vad_stop: Optional[multiprocessing.Event] = None
@@ -458,7 +608,8 @@ class _ASRNode(Node):
         self._vad_proc = multiprocessing.Process(
             target=_vad_worker,
             args=(self._pcm_queue, self._utterance_queue, self._vad_stop,
-                  self._vad_backend, self._vad_threshold, self._vad_silence_ms),
+                  self._vad_backend, self._vad_threshold, self._vad_silence_ms,
+                  self._kws_cfg),
             daemon=True, name="vad_worker",
         )
         self._vad_proc.start()
@@ -537,14 +688,16 @@ class ASRPlugin:
         self._language     = plugin_cfg.get('language', 'zh-CN')
         self._adapter      = _build_asr_adapter(plugin_cfg)
         vad_cfg            = plugin_cfg.get('vad', {})
-        self._vad_backend  = vad_cfg.get('model', 'silero') or 'silero'
+        self._vad_backend  = vad_cfg.get('model', 'sherpa_onnx') or 'sherpa_onnx'
         self._vad_threshold = float(vad_cfg.get('threshold', SPEECH_THRESH))
         self._vad_silence_ms = int(vad_cfg.get('silence_ms', 400))
+        self._kws_cfg      = plugin_cfg.get('kws', {})
         self._nodes: dict[str, _ASRNode] = {}           # key = instance_id
         self._instance_configs: dict[str, dict] = {}    # key = instance_id → per-instance config
         self._executor = executor
         log.info(f"[asr] plugin init: provider={plugin_cfg.get('provider')}, "
-                 f"vad={self._vad_backend}, threshold={self._vad_threshold}, silence_ms={self._vad_silence_ms}")
+                 f"vad={self._vad_backend}, threshold={self._vad_threshold}, silence_ms={self._vad_silence_ms}, "
+                 f"kws_enabled={self._kws_cfg.get('enabled', False)}")
         if not self._adapter:
             log.warning("[asr] adapter not configured (missing url/key) — tools available but start will fail")
 
@@ -624,6 +777,7 @@ class ASRPlugin:
                         vad_silence_ms = int(icfg['vad_silence_ms'])
                 node = _ASRNode(input_topic, adapter, language,
                                 self._vad_backend, vad_threshold, vad_silence_ms,
+                                kws_cfg=self._kws_cfg,
                                 node_suffix=node_key.replace('/', '_').replace('-', '_'))
                 self._executor.add_node(node)
                 self._nodes[node_key] = node
