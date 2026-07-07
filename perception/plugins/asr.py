@@ -340,7 +340,8 @@ class SherpaOnnxASRAdapter(ASRAdapter):
         tokens_path = os.path.join(model_dir, "tokens.txt")
 
         self._recognizer = sherpa_onnx.OnlineRecognizer.from_paraformer(
-            paraformer=encoder_path,
+            encoder=encoder_path,
+            decoder=decoder_path,
             tokens=tokens_path,
             num_threads=num_threads,
             provider=hw_provider,
