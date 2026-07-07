@@ -69,10 +69,10 @@ TOOLS = [
             "type": "object",
             "properties": {
                 "language":      {"type": "string", "description": "Language", "default": "zh-CN", "scope": "shared"},
+                "trigger_mode":  {"type": "string", "enum": ["vad", "kws"], "description": "Trigger mode (vad = always listen, kws = wake word first)", "default": "kws", "scope": "shared"},
+                "kws_keywords":  {"type": "string", "description": "Wake word (pinyin format, e.g. 'x iǎo f àn x iǎo f àn @小范小范')", "scope": "shared", "x-show-when": {"trigger_mode": "kws"}},
                 "vad_threshold": {"type": "number", "description": "VAD speech threshold (0-1, higher = stricter)", "default": 0.5, "scope": "shared"},
                 "vad_silence_ms":{"type": "integer", "description": "Silence duration (ms) before sentence end", "default": 400, "scope": "shared"},
-                "kws_enabled":   {"type": "boolean", "description": "Enable wake word detection", "default": true, "scope": "shared"},
-                "kws_keywords":  {"type": "string", "description": "Wake word (pinyin format, e.g. 'x iǎo f àn x iǎo f àn @小范小范')", "scope": "shared"},
             },
             "required": []
         },

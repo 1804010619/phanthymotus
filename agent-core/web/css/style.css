@@ -504,6 +504,15 @@ html, body {
 }
 .chip-config-btn:hover { background: var(--bg-secondary); color: var(--text-primary); }
 
+.tool-config-field {
+  margin-bottom: 16px;
+}
+.tool-config-field:last-child {
+  margin-bottom: 0;
+}
+.tool-config-field .tool-config-label {
+  margin-top: 0;
+}
 .tool-config-label {
   display: block;
   font-size: 12px;
