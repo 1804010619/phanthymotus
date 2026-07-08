@@ -63,6 +63,12 @@ def _classify_error(e: Exception) -> tuple[str, float | None]:
     if status in (500, 502, 503, 529):
         return LLMErrorKind.SERVER_ERROR, 3.0
 
+    # 模型生成了非法 tool call（arguments 非 JSON）：可重试，下次可能正确
+    if status == 400 and any(kw in body_msg for kw in (
+        'json format', 'invalid_parameter', 'must be in json',
+    )):
+        return LLMErrorKind.SERVER_ERROR, 1.0
+
     # 上下文溢出：从错误消息推断
     if any(kw in body_msg for kw in (
         'context length', 'context_length', 'too many tokens',
