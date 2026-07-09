@@ -17,7 +17,7 @@ plugins:
       keywords:
         - "x iǎo f àn x iǎo f àn @小范小范"
   localAsr:
-    enabled: true
+    enabled: false
     model_dir: /models/sherpa-onnx/asr
     hw_provider: cpu
     num_threads: 2
@@ -33,7 +33,7 @@ plugins:
         - "x iǎo f àn x iǎo f àn @小范小范"
 
   tts:
-    enabled: false
+    enabled: true
     model_dir: /models/sherpa-onnx/tts
     speaker_id: 0
     speed: 1.0
