@@ -412,7 +412,7 @@ class Event:
             msg_count = len(messages)
             tool_count = len(all_tool_list)
             # Estimate prompt size (rough: 1 token ≈ 3 chars for CJK)
-            prompt_chars = sum(len(m.get('content', '')) for m in messages)
+            prompt_chars = sum(len(m.get('content') or '') for m in messages)
             last_user = next((m.get('content', '')[:80] for m in reversed(messages) if m.get('role') == 'user'), '')
             print(f'[decision] llm request: round={round_idx} messages={msg_count} tools={tool_count} ~chars={prompt_chars} last_user={last_user}')
 
