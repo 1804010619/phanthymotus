@@ -16,7 +16,7 @@ plugins:
       model_dir: /models/sherpa-onnx/kws
       keywords:
         - "x iǎo f àn x iǎo f àn @小范小范"
-  asr_local:
+  local_asr:
     enabled: true
     model_dir: /models/sherpa-onnx/asr
     hw_provider: cpu

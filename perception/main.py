@@ -61,10 +61,10 @@ class PerceptionBundle:
             self._plugins.append(ASRPlugin(plugins_cfg["asr"], executor))
             log.info("ASRPlugin loaded")
 
-        if plugins_cfg.get("asr_local", {}).get("enabled", False):
-            from plugins.asr_local import ASRLocalPlugin
-            self._plugins.append(ASRLocalPlugin(plugins_cfg["asr"], executor))
-            log.info("ASRLocalPlugin loaded")
+        if plugins_cfg.get("local_asr", {}).get("enabled", False):
+            from plugins.asr_local import LocalASRPlugin
+            self._plugins.append(LocalASRPlugin(plugins_cfg["local_asr"], executor))
+            log.info("LocalASRPlugin loaded")
 
         if plugins_cfg.get("tts", {}).get("enabled", False):
             from plugins.tts import TTSPlugin

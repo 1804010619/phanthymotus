@@ -451,8 +451,8 @@ class _ASRNode(Node):
 
 # ── Plugin ────────────────────────────────────────────────────────────────────
 
-class ASRLocalPlugin:
-    PREFIX = "asr_local"
+class LocalASRPlugin:
+    PREFIX = "local_asr"
 
     def __init__(self, plugin_cfg: dict, executor):
         self._language     = plugin_cfg.get('language', 'zh-CN')
