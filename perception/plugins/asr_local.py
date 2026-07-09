@@ -46,7 +46,7 @@ _ASR_PUB_QOS = QoSProfile(
 
 TOOLS = [
     {
-        "name": "asr",
+        "name": "localAsr",
         "type": "processor",
         "multiInstance": True,
         "description": "ASR — start/stop speech recognition or get status",
@@ -471,7 +471,7 @@ class LocalASRPlugin:
         return TOOLS
 
     def dispatch(self, name: str, args: dict) -> dict | None:
-        action = args.get("action") if name == "asr" else name
+        action = args.get("action") if name == "localAsr" else name
         instance_id = args.get("instance_id", "")
 
         if action == "info":
