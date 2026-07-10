@@ -68,6 +68,7 @@ TOOLS = [
         "configSchema": {
             "type": "object",
             "properties": {
+                "asr_model":     {"type": "string", "enum": ["paraformer-zh-en", "zipformer-en"], "description": "ASR model (paraformer-zh-en = bilingual, zipformer-en = English only)", "default": "paraformer-zh-en", "scope": "shared"},
                 "trigger_mode":  {"type": "string", "enum": ["vad", "kws"], "description": "Trigger mode (vad = always listen, kws = wake word first)", "default": "kws", "scope": "shared"},
                 "kws_keywords":  {"type": "string", "description": "Wake word (pinyin format, e.g. 'x iǎo f àn x iǎo f àn @小范小范')", "scope": "shared", "x-show-when": {"trigger_mode": "kws"}},
                 "vad_threshold": {"type": "number", "description": "VAD speech threshold (0-1, higher = stricter)", "default": 0.5, "scope": "shared"},
@@ -125,7 +126,7 @@ class SherpaOnnxASRAdapter(ASRAdapter):
             sample_rate=SAMPLE_RATE,
             decoding_method="greedy_search",
         )
-        log.info(f"[asr] sherpa-onnx adapter loaded: encoder={encoder_path}, provider={hw_provider}")
+        log.info(f"[asr] sherpa-onnx paraformer adapter loaded: encoder={encoder_path}, provider={hw_provider}")
 
     def transcribe(self, wav_bytes: bytes, language: str) -> str:
         import io as _io, wave as _wave
@@ -148,11 +149,105 @@ class SherpaOnnxASRAdapter(ASRAdapter):
         return text.strip()
 
 
+class SherpaOnnxZipformerAdapter(ASRAdapter):
+    """On-device streaming ASR using sherpa-onnx zipformer transducer (English)."""
+
+    def __init__(self, model_dir: str, hw_provider: str = "cuda", num_threads: int = 2):
+        from utils.model_downloader import ensure_model
+        ensure_model("asr_en", model_dir)
+
+        import sherpa_onnx
+        import glob as _glob
+
+        # Find encoder/decoder/joiner (prefer int8 + chunk-16)
+        def _find(prefix, prefer_int8=True):
+            pattern = os.path.join(model_dir, f"{prefix}-*.onnx")
+            files = _glob.glob(pattern)
+            if not files:
+                return ""
+            chunk16 = [f for f in files if "chunk-16" in f]
+            cands = chunk16 if chunk16 else files
+            if prefer_int8:
+                int8f = [f for f in cands if "int8" in f]
+                if int8f:
+                    return int8f[0]
+            else:
+                fp32f = [f for f in cands if "int8" not in f]
+                if fp32f:
+                    return fp32f[0]
+            return cands[0]
+
+        encoder_path = _find("encoder", prefer_int8=True)
+        decoder_path = _find("decoder", prefer_int8=False)
+        joiner_path = _find("joiner", prefer_int8=True)
+        tokens_path = os.path.join(model_dir, "tokens.txt")
+
+        if not all([encoder_path, decoder_path, joiner_path]):
+            raise RuntimeError(f"[asr] zipformer model files not found in {model_dir}")
+
+        self._recognizer = sherpa_onnx.OnlineRecognizer.from_transducer(
+            encoder=encoder_path,
+            decoder=decoder_path,
+            joiner=joiner_path,
+            tokens=tokens_path,
+            num_threads=num_threads,
+            provider=hw_provider,
+            sample_rate=SAMPLE_RATE,
+            decoding_method="greedy_search",
+        )
+        log.info(f"[asr] sherpa-onnx zipformer adapter loaded: encoder={encoder_path}, provider={hw_provider}")
+
+    def transcribe(self, wav_bytes: bytes, language: str) -> str:
+        import io as _io, wave as _wave
+        with _wave.open(_io.BytesIO(wav_bytes)) as wf:
+            pcm = wf.readframes(wf.getnframes())
+        n = len(pcm) // 2
+        samples = struct.unpack(f'<{n}h', pcm)
+        float_samples = [s / 32768.0 for s in samples]
+        float_samples += [0.0] * int(SAMPLE_RATE * 0.5)
+
+        stream = self._recognizer.create_stream()
+        stream.accept_waveform(SAMPLE_RATE, float_samples)
+        stream.input_finished()
+        while self._recognizer.is_ready(stream):
+            self._recognizer.decode_streams([stream])
+        result = self._recognizer.get_result(stream)
+        text = result.text if hasattr(result, 'text') else str(result)
+        return text.strip()
+
+
+# ASR model registry
+ASR_MODELS = {
+    "paraformer-zh-en": {
+        "label": "Paraformer Bilingual (zh+en)",
+        "adapter": SherpaOnnxASRAdapter,
+        "default_model_dir": "/models/sherpa-onnx/asr",
+    },
+    "zipformer-en": {
+        "label": "Zipformer English",
+        "adapter": SherpaOnnxZipformerAdapter,
+        "default_model_dir": "/models/sherpa-onnx/asr-en",
+    },
+}
+
+
 def _build_asr_adapter(cfg: dict) -> Optional[ASRAdapter]:
-    model_dir = cfg.get('model_dir', '/models/sherpa-onnx/asr')
+    model_name = cfg.get('asr_model', 'paraformer-zh-en')
+    model_info = ASR_MODELS.get(model_name)
+    if not model_info:
+        log.warning(f"[asr] unknown model '{model_name}', falling back to paraformer-zh-en")
+        model_info = ASR_MODELS["paraformer-zh-en"]
+
+    model_dir = cfg.get('model_dir', model_info["default_model_dir"])
+    # If model changed but model_dir still points to default of another model, use correct default
+    if model_name == "zipformer-en" and model_dir == "/models/sherpa-onnx/asr":
+        model_dir = model_info["default_model_dir"]
+    elif model_name == "paraformer-zh-en" and model_dir == "/models/sherpa-onnx/asr-en":
+        model_dir = model_info["default_model_dir"]
+
     hw_provider = cfg.get('hw_provider', 'cpu')
     num_threads = int(cfg.get('num_threads', 2))
-    return SherpaOnnxASRAdapter(model_dir, hw_provider, num_threads)
+    return model_info["adapter"](model_dir, hw_provider, num_threads)
 
 
 # ── VAD Worker Process ────────────────────────────────────────────────────────
@@ -264,6 +359,12 @@ def _vad_worker(pcm_q: multiprocessing.Queue, result_q: multiprocessing.Queue,
     _log.info(f"[vad-worker] process started (pid={os.getpid()}, backend=sherpa_onnx, kws={kws_enabled})")
     audio_count = 0
 
+    # Pre-buffer: keep last N frames so first word isn't cut off by VAD onset delay
+    from collections import deque
+    PREBUF_FRAMES = 5  # ~500ms at 100ms/frame — covers VAD onset lag
+    prebuf = deque(maxlen=PREBUF_FRAMES)
+    prebuf_used = False  # whether we already prepended prebuf to current utterance
+
     while not stop_evt.is_set():
         try:
             pcm, ts = pcm_q.get(timeout=1)
@@ -303,18 +404,30 @@ def _vad_worker(pcm_q: multiprocessing.Queue, result_q: multiprocessing.Queue,
                         speech_buf = pcm  # include current frame (user may already be speaking)
                         start_ts = ts
                         end_ts = ts
+                        prebuf_used = True  # don't use prebuf for KWS wake (already have context)
                         # Reset KWS stream for next wake
                         kws_stream = kws_spotter.create_stream()
             # Drain any completed VAD segments (discard in wake-wait mode)
             while not vad.empty():
                 vad.pop()
+            prebuf.append((pcm, ts))
 
         elif state == 'listening':
+            # Maintain pre-buffer for non-KWS mode
+            prebuf.append((pcm, ts))
+
             # Collect completed VAD segments (speech that ended)
             while not vad.empty():
                 seg = vad.front
                 seg_pcm = _struct.pack(f'<{len(seg.samples)}h',
                                        *[int(max(-32768, min(32767, s * 32768))) for s in seg.samples])
+                # Prepend pre-buffer on first speech detection to recover onset audio
+                if not speech_buf and not prebuf_used:
+                    for pb_pcm, pb_ts in prebuf:
+                        speech_buf += pb_pcm
+                    if prebuf:
+                        start_ts = prebuf[0][1]
+                    prebuf_used = True
                 if not start_ts:
                     start_ts = ts
                 speech_buf += seg_pcm
@@ -328,6 +441,7 @@ def _vad_worker(pcm_q: multiprocessing.Queue, result_q: multiprocessing.Queue,
                     speech_buf = b''
                     start_ts = None
                     end_ts = None
+                    prebuf_used = False
                     # Return to waiting for wake word (if KWS enabled)
                     if kws_enabled:
                         state = 'waiting_wake'
@@ -416,6 +530,22 @@ class _ASRNode(Node):
         return {"state": "idle"}
 
     def _audio_cb(self, msg):
+        if self._stop_event.is_set():
+            return
+        # Detect dead VAD subprocess to avoid BrokenPipeError in queue feeder
+        if self._vad_proc and not self._vad_proc.is_alive():
+            log.warning(f"[asr] VAD worker died (exitcode={self._vad_proc.exitcode}), stopping ASR")
+            self._stop_event.set()
+            # Clean up queues to suppress feeder thread errors
+            for q in (self._pcm_queue, self._utterance_queue):
+                if q:
+                    try:
+                        q.cancel_join_thread()
+                        q.close()
+                    except Exception:
+                        pass
+            self.state = "error"
+            return
         pcm = bytes(msg.data)
         ts  = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
         try:
@@ -456,6 +586,10 @@ class ASRPlugin:
 
     def __init__(self, plugin_cfg: dict, executor):
         self._language     = plugin_cfg.get('language', 'zh-CN')
+        self._asr_model    = plugin_cfg.get('asr_model', 'paraformer-zh-en')
+        self._plugin_cfg   = plugin_cfg
+        self._loading      = False
+        self._load_error   = None
         self._adapter      = _build_asr_adapter(plugin_cfg)
         vad_cfg            = plugin_cfg.get('vad', {})
         self._vad_backend  = vad_cfg.get('model', 'sherpa_onnx') or 'sherpa_onnx'
@@ -464,17 +598,51 @@ class ASRPlugin:
         self._kws_cfg      = plugin_cfg.get('kws', {})
         self._nodes: dict[str, _ASRNode] = {}           # key = instance_id
         self._executor = executor
-        log.info(f"[asr] plugin init: vad={self._vad_backend}, threshold={self._vad_threshold}, "
+        log.info(f"[asr] plugin init: model={self._asr_model}, vad={self._vad_backend}, threshold={self._vad_threshold}, "
                  f"silence_ms={self._vad_silence_ms}, kws_enabled={self._kws_cfg.get('enabled', False)}")
 
     def get_tools(self) -> list:
         return TOOLS
+
+    def _load_model_async(self, model_name: str):
+        """Download and load ASR model in a background thread."""
+        import threading
+        def _do_load():
+            try:
+                log.info(f"[asr] downloading/loading model '{model_name}'...")
+                self._plugin_cfg['asr_model'] = model_name
+                adapter = _build_asr_adapter(self._plugin_cfg)
+                self._adapter = adapter
+                self._loading = False
+                self._load_error = None
+                log.info(f"[asr] model '{model_name}' ready")
+            except Exception as e:
+                log.error(f"[asr] failed to load model '{model_name}': {e}", exc_info=True)
+                self._loading = False
+                self._load_error = str(e)
+
+        self._loading = True
+        self._load_error = None
+        threading.Thread(target=_do_load, daemon=True, name="asr_model_loader").start()
 
     def dispatch(self, name: str, args: dict) -> dict | None:
         action = args.get("action") if name == "asr" else name
         instance_id = args.get("instance_id", "")
 
         if action == "info":
+            # Report loading/error state at plugin level
+            if self._loading:
+                return {
+                    "name": "ASR", "manufacture": "Embodied", "model": self._asr_model,
+                    "state": "loading",
+                    "desc": f"Downloading model '{self._asr_model}'...",
+                }
+            if self._load_error:
+                return {
+                    "name": "ASR", "manufacture": "Embodied", "model": self._asr_model,
+                    "state": "error",
+                    "desc": f"Model load failed: {self._load_error}",
+                }
             input_topic = args.get("input_topic", "")
             if instance_id and instance_id in self._nodes:
                 node = self._nodes[instance_id]
@@ -516,6 +684,12 @@ class ASRPlugin:
             }
 
         elif action == "start":
+            if self._loading:
+                return {"state": "loading", "message": "Model is being downloaded, please wait..."}
+            if self._load_error:
+                return {"state": "error", "message": f"Model failed to load: {self._load_error}"}
+            if not self._adapter:
+                return {"state": "error", "message": "ASR model not loaded"}
             input_topic = args.get("input_topic")
             # Also accept input_topics list (sent by canvas when multiple connections exist)
             if not input_topic:
@@ -565,12 +739,23 @@ class ASRPlugin:
                 self._kws_cfg['trigger_mode'] = cfg['trigger_mode']
             if 'kws_keywords' in cfg:
                 self._kws_cfg['keywords'] = [cfg['kws_keywords']]
+            # ASR model switch — load in background if changed
+            if 'asr_model' in cfg and cfg['asr_model'] != self._asr_model:
+                # Stop all running nodes first
+                for key in list(self._nodes.keys()):
+                    self._nodes[key].stop()
+                    self._executor.remove_node(self._nodes[key])
+                    del self._nodes[key]
+                self._asr_model = cfg['asr_model']
+                self._load_model_async(self._asr_model)
+                return {"status": "loading", "asr_model": self._asr_model,
+                        "message": f"Switching to model '{self._asr_model}', downloading..."}
             # Stop all nodes (they'll use new config on next start)
             for key in list(self._nodes.keys()):
                 self._nodes[key].stop()
                 self._executor.remove_node(self._nodes[key])
                 del self._nodes[key]
-            return {"status": "configured"}
+            return {"status": "configured", "asr_model": self._asr_model}
 
         return None
 
