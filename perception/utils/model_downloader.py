@@ -15,6 +15,20 @@ log = logging.getLogger(__name__)
 
 COS_BASE = "https://agi-phanthy-dev-1252788780.cos.ap-beijing.myqcloud.com/public"
 
+
+def _progress_hook(name: str):
+    """Create a reporthook for urlretrieve that logs download progress."""
+    last_pct = [0]
+    def hook(block_num, block_size, total_size):
+        if total_size > 0:
+            pct = min(int(block_num * block_size * 100 / total_size), 100)
+            if pct >= last_pct[0] + 10:
+                last_pct[0] = pct
+                mb_done = block_num * block_size / (1024 * 1024)
+                mb_total = total_size / (1024 * 1024)
+                log.info(f"[model_downloader] {name}: {pct}% ({mb_done:.1f}/{mb_total:.1f} MB)")
+    return hook
+
 MODELS = {
     "asr": {
         "url": f"{COS_BASE}/sherpa-onnx-streaming-paraformer-bilingual-zh-en.zip",
@@ -63,7 +77,7 @@ def ensure_model(name: str, model_dir: str) -> None:
     if info.get("single_file"):
         # Direct file download (not an archive)
         dest = os.path.join(model_dir, info["check_file"])
-        urlretrieve(url, dest)
+        urlretrieve(url, dest, reporthook=_progress_hook(name))
         log.info(f"[model_downloader] {name}: done.")
         return
 
@@ -77,7 +91,7 @@ def ensure_model(name: str, model_dir: str) -> None:
         tmp_path = tmp.name
 
     try:
-        urlretrieve(url, tmp_path)
+        urlretrieve(url, tmp_path, reporthook=_progress_hook(name))
         log.info(f"[model_downloader] {name}: extracting to {model_dir} ...")
 
         if suffix == ".zip":

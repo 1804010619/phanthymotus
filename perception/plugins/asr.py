@@ -569,6 +569,8 @@ class ASRPlugin:
         self._language     = plugin_cfg.get('language', 'zh-CN')
         self._asr_model    = plugin_cfg.get('asr_model', 'paraformer-zh-en')
         self._plugin_cfg   = plugin_cfg
+        self._loading      = False
+        self._load_error   = None
         self._adapter      = _build_asr_adapter(plugin_cfg)
         vad_cfg            = plugin_cfg.get('vad', {})
         self._vad_backend  = vad_cfg.get('model', 'sherpa_onnx') or 'sherpa_onnx'
@@ -583,11 +585,45 @@ class ASRPlugin:
     def get_tools(self) -> list:
         return TOOLS
 
+    def _load_model_async(self, model_name: str):
+        """Download and load ASR model in a background thread."""
+        import threading
+        def _do_load():
+            try:
+                log.info(f"[asr] downloading/loading model '{model_name}'...")
+                self._plugin_cfg['asr_model'] = model_name
+                adapter = _build_asr_adapter(self._plugin_cfg)
+                self._adapter = adapter
+                self._loading = False
+                self._load_error = None
+                log.info(f"[asr] model '{model_name}' ready")
+            except Exception as e:
+                log.error(f"[asr] failed to load model '{model_name}': {e}", exc_info=True)
+                self._loading = False
+                self._load_error = str(e)
+
+        self._loading = True
+        self._load_error = None
+        threading.Thread(target=_do_load, daemon=True, name="asr_model_loader").start()
+
     def dispatch(self, name: str, args: dict) -> dict | None:
         action = args.get("action") if name == "asr" else name
         instance_id = args.get("instance_id", "")
 
         if action == "info":
+            # Report loading/error state at plugin level
+            if self._loading:
+                return {
+                    "name": "ASR", "manufacture": "Embodied", "model": self._asr_model,
+                    "state": "loading",
+                    "desc": f"Downloading model '{self._asr_model}'...",
+                }
+            if self._load_error:
+                return {
+                    "name": "ASR", "manufacture": "Embodied", "model": self._asr_model,
+                    "state": "error",
+                    "desc": f"Model load failed: {self._load_error}",
+                }
             input_topic = args.get("input_topic", "")
             if instance_id and instance_id in self._nodes:
                 node = self._nodes[instance_id]
@@ -629,6 +665,12 @@ class ASRPlugin:
             }
 
         elif action == "start":
+            if self._loading:
+                return {"state": "loading", "message": "Model is being downloaded, please wait..."}
+            if self._load_error:
+                return {"state": "error", "message": f"Model failed to load: {self._load_error}"}
+            if not self._adapter:
+                return {"state": "error", "message": "ASR model not loaded"}
             input_topic = args.get("input_topic")
             # Also accept input_topics list (sent by canvas when multiple connections exist)
             if not input_topic:
@@ -678,12 +720,17 @@ class ASRPlugin:
                 self._kws_cfg['trigger_mode'] = cfg['trigger_mode']
             if 'kws_keywords' in cfg:
                 self._kws_cfg['keywords'] = [cfg['kws_keywords']]
-            # ASR model switch — rebuild adapter if changed
+            # ASR model switch — load in background if changed
             if 'asr_model' in cfg and cfg['asr_model'] != self._asr_model:
+                # Stop all running nodes first
+                for key in list(self._nodes.keys()):
+                    self._nodes[key].stop()
+                    self._executor.remove_node(self._nodes[key])
+                    del self._nodes[key]
                 self._asr_model = cfg['asr_model']
-                self._plugin_cfg['asr_model'] = self._asr_model
-                log.info(f"[asr] switching model to: {self._asr_model}")
-                self._adapter = _build_asr_adapter(self._plugin_cfg)
+                self._load_model_async(self._asr_model)
+                return {"status": "loading", "asr_model": self._asr_model,
+                        "message": f"Switching to model '{self._asr_model}', downloading..."}
             # Stop all nodes (they'll use new config on next start)
             for key in list(self._nodes.keys()):
                 self._nodes[key].stop()

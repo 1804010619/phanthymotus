@@ -225,6 +225,8 @@ class VideoObjectPerceptionPlugin:
         self._base_classes = list(_COCO_80_CLASSES)
         self._extra_classes: list[str] = plugin_cfg.get("classes") or []
         self._model = None  # lazy load
+        self._model_loading = False
+        self._model_load_error = None
         self._model_lock = threading.Lock()
         self._nodes: dict[str, _VOPNode] = {}
         self._instance_configs: dict[str, dict] = {}  # per-instance config overrides
@@ -383,6 +385,19 @@ class VideoObjectPerceptionPlugin:
         instance_id = args.get("instance_id", "")
 
         if action == "info":
+            # Report loading/error state
+            if self._model_loading:
+                return {
+                    "name": "VideoObjectPerception", "manufacture": "Embodied", "model": self._model_name,
+                    "state": "loading",
+                    "desc": "Loading YOLO model...",
+                }
+            if self._model_load_error:
+                return {
+                    "name": "VideoObjectPerception", "manufacture": "Embodied", "model": self._model_name,
+                    "state": "error",
+                    "desc": f"Model load failed: {self._model_load_error}",
+                }
             instances = {}
             for key, node in self._nodes.items():
                 instances[key] = {
@@ -432,10 +447,22 @@ class VideoObjectPerceptionPlugin:
             node_key = instance_id or input_topic
             if node_key not in self._nodes:
                 if self._model is None:
+                    if self._model_loading:
+                        return {"state": "loading", "message": "Model is still loading, please wait..."}
+                    if self._model_load_error:
+                        return {"state": "error", "message": f"Model failed to load: {self._model_load_error}"}
                     # Model not loaded yet — start loading in background
                     def _bg_start():
-                        self._ensure_model()
-                        self._start_node(node_key, input_topic)
+                        self._model_loading = True
+                        self._model_load_error = None
+                        try:
+                            self._ensure_model()
+                            self._model_loading = False
+                            self._start_node(node_key, input_topic)
+                        except Exception as e:
+                            self._model_loading = False
+                            self._model_load_error = str(e)
+                            log.error(f"[vop] model load failed: {e}", exc_info=True)
                     threading.Thread(target=_bg_start, daemon=True, name="vop_model_load").start()
                     return {"state": "loading", "input": input_topic, "output": f"{input_topic}/objects",
                             "message": "Model loading in background, will start automatically"}

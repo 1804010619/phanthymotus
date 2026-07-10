@@ -310,8 +310,15 @@ class TTSPlugin:
     PREFIX = "tts"
 
     def __init__(self, plugin_cfg: dict, executor):
-        self._adapter  = _build_tts_adapter(plugin_cfg)
         self._cfg      = plugin_cfg
+        self._loading  = False
+        self._load_error = None
+        try:
+            self._adapter  = _build_tts_adapter(plugin_cfg)
+        except Exception as e:
+            log.error(f"[tts] failed to load model: {e}", exc_info=True)
+            self._adapter = None
+            self._load_error = str(e)
         self._nodes: dict[str, _TTSNode] = {}
         self._executor = executor
         log.info(f"[tts] plugin init: sherpa-onnx VITS, "
@@ -325,6 +332,18 @@ class TTSPlugin:
         instance_id = args.get("instance_id", "")
 
         if action == "info":
+            if self._loading:
+                return {
+                    "name": "TTS", "manufacture": "Embodied", "model": "tts",
+                    "state": "loading",
+                    "desc": "Downloading TTS model...",
+                }
+            if self._load_error:
+                return {
+                    "name": "TTS", "manufacture": "Embodied", "model": "tts",
+                    "state": "error",
+                    "desc": f"Model load failed: {self._load_error}",
+                }
             input_topic = args.get("input_topic", "")
             if instance_id and instance_id in self._nodes:
                 node = self._nodes[instance_id]
@@ -365,6 +384,12 @@ class TTSPlugin:
             }
 
         elif action == "start":
+            if self._loading:
+                return {"state": "loading", "message": "TTS model is being downloaded, please wait..."}
+            if self._load_error:
+                return {"state": "error", "message": f"TTS model failed to load: {self._load_error}"}
+            if not self._adapter:
+                return {"state": "error", "message": "TTS model not loaded"}
             input_topic = args.get("input_topic") or ''
             node_key = instance_id or input_topic or '_default'
             # Clean up _default node if it would conflict with this instance
@@ -406,6 +431,10 @@ class TTSPlugin:
             return {"state": "idle"}
 
         elif action == "speak":
+            if self._loading:
+                return {"state": "loading", "message": "TTS model is being downloaded, please wait..."}
+            if self._load_error or not self._adapter:
+                return {"state": "error", "message": f"TTS model not available: {self._load_error or 'not loaded'}"}
             text = args.get("text", "")
             if not text:
                 raise ValueError("text is required")
