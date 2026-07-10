@@ -19,6 +19,8 @@ build/
 resource/world/
 resource/log/
 resource/frame_rgb.jpg
+perception/models/
+*.onnx
 
 # Media (runtime captures)
 *.jpg

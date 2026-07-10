@@ -3,8 +3,11 @@ mcp_port: 15720
 plugins:
   asr:
     enabled: true
+    mode: offline               # offline | online | streaming | segmented
+    model_path: /models/sherpa-onnx/asr-offline
     asr_model: paraformer-zh-en   # paraformer-zh-en | zipformer-en
     model_dir: /models/sherpa-onnx/asr
+    device: cpu
     hw_provider: cpu
     num_threads: 2
     language: zh-CN
@@ -13,19 +16,20 @@ plugins:
       threshold: 0.5
       silence_ms: 400
     kws:
-      enabled: true
+      enabled: false
+      trigger_mode: vad
       model_dir: /models/sherpa-onnx/kws
       keywords:
         - "x iǎo f àn x iǎo f àn @小范小范"
 
   tts:
-    enabled: true
+    enabled: false
     model_dir: /models/sherpa-onnx/tts
     speaker_id: 0
     speed: 1.0
 
   htmsg:
-    enabled: true
+    enabled: false
     namespace: ""       # auto-detect from hostname if empty
     keyframe:
       dist_thresh: 1.0    # meters — insert keyframe when moved this far
@@ -39,7 +43,7 @@ plugins:
       max_nodes: 500
 
   vop:
-    enabled: true
+    enabled: false
     namespace: ""       # auto-detect from hostname if empty
     model: "yolov8s-worldv2"
     confidence: 0.3
