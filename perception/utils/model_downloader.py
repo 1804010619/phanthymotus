@@ -38,6 +38,10 @@ MODELS = {
         "url": f"{COS_BASE}/sherpa-onnx-streaming-zipformer-en-2023-06-26.zip",
         "check_file": "tokens.txt",
     },
+    "asr_sensevoice": {
+        "url": f"{COS_BASE}/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17.zip",
+        "check_file": "tokens.txt",
+    },
     "tts": {
         "url": f"{COS_BASE}/matcha-icefall-zh-en.tar.bz2",
         "check_file": "model-steps-3.onnx",

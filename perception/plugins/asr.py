@@ -68,7 +68,7 @@ TOOLS = [
         "configSchema": {
             "type": "object",
             "properties": {
-                "asr_model":     {"type": "string", "enum": ["paraformer-zh-en", "zipformer-en"], "description": "ASR model (paraformer-zh-en = bilingual, zipformer-en = English only)", "default": "paraformer-zh-en", "scope": "shared"},
+                "asr_model":     {"type": "string", "enum": ["paraformer-zh-en", "zipformer-en", "sensevoice-small"], "description": "ASR model (paraformer-zh-en = bilingual streaming, zipformer-en = English only, sensevoice-small = multilingual non-autoregressive)", "default": "paraformer-zh-en", "scope": "shared"},
                 "trigger_mode":  {"type": "string", "enum": ["vad", "kws"], "description": "Trigger mode (vad = always listen, kws = wake word first)", "default": "kws", "scope": "shared"},
                 "kws_keywords":  {"type": "string", "description": "Wake word (pinyin format, e.g. 'x iǎo f àn x iǎo f àn @小范小范')", "scope": "shared", "x-show-when": {"trigger_mode": "kws"}},
                 "vad_threshold": {"type": "number", "description": "VAD speech threshold (0-1, higher = stricter)", "default": 0.5, "scope": "shared"},
@@ -216,6 +216,48 @@ class SherpaOnnxZipformerAdapter(ASRAdapter):
         return text.strip()
 
 
+class SherpaOnnxSenseVoiceAdapter(ASRAdapter):
+    """Offline non-autoregressive ASR using SenseVoice-Small (zh/en/ja/ko/cantonese).
+
+    Extremely fast inference (10s audio in ~70ms). Best for Chinese-English
+    code-switching scenarios. Uses sherpa_onnx.OfflineRecognizer.
+    """
+
+    def __init__(self, model_dir: str, hw_provider: str = "cuda", num_threads: int = 2):
+        from utils.model_downloader import ensure_model
+        ensure_model("asr_sensevoice", model_dir)
+
+        import sherpa_onnx
+        model_path = os.path.join(model_dir, "model.int8.onnx")
+        if not os.path.exists(model_path):
+            model_path = os.path.join(model_dir, "model.onnx")
+        tokens_path = os.path.join(model_dir, "tokens.txt")
+
+        self._recognizer = sherpa_onnx.OfflineRecognizer.from_sense_voice(
+            model=model_path,
+            tokens=tokens_path,
+            num_threads=num_threads,
+            provider=hw_provider,
+            use_itn=True,
+            language="auto",
+        )
+        log.info(f"[asr] sherpa-onnx sensevoice adapter loaded: model={model_path}, provider={hw_provider}")
+
+    def transcribe(self, wav_bytes: bytes, language: str) -> str:
+        import io as _io, wave as _wave
+        with _wave.open(_io.BytesIO(wav_bytes)) as wf:
+            pcm = wf.readframes(wf.getnframes())
+        n = len(pcm) // 2
+        samples = struct.unpack(f'<{n}h', pcm)
+        float_samples = [s / 32768.0 for s in samples]
+
+        stream = self._recognizer.create_stream()
+        stream.accept_waveform(SAMPLE_RATE, float_samples)
+        self._recognizer.decode_streams([stream])
+        text = stream.result.text
+        return text.strip()
+
+
 # ASR model registry
 ASR_MODELS = {
     "paraformer-zh-en": {
@@ -228,6 +270,11 @@ ASR_MODELS = {
         "adapter": SherpaOnnxZipformerAdapter,
         "default_model_dir": "/models/sherpa-onnx/asr-en",
     },
+    "sensevoice-small": {
+        "label": "SenseVoice Small (zh+en+ja+ko+yue)",
+        "adapter": SherpaOnnxSenseVoiceAdapter,
+        "default_model_dir": "/models/sherpa-onnx/sensevoice",
+    },
 }
 
 
@@ -237,12 +284,12 @@ def _build_asr_adapter(cfg: dict) -> Optional[ASRAdapter]:
     if not model_info:
         log.warning(f"[asr] unknown model '{model_name}', falling back to paraformer-zh-en")
         model_info = ASR_MODELS["paraformer-zh-en"]
+        model_name = "paraformer-zh-en"
 
     model_dir = cfg.get('model_dir', model_info["default_model_dir"])
-    # If model changed but model_dir still points to default of another model, use correct default
-    if model_name == "zipformer-en" and model_dir == "/models/sherpa-onnx/asr":
-        model_dir = model_info["default_model_dir"]
-    elif model_name == "paraformer-zh-en" and model_dir == "/models/sherpa-onnx/asr-en":
+    # If model_dir points to another model's default, use correct default
+    other_defaults = [v["default_model_dir"] for k, v in ASR_MODELS.items() if k != model_name]
+    if model_dir in other_defaults:
         model_dir = model_info["default_model_dir"]
 
     hw_provider = cfg.get('hw_provider', 'cpu')
