@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
+from __future__ import annotations
+
 import io
 import json
 import logging
-import struct
 import threading
 import wave
 from pathlib import Path
+
+from plugins.asr_runtime import pcm16_to_float_samples
 
 
 SAMPLE_RATE = 16000
@@ -113,6 +116,7 @@ class OfflineASRAdapter:
         self._recognizer = _create_sherpa_recognizer(
             model_path, loaded_config, sample_rate=SAMPLE_RATE
         )
+        self._decode_lock = threading.Lock()
 
     @classmethod
     def get_instance(
@@ -146,17 +150,14 @@ class OfflineASRAdapter:
             sample_rate = wav_file.getframerate()
             raw_pcm = wav_file.readframes(wav_file.getnframes())
 
-        sample_count = len(raw_pcm) // 2
-        samples = [
-            sample / 32768.0
-            for sample in struct.unpack(f"<{sample_count}h", raw_pcm)
-        ]
-        stream = self._recognizer.create_stream()
-        stream.accept_waveform(sample_rate, samples)
-        self._recognizer.decode_stream(stream)
+        samples = pcm16_to_float_samples(raw_pcm)
+        with self._decode_lock:
+            stream = self._recognizer.create_stream()
+            stream.accept_waveform(sample_rate, samples)
+            self._recognizer.decode_stream(stream)
 
-        result = getattr(stream, "result", None)
-        if result is None and hasattr(self._recognizer, "get_result"):
-            result = self._recognizer.get_result(stream)
-        text = getattr(result, "text", result or "")
+            result = getattr(stream, "result", None)
+            if result is None and hasattr(self._recognizer, "get_result"):
+                result = self._recognizer.get_result(stream)
+            text = getattr(result, "text", result or "")
         return str(text).strip()

@@ -283,7 +283,8 @@ async def _ws_asr_handler(websocket):
          {"text": "识别结果"}
       4. Client sends text "flush" to force-flush remaining speech
     """
-    from plugins.asr import VadSession, _build_asr_adapter, _pcm16_to_wav
+    from plugins.asr import _build_asr_adapter, _pcm16_to_wav
+    from plugins.asr_runtime import VadSession, resolve_vad_settings
     import websockets
 
     # 1. Receive config frame
@@ -294,23 +295,41 @@ async def _ws_asr_handler(websocket):
         log.warning(f"[ws_asr] invalid config frame: {e}")
         return
 
-    adapter = _build_asr_adapter(cfg)
     language = cfg.get('language', 'zh-CN')
+    vad_settings = resolve_vad_settings(cfg)
+    loop = asyncio.get_running_loop()
+
+    try:
+        adapter = await loop.run_in_executor(
+            None, lambda: _build_asr_adapter(cfg)
+        )
+        session = await loop.run_in_executor(
+            None, lambda: VadSession(**vad_settings)
+        )
+    except Exception as e:
+        log.error(f"[ws_asr] initialization error: {e}", exc_info=True)
+        await websocket.send(json.dumps({
+            'type': 'asr_error', 'payload': {'error': str(e)}
+        }))
+        return
 
     if adapter is None:
         await websocket.send(json.dumps({'type': 'asr_error', 'payload': {'error': 'ASR adapter not configured'}}))
         return
 
-    session = VadSession()
-    session.init()
-
-    await websocket.send(json.dumps({'type': 'asr_ready', 'payload': {'language': language}}))
-    log.info(f"[ws_asr] client connected, provider={cfg.get('provider','?')}")
+    await websocket.send(json.dumps({
+        'type': 'asr_ready',
+        'payload': {'language': language, 'vad_backend': session.backend},
+    }))
+    log.info(
+        f"[ws_asr] client connected, provider={cfg.get('provider','?')}, "
+        f"vad={session.backend}"
+    )
 
     async def _transcribe_and_send(pcm: bytes):
         try:
             wav = _pcm16_to_wav(pcm)
-            text = await asyncio.get_event_loop().run_in_executor(
+            text = await loop.run_in_executor(
                 None, lambda: adapter.transcribe(wav, language)
             )
             if text and text.strip():

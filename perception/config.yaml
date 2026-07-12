@@ -3,7 +3,7 @@ mcp_port: 15720
 plugins:
   asr:
     enabled: true
-    mode: offline               # offline | online | streaming | segmented
+    mode: offline               # offline | streaming (online/segmented are legacy aliases)
     model_path: /models/sherpa-onnx/asr-offline
     asr_model: paraformer-zh-en   # paraformer-zh-en | zipformer-en
     model_dir: /models/sherpa-onnx/asr
@@ -15,6 +15,7 @@ plugins:
       model: sherpa_onnx    # sherpa_onnx (ONNX, lightweight) | silero (PyTorch) | webrtc
       threshold: 0.5
       silence_ms: 400
+      pre_roll_ms: 500
     kws:
       enabled: false
       trigger_mode: vad
