@@ -53,9 +53,17 @@ plugins:
       max_nodes: 500
 
   vop:
-    enabled: true
+    enabled: false
     namespace: ""       # auto-detect from hostname if empty
     model: "yolov8s-worldv2"
     confidence: 0.3
     classes: []         # empty = default broad set
     fps: 5
+
+  ocr:
+    enabled: true
+    provider: openai   # openai | qwen | tesseract | google
+    url: ""            # API URL (empty = default endpoint)
+    key: ""            # API Key
+    model: ""          # model name (default: gpt-4o-mini / qwen-vl-max)
+    language: "zh"     # default language hint
