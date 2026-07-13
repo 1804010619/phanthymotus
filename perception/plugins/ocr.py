@@ -27,7 +27,7 @@ from std_msgs.msg import String
 log = logging.getLogger(__name__)
 
 _LOW_LAT_QOS = QoSProfile(
-    reliability=ReliabilityPolicy.BEST_EFFORT,
+    reliability=ReliabilityPolicy.RELIABLE,  # 使用 RELIABLE 确保消息可靠送达
     history=HistoryPolicy.KEEP_LAST,
     depth=10,
     durability=DurabilityPolicy.VOLATILE,
