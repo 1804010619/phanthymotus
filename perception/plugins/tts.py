@@ -81,6 +81,85 @@ class TTSAdapter(ABC):
         yield self.synthesize(text)
 
 
+def _resample_to_16k(samples, src_rate: int):
+    """Resample float PCM to 16 kHz for audio/pcm-16k output."""
+    if src_rate == SAMPLE_RATE:
+        return samples
+    from math import gcd
+
+    import numpy as np
+    from scipy.signal import resample_poly
+
+    g = gcd(src_rate, SAMPLE_RATE)
+    return resample_poly(np.asarray(samples, dtype=np.float32), SAMPLE_RATE // g, src_rate // g)
+
+
+def _float_samples_to_pcm16(samples) -> bytes:
+    import struct
+
+    return struct.pack(
+        f"<{len(samples)}h",
+        *[int(max(-32768, min(32767, s * 32767))) for s in samples],
+    )
+
+
+class SherpaOnnxVitsTTSAdapter(TTSAdapter):
+    """On-device TTS using sherpa-onnx VITS (e.g. vits-melo-tts-zh_en-8k)."""
+
+    def __init__(self, model_dir: str, speaker_id: int = 0, speed: float = 1.0,
+                 model_name: str = "tts_melo_8k"):
+        import os
+        from utils.model_downloader import ensure_model
+
+        ensure_model(model_name, model_dir)
+
+        import sherpa_onnx
+
+        model_path = os.path.join(model_dir, "model.onnx")
+        tokens_path = os.path.join(model_dir, "tokens.txt")
+        lexicon_path = os.path.join(model_dir, "lexicon.txt")
+        dict_dir = os.path.join(model_dir, "dict")
+
+        rule_fsts = []
+        for name in ("date.fst", "number.fst", "phone.fst"):
+            p = os.path.join(model_dir, name)
+            if os.path.exists(p):
+                rule_fsts.append(p)
+
+        tts_config = sherpa_onnx.OfflineTtsConfig(
+            model=sherpa_onnx.OfflineTtsModelConfig(
+                vits=sherpa_onnx.OfflineTtsVitsModelConfig(
+                    model=model_path,
+                    lexicon=lexicon_path if os.path.exists(lexicon_path) else "",
+                    tokens=tokens_path,
+                    dict_dir=dict_dir if os.path.isdir(dict_dir) else "",
+                    length_scale=1.0 / speed if speed else 1.0,
+                ),
+                num_threads=2,
+                provider="cpu",
+            ),
+            rule_fsts=",".join(rule_fsts) if rule_fsts else "",
+        )
+        self._tts = sherpa_onnx.OfflineTts(tts_config)
+        self._sid = speaker_id
+        self._speed = speed
+        self._model_sr = self._tts.sample_rate
+        log.info(
+            f"[tts] sherpa-onnx VITS loaded: model_dir={model_dir}, "
+            f"sample_rate={self._model_sr}, speaker_id={speaker_id}, speed={speed}"
+        )
+
+    def synthesize(self, text: str) -> bytes:
+        return b"".join(self.synthesize_stream(text))
+
+    def synthesize_stream(self, text: str):
+        audio = self._tts.generate(text, sid=self._sid, speed=self._speed)
+        samples = _resample_to_16k(audio.samples, self._model_sr)
+        pcm = _float_samples_to_pcm16(samples)
+        for i in range(0, len(pcm), CHUNK_BYTES):
+            yield pcm[i : i + CHUNK_BYTES]
+
+
 class SherpaOnnxTTSAdapter(TTSAdapter):
     """On-device TTS using sherpa-onnx Matcha (flow-matching, fast non-autoregressive)."""
 
@@ -132,23 +211,27 @@ class SherpaOnnxTTSAdapter(TTSAdapter):
         return b''.join(self.synthesize_stream(text))
 
     def synthesize_stream(self, text: str):
-        import struct
         audio = self._tts.generate(text, sid=self._sid, speed=self._speed)
-        float_samples = audio.samples
-        # Matcha + vocos-16khz outputs 16kHz directly, no resampling needed
-        pcm = struct.pack(f'<{len(float_samples)}h',
-                         *[int(max(-32768, min(32767, s * 32767))) for s in float_samples])
+        samples = _resample_to_16k(audio.samples, self._tts.sample_rate)
+        pcm = _float_samples_to_pcm16(samples)
         for i in range(0, len(pcm), CHUNK_BYTES):
-            yield pcm[i:i + CHUNK_BYTES]
+            yield pcm[i : i + CHUNK_BYTES]
 
 
 
 
 def _build_tts_adapter(cfg: dict) -> TTSAdapter:
-    import os
-    model_dir = cfg.get('model_dir', '/models/sherpa-onnx/tts')
-    speaker_id = int(cfg.get('speaker_id', 0))
-    speed = float(cfg.get('speed', 1.0))
+    model_dir = cfg.get("model_dir", "/models/sherpa-onnx/tts")
+    speaker_id = int(cfg.get("speaker_id", 0))
+    speed = float(cfg.get("speed", 1.0))
+    backend = cfg.get("backend", "vits")
+    if backend == "vits":
+        return SherpaOnnxVitsTTSAdapter(
+            model_dir,
+            speaker_id,
+            speed,
+            model_name=cfg.get("model_name", "tts_melo_8k"),
+        )
     return SherpaOnnxTTSAdapter(model_dir, speaker_id, speed)
 
 

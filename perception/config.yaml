@@ -20,7 +20,9 @@ plugins:
 
   tts:
     enabled: true
-    model_dir: /models/sherpa-onnx/tts
+    backend: vits
+    model_name: tts_melo_8k
+    model_dir: /models/vits-melo-tts-zh_en-8k
     speaker_id: 0
     speed: 1.0
 

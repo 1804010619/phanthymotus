@@ -14,6 +14,7 @@ from urllib.request import urlretrieve
 log = logging.getLogger(__name__)
 
 COS_BASE = "https://agi-phanthy-dev-1252788780.cos.ap-beijing.myqcloud.com/public"
+JUICEFS_BASE = "http://172.28.4.81:34567/fanyi/phanthymotus_tts"
 
 
 def _progress_hook(name: str):
@@ -51,6 +52,14 @@ MODELS = {
         "check_file": "vocos-16khz-univ.onnx",
         "single_file": True,
     },
+    "tts_melo_8k": {
+        "url": f"{JUICEFS_BASE}/vits-melo-tts-zh_en-8k.tar.bz2",
+        "check_file": "model.onnx",
+    },
+    "tts_melo": {
+        "url": f"{JUICEFS_BASE}/vits-melo-tts-zh_en.tar.bz2",
+        "check_file": "model.onnx",
+    },
     "kws": {
         "url": f"{COS_BASE}/sherpa-onnx-kws-zipformer-zh-en-3M-2025-12-20.tar.bz2",
         "check_file": "tokens.txt",
@@ -58,13 +67,13 @@ MODELS = {
     "vad": {
         "url": f"{COS_BASE}/silero_vad.onnx",
         "check_file": "silero_vad.onnx",
-        "single_file": True,  # Not an archive, just a single file download
+        "single_file": True,
     },
 }
 
 
 def ensure_model(name: str, model_dir: str) -> None:
-    """Ensure model files exist in model_dir. Download from COS if missing."""
+    """Ensure model files exist in model_dir. Download if missing."""
     info = MODELS.get(name)
     if not info:
         raise ValueError(f"Unknown model name: {name}")
@@ -79,36 +88,27 @@ def ensure_model(name: str, model_dir: str) -> None:
     log.info(f"[model_downloader] {name}: downloading from {url} ...")
 
     if info.get("single_file"):
-        # Direct file download (not an archive)
         dest = os.path.join(model_dir, info["check_file"])
         urlretrieve(url, dest, reporthook=_progress_hook(name))
         log.info(f"[model_downloader] {name}: done.")
         return
 
-    # Determine suffix from URL
-    if url.endswith(".zip"):
-        suffix = ".zip"
-    else:
-        suffix = ".tar.bz2"
-
+    suffix = ".zip" if url.endswith(".zip") else ".tar.bz2"
     with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
         tmp_path = tmp.name
 
     try:
         urlretrieve(url, tmp_path, reporthook=_progress_hook(name))
         log.info(f"[model_downloader] {name}: extracting to {model_dir} ...")
-
         if suffix == ".zip":
             _extract_zip(tmp_path, model_dir)
         else:
             _extract_tar(tmp_path, model_dir)
-
         log.info(f"[model_downloader] {name}: done.")
     finally:
         if os.path.exists(tmp_path):
             os.unlink(tmp_path)
 
-    # Verify
     if not os.path.exists(check_path):
         raise RuntimeError(
             f"[model_downloader] {name}: download completed but {info['check_file']} "
@@ -119,7 +119,6 @@ def ensure_model(name: str, model_dir: str) -> None:
 def _extract_zip(zip_path: str, model_dir: str) -> None:
     """Extract zip, stripping common top-level directory prefix."""
     with zipfile.ZipFile(zip_path, 'r') as zf:
-        # Filter out __MACOSX and directory entries
         names = [n for n in zf.namelist()
                  if not n.endswith('/') and not n.startswith('__MACOSX')]
         if not names:
