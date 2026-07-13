@@ -77,26 +77,34 @@ class OCRAdapter(ABC):
     """OCR 适配器抽象基类"""
 
     @abstractmethod
-    def recognize(self, image_bytes: bytes, language: str = "zh") -> str:
-        """识别图片中的文字，返回文本"""
+    def recognize(self, image_bytes: bytes, language: str = "zh") -> list:
+        """识别图片中的文字，返回文本列表（每项包含 text 和 bbox）"""
         ...
+
+    @staticmethod
+    def format_result(results: list) -> str:
+        """将结果列表格式化为纯文本字符串（用于兼容旧逻辑）"""
+        return " ".join(item.get("text", "") for item in results if item.get("text"))
 
 
 class OpenAIVisionAdapter(OCRAdapter):
     """OpenAI Vision API (GPT-4o / GPT-4o-mini) OCR"""
 
     _SYSTEM_PROMPT = (
-        "You are an OCR (Optical Character Recognition) system. "
-        "Your task is to extract ALL text from the provided image accurately.\n\n"
+        "You are an OCR (Optical Character Recognition) system with bounding box detection.\n\n"
+        "Your task is to extract ALL text from the provided image and return each text segment with its bounding box coordinates.\n\n"
+        "Output format: Return a JSON array where each element contains:\n"
+        "- \"text\": the extracted text string\n"
+        "- \"bbox\": [x1, y1, x2, y2] coordinates of the bounding box (top-left x, top-left y, bottom-right x, bottom-right y)\n\n"
         "Rules:\n"
-        "1. Extract text exactly as it appears in the image, preserving the original order and structure.\n"
-        "2. Do NOT translate, summarize, or interpret the text.\n"
-        "3. Do NOT add any explanations, prefixes, or comments.\n"
-        "4. If there is no text in the image, return an empty string.\n"
-        "5. For multi-language text, transcribe each language as-is.\n"
-        "6. Preserve line breaks and spacing where appropriate.\n"
-        "\n"
-        "Output ONLY the extracted text, nothing else."
+        "1. Extract text exactly as it appears in the image, preserving the original order.\n"
+        "2. Each text segment should be a distinct line or logical text block.\n"
+        "3. Bounding box coordinates should be integers representing pixel positions.\n"
+        "4. Do NOT translate, summarize, or interpret the text.\n"
+        "5. If there is no text in the image, return an empty array [].\n"
+        "6. For multi-language text, transcribe each language as-is.\n\n"
+        "Output ONLY the JSON array, nothing else. Example:\n"
+        '[{"text": "Hello World", "bbox": [100, 50, 300, 80]}, {"text": "Price: $10", "bbox": [100, 100, 250, 130]}]'
     )
 
     def __init__(self, url: str, key: str, model: str):
@@ -104,7 +112,7 @@ class OpenAIVisionAdapter(OCRAdapter):
         self.key = key
         self.model = model or "gpt-4o-mini"
 
-    def recognize(self, image_bytes: bytes, language: str = "zh") -> str:
+    def recognize(self, image_bytes: bytes, language: str = "zh") -> list:
         import requests
 
         image_b64 = base64.b64encode(image_bytes).decode("utf-8")
@@ -132,7 +140,7 @@ class OpenAIVisionAdapter(OCRAdapter):
                     },
                     {
                         "type": "text",
-                        "text": f"Please extract all text from this image. Language hint: {language}"
+                        "text": f"Extract all text from this image with bounding boxes. Language hint: {language}"
                     }
                 ]
             }
@@ -156,8 +164,38 @@ class OpenAIVisionAdapter(OCRAdapter):
         response.raise_for_status()
 
         result = response.json()
-        text = result.get("choices", [{}])[0].get("message", {}).get("content", "")
-        return text.strip()
+        content = result.get("choices", [{}])[0].get("message", {}).get("content", "")
+        return self._parse_result(content)
+
+    @staticmethod
+    def _parse_result(content: str) -> list:
+        """解析模型返回的 JSON 结果"""
+        content = content.strip()
+        # 尝试提取 JSON 数组
+        if content.startswith("["):
+            try:
+                return json.loads(content)
+            except json.JSONDecodeError:
+                pass
+        # 尝试从 markdown 代码块中提取
+        import re
+        match = re.search(r"```(?:json)?\s*(\[.*?\])\s*```", content, re.DOTALL)
+        if match:
+            try:
+                return json.loads(match.group(1))
+            except json.JSONDecodeError:
+                pass
+        # 尝试找到第一个 [ 到最后一个 ]
+        start = content.find("[")
+        end = content.rfind("]")
+        if start != -1 and end != -1 and end > start:
+            try:
+                return json.loads(content[start:end + 1])
+            except json.JSONDecodeError:
+                pass
+        # 兜底：作为纯文本处理
+        log.warning(f"[ocr] failed to parse JSON result, treating as plain text: {content[:200]!r}")
+        return [{"text": content, "bbox": []}]
 
 
 class QwenVLAdapter(OCRAdapter):
@@ -167,16 +205,19 @@ class QwenVLAdapter(OCRAdapter):
     """
 
     _SYSTEM_PROMPT = (
-        "你是一个 OCR 文字识别系统。\n\n"
-        "任务：从图片中提取所有文字。\n\n"
+        "你是一个 OCR 文字识别系统，支持坐标检测。\n\n"
+        "任务：从图片中提取所有文字，并返回每段文字的边界框坐标。\n\n"
+        "输出格式：返回 JSON 数组，每个元素包含：\n"
+        '- "text": 提取的文字\n'
+        '- "bbox": [x1, y1, x2, y2] 边界框坐标（左上角x, 左上角y, 右下角x, 右下角y）\n\n'
         "规则：\n"
-        "1. 准确提取图片中的所有文字，保持原有顺序和结构。\n"
-        "2. 不要翻译、总结或解释文字内容。\n"
-        "3. 不要添加任何前缀、解释或评论。\n"
-        "4. 如果图片中没有文字，返回空字符串。\n"
-        "5. 保持适当的换行和空格。\n"
-        "\n"
-        "只输出提取的文字，不要输出其他内容。"
+        "1. 准确提取图片中的所有文字，保持原有顺序。\n"
+        "2. 每段文字应为独立的一行或逻辑文本块。\n"
+        "3. 坐标为整数，表示像素位置。\n"
+        "4. 不要翻译、总结或解释文字内容。\n"
+        "5. 如果图片中没有文字，返回空数组 []。\n\n"
+        "只输出 JSON 数组，不要输出其他内容。示例：\n"
+        '[{"text": "你好世界", "bbox": [100, 50, 300, 80]}, {"text": "价格：10元", "bbox": [100, 100, 250, 130]}]'
     )
 
     def __init__(self, url: str, key: str, model: str):
@@ -184,7 +225,7 @@ class QwenVLAdapter(OCRAdapter):
         self.key = key
         self.model = model or "qwen-vl-max"
 
-    def recognize(self, image_bytes: bytes, language: str = "zh") -> str:
+    def recognize(self, image_bytes: bytes, language: str = "zh") -> list:
         import requests
 
         image_b64 = base64.b64encode(image_bytes).decode("utf-8")
@@ -204,7 +245,7 @@ class QwenVLAdapter(OCRAdapter):
                     },
                     {
                         "type": "text",
-                        "text": "请识别图片中的所有文字。"
+                        "text": "请识别图片中的所有文字并返回坐标。"
                     }
                 ]
             }
@@ -228,20 +269,21 @@ class QwenVLAdapter(OCRAdapter):
         response.raise_for_status()
 
         result = response.json()
-        text = result.get("choices", [{}])[0].get("message", {}).get("content", "")
-        return text.strip()
+        content = result.get("choices", [{}])[0].get("message", {}).get("content", "")
+        return OpenAIVisionAdapter._parse_result(content)
 
 
 class TesseractAdapter(OCRAdapter):
     """Tesseract 本地 OCR 引擎
 
     离线 OCR，无需网络，但精度较低。
+    Tesseract 不支持坐标输出，返回无 bbox 的结果。
     """
 
     def __init__(self, language: str = "chi_sim+eng"):
         self._language = language
 
-    def recognize(self, image_bytes: bytes, language: str = "zh") -> str:
+    def recognize(self, image_bytes: bytes, language: str = "zh") -> list:
         try:
             import pytesseract
             from PIL import Image
@@ -260,8 +302,19 @@ class TesseractAdapter(OCRAdapter):
         tesseract_lang = lang_map.get(language, self._language)
 
         image = Image.open(BytesIO(image_bytes))
-        text = pytesseract.image_to_string(image, lang=tesseract_lang)
-        return text.strip()
+        # 使用 image_to_data 获取带坐标的结果
+        data = pytesseract.image_to_data(image, lang=tesseract_lang, output_type=pytesseract.Output.DICT)
+        results = []
+        for i in range(len(data["text"])):
+            text = data["text"][i].strip()
+            if not text:
+                continue
+            x, y, w, h = data["left"][i], data["top"][i], data["width"][i], data["height"][i]
+            results.append({
+                "text": text,
+                "bbox": [x, y, x + w, y + h],
+            })
+        return results
 
 
 def _build_ocr_adapter(cfg: dict) -> Optional[OCRAdapter]:
@@ -377,14 +430,15 @@ class _OCRNode(Node):
             try:
                 log.info(f"[ocr] worker processing frame: size={len(image_bytes)} bytes, "
                          f"adapter={type(self._adapter).__name__}, language={self._language}")
-                text = self._adapter.recognize(image_bytes, self._language)
-                log.info(f"[ocr] adapter returned: text_len={len(text)}, text_preview={text[:200]!r}")
+                results = self._adapter.recognize(image_bytes, self._language)
+                log.info(f"[ocr] adapter returned: {len(results)} items, preview={str(results[:2])[:200]!r}")
 
-                if not text.strip():
-                    log.warning(f"[ocr] recognition returned empty text, publishing empty result")
+                if not results:
+                    log.warning(f"[ocr] recognition returned empty results, publishing empty result")
                     # 即使为空也发布，让调用方知道已处理
                     result = {
                         "text": "",
+                        "items": [],
                         "timestamp": ts,
                         "language": self._language,
                     }
@@ -393,8 +447,11 @@ class _OCRNode(Node):
                     self._pub.publish(msg)
                     continue
 
+                # 同时返回详细结果和纯文本（兼容旧逻辑）
+                text = OCRAdapter.format_result(results)
                 result = {
                     "text": text,
+                    "items": results,  # 包含每个文本及其坐标
                     "timestamp": ts,
                     "language": self._language,
                 }
@@ -403,13 +460,14 @@ class _OCRNode(Node):
                 msg.data = json.dumps(result, ensure_ascii=False)
                 self._pub.publish(msg)
 
-                log.info(f"[ocr] published result to {self._output_topic}: {text[:100]}...")
+                log.info(f"[ocr] published result to {self._output_topic}: {len(results)} items, text_len={len(text)}")
             except Exception as e:
                 log.error(f"[ocr] recognition error: {e}", exc_info=True)
                 # 发布错误结果，让调用方知道处理失败
                 try:
                     error_result = {
                         "text": "",
+                        "items": [],
                         "error": str(e),
                         "timestamp": ts,
                         "language": self._language,
