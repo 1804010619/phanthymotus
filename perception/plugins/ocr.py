@@ -312,6 +312,7 @@ class _OCRNode(Node):
         self._frame_queue: queue.Queue = queue.Queue(maxsize=5)
         self._worker_thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
+        self._frame_count = 0  # 收到的图片帧计数
 
         log.info(f"[ocr] node created: subscribing={self._input_topic}, publishing={self._output_topic}")
 
@@ -347,15 +348,21 @@ class _OCRNode(Node):
 
     def _image_cb(self, msg: CompressedImage):
         """接收图片帧，放入队列"""
+        self._frame_count += 1
+        image_data = bytes(msg.data)
+        log.info(f"[ocr] received image frame #{self._frame_count}: "
+                 f"size={len(image_data)} bytes, format={msg.format}, "
+                 f"topic={self._input_topic}")
         try:
-            self._frame_queue.put_nowait((bytes(msg.data), time.time()))
+            self._frame_queue.put_nowait((image_data, time.time()))
         except queue.Full:
+            log.warning(f"[ocr] frame queue full, dropping old frame (queue_size=5)")
             try:
                 self._frame_queue.get_nowait()
             except queue.Empty:
                 pass
             try:
-                self._frame_queue.put_nowait((bytes(msg.data), time.time()))
+                self._frame_queue.put_nowait((image_data, time.time()))
             except queue.Full:
                 pass
 
@@ -368,8 +375,22 @@ class _OCRNode(Node):
                 continue
 
             try:
+                log.info(f"[ocr] worker processing frame: size={len(image_bytes)} bytes, "
+                         f"adapter={type(self._adapter).__name__}, language={self._language}")
                 text = self._adapter.recognize(image_bytes, self._language)
+                log.info(f"[ocr] adapter returned: text_len={len(text)}, text_preview={text[:200]!r}")
+
                 if not text.strip():
+                    log.warning(f"[ocr] recognition returned empty text, publishing empty result")
+                    # 即使为空也发布，让调用方知道已处理
+                    result = {
+                        "text": "",
+                        "timestamp": ts,
+                        "language": self._language,
+                    }
+                    msg = String()
+                    msg.data = json.dumps(result, ensure_ascii=False)
+                    self._pub.publish(msg)
                     continue
 
                 result = {
@@ -382,9 +403,23 @@ class _OCRNode(Node):
                 msg.data = json.dumps(result, ensure_ascii=False)
                 self._pub.publish(msg)
 
-                log.info(f"[ocr] recognized: {text[:100]}...")
+                log.info(f"[ocr] published result to {self._output_topic}: {text[:100]}...")
             except Exception as e:
                 log.error(f"[ocr] recognition error: {e}", exc_info=True)
+                # 发布错误结果，让调用方知道处理失败
+                try:
+                    error_result = {
+                        "text": "",
+                        "error": str(e),
+                        "timestamp": ts,
+                        "language": self._language,
+                    }
+                    msg = String()
+                    msg.data = json.dumps(error_result, ensure_ascii=False)
+                    self._pub.publish(msg)
+                    log.info(f"[ocr] published error result to {self._output_topic}")
+                except Exception:
+                    pass
 
     def _status_dict(self) -> dict:
         return {
