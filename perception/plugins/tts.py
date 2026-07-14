@@ -23,6 +23,14 @@ log = logging.getLogger(__name__)
 
 SAMPLE_RATE = 16000
 CHUNK_BYTES = 3200  # 100ms @ 16kHz 16-bit mono
+MAX_SEGMENT_CHARS = 120
+# Local synthesis buffer. 600 frames is about 60 seconds / 1.9 MB of PCM.
+# It lets the producer synthesize the next sentence while the current one plays.
+SYNTH_QUEUE_FRAMES = 600
+
+_STRONG_SENTENCE_END = frozenset("。！？!?；;")
+_WEAK_SENTENCE_END = frozenset("，,、：:")
+_CLOSING_PUNCTUATION = frozenset("”’\"'》〉】〕）)]}」』")
 
 _LOW_LAT_QOS = QoSProfile(
     reliability=ReliabilityPolicy.BEST_EFFORT,
@@ -72,13 +80,140 @@ TOOLS = [
 
 # ── TTS Adapter ──────────────────────────────────────────────────────────────
 
+
+def _is_cjk(char: str) -> bool:
+    """Return True for common CJK code-point ranges."""
+    if not char:
+        return False
+    code = ord(char)
+    return (
+        0x3400 <= code <= 0x4DBF
+        or 0x4E00 <= code <= 0x9FFF
+        or 0xF900 <= code <= 0xFAFF
+    )
+
+
+def _split_long_segment(segment: str, max_chars: int) -> list[str]:
+    """Split an unusually long sentence at weak punctuation or whitespace."""
+    if max_chars <= 0 or len(segment) <= max_chars:
+        return [segment]
+
+    parts: list[str] = []
+    remaining = segment
+    min_cut = max(1, max_chars // 2)
+
+    while len(remaining) > max_chars:
+        cut = -1
+
+        # Prefer a comma/colon-like boundary near the maximum length.
+        for index in range(max_chars - 1, min_cut - 1, -1):
+            if remaining[index] in _WEAK_SENTENCE_END:
+                cut = index + 1
+                break
+
+        # For English text, prefer a whitespace boundary rather than
+        # splitting through the middle of a word.
+        if cut < 0:
+            space_index = remaining.rfind(" ", min_cut, max_chars + 1)
+            if space_index >= 0:
+                cut = space_index + 1
+
+        if cut < 0:
+            cut = max_chars
+
+        part = remaining[:cut].strip()
+        if part:
+            parts.append(part)
+        remaining = remaining[cut:].strip()
+
+    if remaining:
+        parts.append(remaining)
+    return parts
+
+
+def _split_text_for_tts(text: str, max_chars: int = MAX_SEGMENT_CHARS) -> list[str]:
+    """Split text into TTS-friendly sentences while retaining punctuation.
+
+    Primary boundaries are Chinese/English sentence-ending punctuation and
+    newlines. English full stops are kept inside decimal numbers. A very long
+    sentence is split again at comma/colon-like punctuation or whitespace.
+    """
+    normalized = text.replace("\r\n", "\n").replace("\r", "\n").strip()
+    if not normalized:
+        return []
+
+    segments: list[str] = []
+    current: list[str] = []
+    text_len = len(normalized)
+    index = 0
+
+    while index < text_len:
+        char = normalized[index]
+        current.append(char)
+        is_boundary = char == "\n" or char in _STRONG_SENTENCE_END
+
+        if char == ".":
+            previous = normalized[index - 1] if index > 0 else ""
+            following = normalized[index + 1] if index + 1 < text_len else ""
+            is_decimal = previous.isdigit() and following.isdigit()
+            # Avoid splitting 3.14, but support both "Hello. Next" and
+            # mixed text such as "Hello.下一句".
+            is_boundary = not is_decimal and (
+                not following
+                or following.isspace()
+                or following in _CLOSING_PUNCTUATION
+                or _is_cjk(following)
+            )
+
+        if is_boundary:
+            # Keep closing quotes/brackets with the sentence-ending mark.
+            next_index = index + 1
+            while (
+                next_index < text_len
+                and normalized[next_index] in _CLOSING_PUNCTUATION
+            ):
+                current.append(normalized[next_index])
+                next_index += 1
+            index = next_index - 1
+
+            sentence = "".join(current).strip()
+            if sentence:
+                segments.extend(_split_long_segment(sentence, max_chars))
+            current = []
+
+        index += 1
+
+    tail = "".join(current).strip()
+    if tail:
+        segments.extend(_split_long_segment(tail, max_chars))
+
+    return segments
+
 class TTSAdapter(ABC):
     @abstractmethod
-    def synthesize(self, text: str) -> bytes: ...
+    def _synthesize_segment(self, text: str) -> bytes: ...
+
+    def split_text(self, text: str) -> list[str]:
+        return _split_text_for_tts(text)
+
+    def synthesize(self, text: str) -> bytes:
+        """Synthesize all segments and return one concatenated PCM stream."""
+        return b"".join(self.synthesize_stream(text))
 
     def synthesize_stream(self, text: str):
-        """Yield raw PCM bytes as they arrive. Default: collect all."""
-        yield self.synthesize(text)
+        """Yield concatenated PCM chunks, synthesized one sentence at a time."""
+        yield from self.synthesize_segments_stream(self.split_text(text))
+
+    def synthesize_segments_stream(self, segments: list[str]):
+        """Synthesize pre-split segments and yield one continuous PCM stream."""
+        buffer = b""
+        for segment in segments:
+            buffer += self._synthesize_segment(segment)
+            while len(buffer) >= CHUNK_BYTES:
+                yield buffer[:CHUNK_BYTES]
+                buffer = buffer[CHUNK_BYTES:]
+        if buffer:
+            yield buffer
 
 
 def _resample_to_16k(samples, src_rate: int):
@@ -107,7 +242,7 @@ class SherpaOnnxVitsTTSAdapter(TTSAdapter):
     """On-device TTS using sherpa-onnx VITS (e.g. vits-melo-tts-zh_en-8k)."""
 
     def __init__(self, model_dir: str, speaker_id: int = 0, speed: float = 1.0,
-                 model_name: str = "tts_melo_8k", hw_provider: str = "cuda",
+                 model_name: str = "tts_melo_8k", hw_provider: str = "cpu",
                  num_threads: int = 4):
         import os
         from utils.model_downloader import ensure_model
@@ -118,8 +253,11 @@ class SherpaOnnxVitsTTSAdapter(TTSAdapter):
 
         model_path = os.path.join(model_dir, "model.onnx")
         tokens_path = os.path.join(model_dir, "tokens.txt")
+        espeak_data_dir = os.path.join(model_dir, "espeak-ng-data")
         lexicon_path = os.path.join(model_dir, "lexicon.txt")
         dict_dir = os.path.join(model_dir, "dict")
+
+        use_espeak = os.path.isdir(espeak_data_dir)
 
         rule_fsts = []
         for name in ("date.fst", "number.fst", "phone.fst"):
@@ -131,9 +269,10 @@ class SherpaOnnxVitsTTSAdapter(TTSAdapter):
             model=sherpa_onnx.OfflineTtsModelConfig(
                 vits=sherpa_onnx.OfflineTtsVitsModelConfig(
                     model=model_path,
-                    lexicon=lexicon_path if os.path.exists(lexicon_path) else "",
                     tokens=tokens_path,
-                    dict_dir=dict_dir if os.path.isdir(dict_dir) else "",
+                    lexicon="" if use_espeak else (lexicon_path if os.path.exists(lexicon_path) else ""),
+                    dict_dir="" if use_espeak else (dict_dir if os.path.isdir(dict_dir) else ""),
+                    data_dir=espeak_data_dir if use_espeak else "",
                     length_scale=1.0 / speed if speed else 1.0,
                 ),
                 num_threads=num_threads,
@@ -145,21 +284,17 @@ class SherpaOnnxVitsTTSAdapter(TTSAdapter):
         self._sid = speaker_id
         self._speed = speed
         self._model_sr = self._tts.sample_rate
+        mode = "espeak" if use_espeak else "lexicon"
         log.info(
-            f"[tts] sherpa-onnx VITS loaded: model_dir={model_dir}, "
+            f"[tts] sherpa-onnx VITS loaded: model_dir={model_dir}, mode={mode}, "
             f"sample_rate={self._model_sr}, speaker_id={speaker_id}, speed={speed}, "
             f"provider={hw_provider}, num_threads={num_threads}"
         )
 
-    def synthesize(self, text: str) -> bytes:
-        return b"".join(self.synthesize_stream(text))
-
-    def synthesize_stream(self, text: str):
+    def _synthesize_segment(self, text: str) -> bytes:
         audio = self._tts.generate(text, sid=self._sid, speed=self._speed)
         samples = _resample_to_16k(audio.samples, self._model_sr)
-        pcm = _float_samples_to_pcm16(samples)
-        for i in range(0, len(pcm), CHUNK_BYTES):
-            yield pcm[i : i + CHUNK_BYTES]
+        return _float_samples_to_pcm16(samples)
 
 
 class SherpaOnnxTTSAdapter(TTSAdapter):
@@ -209,15 +344,10 @@ class SherpaOnnxTTSAdapter(TTSAdapter):
         log.info(f"[tts] sherpa-onnx Matcha loaded: model_dir={model_dir}, "
                  f"speaker_id={speaker_id}, speed={speed}")
 
-    def synthesize(self, text: str) -> bytes:
-        return b''.join(self.synthesize_stream(text))
-
-    def synthesize_stream(self, text: str):
+    def _synthesize_segment(self, text: str) -> bytes:
         audio = self._tts.generate(text, sid=self._sid, speed=self._speed)
         samples = _resample_to_16k(audio.samples, self._tts.sample_rate)
-        pcm = _float_samples_to_pcm16(samples)
-        for i in range(0, len(pcm), CHUNK_BYTES):
-            yield pcm[i : i + CHUNK_BYTES]
+        return _float_samples_to_pcm16(samples)
 
 
 
@@ -233,7 +363,7 @@ def _build_tts_adapter(cfg: dict) -> TTSAdapter:
             speaker_id,
             speed,
             model_name=cfg.get("model_name", "tts_melo_8k"),
-            hw_provider=cfg.get("hw_provider", "cuda"),
+            hw_provider=cfg.get("hw_provider", "cpu"),
             num_threads=int(cfg.get("num_threads", 4)),
         )
     return SherpaOnnxTTSAdapter(model_dir, speaker_id, speed)
@@ -317,8 +447,58 @@ class _TTSNode(Node):
                 t0    = None  # wall-clock start of playback
                 frames_sent = 0
                 prebuf = []   # pre-buffer queue
+                first_audio_latency = None
+                segments = self._adapter.split_text(text)
+                if not segments:
+                    continue
 
-                for raw_chunk in self._adapter.synthesize_stream(text):
+                log.info(
+                    f"[tts] split {len(text)} chars into {len(segments)} segment(s): "
+                    f"{[len(segment) for segment in segments]}"
+                )
+
+                # Decouple offline sentence synthesis from real-time publishing.
+                # The producer can generate the next sentence while audio from
+                # the current sentence is being paced to the ROS2 topic.
+                audio_queue = queue.Queue(maxsize=SYNTH_QUEUE_FRAMES)
+                stream_end = object()
+                producer_error = []
+
+                def _queue_put(item) -> bool:
+                    while not self._stop_event.is_set():
+                        try:
+                            audio_queue.put(item, timeout=0.1)
+                            return True
+                        except queue.Full:
+                            continue
+                    return False
+
+                def _produce_audio():
+                    try:
+                        for chunk in self._adapter.synthesize_segments_stream(segments):
+                            if self._stop_event.is_set() or not _queue_put(chunk):
+                                break
+                    except Exception as exc:
+                        producer_error.append(exc)
+                    finally:
+                        _queue_put(stream_end)
+
+                producer_thread = threading.Thread(target=_produce_audio, daemon=True)
+                producer_thread.start()
+
+                while not self._stop_event.is_set():
+                    try:
+                        raw_chunk = audio_queue.get(timeout=0.1)
+                    except queue.Empty:
+                        if not producer_thread.is_alive() and audio_queue.empty():
+                            break
+                        continue
+
+                    if raw_chunk is stream_end:
+                        break
+                    if first_audio_latency is None:
+                        first_audio_latency = _time.monotonic() - t_start
+
                     if self._stop_event.is_set():
                         break
                     buf  += raw_chunk
@@ -379,7 +559,23 @@ class _TTSNode(Node):
                     msg.format = "audio/pcm-16k"
                     msg.data   = list(buf)
                     self._pub.publish(msg)
-                log.info(f"[tts] spoke {len(text)} chars → {total} bytes ({frames_sent} frames) in {_time.monotonic() - t_start:.2f}s")
+                    frames_sent += 1
+
+                producer_thread.join(timeout=0.2)
+                if producer_error:
+                    raise producer_error[0]
+
+                elapsed = _time.monotonic() - t_start
+                first_audio_text = (
+                    f", first_audio={first_audio_latency:.2f}s"
+                    if first_audio_latency is not None
+                    else ""
+                )
+                log.info(
+                    f"[tts] spoke {len(text)} chars in {len(segments)} segment(s) "
+                    f"→ {total} bytes ({frames_sent} frames) in {elapsed:.2f}s"
+                    f"{first_audio_text}"
+                )
             except Exception as e:
                 log.error(f"[tts] synthesis error: {e}", exc_info=True)
 
@@ -407,6 +603,7 @@ class TTSPlugin:
             self._adapter = None
             self._load_error = str(e)
         self._nodes: dict[str, _TTSNode] = {}
+        self._instance_configs: dict[str, dict] = {}
         self._executor = executor
         log.info(f"[tts] plugin init: sherpa-onnx VITS, "
                  f"speaker_id={plugin_cfg.get('speaker_id', 0)}, speed={plugin_cfg.get('speed', 1.0)}")
