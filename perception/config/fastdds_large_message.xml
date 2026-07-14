@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<profiles xmlns="http://www.eprosima.com/XMLSchemas/fastRTPS_Profiles">
+    <transport_descriptors>
+        <transport_descriptor>
+            <transport_id>large_message_transport</transport_id>
+            <type>UDPv4</type>
+            <maxMessageSize>10485760</maxMessageSize>
+            <fragment_size>65000</fragment_size>
+        </transport_descriptor>
+    </transport_descriptors>
+
+    <participant profile_name="large_message_profile" is_default_profile="true">
+        <rtps>
+            <userTransports>
+                <transport_descriptor_ref>large_message_transport</transport_descriptor_ref>
+            </userTransports>
+        </rtps>
+    </participant>
+</profiles>
