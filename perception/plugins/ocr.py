@@ -152,7 +152,11 @@ class OpenAIVisionAdapter(OCRAdapter):
         # 获取原始图片尺寸
         orig_w, orig_h = self._get_image_dimensions(image_bytes)
 
-        # 使用模板填充尺寸信息
+        _MAX_SIDE = 3072
+        scale = min(_MAX_SIDE / max(orig_w, orig_h), 1.0)
+        model_w = int(orig_w * scale)
+        model_h = int(orig_h * scale)
+
         system_prompt = self._SYSTEM_PROMPT_TEMPLATE.format(width=orig_w, height=orig_h)
 
         image_b64 = base64.b64encode(image_bytes).decode("utf-8")
@@ -165,6 +169,16 @@ class OpenAIVisionAdapter(OCRAdapter):
             image_format = "bmp"
         elif image_bytes[:4] == b'RIFF' and image_bytes[8:12] == b'WEBP':
             image_format = "webp"
+
+        # 若图片被模型内部缩放，附加坐标映射提示
+        user_text = f"Extract all text from this image with bounding boxes. Language hint: {language}"
+        if scale < 1.0:
+            user_text += (
+                f"\nNOTE: The model internally processes this image at {model_w}x{model_h}. "
+                f"Scale factor is {1/scale:.4f}. "
+                f"Multiply all coordinates by {1/scale:.4f} to map them back to the original "
+                f"{orig_w}x{orig_h} image. Return coordinates in the original {orig_w}x{orig_h} space."
+            )
 
         messages = [
             {"role": "system", "content": system_prompt},
@@ -180,7 +194,7 @@ class OpenAIVisionAdapter(OCRAdapter):
                     },
                     {
                         "type": "text",
-                        "text": f"Extract all text from this image with bounding boxes. Language hint: {language}"
+                        "text": user_text
                     }
                 ]
             }
@@ -206,16 +220,6 @@ class OpenAIVisionAdapter(OCRAdapter):
         result = response.json()
         content = result.get("choices", [{}])[0].get("message", {}).get("content", "")
         parsed_results = self._parse_result(content)
-
-        # 模型内部会缩放图片，尝试获取模型处理后的尺寸并坐标还原
-        # GPT-4o 在 "high" detail 下通常缩放至最长边 768px 或 2048px
-        # 这里通过再次检查 image_url 的 detail 来估算：
-        # "high" detail → GPT-4o 先缩放到 512px (low) 再裁剪到 2048px (high)
-        # 实际难以精确知道模型内部尺寸，所以依赖提示让模型直接返回原始尺度坐标
-        if orig_w != 512 and orig_h != 512:
-            # 如果提示生效，模型应已返回原始尺度坐标；否则尝试不缩放直接返回
-            pass
-
         return parsed_results
 
     @staticmethod
