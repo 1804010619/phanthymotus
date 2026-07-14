@@ -107,7 +107,8 @@ class SherpaOnnxVitsTTSAdapter(TTSAdapter):
     """On-device TTS using sherpa-onnx VITS (e.g. vits-melo-tts-zh_en-8k)."""
 
     def __init__(self, model_dir: str, speaker_id: int = 0, speed: float = 1.0,
-                 model_name: str = "tts_melo_8k"):
+                 model_name: str = "tts_melo_8k", hw_provider: str = "cuda",
+                 num_threads: int = 4):
         import os
         from utils.model_downloader import ensure_model
 
@@ -135,8 +136,8 @@ class SherpaOnnxVitsTTSAdapter(TTSAdapter):
                     dict_dir=dict_dir if os.path.isdir(dict_dir) else "",
                     length_scale=1.0 / speed if speed else 1.0,
                 ),
-                num_threads=2,
-                provider="cpu",
+                num_threads=num_threads,
+                provider=hw_provider,
             ),
             rule_fsts=",".join(rule_fsts) if rule_fsts else "",
         )
@@ -146,7 +147,8 @@ class SherpaOnnxVitsTTSAdapter(TTSAdapter):
         self._model_sr = self._tts.sample_rate
         log.info(
             f"[tts] sherpa-onnx VITS loaded: model_dir={model_dir}, "
-            f"sample_rate={self._model_sr}, speaker_id={speaker_id}, speed={speed}"
+            f"sample_rate={self._model_sr}, speaker_id={speaker_id}, speed={speed}, "
+            f"provider={hw_provider}, num_threads={num_threads}"
         )
 
     def synthesize(self, text: str) -> bytes:
@@ -231,6 +233,8 @@ def _build_tts_adapter(cfg: dict) -> TTSAdapter:
             speaker_id,
             speed,
             model_name=cfg.get("model_name", "tts_melo_8k"),
+            hw_provider=cfg.get("hw_provider", "cuda"),
+            num_threads=int(cfg.get("num_threads", 4)),
         )
     return SherpaOnnxTTSAdapter(model_dir, speaker_id, speed)
 
