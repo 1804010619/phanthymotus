@@ -135,6 +135,28 @@ class OpenAIVisionAdapter(OCRAdapter):
         return scaled
 
     @staticmethod
+    def _convert_gemini_bbox(results: list, orig_w: int, orig_h: int) -> list:
+        """Gemini 原生输出 [ymin, xmin, ymax, xmax] 归一化到 [0, 1000]，
+        转换为像素坐标 [x1, y1, x2, y2]。"""
+        converted = []
+        for item in results:
+            bbox = item.get("bbox", [])
+            if len(bbox) == 4:
+                ymin_n, xmin_n, ymax_n, xmax_n = bbox
+                converted.append({
+                    **item,
+                    "bbox": [
+                        int(xmin_n / 1000 * orig_w),
+                        int(ymin_n / 1000 * orig_h),
+                        int(xmax_n / 1000 * orig_w),
+                        int(ymax_n / 1000 * orig_h),
+                    ]
+                })
+            else:
+                converted.append(item)
+        return converted
+
+    @staticmethod
     def _get_image_dimensions(image_bytes: bytes) -> tuple:
         """获取原始图片尺寸 (width, height)"""
         from PIL import Image
@@ -154,8 +176,6 @@ class OpenAIVisionAdapter(OCRAdapter):
 
         _MAX_SIDE = 3072
         scale = min(_MAX_SIDE / max(orig_w, orig_h), 1.0)
-        model_w = int(orig_w * scale)
-        model_h = int(orig_h * scale)
 
         system_prompt = self._SYSTEM_PROMPT_TEMPLATE.format(width=orig_w, height=orig_h)
 
@@ -170,15 +190,7 @@ class OpenAIVisionAdapter(OCRAdapter):
         elif image_bytes[:4] == b'RIFF' and image_bytes[8:12] == b'WEBP':
             image_format = "webp"
 
-        # 若图片被模型内部缩放，附加坐标映射提示
         user_text = f"Extract all text from this image with bounding boxes. Language hint: {language}"
-        if scale < 1.0:
-            user_text += (
-                f"\nNOTE: The model internally processes this image at {model_w}x{model_h}. "
-                f"Scale factor is {1/scale:.4f}. "
-                f"Multiply all coordinates by {1/scale:.4f} to map them back to the original "
-                f"{orig_w}x{orig_h} image. Return coordinates in the original {orig_w}x{orig_h} space."
-            )
 
         messages = [
             {"role": "system", "content": system_prompt},
@@ -220,7 +232,7 @@ class OpenAIVisionAdapter(OCRAdapter):
         result = response.json()
         content = result.get("choices", [{}])[0].get("message", {}).get("content", "")
         parsed_results = self._parse_result(content)
-        return parsed_results
+        return self._convert_gemini_bbox(parsed_results, orig_w, orig_h)
 
     @staticmethod
     def _parse_result(content: str) -> list:
