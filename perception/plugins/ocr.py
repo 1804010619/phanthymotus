@@ -106,7 +106,7 @@ class OpenAIVisionAdapter(OCRAdapter):
         "Image dimensions: {width}x{height} (width x height).\n"
         "IMPORTANT: Return bounding box coordinates scaled to the original image dimensions ({width}x{height}).\n\n"
         "Output ONLY the JSON array, nothing else. Example:\n"
-        '[{ "text": "Hello World", "bbox": [100, 50, 300, 80] }, { "text": "Price: $10", "bbox": [100, 100, 250, 130] }]'
+        '[{{"text": "Hello World", "bbox": [100, 50, 300, 80]}}, {{"text": "Price: $10", "bbox": [100, 100, 250, 130]}}]'
     )
 
     @staticmethod
@@ -270,7 +270,7 @@ class QwenVLAdapter(OCRAdapter):
         "图片原始尺寸：{width}x{height}（宽 x 高）。\n"
         "重要：请返回基于原始图片尺寸的边界框坐标。\n\n"
         "只输出 JSON 数组，不要输出其他内容。示例：\n"
-        '[{ "text": "你好世界", "bbox": [100, 50, 300, 80] }, { "text": "价格：10元", "bbox": [100, 100, 250, 130] }]'
+        '[{{"text": "你好世界", "bbox": [100, 50, 300, 80]}}, {{"text": "价格：10元", "bbox": [100, 100, 250, 130]}}]'
     )
 
     def __init__(self, url: str, key: str, model: str):
