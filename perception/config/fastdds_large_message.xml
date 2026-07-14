@@ -2,24 +2,20 @@
 <profiles xmlns="http://www.eprosima.com/XMLSchemas/fastRTPS_Profiles">
     <transport_descriptors>
         <transport_descriptor>
-            <transport_id>large_message_transport</transport_id>
+            <transport_id>CustomUDPTransport</transport_id>
             <type>UDPv4</type>
-            <maxMessageSize>10485760</maxMessageSize>
+            <maxMessageSize>65000</maxMessageSize>
+            <sendBufferSize>8388608</sendBufferSize>
+            <receiveBufferSize>8388608</receiveBufferSize>
         </transport_descriptor>
     </transport_descriptors>
 
     <participant profile_name="large_message_profile" is_default_profile="true">
         <rtps>
             <userTransports>
-                <transport_id>large_message_transport</transport_id>
+                <transport_id>CustomUDPTransport</transport_id>
             </userTransports>
-            <builtin>
-                <discovery_config>
-                    <leaseDuration>
-                        <sec>DURATION_INFINITY</sec>
-                    </leaseDuration>
-                </discovery_config>
-            </builtin>
+            <useBuiltinTransports>false</useBuiltinTransports>
         </rtps>
     </participant>
 </profiles>
