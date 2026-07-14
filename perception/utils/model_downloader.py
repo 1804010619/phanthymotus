@@ -60,6 +60,10 @@ MODELS = {
         "url": f"{JUICEFS_BASE}/vits-melo-tts-zh_en.tar.bz2",
         "check_file": "model.onnx",
     },
+    "tts_zh_finetuned": {
+        "url": f"{JUICEFS_BASE}/zh_finetuned.tar.bz2",
+        "check_file": "model.onnx",
+    },
     "kws": {
         "url": f"{COS_BASE}/sherpa-onnx-kws-zipformer-zh-en-3M-2025-12-20.tar.bz2",
         "check_file": "tokens.txt",

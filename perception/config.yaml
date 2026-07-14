@@ -21,8 +21,8 @@ plugins:
   tts:
     enabled: true
     backend: vits
-    model_name: tts_melo_8k
-    model_dir: /models/vits-melo-tts-zh_en-8k
+    model_name: tts_zh_finetuned
+    model_dir: /models/zh_finetuned
     hw_provider: cpu
     num_threads: 8
     speaker_id: 0
