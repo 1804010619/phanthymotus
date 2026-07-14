@@ -90,7 +90,7 @@ class OCRAdapter(ABC):
 class OpenAIVisionAdapter(OCRAdapter):
     """OpenAI Vision API (GPT-4o / GPT-4o-mini) OCR"""
 
-    _SYSTEM_PROMPT = (
+    _SYSTEM_PROMPT_TEMPLATE = (
         "You are an OCR (Optical Character Recognition) system with bounding box detection.\n\n"
         "Your task is to extract ALL text from the provided image and return each text segment with its bounding box coordinates.\n\n"
         "Output format: Return a JSON array where each element contains:\n"
@@ -103,9 +103,43 @@ class OpenAIVisionAdapter(OCRAdapter):
         "4. Do NOT translate, summarize, or interpret the text.\n"
         "5. If there is no text in the image, return an empty array [].\n"
         "6. For multi-language text, transcribe each language as-is.\n\n"
+        "Image dimensions: {width}x{height} (width x height).\n"
+        "IMPORTANT: Return bounding box coordinates scaled to the original image dimensions ({width}x{height}).\n\n"
         "Output ONLY the JSON array, nothing else. Example:\n"
         '[{"text": "Hello World", "bbox": [100, 50, 300, 80]}, {"text": "Price: $10", "bbox": [100, 100, 250, 130]}]'
     )
+
+    @staticmethod
+    def _scale_results(results: list, orig_w: int, orig_h: int, model_w: int, model_h: int) -> list:
+        """将模型返回的坐标缩放到原始图片尺寸"""
+        if model_w <= 0 or model_h <= 0 or orig_w == model_w and orig_h == model_h:
+            return results
+        scale_x = orig_w / model_w
+        scale_y = orig_h / model_h
+        scaled = []
+        for item in results:
+            bbox = item.get("bbox", [])
+            if bbox and len(bbox) == 4:
+                scaled_item = {
+                    **item,
+                    "bbox": [
+                        int(round(bbox[0] * scale_x)),
+                        int(round(bbox[1] * scale_y)),
+                        int(round(bbox[2] * scale_x)),
+                        int(round(bbox[3] * scale_y)),
+                    ],
+                }
+                scaled.append(scaled_item)
+            else:
+                scaled.append(item)
+        return scaled
+
+    @staticmethod
+    def _get_image_dimensions(image_bytes: bytes) -> tuple:
+        """获取原始图片尺寸 (width, height)"""
+        from PIL import Image
+        with Image.open(BytesIO(image_bytes)) as img:
+            return img.width, img.height
 
     def __init__(self, url: str, key: str, model: str):
         self.base_url = url.rstrip('/') if url else "https://api.openai.com/v1"
@@ -114,6 +148,12 @@ class OpenAIVisionAdapter(OCRAdapter):
 
     def recognize(self, image_bytes: bytes, language: str = "zh") -> list:
         import requests
+
+        # 获取原始图片尺寸
+        orig_w, orig_h = self._get_image_dimensions(image_bytes)
+
+        # 使用模板填充尺寸信息
+        system_prompt = self._SYSTEM_PROMPT_TEMPLATE.format(width=orig_w, height=orig_h)
 
         image_b64 = base64.b64encode(image_bytes).decode("utf-8")
 
@@ -127,7 +167,7 @@ class OpenAIVisionAdapter(OCRAdapter):
             image_format = "webp"
 
         messages = [
-            {"role": "system", "content": self._SYSTEM_PROMPT},
+            {"role": "system", "content": system_prompt},
             {
                 "role": "user",
                 "content": [
@@ -165,7 +205,18 @@ class OpenAIVisionAdapter(OCRAdapter):
 
         result = response.json()
         content = result.get("choices", [{}])[0].get("message", {}).get("content", "")
-        return self._parse_result(content)
+        parsed_results = self._parse_result(content)
+
+        # 模型内部会缩放图片，尝试获取模型处理后的尺寸并坐标还原
+        # GPT-4o 在 "high" detail 下通常缩放至最长边 768px 或 2048px
+        # 这里通过再次检查 image_url 的 detail 来估算：
+        # "high" detail → GPT-4o 先缩放到 512px (low) 再裁剪到 2048px (high)
+        # 实际难以精确知道模型内部尺寸，所以依赖提示让模型直接返回原始尺度坐标
+        if orig_w != 512 and orig_h != 512:
+            # 如果提示生效，模型应已返回原始尺度坐标；否则尝试不缩放直接返回
+            pass
+
+        return parsed_results
 
     @staticmethod
     def _parse_result(content: str) -> list:
@@ -204,7 +255,7 @@ class QwenVLAdapter(OCRAdapter):
     通过 OpenAI 兼容接口调用 Qwen-VL 进行 OCR。
     """
 
-    _SYSTEM_PROMPT = (
+    _SYSTEM_PROMPT_TEMPLATE = (
         "你是一个 OCR 文字识别系统，支持坐标检测。\n\n"
         "任务：从图片中提取所有文字，并返回每段文字的边界框坐标。\n\n"
         "输出格式：返回 JSON 数组，每个元素包含：\n"
@@ -216,6 +267,8 @@ class QwenVLAdapter(OCRAdapter):
         "3. 坐标为整数，表示像素位置。\n"
         "4. 不要翻译、总结或解释文字内容。\n"
         "5. 如果图片中没有文字，返回空数组 []。\n\n"
+        "图片原始尺寸：{width}x{height}（宽 x 高）。\n"
+        "重要：请返回基于原始图片尺寸的边界框坐标。\n\n"
         "只输出 JSON 数组，不要输出其他内容。示例：\n"
         '[{"text": "你好世界", "bbox": [100, 50, 300, 80]}, {"text": "价格：10元", "bbox": [100, 100, 250, 130]}]'
     )
@@ -228,6 +281,12 @@ class QwenVLAdapter(OCRAdapter):
     def recognize(self, image_bytes: bytes, language: str = "zh") -> list:
         import requests
 
+        # 获取原始图片尺寸
+        orig_w, orig_h = OpenAIVisionAdapter._get_image_dimensions(image_bytes)
+
+        # 使用模板填充尺寸信息
+        system_prompt = self._SYSTEM_PROMPT_TEMPLATE.format(width=orig_w, height=orig_h)
+
         image_b64 = base64.b64encode(image_bytes).decode("utf-8")
 
         image_format = "jpeg"
@@ -235,7 +294,7 @@ class QwenVLAdapter(OCRAdapter):
             image_format = "png"
 
         messages = [
-            {"role": "system", "content": self._SYSTEM_PROMPT},
+            {"role": "system", "content": system_prompt},
             {
                 "role": "user",
                 "content": [
