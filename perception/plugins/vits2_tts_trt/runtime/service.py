@@ -97,13 +97,16 @@ async def lifespan(_: FastAPI):
     global _engine, _ready
     _ready = False
     _engine = TensorRTTTSEngine(MODEL_CONFIG, ENGINE_DIR)
-    # Warm both the frontend caches and all three engines before advertising ready.
+    # Warm Chinese, English, and mixed-language paths before advertising ready.
+    warmup_bytes = 0
     with _lock:
-        pcm = _engine.synthesize("你好。")
-    if not pcm:
-        raise RuntimeError("TensorRT warmup produced no audio")
+        for text in ("你好。", "Hello world.", "今天AI助手ready了。"): 
+            pcm = _engine.synthesize(text)
+            if not pcm:
+                raise RuntimeError("TensorRT warmup produced no audio")
+            warmup_bytes += len(pcm)
     _ready = True
-    log.info("VITS2 TensorRT backend ready: warmup_bytes=%d", len(pcm))
+    log.info("VITS2 TensorRT backend ready: warmup_bytes=%d", warmup_bytes)
     try:
         yield
     finally:
