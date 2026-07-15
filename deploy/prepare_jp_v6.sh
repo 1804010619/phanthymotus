@@ -45,10 +45,11 @@ COPY --from=pytorch-donor /usr/local/lib/python3.10/dist-packages/ /tmp/pt-donor
 RUN cd /tmp/pt-donor && \
     mkdir -p /usr/local/lib/python3.10/dist-packages && \
     for item in torch torchgen torchvision triton; do \
-        [ -e "\$item" ] && cp -a "\$item" /usr/local/lib/python3.10/dist-packages/; \
+        if [ -e "\$item" ]; then cp -a "\$item" /usr/local/lib/python3.10/dist-packages/; fi; \
     done && \
+  shopt -s nullglob && \
     for item in torch-*.dist-info torchvision-*.dist-info triton-*.dist-info; do \
-        [ -e "\$item" ] && cp -a "\$item" /usr/local/lib/python3.10/dist-packages/; \
+        cp -a "\$item" /usr/local/lib/python3.10/dist-packages/; \
     done && \
     rm -rf /tmp/pt-donor
 DOCKERFILE
