@@ -100,7 +100,12 @@ async def lifespan(_: FastAPI):
     # Warm Chinese, English, and mixed-language paths before advertising ready.
     warmup_bytes = 0
     with _lock:
-        for text in ("你好。", "Hello world.", "今天AI助手ready了。"): 
+        for text in (
+            "你好。",
+            "Hello world.",
+            "周末我和Lucy去公园散步，顺便买了一杯coffee。",
+            "开会前请把PPT发给David，他会提前review内容。",
+        ):
             pcm = _engine.synthesize(text)
             if not pcm:
                 raise RuntimeError("TensorRT warmup produced no audio")
