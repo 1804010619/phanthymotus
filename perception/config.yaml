@@ -24,6 +24,11 @@ plugins:
     speaker_id: 0
     speed: 1.0
 
+  vits2_tts:
+    enabled: true
+    vits2_model_dir: /models/vits2-mix
+    vits2_num_threads: 6
+
   htmsg:
     enabled: true
     namespace: ""       # auto-detect from hostname if empty

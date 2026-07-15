@@ -15,6 +15,7 @@ WebSocket ASR 端口: config.ws_port（默认 15721）
 from __future__ import annotations
 
 import asyncio
+import importlib
 import json
 import logging
 import os
@@ -61,10 +62,15 @@ class PerceptionBundle:
             self._plugins.append(ASRPlugin(plugins_cfg["asr"], executor))
             log.info("ASRPlugin loaded")
 
-        if plugins_cfg.get("tts", {}).get("enabled", False):
-            from plugins.tts import TTSPlugin
-            self._plugins.append(TTSPlugin(plugins_cfg["tts"], executor))
-            log.info("TTSPlugin loaded")
+        tts_plugin = os.environ.get("TTS_PLUGIN", "tts").strip() or "tts"
+        if not tts_plugin.isidentifier():
+            raise ValueError(f"Invalid TTS_PLUGIN value: {tts_plugin!r}")
+        tts_cfg = plugins_cfg.get(tts_plugin, {})
+        if tts_cfg.get("enabled", False):
+            module = importlib.import_module(f"plugins.{tts_plugin}")
+            TTSPlugin = module.TTSPlugin
+            self._plugins.append(TTSPlugin(tts_cfg, executor))
+            log.info("TTSPlugin loaded: plugins.%s", tts_plugin)
 
         if plugins_cfg.get("htmsg", {}).get("enabled", False):
             import re, socket
@@ -391,8 +397,8 @@ def main():
     global _bundle
 
     cfg      = _load_config()
-    mcp_port = int(cfg.get("mcp_port", 15720))
-    ws_port  = int(cfg.get("ws_port",  15721))
+    mcp_port = int(os.environ.get("MCP_PORT") or cfg.get("mcp_port", 15720))
+    ws_port = int(os.environ.get("WS_PORT") or cfg.get("ws_port", 15721))
 
     log.info(f"perception bundle starting, mcp_port={mcp_port}, ws_port={ws_port}")
     log.info(f"config: plugins.asr.enabled={cfg.get('plugins',{}).get('asr',{}).get('enabled')}, "

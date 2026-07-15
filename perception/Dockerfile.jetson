@@ -13,6 +13,7 @@ ARG APT_MIRROR=mirrors.tuna.tsinghua.edu.cn
 ARG BASE_IMAGE=bj-warehouse.tencentcloudcr.com/phanthy-motus/jetson-base:jp511-torch
 FROM ${BASE_IMAGE}
 ARG PYPI_MIRROR APT_MIRROR
+ARG VITS2_RESOURCE_BASE_URL=http://172.28.4.81:34567/liaoqianqian/jetson/vits2-mix
 
 # ── APT mirror (conditional) ─────────────────────────────────────
 RUN if [ -n "${APT_MIRROR}" ]; then \
@@ -33,6 +34,30 @@ RUN rm -f /etc/apt/sources.list.d/* && rm -rf /var/cache/apt/archives/* /var/lib
 
 RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} colcon-common-extensions && \
     pip3 install --no-cache-dir -i ${PYPI_MIRROR} "empy<4"
+
+# ── VITS2 CPU TTS: prebuilt ARM64 deps + versioned runtime assets ─
+COPY perception/utils/download_vits2_resources.py /tmp/download_vits2_resources.py
+COPY perception/plugins/vits2_tts/requirements.jetson.txt /tmp/vits2-requirements.txt
+RUN python3 /tmp/download_vits2_resources.py deps \
+      --base-url "${VITS2_RESOURCE_BASE_URL}" --output-dir /tmp/vits2-download && \
+    mkdir -p /tmp/vits2-deps && \
+    tar --no-same-owner -xzf /tmp/vits2-download/jetson-prebuilt-deps.tar.gz \
+      -C /tmp/vits2-deps --strip-components=2 && \
+    test -e /tmp/vits2-deps/openfst/lib/libfstfar.so && \
+    cp -a /tmp/vits2-deps/openfst/lib/. /usr/local/lib/ && \
+    pip3 install --no-cache-dir --no-index \
+      --find-links=/tmp/vits2-deps/wheels \
+      -r /tmp/vits2-requirements.txt && \
+    LD_LIBRARY_PATH=/usr/local/lib python3 -c "import onnxruntime, pynini, tn; assert 'CPUExecutionProvider' in onnxruntime.get_available_providers()" && \
+    rm -rf /tmp/vits2-deps /tmp/vits2-download /tmp/vits2-requirements.txt
+
+RUN python3 /tmp/download_vits2_resources.py assets \
+      --base-url "${VITS2_RESOURCE_BASE_URL}" --output-dir /tmp/vits2-download && \
+    mkdir -p /models/vits2-mix && \
+    tar --no-same-owner -xzf /tmp/vits2-download/vits2-mix-assets.tar.gz \
+      -C /models/vits2-mix && \
+    python3 -c "import json; from pathlib import Path; root=Path('/models/vits2-mix/onnx'); manifest=json.loads((root/'onnx_manifest.json').read_text()); files=[root/e['file'] for e in manifest['models'].values()]; total=sum(p.stat().st_size for p in files); assert len(files) == 3; assert total <= 50 * 1024 * 1024; print('VITS2 model bytes:', total)" && \
+    rm -rf /tmp/vits2-download /tmp/download_vits2_resources.py
 
 # ── audio_msgs ROS2 package (Humble already in base) ──────────────
 COPY deploy/ros-base/audio_msgs/ /ros_ws/src/audio_msgs/
@@ -94,7 +119,11 @@ RUN find /ros_ws/install -name "site-packages" -type d > /usr/local/lib/python3.
     find /opt/ros/humble/install -name "site-packages" -type d >> /usr/local/lib/python3.8/dist-packages/ros_ws.pth
 
 # ROS2 shared libraries（audio_msgs .so 等）
-ENV LD_LIBRARY_PATH="/ros_ws/install/audio_msgs/lib:/opt/ros/humble/install/lib:${LD_LIBRARY_PATH}"
+ENV LD_LIBRARY_PATH="/usr/local/lib:/ros_ws/install/audio_msgs/lib:/opt/ros/humble/install/lib:${LD_LIBRARY_PATH}" \
+    NLTK_DATA="/models/vits2-mix/nltk_data" \
+    EN_TN_CACHE_DIR="/models/vits2-mix/tn_cache" \
+    TN_CACHE_DIR="/models/vits2-mix/tn_cache" \
+    VITS2_FRONTEND_DATA_DIR="/models/vits2-mix/frontend_data"
 ENV AMENT_PREFIX_PATH="/ros_ws/install/audio_msgs:/opt/ros/humble/install"
 
 CMD ["/bin/bash", "-c", \
