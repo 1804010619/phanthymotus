@@ -34,7 +34,7 @@ class Vits2OnnxCpuAdapter(TTSAdapter):
         self,
         model_dir: str,
         speed: float = 1.0,
-        num_threads: int = 6,
+        num_threads: int = 1,
         max_chunk_tokens: int = 64,
     ):
         if speed <= 0:
@@ -150,6 +150,6 @@ def build_adapter(cfg: dict) -> TTSAdapter:
     return Vits2OnnxCpuAdapter(
         model_dir=cfg.get("vits2_model_dir", "/models/vits2-mix"),
         speed=float(cfg.get("speed", 1.0)),
-        num_threads=max(1, int(cfg.get("vits2_num_threads", 6))),
+        num_threads=max(1, int(cfg.get("vits2_num_threads", 1))),
         max_chunk_tokens=int(cfg.get("vits2_max_chunk_tokens", 64)),
     )

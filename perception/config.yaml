@@ -27,8 +27,16 @@ plugins:
   vits2_tts:
     enabled: true
     vits2_model_dir: /models/vits2-mix
-    vits2_num_threads: 2
+    vits2_num_threads: 1
     vits2_max_chunk_tokens: 64
+    vits2_warmup: true
+
+  vits2_tts_trt:
+    enabled: true
+    backend_url: http://127.0.0.1:18080
+    request_timeout: 295
+    speaker_id: 0
+    speed: 1.0
     vits2_warmup: true
 
   htmsg:

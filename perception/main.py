@@ -82,17 +82,27 @@ class PerceptionBundle:
             log.info("ASRPlugin loaded")
 
         requested_tts_plugin = os.environ.get("TTS_PLUGIN", "").strip()
-        tts_plugin = requested_tts_plugin or "vits2_tts"
+        default_tts_plugin = os.environ.get(
+            "DEFAULT_TTS_PLUGIN", "vits2_tts"
+        ).strip()
+        if not default_tts_plugin.isidentifier():
+            raise RuntimeError(
+                f"Invalid DEFAULT_TTS_PLUGIN={default_tts_plugin!r}"
+            )
+        tts_plugin = requested_tts_plugin or default_tts_plugin
         tts_cfg = plugins_cfg.get(tts_plugin, {})
         if not tts_plugin.isidentifier() or not tts_cfg.get("enabled", False):
             log.warning(
-                "Invalid or disabled TTS_PLUGIN=%r; falling back to vits2_tts",
+                "Invalid or disabled TTS_PLUGIN=%r; falling back to %s",
                 requested_tts_plugin,
+                default_tts_plugin,
             )
-            tts_plugin = "vits2_tts"
+            tts_plugin = default_tts_plugin
             tts_cfg = plugins_cfg.get(tts_plugin, {})
         if not tts_cfg.get("enabled", False):
-            raise RuntimeError("Fallback plugin vits2_tts is not enabled")
+            raise RuntimeError(
+                f"Fallback plugin {default_tts_plugin!r} is not enabled"
+            )
         module = importlib.import_module(f"plugins.{tts_plugin}")
         TTSPlugin = module.TTSPlugin
         self._plugins.append(TTSPlugin(tts_cfg, executor))
