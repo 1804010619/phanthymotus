@@ -250,6 +250,8 @@ class SherpaOnnxSenseVoiceAdapter(ASRAdapter):
         n = len(pcm) // 2
         samples = struct.unpack(f'<{n}h', pcm)
         float_samples = [s / 32768.0 for s in samples]
+        # Pad 500ms silence at the end to avoid last-token truncation
+        float_samples += [0.0] * int(SAMPLE_RATE * 0.5)
 
         stream = self._recognizer.create_stream()
         stream.accept_waveform(SAMPLE_RATE, float_samples)
@@ -460,8 +462,10 @@ def _vad_worker(pcm_q: multiprocessing.Queue, result_q: multiprocessing.Queue,
             prebuf.append((pcm, ts))
 
         elif state == 'listening':
-            # Maintain pre-buffer for non-KWS mode
-            prebuf.append((pcm, ts))
+            # Only update pre-buffer when VAD has NOT detected speech onset yet,
+            # so prebuf retains the frames *before* speech started.
+            if not vad.is_speech_detected():
+                prebuf.append((pcm, ts))
 
             # Collect completed VAD segments (speech that ended)
             while not vad.empty():
