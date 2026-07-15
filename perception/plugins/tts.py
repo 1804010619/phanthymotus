@@ -28,6 +28,33 @@ MAX_SEGMENT_CHARS = 120
 # It lets the producer synthesize the next sentence while the current one plays.
 SYNTH_QUEUE_FRAMES = 600
 
+
+def _maybe_set_cpu_affinity() -> None:
+    """Optional CPU pinning for Jetson benchmarks (TTS_CPU_AFFINITY=0,1,2,3)."""
+    import os
+
+    if not hasattr(os, "sched_setaffinity"):
+        return
+    spec = os.environ.get("TTS_CPU_AFFINITY", "").strip()
+    if not spec:
+        return
+    cores = {int(x.strip()) for x in spec.split(",") if x.strip()}
+    if cores:
+        os.sched_setaffinity(0, cores)
+        log.info(f"[tts] CPU affinity set to {sorted(cores)}")
+
+
+def _process_rss_mb() -> float:
+    """Current process RSS in MB (for Jetson memory benchmarking)."""
+    import os
+
+    import psutil
+
+    return psutil.Process(os.getpid()).memory_info().rss / (1024 ** 2)
+
+
+_maybe_set_cpu_affinity()
+
 _STRONG_SENTENCE_END = frozenset("。！？!?；;")
 _WEAK_SENTENCE_END = frozenset("，,、：:")
 _CLOSING_PUNCTUATION = frozenset("”’\"'》〉】〕）)]}」』")
@@ -251,6 +278,7 @@ class SherpaOnnxVitsTTSAdapter(TTSAdapter):
 
         import sherpa_onnx
 
+        mem_before = _process_rss_mb()
         model_path = os.path.join(model_dir, "model.onnx")
         tokens_path = os.path.join(model_dir, "tokens.txt")
         espeak_data_dir = os.path.join(model_dir, "espeak-ng-data")
@@ -285,10 +313,12 @@ class SherpaOnnxVitsTTSAdapter(TTSAdapter):
         self._speed = speed
         self._model_sr = self._tts.sample_rate
         mode = "espeak" if use_espeak else "lexicon"
+        mem_after = _process_rss_mb()
         log.info(
             f"[tts] sherpa-onnx VITS loaded: model_dir={model_dir}, mode={mode}, "
             f"sample_rate={self._model_sr}, speaker_id={speaker_id}, speed={speed}, "
-            f"provider={hw_provider}, num_threads={num_threads}"
+            f"provider={hw_provider}, num_threads={num_threads}, "
+            f"memory_mb={mem_before:.1f}->{mem_after:.1f}"
         )
 
     def _synthesize_segment(self, text: str) -> bytes:
@@ -364,7 +394,7 @@ def _build_tts_adapter(cfg: dict) -> TTSAdapter:
             speed,
             model_name=cfg.get("model_name", "tts_melo_8k"),
             hw_provider=cfg.get("hw_provider", "cpu"),
-            num_threads=int(cfg.get("num_threads", 4)),
+            num_threads=int(cfg.get("num_threads", 2)),
         )
     return SherpaOnnxTTSAdapter(model_dir, speaker_id, speed)
 
@@ -463,6 +493,7 @@ class _TTSNode(Node):
                 audio_queue = queue.Queue(maxsize=SYNTH_QUEUE_FRAMES)
                 stream_end = object()
                 producer_error = []
+                synth_elapsed = [0.0]
 
                 def _queue_put(item) -> bool:
                     while not self._stop_event.is_set():
@@ -474,6 +505,7 @@ class _TTSNode(Node):
                     return False
 
                 def _produce_audio():
+                    synth_t0 = _time.monotonic()
                     try:
                         for chunk in self._adapter.synthesize_segments_stream(segments):
                             if self._stop_event.is_set() or not _queue_put(chunk):
@@ -481,6 +513,7 @@ class _TTSNode(Node):
                     except Exception as exc:
                         producer_error.append(exc)
                     finally:
+                        synth_elapsed[0] = _time.monotonic() - synth_t0
                         _queue_put(stream_end)
 
                 producer_thread = threading.Thread(target=_produce_audio, daemon=True)
@@ -566,15 +599,21 @@ class _TTSNode(Node):
                     raise producer_error[0]
 
                 elapsed = _time.monotonic() - t_start
+                audio_duration = total / (SAMPLE_RATE * 2) if total else 0.0
+                synth_rtf = (synth_elapsed[0] / audio_duration) if audio_duration > 0 else 0.0
+                e2e_rtf = (elapsed / audio_duration) if audio_duration > 0 else 0.0
+                mem_mb = _process_rss_mb()
                 first_audio_text = (
-                    f", first_audio={first_audio_latency:.2f}s"
+                    f", TTFT={first_audio_latency:.2f}s"
                     if first_audio_latency is not None
                     else ""
                 )
                 log.info(
                     f"[tts] spoke {len(text)} chars in {len(segments)} segment(s) "
                     f"→ {total} bytes ({frames_sent} frames) in {elapsed:.2f}s"
-                    f"{first_audio_text}"
+                    f"{first_audio_text}, "
+                    f"audio={audio_duration:.2f}s, synth_RTF={synth_rtf:.2f}, "
+                    f"e2e_RTF={e2e_rtf:.2f}, memory_mb={mem_mb:.1f}"
                 )
             except Exception as e:
                 log.error(f"[tts] synthesis error: {e}", exc_info=True)
