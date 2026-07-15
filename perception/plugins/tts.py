@@ -280,6 +280,7 @@ class SherpaOnnxVitsTTSAdapter(TTSAdapter):
 
         mem_before = _process_rss_mb()
         model_path = os.path.join(model_dir, "model.onnx")
+        model_size_mb = os.path.getsize(model_path) / (1024 * 1024) if os.path.exists(model_path) else 0.0
         tokens_path = os.path.join(model_dir, "tokens.txt")
         espeak_data_dir = os.path.join(model_dir, "espeak-ng-data")
         lexicon_path = os.path.join(model_dir, "lexicon.txt")
@@ -316,7 +317,8 @@ class SherpaOnnxVitsTTSAdapter(TTSAdapter):
         mem_after = _process_rss_mb()
         log.info(
             f"[tts] sherpa-onnx VITS loaded: model_dir={model_dir}, mode={mode}, "
-            f"sample_rate={self._model_sr}, speaker_id={speaker_id}, speed={speed}, "
+            f"sample_rate={self._model_sr}, model_size_mb={model_size_mb:.1f}, "
+            f"speaker_id={speaker_id}, speed={speed}, "
             f"provider={hw_provider}, num_threads={num_threads}, "
             f"memory_mb={mem_before:.1f}->{mem_after:.1f}"
         )

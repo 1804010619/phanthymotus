@@ -52,12 +52,17 @@ MODELS = {
         "check_file": "vocos-16khz-univ.onnx",
         "single_file": True,
     },
+    # FP32: pack from vits-melo-tts-zh_en/ (NOT vits-melo-tts-zh_en_int8/)
     "tts_melo_8k": {
         "url": f"{JUICEFS_BASE}/vits-melo-tts-zh_en-8k.tar.bz2",
         "check_file": "model.onnx",
     },
     "tts_melo": {
         "url": f"{JUICEFS_BASE}/vits-melo-tts-zh_en.tar.bz2",
+        "check_file": "model.onnx",
+    },
+    "tts_melo_int8": {
+        "url": f"{JUICEFS_BASE}/vits-melo-tts-zh_en_int8.tar.bz2",
         "check_file": "model.onnx",
     },
     "tts_zh_finetuned": {

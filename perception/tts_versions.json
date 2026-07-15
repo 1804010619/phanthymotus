@@ -1,132 +1,77 @@
 {
   "branch": "feat/fanyi-tts",
   "repo": "https://github.com/4paradigm/phanthymotus",
-  "note": "榜单只提交 commit_id；同一分支不同 commit 对应不同模型/代码组合。Jetson 测试: git checkout <commit>",
+  "note": "榜单只提交 commit_id；Jetson 只能 git pull + 打镜像，模型靠 JuiceFS 自动下载",
   "models": {
     "tts_melo_8k": {
       "label": "8k Melo VITS",
       "model_dir": "/models/vits-melo-tts-zh_en-8k",
       "sample_rate": 8000,
-      "size_mb": 34,
-      "needs_lexicon_dict": true,
-      "needs_espeak_data": false,
+      "quantize": "fp32",
+      "source_dir": "vits-melo-tts-zh_en-8k/",
       "juicefs_tar": "vits-melo-tts-zh_en-8k.tar.bz2"
     },
     "tts_melo": {
-      "label": "44.1k Melo VITS",
+      "label": "44.1k Melo VITS (FP32)",
       "model_dir": "/models/vits-melo-tts-zh_en",
       "sample_rate": 44100,
-      "size_mb": 51,
-      "needs_lexicon_dict": true,
-      "needs_espeak_data": false,
-      "juicefs_tar": "vits-melo-tts-zh_en.tar.bz2"
+      "quantize": "fp32",
+      "source_dir": "vits-melo-tts-zh_en/",
+      "juicefs_tar": "vits-melo-tts-zh_en.tar.bz2",
+      "note": "云桌面 phanthymotus_tts/vits-melo-tts-zh_en，不是 _int8 目录"
+    },
+    "tts_melo_int8": {
+      "label": "44.1k Melo VITS (int8)",
+      "model_dir": "/models/vits-melo-tts-zh_en_int8",
+      "sample_rate": 44100,
+      "quantize": "int8",
+      "source_dir": "vits-melo-tts-zh_en_int8/",
+      "juicefs_tar": "vits-melo-tts-zh_en_int8.tar.bz2"
     },
     "tts_zh_finetuned": {
       "label": "小模型 zh_finetuned",
       "model_dir": "/models/zh_finetuned",
-      "sample_rate": "见日志 sample_rate",
-      "size_mb": 22,
+      "sample_rate": 22050,
+      "quantize": "fp32",
       "needs_lexicon_dict": false,
       "needs_espeak_data": true,
       "juicefs_tar": "zh_finetuned.tar.bz2"
     }
   },
+  "jetson_results_6threads": {
+    "8k": { "synth_RTF": 0.39, "e2e_RTF": 1.39, "TTFT": 0.78 },
+    "zh_finetuned": { "synth_RTF": 0.61, "e2e_RTF": 1.58, "TTFT": 1.31 },
+    "44k_int8_juicefs": { "synth_RTF": 2.37, "e2e_RTF": 3.35, "TTFT": 6.73, "note": "JuiceFS 旧包可能是 int8，待重打 FP32 tar 后复测" }
+  },
   "commits": [
-    {
-      "commit": "30a89d3",
-      "model": "tts_melo_8k",
-      "num_threads": 2,
-      "hw_provider": "cpu",
-      "segmented": false,
-      "plugins": "asr/htmsg/vop 全开",
-      "result": "ASR 下载失败",
-      "leaderboard_yaml": "PHANTHYMOTUS_COMMIT_ID=30a89d3"
-    },
     {
       "commit": "9575b52",
       "model": "tts_melo_8k",
       "num_threads": 2,
-      "hw_provider": "cpu",
-      "segmented": false,
-      "plugins": "仅 TTS",
-      "result": "20/20 有音频，RTF 1.17-1.44，TTFT 未达标",
-      "leaderboard_yaml": "PHANTHYMOTUS_COMMIT_ID=9575b52",
-      "recommended_for": "8k 榜单复现（最稳）"
+      "result": "20/20 有音频，RTF 1.17-1.44",
+      "recommended_for": "8k 榜单复现（无切句，最稳）"
     },
     {
-      "commit": "22af188",
-      "model": "tts_melo",
+      "commit": "b9f8cbd",
+      "model": "tts_melo_8k",
       "num_threads": 2,
-      "hw_provider": "cpu",
-      "segmented": false,
-      "plugins": "仅 TTS",
-      "result": "44.1k 版本，未完整验证",
-      "leaderboard_yaml": "PHANTHYMOTUS_COMMIT_ID=22af188",
-      "recommended_for": "44.1k 测试"
-    },
-    {
-      "commit": "1911923",
-      "model": "tts_melo_8k",
-      "num_threads": 8,
-      "hw_provider": "cpu",
-      "segmented": false,
-      "plugins": "仅 TTS",
-      "result": "8k 8线程版",
-      "leaderboard_yaml": "PHANTHYMOTUS_COMMIT_ID=1911923"
-    },
-    {
-      "commit": "d46e607",
-      "model": "tts_melo_8k",
-      "num_threads": 4,
-      "hw_provider": "cuda",
-      "segmented": false,
-      "result": "GPU 比 CPU 慢，不推荐",
-      "leaderboard_yaml": "PHANTHYMOTUS_COMMIT_ID=d46e607"
-    },
-    {
-      "commit": "5678355",
-      "model": "tts_melo",
-      "num_threads": 4,
-      "hw_provider": "cuda",
-      "segmented": false,
-      "result": "44.1k + CUDA，20/20 失败超时",
-      "leaderboard_yaml": "PHANTHYMOTUS_COMMIT_ID=5678355"
-    },
-    {
-      "commit": "47d6ee4",
-      "model": "tts_zh_finetuned",
-      "num_threads": 8,
-      "hw_provider": "cpu",
-      "segmented": false,
-      "plugins": "仅 TTS",
-      "result": "小模型首版，无 espeak 修复",
-      "leaderboard_yaml": "PHANTHYMOTUS_COMMIT_ID=47d6ee4"
-    },
-    {
-      "commit": "0b8d954",
-      "model": "tts_zh_finetuned",
-      "num_threads": 8,
-      "hw_provider": "cpu",
-      "segmented": true,
-      "plugins": "仅 TTS",
-      "result": "小模型 + 切句 + espeak，交榜失败",
-      "leaderboard_yaml": "PHANTHYMOTUS_COMMIT_ID=0b8d954"
+      "result": "切句 + RTF 日志；Jetson 6 线程实测 TTFT 0.78s",
+      "recommended_for": "当前基线"
     }
   ],
-  "jetson_test": {
-    "ssh": "develop@10.100.121.16",
-    "workdir": "/home/develop/<邮箱前缀>/phanthymotus",
-    "checkout_example": "git fetch && git checkout 9575b52",
-    "optional_env": {
-      "TTS_CPU_AFFINITY": "0,1,2,3,4,5,6,7",
-      "comment": "绑核，仅 Linux/Jetson 有效"
-    }
-  },
   "next_push_plan": {
-    "model": "tts_melo_8k",
-    "num_threads": 2,
-    "hw_provider": "cpu",
-    "additions": "RTF + 内存日志（融合组长 benchmark 思路）",
-    "config_change": "config.yaml 改回 8k + num_threads: 2"
+    "git": [
+      "model_downloader: 区分 tts_melo (FP32) / tts_melo_int8",
+      "config.yaml: num_threads 6（Jetson 实测最优）",
+      "tts.py: 加载日志打印 model_size_mb"
+    ],
+    "juicefs_cloud_desktop": [
+      "cd /mnt/data/fanyi/phanthymotus_tts",
+      "tar cjf vits-melo-tts-zh_en.tar.bz2 vits-melo-tts-zh_en/",
+      "tar cjf vits-melo-tts-zh_en_int8.tar.bz2 vits-melo-tts-zh_en_int8/",
+      "cp *.tar.bz2 到 JuiceFS 挂载目录（与 model_downloader URL 一致）",
+      "Jetson 上删旧模型目录后 restart，避免 already exists 跳过下载"
+    ],
+    "leaderboard": "继续交 8k；44k FP32 仅对比测试"
   }
 }
