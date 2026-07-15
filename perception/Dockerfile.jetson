@@ -21,6 +21,11 @@ ARG SHERPA_ONNX_GPU_ORT_VERSION=1.18.1
 FROM ${BASE_IMAGE}
 ARG PYPI_MIRROR APT_MIRROR SHERPA_ONNX_ENABLE_GPU SHERPA_ONNX_GPU_ORT_VERSION
 
+# jp6/dustynv base sets PIP_INDEX_URL=jetson.webredirect.org (often unreachable)
+ENV PIP_INDEX_URL=${PYPI_MIRROR} \
+    PIP_EXTRA_INDEX_URL= \
+    PIP_TRUSTED_HOST=mirrors.tuna.tsinghua.edu.cn pypi.tuna.tsinghua.edu.cn pypi.org files.pythonhosted.org
+
 # ── APT mirror (conditional) ─────────────────────────────────────
 RUN if [ -n "${APT_MIRROR}" ]; then \
         sed -i "s/archive.ubuntu.com/${APT_MIRROR}/g; s/ports.ubuntu.com/${APT_MIRROR}/g" /etc/apt/sources.list; \
@@ -76,7 +81,8 @@ RUN pip3 install --no-cache-dir --no-deps -i ${PYPI_MIRROR} ultralytics && \
     "ultralytics-thop>=0.2.7" "seaborn>=0.11.0" && \
     pip3 uninstall -y opencv-python opencv-python-headless 2>/dev/null; true
 # ultralytics CLIP (GitHub via mirror, needed for set_classes)
-RUN pip3 install --no-cache-dir --no-deps "git+https://ghfast.top/https://github.com/ultralytics/CLIP.git" && \
+RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} --no-deps --no-build-isolation \
+    "git+https://ghfast.top/https://github.com/ultralytics/CLIP.git" && \
     pip3 install --no-cache-dir -i ${PYPI_MIRROR} ftfy regex
 
 # Pre-download CLIP weights into image (avoids 338MB download at runtime)
