@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+# prepare_jp_v6_local.sh — 在 Jetson 本机构建 jp6-torch base（无需 TCR 凭证）
+#
+# Usage (on Jetson JP6 host):
+#   ./prepare_jp_v6_local.sh
+#   export BASE_IMAGE=local/phanthy-motus/jetson-base:jp6-torch
+#   ./build_perception.sh --variant jetson
+set -euo pipefail
+
+ROS_BASE="${ROS_BASE:-dustynv/ros:humble-desktop-l4t-r36.4.0}"
+PYTORCH_DONOR="${PYTORCH_DONOR:-dustynv/l4t-pytorch:r36.4.0}"
+TARGET="${TARGET:-local/phanthy-motus/jetson-base:jp6-torch}"
+
+echo "============================================"
+echo "Building local Jetson JP6 PyTorch base"
+echo "ROS base: ${ROS_BASE}"
+echo "Donor:    ${PYTORCH_DONOR}"
+echo "Target:   ${TARGET}"
+echo "============================================"
+
+docker pull "${ROS_BASE}"
+docker pull "${PYTORCH_DONOR}"
+
+TMPFILE="$(mktemp)"
+cat > "${TMPFILE}" <<DOCKERFILE
+FROM ${PYTORCH_DONOR} AS pytorch-donor
+FROM ${ROS_BASE}
+RUN rm -f /etc/apt/sources.list.d/* && rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/* && \
+    apt-get -o Acquire::AllowInsecureRepositories=true update && \
+    apt-get install -y --no-install-recommends --allow-unauthenticated libopenblas-base && \
+    rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*
+COPY --from=pytorch-donor /usr/local/lib/python3.10/dist-packages/torch /usr/local/lib/python3.10/dist-packages/torch
+COPY --from=pytorch-donor /usr/local/lib/python3.10/dist-packages/torch-*.dist-info /usr/local/lib/python3.10/dist-packages/
+COPY --from=pytorch-donor /usr/local/lib/python3.10/dist-packages/torchvision /usr/local/lib/python3.10/dist-packages/torchvision
+COPY --from=pytorch-donor /usr/local/lib/python3.10/dist-packages/torchvision-*.dist-info /usr/local/lib/python3.10/dist-packages/
+DOCKERFILE
+
+docker build -f "${TMPFILE}" -t "${TARGET}" .
+rm -f "${TMPFILE}"
+
+echo ""
+echo "Done. Local JP6 base:"
+echo "  ${TARGET}"
+echo ""
+echo "Next:"
+echo "  export BASE_IMAGE=${TARGET}"
+echo "  ./deploy/build_perception.sh --variant jetson"

@@ -1,18 +1,25 @@
-# ── Jetson GPU variant ──────────────────────────────────────────────
-# Base: jetson-base:jp511-torch (torch 2.0 + torchvision 0.15 with CUDA)
+# ── Jetson GPU variant (JetPack 6) ───────────────────────────────────
+# Base: jetson-base:jp6-torch (PyTorch + ROS2 Humble on L4T r36.4)
 #
 # Build context: repo root (phanthy-motus/) so we can access both
 # src/perception_stack/ and deploy/ros-base/audio_msgs/
 #
 # Usage:
 #   ./deploy/build_perception.sh --variant jetson --mirror tuna
+#
+# If jp6-torch is not yet in the private registry, build it locally first:
+#   ./deploy/prepare_jp_v6_local.sh
+#   export BASE_IMAGE=local/phanthy-motus/jetson-base:jp6-torch
+#   ./deploy/build_perception.sh --variant jetson
 # ────────────────────────────────────────────────────────────────────
 
 ARG PYPI_MIRROR=https://pypi.tuna.tsinghua.edu.cn/simple/
 ARG APT_MIRROR=mirrors.tuna.tsinghua.edu.cn
-ARG BASE_IMAGE=bj-warehouse.tencentcloudcr.com/phanthy-motus/jetson-base:jp511-torch
+ARG BASE_IMAGE=bj-warehouse.tencentcloudcr.com/phanthy-motus/jetson-base:jp6-torch
+ARG SHERPA_ONNX_ENABLE_GPU=ON
+ARG SHERPA_ONNX_GPU_ORT_VERSION=1.18.1
 FROM ${BASE_IMAGE}
-ARG PYPI_MIRROR APT_MIRROR
+ARG PYPI_MIRROR APT_MIRROR SHERPA_ONNX_ENABLE_GPU SHERPA_ONNX_GPU_ORT_VERSION
 
 # ── APT mirror (conditional) ─────────────────────────────────────
 RUN if [ -n "${APT_MIRROR}" ]; then \
@@ -28,7 +35,8 @@ RUN if ls /etc/apt/sources.list.d/*.list 1>/dev/null 2>&1; then \
 # ── System deps ────────────────────────────────────────────────────
 RUN rm -f /etc/apt/sources.list.d/* && rm -rf /var/cache/apt/archives/* /var/lib/apt/lists/* && \
     apt-get -o Acquire::AllowInsecureRepositories=true update && \
-    apt-get install -y --no-install-recommends --allow-unauthenticated ffmpeg && \
+    apt-get install -y --no-install-recommends --allow-unauthenticated \
+        ffmpeg git cmake build-essential && \
     apt-get clean && rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*
 
 RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} colcon-common-extensions && \
@@ -52,12 +60,14 @@ RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} \
 # ── VOP deps (YOLOv8-World object detection) ─────────────────────
 # Fix broken system cv2 __init__.py (mat_wrapper circular import on Jetson)
 RUN python3 -c "import cv2" 2>/dev/null || { \
-    echo 'import importlib.util, sys, os' > /usr/lib/python3.8/dist-packages/cv2/__init__.py && \
-    echo '_so = os.path.join(os.path.dirname(__file__), "python-3.8", "cv2.cpython-38-aarch64-linux-gnu.so")' >> /usr/lib/python3.8/dist-packages/cv2/__init__.py && \
-    echo '_spec = importlib.util.spec_from_file_location("cv2", _so)' >> /usr/lib/python3.8/dist-packages/cv2/__init__.py && \
-    echo '_mod = importlib.util.module_from_spec(_spec)' >> /usr/lib/python3.8/dist-packages/cv2/__init__.py && \
-    echo '_spec.loader.exec_module(_mod)' >> /usr/lib/python3.8/dist-packages/cv2/__init__.py && \
-    echo 'sys.modules["cv2"] = _mod' >> /usr/lib/python3.8/dist-packages/cv2/__init__.py; \
+    PYTAG=$(python3 -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')"); \
+    CV2PKG="/usr/lib/python${PYTAG}/dist-packages/cv2"; \
+    echo 'import importlib.util, sys, os' > "${CV2PKG}/__init__.py" && \
+    echo '_so = os.path.join(os.path.dirname(__file__), f"python-{PYTAG}", f"cv2.cpython-{PYTAG}-aarch64-linux-gnu.so")' >> "${CV2PKG}/__init__.py" && \
+    echo '_spec = importlib.util.spec_from_file_location("cv2", _so)' >> "${CV2PKG}/__init__.py" && \
+    echo '_mod = importlib.util.module_from_spec(_spec)' >> "${CV2PKG}/__init__.py" && \
+    echo '_spec.loader.exec_module(_mod)' >> "${CV2PKG}/__init__.py" && \
+    echo 'sys.modules["cv2"] = _mod' >> "${CV2PKG}/__init__.py"; \
     }
 # Install ultralytics WITHOUT replacing Jetson's CUDA torch + torchvision
 RUN pip3 install --no-cache-dir --no-deps -i ${PYPI_MIRROR} ultralytics && \
@@ -76,8 +86,23 @@ RUN mkdir -p /work/weights/clip && \
 # Set YOLO_CONFIG_DIR so WEIGHTS_DIR resolves to /work/weights
 ENV YOLO_CONFIG_DIR=/work
 
-# ── sherpa-onnx (on-device ASR/TTS/KWS) ──────────────────────────
-RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} sherpa-onnx
+# ── sherpa-onnx (on-device ASR/TTS/KWS, GPU build for JetPack 6) ─
+# PyPI aarch64 wheel is CPU-only. Build from source with CUDA ORT for JP6.
+RUN if [ "${SHERPA_ONNX_ENABLE_GPU}" = "ON" ]; then \
+        pip3 uninstall -y sherpa-onnx 2>/dev/null || true; \
+        git clone --depth 1 https://github.com/k2-fsa/sherpa-onnx /tmp/sherpa-onnx && \
+        cd /tmp/sherpa-onnx && \
+        SHERPA_ONNX_CMAKE_ARGS="-DSHERPA_ONNX_ENABLE_GPU=ON \
+-DSHERPA_ONNX_LINUX_ARM64_GPU_ONNXRUNTIME_VERSION=${SHERPA_ONNX_GPU_ORT_VERSION} \
+-DBUILD_SHARED_LIBS=ON \
+-DSHERPA_ONNX_ENABLE_PORTAUDIO=OFF \
+-DSHERPA_ONNX_ENABLE_WEBSOCKET=OFF \
+-DSHERPA_ONNX_ENABLE_TESTS=OFF" \
+        pip3 install . --no-cache-dir && \
+        rm -rf /tmp/sherpa-onnx; \
+    else \
+        pip3 install --no-cache-dir -i ${PYPI_MIRROR} sherpa-onnx; \
+    fi
 
 # ── Application code ───────────────────────────────────────────────
 WORKDIR /work
@@ -90,11 +115,12 @@ EXPOSE 15720
 EXPOSE 15721
 
 # 确保 ROS2 Python 包始终在 PYTHONPATH 中（不依赖 source setup.bash）
-RUN find /ros_ws/install -name "site-packages" -type d > /usr/local/lib/python3.8/dist-packages/ros_ws.pth && \
-    find /opt/ros/humble/install -name "site-packages" -type d >> /usr/local/lib/python3.8/dist-packages/ros_ws.pth
+RUN SITE=$(python3 -c "import site; print(site.getsitepackages()[0])") && \
+    find /ros_ws/install -name "site-packages" -type d > "${SITE}/ros_ws.pth" && \
+  (find /opt/ros/humble/install -name "site-packages" -type d >> "${SITE}/ros_ws.pth" 2>/dev/null || true)
 
-# ROS2 shared libraries（audio_msgs .so 等）
-ENV LD_LIBRARY_PATH="/ros_ws/install/audio_msgs/lib:/opt/ros/humble/install/lib:${LD_LIBRARY_PATH}"
+# ROS2 shared libraries（audio_msgs .so 等）+ JP6 NVIDIA user-space libs
+ENV LD_LIBRARY_PATH="/usr/lib/aarch64-linux-gnu/nvidia:/usr/lib/aarch64-linux-gnu:/usr/local/cuda/lib64:/ros_ws/install/audio_msgs/lib:/opt/ros/humble/install/lib:${LD_LIBRARY_PATH}"
 ENV AMENT_PREFIX_PATH="/ros_ws/install/audio_msgs:/opt/ros/humble/install"
 
 CMD ["/bin/bash", "-c", \

@@ -76,7 +76,18 @@ fi
 
 select_mirror
 
-do_build "${DOCKERFILE}" "${BUILD_CONTEXT}" "${FULL_IMAGE}"
+extra_build_args=()
+if [ -n "${BASE_IMAGE:-}" ]; then
+    extra_build_args+=("BASE_IMAGE=${BASE_IMAGE}")
+fi
+if [ -n "${SHERPA_ONNX_ENABLE_GPU:-}" ]; then
+    extra_build_args+=("SHERPA_ONNX_ENABLE_GPU=${SHERPA_ONNX_ENABLE_GPU}")
+fi
+if [ -n "${SHERPA_ONNX_GPU_ORT_VERSION:-}" ]; then
+    extra_build_args+=("SHERPA_ONNX_GPU_ORT_VERSION=${SHERPA_ONNX_GPU_ORT_VERSION}")
+fi
+
+do_build "${DOCKERFILE}" "${BUILD_CONTEXT}" "${FULL_IMAGE}" "${extra_build_args[@]}"
 
 if ${PUSH_ENABLED}; then
     do_push "${FULL_IMAGE}"
