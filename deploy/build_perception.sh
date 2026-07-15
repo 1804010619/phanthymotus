@@ -86,6 +86,9 @@ fi
 if [ -n "${SHERPA_ONNX_GPU_ORT_VERSION:-}" ]; then
     extra_build_args+=("SHERPA_ONNX_GPU_ORT_VERSION=${SHERPA_ONNX_GPU_ORT_VERSION}")
 fi
+if [ -n "${SKIP_VOP_DEPS:-}" ]; then
+    extra_build_args+=("SKIP_VOP_DEPS=${SKIP_VOP_DEPS}")
+fi
 
 do_build "${DOCKERFILE}" "${BUILD_CONTEXT}" "${FULL_IMAGE}" "${extra_build_args[@]}"
 
