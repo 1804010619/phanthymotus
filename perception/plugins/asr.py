@@ -250,6 +250,8 @@ class SherpaOnnxSenseVoiceAdapter(ASRAdapter):
         n = len(pcm) // 2
         samples = struct.unpack(f'<{n}h', pcm)
         float_samples = [s / 32768.0 for s in samples]
+        # Pad 500ms silence at the end to avoid last-token truncation
+        float_samples += [0.0] * int(SAMPLE_RATE * 0.5)
 
         stream = self._recognizer.create_stream()
         stream.accept_waveform(SAMPLE_RATE, float_samples)
@@ -383,8 +385,8 @@ def _vad_worker(pcm_q: multiprocessing.Queue, result_q: multiprocessing.Queue,
                     keywords_file=kws_keywords_file,
                     num_threads=1,
                     provider="cpu",
-                    keywords_score=1.5,
-                    keywords_threshold=0.1,
+                    keywords_score=1.0,
+                    keywords_threshold=0.25,
                 )
                 kws_stream = kws_spotter.create_stream()
                 _log.info(f"[vad-worker] KWS initialized, keywords={keywords}")
@@ -460,8 +462,10 @@ def _vad_worker(pcm_q: multiprocessing.Queue, result_q: multiprocessing.Queue,
             prebuf.append((pcm, ts))
 
         elif state == 'listening':
-            # Maintain pre-buffer for non-KWS mode
-            prebuf.append((pcm, ts))
+            # Only update pre-buffer when VAD has NOT detected speech onset yet,
+            # so prebuf retains the frames *before* speech started.
+            if not vad.is_speech_detected():
+                prebuf.append((pcm, ts))
 
             # Collect completed VAD segments (speech that ended)
             while not vad.empty():
@@ -790,18 +794,20 @@ class ASRPlugin:
             if 'asr_model' in cfg and cfg['asr_model'] != self._asr_model:
                 # Stop all running nodes first
                 for key in list(self._nodes.keys()):
-                    self._nodes[key].stop()
-                    self._executor.remove_node(self._nodes[key])
-                    del self._nodes[key]
+                    node = self._nodes.pop(key, None)
+                    if node:
+                        node.stop()
+                        self._executor.remove_node(node)
                 self._asr_model = cfg['asr_model']
                 self._load_model_async(self._asr_model)
                 return {"status": "loading", "asr_model": self._asr_model,
                         "message": f"Switching to model '{self._asr_model}', downloading..."}
             # Stop all nodes (they'll use new config on next start)
             for key in list(self._nodes.keys()):
-                self._nodes[key].stop()
-                self._executor.remove_node(self._nodes[key])
-                del self._nodes[key]
+                node = self._nodes.pop(key, None)
+                if node:
+                    node.stop()
+                    self._executor.remove_node(node)
             return {"status": "configured", "asr_model": self._asr_model}
 
         return None
