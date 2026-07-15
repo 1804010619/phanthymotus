@@ -174,10 +174,19 @@ class TTSPlugin:
         self._load_error = None
         try:
             self._adapter = build_adapter(self._cfg)
+            if self._cfg.get("vits2_warmup", True):
+                started = time.monotonic()
+                warmup_bytes = self._adapter.warmup()
+                log.info(
+                    "[vits2_tts] warmup completed: bytes=%d elapsed=%.3fs",
+                    warmup_bytes,
+                    time.monotonic() - started,
+                )
         except Exception as exc:
             log.exception("[vits2_tts] failed to load model")
             self._adapter = None
             self._load_error = str(exc)
+            raise RuntimeError("VITS2 model load or warmup failed") from exc
 
     def get_tools(self):
         return TOOLS

@@ -2,6 +2,7 @@ import os
 import re
 import runpy
 
+import jieba
 from pypinyin import lazy_pinyin, Style, load_phrases_dict
 
 from .symbols import punctuation
@@ -9,7 +10,7 @@ from .tone_sandhi import ToneSandhi
 
 from tn.chinese.normalizer import Normalizer as ZhNormalizer
 
-from .heteronym import custom_dict
+from .heteronym import custom_dict, jieba_phrases
 
 
 def _load_phrase_pinyin_data():
@@ -22,6 +23,8 @@ def _load_phrase_pinyin_data():
 _load_phrase_pinyin_data()
 # Project-specific entries load last so they can override the broad dictionary.
 load_phrases_dict(custom_dict, style="tone2")
+for phrase in jieba_phrases:
+    jieba.add_word(phrase)
 
 current_file_path = os.path.dirname(__file__)
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))

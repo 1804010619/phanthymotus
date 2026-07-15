@@ -28,7 +28,8 @@ plugins:
     enabled: true
     vits2_model_dir: /models/vits2-mix
     vits2_num_threads: 2
-    vits2_max_chunk_tokens: 128
+    vits2_max_chunk_tokens: 64
+    vits2_warmup: true
 
   htmsg:
     enabled: false

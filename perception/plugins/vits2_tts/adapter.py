@@ -25,6 +25,9 @@ class TTSAdapter(ABC):
     def synthesize_stream(self, text: str):
         yield self.synthesize(text)
 
+    def warmup(self) -> int:
+        return 0
+
 
 class Vits2OnnxCpuAdapter(TTSAdapter):
     def __init__(
@@ -32,7 +35,7 @@ class Vits2OnnxCpuAdapter(TTSAdapter):
         model_dir: str,
         speed: float = 1.0,
         num_threads: int = 6,
-        max_chunk_tokens: int = 128,
+        max_chunk_tokens: int = 64,
     ):
         if speed <= 0:
             raise ValueError("TTS speed must be greater than zero")
@@ -59,6 +62,15 @@ class Vits2OnnxCpuAdapter(TTSAdapter):
         )
         self._length_scale = 1.0 / speed
         self._lock = threading.Lock()
+
+    def warmup(self) -> int:
+        with self._lock:
+            pcm = self._engine.synthesize(
+                "你好。", length_scale=self._length_scale
+            )
+        if not pcm:
+            raise RuntimeError("VITS2 warmup produced no audio")
+        return len(pcm)
 
     def _split_text(self, text: str) -> list[str]:
         limit = self._max_chunk_tokens
@@ -139,5 +151,5 @@ def build_adapter(cfg: dict) -> TTSAdapter:
         model_dir=cfg.get("vits2_model_dir", "/models/vits2-mix"),
         speed=float(cfg.get("speed", 1.0)),
         num_threads=max(1, int(cfg.get("vits2_num_threads", 6))),
-        max_chunk_tokens=int(cfg.get("vits2_max_chunk_tokens", 128)),
+        max_chunk_tokens=int(cfg.get("vits2_max_chunk_tokens", 64)),
     )
