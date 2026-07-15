@@ -25,7 +25,7 @@ ARG PYPI_MIRROR APT_MIRROR SHERPA_ONNX_ENABLE_GPU SHERPA_ONNX_GPU_ORT_VERSION SK
 # jp6/dustynv base sets PIP_INDEX_URL=jetson.webredirect.org (often unreachable)
 ENV PIP_INDEX_URL=${PYPI_MIRROR} \
     PIP_EXTRA_INDEX_URL= \
-    PIP_TRUSTED_HOST=mirrors.tuna.tsinghua.edu.cn pypi.tuna.tsinghua.edu.cn pypi.org files.pythonhosted.org
+    PIP_TRUSTED_HOST="mirrors.tuna.tsinghua.edu.cn pypi.tuna.tsinghua.edu.cn pypi.org files.pythonhosted.org"
 
 # ── APT mirror (conditional) ─────────────────────────────────────
 RUN if [ -n "${APT_MIRROR}" ]; then \
