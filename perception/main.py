@@ -50,6 +50,25 @@ def _load_config() -> dict:
         return yaml.safe_load(f)
 
 
+def _sanitize_mcp_log(value, key: str = ""):
+    """Redact request content and credentials before writing MCP logs."""
+    normalized_key = key.lower()
+    if normalized_key in {"api_key", "key", "token", "authorization"}:
+        return "<redacted>" if value else ""
+    if normalized_key == "text" and os.environ.get(
+        "LOG_MCP_TEXT", ""
+    ).lower() not in {"1", "true", "yes", "on"}:
+        return f"<redacted:{len(str(value))} chars>"
+    if isinstance(value, dict):
+        return {
+            item_key: _sanitize_mcp_log(item_value, item_key)
+            for item_key, item_value in value.items()
+        }
+    if isinstance(value, list):
+        return [_sanitize_mcp_log(item, key) for item in value]
+    return value
+
+
 # ── Bundle ────────────────────────────────────────────────────────────────────
 
 class PerceptionBundle:
@@ -261,13 +280,21 @@ def make_handler():
                     # info action is heartbeat probe — log at DEBUG to reduce noise
                     is_info = (args.get('action') == 'info')
                     if not is_info:
-                        log.info(f"[mcp] tools/call: {name}({args})")
+                        log.info(
+                            "[mcp] tools/call: %s(%s)",
+                            name,
+                            _sanitize_mcp_log(args),
+                        )
                     result = _bundle.dispatch(name, args)
                     if result is None:
                         err(-32601, f"Unknown tool: {name}")
                     else:
                         if not is_info:
-                            log.info(f"[mcp] tools/call result: {json.dumps(result)[:200]}")
+                            safe_result = _sanitize_mcp_log(result)
+                            log.info(
+                                "[mcp] tools/call result: %s",
+                                json.dumps(safe_result)[:200],
+                            )
                         ok({"content": [{"type": "text", "text": json.dumps(result)}]})
                 else:
                     err(-32601, f"Method not found: {method}")

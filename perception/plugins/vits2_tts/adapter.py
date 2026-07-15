@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import logging
 import os
+import re
 import threading
 from abc import ABC, abstractmethod
 from pathlib import Path
@@ -12,6 +14,7 @@ from .onnx_cpu_engine import OnnxCpuEngine
 
 SAMPLE_RATE = 16000
 CHUNK_BYTES = 3200
+log = logging.getLogger(__name__)
 
 
 class TTSAdapter(ABC):
@@ -24,7 +27,13 @@ class TTSAdapter(ABC):
 
 
 class Vits2OnnxCpuAdapter(TTSAdapter):
-    def __init__(self, model_dir: str, speed: float = 1.0, num_threads: int = 6):
+    def __init__(
+        self,
+        model_dir: str,
+        speed: float = 1.0,
+        num_threads: int = 6,
+        max_chunk_tokens: int = 128,
+    ):
         if speed <= 0:
             raise ValueError("TTS speed must be greater than zero")
 
@@ -45,19 +54,81 @@ class Vits2OnnxCpuAdapter(TTSAdapter):
             raise RuntimeError(
                 f"VITS2 sample rate must be {SAMPLE_RATE}, got {self._engine.sample_rate}"
             )
+        self._max_chunk_tokens = max(
+            16, min(int(max_chunk_tokens), self._engine.max_text_tokens)
+        )
         self._length_scale = 1.0 / speed
         self._lock = threading.Lock()
+
+    def _split_text(self, text: str) -> list[str]:
+        limit = self._max_chunk_tokens
+        units = re.findall(r".*?[。！？!?；;\n]+|.+$", text, flags=re.DOTALL)
+        chunks = []
+        current = ""
+
+        for unit in units:
+            candidate = current + unit
+            if self._engine.text_token_count(candidate) <= limit:
+                current = candidate
+                continue
+            if current.strip():
+                chunks.append(current.strip())
+                current = ""
+
+            remainder = unit.strip()
+            while remainder:
+                if self._engine.text_token_count(remainder) <= limit:
+                    current = remainder
+                    break
+                low, high = 1, len(remainder)
+                while low < high:
+                    middle = (low + high + 1) // 2
+                    if self._engine.text_token_count(remainder[:middle]) <= limit:
+                        low = middle
+                    else:
+                        high = middle - 1
+                if low < 1:
+                    raise ValueError("Unable to split text within the token limit")
+                chunks.append(remainder[:low].strip())
+                remainder = remainder[low:].strip()
+
+        if current.strip():
+            chunks.append(current.strip())
+        token_counts = [self._engine.text_token_count(chunk) for chunk in chunks]
+        log.info(
+            "[vits2_tts] text redacted: tokens=%d chunks=%d chunk_tokens=%s",
+            sum(token_counts),
+            len(chunks),
+            token_counts,
+        )
+        return chunks
 
     def synthesize(self, text: str) -> bytes:
         if not text.strip():
             raise ValueError("TTS text must not be empty")
         with self._lock:
-            return self._engine.synthesize(text, length_scale=self._length_scale)
+            chunks = self._split_text(text)
+            silence = b"\x00\x00" * (SAMPLE_RATE // 10)
+            audio = [
+                self._engine.synthesize(chunk, length_scale=self._length_scale)
+                for chunk in chunks
+            ]
+            return silence.join(audio)
 
     def synthesize_stream(self, text: str):
-        pcm = self.synthesize(text)
-        for offset in range(0, len(pcm), CHUNK_BYTES):
-            yield pcm[offset:offset + CHUNK_BYTES]
+        if not text.strip():
+            raise ValueError("TTS text must not be empty")
+        with self._lock:
+            chunks = self._split_text(text)
+            silence = b"\x00\x00" * (SAMPLE_RATE // 10)
+            for chunk_index, chunk in enumerate(chunks):
+                if chunk_index:
+                    yield silence
+                pcm = self._engine.synthesize(
+                    chunk, length_scale=self._length_scale
+                )
+                for offset in range(0, len(pcm), CHUNK_BYTES):
+                    yield pcm[offset:offset + CHUNK_BYTES]
 
 
 def build_adapter(cfg: dict) -> TTSAdapter:
@@ -68,4 +139,5 @@ def build_adapter(cfg: dict) -> TTSAdapter:
         model_dir=cfg.get("vits2_model_dir", "/models/vits2-mix"),
         speed=float(cfg.get("speed", 1.0)),
         num_threads=max(1, int(cfg.get("vits2_num_threads", 6))),
+        max_chunk_tokens=int(cfg.get("vits2_max_chunk_tokens", 128)),
     )

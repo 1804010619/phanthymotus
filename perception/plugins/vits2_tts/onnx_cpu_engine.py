@@ -129,6 +129,10 @@ class OnnxCpuEngine:
             ids = tuple(_intersperse(values) for values in ids)
         return tuple(tuple(values) for values in ids)
 
+    def text_token_count(self, text):
+        """Return the encoded phone-token count used by the ONNX encoder."""
+        return len(self._text_ids(text)[0])
+
     @torch.inference_mode()
     def synthesize(self, text, noise_scale=0.667, length_scale=1.0):
         phone_ids, tone_ids, lang_ids = self._text_ids(text)

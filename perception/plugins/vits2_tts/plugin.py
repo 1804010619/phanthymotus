@@ -130,12 +130,20 @@ class _Vits2TTSNode(Node):
             except queue.Empty:
                 continue
             try:
-                started = time.monotonic()
+                started = None
                 for frame_index, pcm in enumerate(self._adapter.synthesize_stream(text)):
                     if self._stop_event.is_set():
                         break
+                    now = time.monotonic()
+                    if started is None:
+                        started = now
                     target = started + frame_index * frame_duration
-                    delay = target - time.monotonic()
+                    # Rebase after an ONNX segment takes longer than one frame;
+                    # otherwise all buffered frames would be published at once.
+                    if target < now - frame_duration:
+                        started = now - frame_index * frame_duration
+                        target = now
+                    delay = target - now
                     if delay > 0:
                         time.sleep(delay)
                     self._publish(pcm)

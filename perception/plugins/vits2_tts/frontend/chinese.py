@@ -1,5 +1,6 @@
 import os
 import re
+import runpy
 
 from pypinyin import lazy_pinyin, Style, load_phrases_dict
 
@@ -9,6 +10,17 @@ from .tone_sandhi import ToneSandhi
 from tn.chinese.normalizer import Normalizer as ZhNormalizer
 
 from .heteronym import custom_dict
+
+
+def _load_phrase_pinyin_data():
+    data_dir = os.getenv("VITS2_FRONTEND_DATA_DIR", os.path.dirname(__file__))
+    di_path = os.path.join(data_dir, "phrase_pinyin_data", "di.py")
+    if os.path.isfile(di_path):
+        runpy.run_path(di_path)["load"]()
+
+
+_load_phrase_pinyin_data()
+# Project-specific entries load last so they can override the broad dictionary.
 load_phrases_dict(custom_dict, style="tone2")
 
 current_file_path = os.path.dirname(__file__)

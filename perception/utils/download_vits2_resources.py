@@ -21,7 +21,7 @@ RESOURCES = {
     ),
     "assets": (
         "vits2-mix-assets.tar.gz",
-        "564d61391a63c178f61e457216e7f7975c95e8b1d4f4def13c7b11c66afc7a3d",
+        "d299ca41ebdd73d884399738db21664b7bc79ccdbcb628b56d29607aaf3556e0",
     ),
 }
 
