@@ -78,7 +78,7 @@ class Vits2TensorRTAdapter(TTSAdapter):
                 )
             pending = bytearray()
             while True:
-                block = response.read(64 * 1024)
+                block = response.read(CHUNK_BYTES)
                 if not block:
                     break
                 pending.extend(block)
