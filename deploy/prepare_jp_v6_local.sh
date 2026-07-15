@@ -7,8 +7,9 @@
 #   ./build_perception.sh --variant jetson
 set -euo pipefail
 
-ROS_BASE="${ROS_BASE:-dustynv/ros:humble-desktop-l4t-r36.4.0}"
-PYTORCH_DONOR="${PYTORCH_DONOR:-dustynv/l4t-pytorch:r36.4.0}"
+# DaoCloud 镜像加速（与 prepare_jetson_base.sh 一致）；直连 Docker Hub 超时时用默认即可
+ROS_BASE="${ROS_BASE:-docker.m.daocloud.io/dustynv/ros:humble-desktop-l4t-r36.4.0}"
+PYTORCH_DONOR="${PYTORCH_DONOR:-docker.m.daocloud.io/dustynv/l4t-pytorch:r36.4.0}"
 TARGET="${TARGET:-local/phanthy-motus/jetson-base:jp6-torch}"
 
 echo "============================================"
