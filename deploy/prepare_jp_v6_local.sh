@@ -30,10 +30,16 @@ RUN rm -f /etc/apt/sources.list.d/* && rm -rf /var/lib/apt/lists/* /var/cache/ap
     apt-get -o Acquire::AllowInsecureRepositories=true update && \
     apt-get install -y --no-install-recommends --allow-unauthenticated libopenblas-base && \
     rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*
-COPY --from=pytorch-donor /usr/local/lib/python3.10/dist-packages/torch /usr/local/lib/python3.10/dist-packages/torch
-COPY --from=pytorch-donor /usr/local/lib/python3.10/dist-packages/torch-*.dist-info /usr/local/lib/python3.10/dist-packages/
-COPY --from=pytorch-donor /usr/local/lib/python3.10/dist-packages/torchvision /usr/local/lib/python3.10/dist-packages/torchvision
-COPY --from=pytorch-donor /usr/local/lib/python3.10/dist-packages/torchvision-*.dist-info /usr/local/lib/python3.10/dist-packages/
+COPY --from=pytorch-donor /usr/local/lib/python3.10/dist-packages/ /tmp/pt-donor/
+RUN cd /tmp/pt-donor && \
+    mkdir -p /usr/local/lib/python3.10/dist-packages && \
+    for item in torch torchgen torchvision triton; do \
+        [ -e "\$item" ] && cp -a "\$item" /usr/local/lib/python3.10/dist-packages/; \
+    done && \
+    for item in torch-*.dist-info torchvision-*.dist-info triton-*.dist-info; do \
+        [ -e "\$item" ] && cp -a "\$item" /usr/local/lib/python3.10/dist-packages/; \
+    done && \
+    rm -rf /tmp/pt-donor
 DOCKERFILE
 
 docker build -f "${TMPFILE}" -t "${TARGET}" .
