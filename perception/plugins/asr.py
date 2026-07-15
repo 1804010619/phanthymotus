@@ -794,18 +794,20 @@ class ASRPlugin:
             if 'asr_model' in cfg and cfg['asr_model'] != self._asr_model:
                 # Stop all running nodes first
                 for key in list(self._nodes.keys()):
-                    self._nodes[key].stop()
-                    self._executor.remove_node(self._nodes[key])
-                    del self._nodes[key]
+                    node = self._nodes.pop(key, None)
+                    if node:
+                        node.stop()
+                        self._executor.remove_node(node)
                 self._asr_model = cfg['asr_model']
                 self._load_model_async(self._asr_model)
                 return {"status": "loading", "asr_model": self._asr_model,
                         "message": f"Switching to model '{self._asr_model}', downloading..."}
             # Stop all nodes (they'll use new config on next start)
             for key in list(self._nodes.keys()):
-                self._nodes[key].stop()
-                self._executor.remove_node(self._nodes[key])
-                del self._nodes[key]
+                node = self._nodes.pop(key, None)
+                if node:
+                    node.stop()
+                    self._executor.remove_node(node)
             return {"status": "configured", "asr_model": self._asr_model}
 
         return None
