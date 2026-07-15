@@ -9,17 +9,17 @@ ARG VITS2_RUNTIME_SHA256=83a24d5d4a7ace48ab533cc255654bb0d79e3bd728125da01ffd1ab
 
 USER root
 
-# ROS Humble uses the Ubuntu 22.04 system Python. TensorRT remains isolated in
-# the NGC Python 3.12 environment and is never imported by the ROS process.
-RUN . /etc/os-release && test "$VERSION_CODENAME" = jammy && \
+# ROS Jazzy uses the Ubuntu 24.04 system Python. TensorRT remains isolated in
+# the NGC Python environment and is never imported by the ROS process.
+RUN . /etc/os-release && test "$VERSION_CODENAME" = noble && \
     apt-get update && apt-get install -y --no-install-recommends \
       ca-certificates curl gnupg python3-yaml && \
     curl -fsSL https://raw.githubusercontent.com/ros/rosdistro/master/ros.key \
       | gpg --dearmor -o /usr/share/keyrings/ros-archive-keyring.gpg && \
-    echo "deb [arch=arm64 signed-by=/usr/share/keyrings/ros-archive-keyring.gpg] http://packages.ros.org/ros2/ubuntu jammy main" \
+    echo "deb [arch=arm64 signed-by=/usr/share/keyrings/ros-archive-keyring.gpg] http://packages.ros.org/ros2/ubuntu noble main" \
       > /etc/apt/sources.list.d/ros2.list && \
     apt-get update && apt-get install -y --no-install-recommends \
-      ros-humble-ros-base python3-colcon-common-extensions && \
+      ros-jazzy-ros-base python3-colcon-common-extensions && \
     rm -rf /var/lib/apt/lists/*
 
 COPY perception/utils/download_vits2_trt_runtime.py /tmp/download_vits2_trt_runtime.py
@@ -43,7 +43,7 @@ RUN /usr/local/bin/python3 /tmp/download_vits2_trt_runtime.py \
     rm -f /tmp/vits2-mix-jp6-runtime.tar.gz /tmp/vits2-trt-requirements.txt /tmp/download_vits2_trt_runtime.py
 
 COPY deploy/ros-base/audio_msgs/ /ros_ws/src/audio_msgs/
-RUN cd /ros_ws && . /opt/ros/humble/setup.bash && \
+RUN cd /ros_ws && . /opt/ros/jazzy/setup.bash && \
     colcon build --packages-select audio_msgs --cmake-args \
       -DCMAKE_BUILD_TYPE=Release \
       -DPython3_EXECUTABLE=/usr/bin/python3 \
@@ -74,8 +74,8 @@ RUN cp /opt/vits2-runtime/runtime/frontend_assets/cmudict.rep \
     VITS2_FRONTEND_DATA_DIR=/models/vits2-mix/frontend_data \
     /usr/local/bin/python3 -c "from frontend.cleaner import clean_text_mix; [clean_text_mix(t) for t in ('你好。','Hello。','今天AI助手ready了。','他警惕地观察。')]"
 
-ENV LD_LIBRARY_PATH=/usr/local/lib:/ros_ws/install/audio_msgs/lib:/opt/ros/humble/lib:${LD_LIBRARY_PATH} \
-    AMENT_PREFIX_PATH=/ros_ws/install/audio_msgs:/opt/ros/humble \
+ENV LD_LIBRARY_PATH=/usr/local/lib:/ros_ws/install/audio_msgs/lib:/opt/ros/jazzy/lib:${LD_LIBRARY_PATH} \
+    AMENT_PREFIX_PATH=/ros_ws/install/audio_msgs:/opt/ros/jazzy \
     NLTK_DATA=/models/vits2-mix/nltk_data \
     EN_TN_CACHE_DIR=/models/vits2-mix/tn_cache \
     TN_CACHE_DIR=/models/vits2-mix/tn_cache \

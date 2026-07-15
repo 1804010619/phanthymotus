@@ -38,7 +38,7 @@ curl -fsS "http://127.0.0.1:${TRT_PORT}/ready" | grep -q True
 
 export TTS_PLUGIN=${TTS_PLUGIN:-vits2_tts_trt}
 export VITS2_TRT_BACKEND_URL=${VITS2_TRT_BACKEND_URL:-http://127.0.0.1:${TRT_PORT}}
-source /opt/ros/humble/setup.bash
+source /opt/ros/jazzy/setup.bash
 source /ros_ws/install/setup.bash
 cd /work
 /usr/bin/python3 /work/main.py &
