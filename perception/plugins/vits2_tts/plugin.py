@@ -155,9 +155,9 @@ class _Vits2TTSNode(Node):
 
 
 class TTSPlugin:
-    """VITS2 implementation of the standard external `tts` contract."""
+    """VITS2 implementation exposed as the `vits2_tts` MCP tool."""
 
-    PREFIX = "tts"
+    PREFIX = "vits2"
 
     def __init__(self, plugin_cfg: dict, executor):
         self._cfg = dict(plugin_cfg)

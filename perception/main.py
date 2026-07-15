@@ -62,15 +62,22 @@ class PerceptionBundle:
             self._plugins.append(ASRPlugin(plugins_cfg["asr"], executor))
             log.info("ASRPlugin loaded")
 
-        tts_plugin = os.environ.get("TTS_PLUGIN", "tts").strip() or "tts"
-        if not tts_plugin.isidentifier():
-            raise ValueError(f"Invalid TTS_PLUGIN value: {tts_plugin!r}")
+        requested_tts_plugin = os.environ.get("TTS_PLUGIN", "").strip()
+        tts_plugin = requested_tts_plugin or "vits2_tts"
         tts_cfg = plugins_cfg.get(tts_plugin, {})
-        if tts_cfg.get("enabled", False):
-            module = importlib.import_module(f"plugins.{tts_plugin}")
-            TTSPlugin = module.TTSPlugin
-            self._plugins.append(TTSPlugin(tts_cfg, executor))
-            log.info("TTSPlugin loaded: plugins.%s", tts_plugin)
+        if not tts_plugin.isidentifier() or not tts_cfg.get("enabled", False):
+            log.warning(
+                "Invalid or disabled TTS_PLUGIN=%r; falling back to vits2_tts",
+                requested_tts_plugin,
+            )
+            tts_plugin = "vits2_tts"
+            tts_cfg = plugins_cfg.get(tts_plugin, {})
+        if not tts_cfg.get("enabled", False):
+            raise RuntimeError("Fallback plugin vits2_tts is not enabled")
+        module = importlib.import_module(f"plugins.{tts_plugin}")
+        TTSPlugin = module.TTSPlugin
+        self._plugins.append(TTSPlugin(tts_cfg, executor))
+        log.info("TTSPlugin loaded: plugins.%s", tts_plugin)
 
         if plugins_cfg.get("htmsg", {}).get("enabled", False):
             import re, socket
@@ -111,7 +118,7 @@ class PerceptionBundle:
 
     def tts_synthesize_raw(self, text: str) -> bytes:
         for p in self._plugins:
-            if getattr(p, 'PREFIX', None) == 'tts':
+            if getattr(p, 'PREFIX', None) in ('tts', 'vits2'):
                 return p.synthesize_raw(text)
         raise RuntimeError("TTS plugin not loaded or not enabled")
 
