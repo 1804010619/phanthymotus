@@ -757,6 +757,15 @@ class ASRPlugin:
                                 node_suffix=node_key.replace('/', '_').replace('-', '_'))
                 self._executor.add_node(node)
                 self._nodes[node_key] = node
+            else:
+                # Sync latest config into existing node before restart
+                node = self._nodes[node_key]
+                node._adapter = self._adapter
+                node._language = self._language
+                node._vad_backend = self._vad_backend
+                node._vad_threshold = self._vad_threshold
+                node._vad_silence_ms = self._vad_silence_ms
+                node._kws_cfg = self._kws_cfg
             return self._nodes[node_key].start()
 
         elif action == "stop":
@@ -803,11 +812,10 @@ class ASRPlugin:
                 return {"status": "loading", "asr_model": self._asr_model,
                         "message": f"Switching to model '{self._asr_model}', downloading..."}
             # Stop all nodes (they'll use new config on next start)
+            # Only stop VAD internals — keep node in executor to avoid DDS re-discovery delay
             for key in list(self._nodes.keys()):
-                node = self._nodes.pop(key, None)
-                if node:
-                    node.stop()
-                    self._executor.remove_node(node)
+                node = self._nodes[key]
+                node.stop()
             return {"status": "configured", "asr_model": self._asr_model}
 
         return None
