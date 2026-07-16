@@ -1,4 +1,5 @@
 numpy==1.26.1
+websockets==16.1
 pynini==2.1.6
 WeTextProcessing==1.0.4.1
 pypinyin==0.55.0
