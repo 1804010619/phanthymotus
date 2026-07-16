@@ -1359,52 +1359,72 @@ async function _startProject() {
     _stopProject();
   };
 
-  // Start all cards in parallel
-  const promises = startItems.map(async ({ card, args }, i) => {
-    updateItem(i, 'starting');
-    try {
-      const startResult = await _triggerAction(card.mcpId, card.toolName, 'start', args);
-      if (aborted) return;
-      if (startResult && startResult.code !== 200) {
-        updateItem(i, 'error', startResult.message || '启动失败');
-        _logActivity('error', `${card.toolName} 启动失败: ${startResult.message || '未知错误'}`);
-        if (!aborted) { aborted = true; modal.onCancel?.(); }
-        return;
-      }
-      // Auto-start mic stream for remote_mic card
-      if (card.toolName === 'remote_mic' && !isMicActive()) {
-        const wsProto = location.protocol === 'https:' ? 'wss' : 'ws';
-        const wsUrl = `${wsProto}://${location.host}/ws/mic`;
-        try {
-          await toggleMicStream(wsUrl, (active) => {
-            const micBtn = card.el?.querySelector('.canvas-mic-btn');
-            if (micBtn) {
-              micBtn.textContent = active ? '\u23F9 停止录音' : '\uD83C\uDF99 开始录音';
-              micBtn.classList.toggle('recording', active);
-            }
-          });
-        } catch (err) {
-          _logActivity('error', '麦克风启动失败: ' + err.message);
-        }
-      }
-      // Update card.topicOut from start response
-      const parsed = _parseMcpCallResult(startResult);
-      if (parsed?.topic_out?.some(t => t.topic)) {
-        card.topicOut = parsed.topic_out;
-        const outPorts = [...card.el.querySelectorAll('.canvas-port.out')];
-        parsed.topic_out.forEach((t, idx) => { if (outPorts[idx] && t.topic) outPorts[idx].dataset.topic = t.topic; });
-      }
-      updateItem(i, 'ready');
-    } catch (e) {
-      if (!aborted) {
-        updateItem(i, 'error', e.message || '异常');
-        aborted = true;
-        modal.onCancel?.();
-      }
-    }
+  // Split into sources (no inbound connections) and processors (have inbound connections)
+  const sourceIndices = [];
+  const processorIndices = [];
+  startItems.forEach(({ card }, i) => {
+    const hasInbound = _connections.some(c => c.toCardId === card.id);
+    (hasInbound ? processorIndices : sourceIndices).push(i);
   });
 
-  await Promise.allSettled(promises);
+  // Helper to start a batch of items by index
+  async function _startBatch(indices) {
+    const batch = indices.map(i => (async () => {
+      const { card, args } = startItems[i];
+      updateItem(i, 'starting');
+      try {
+        const startResult = await _triggerAction(card.mcpId, card.toolName, 'start', args);
+        if (aborted) return;
+        if (startResult && startResult.code !== 200) {
+          updateItem(i, 'error', startResult.message || '启动失败');
+          _logActivity('error', `${card.toolName} 启动失败: ${startResult.message || '未知错误'}`);
+          if (!aborted) { aborted = true; modal.onCancel?.(); }
+          return;
+        }
+        // Auto-start mic stream for remote_mic card
+        if (card.toolName === 'remote_mic' && !isMicActive()) {
+          const wsProto = location.protocol === 'https:' ? 'wss' : 'ws';
+          const wsUrl = `${wsProto}://${location.host}/ws/mic`;
+          try {
+            await toggleMicStream(wsUrl, (active) => {
+              const micBtn = card.el?.querySelector('.canvas-mic-btn');
+              if (micBtn) {
+                micBtn.textContent = active ? '\u23F9 停止录音' : '\uD83C\uDF99 开始录音';
+                micBtn.classList.toggle('recording', active);
+              }
+            });
+          } catch (err) {
+            _logActivity('error', '麦克风启动失败: ' + err.message);
+          }
+        }
+        // Update card.topicOut from start response
+        const parsed = _parseMcpCallResult(startResult);
+        if (parsed?.topic_out?.some(t => t.topic)) {
+          card.topicOut = parsed.topic_out;
+          const outPorts = [...card.el.querySelectorAll('.canvas-port.out')];
+          parsed.topic_out.forEach((t, idx) => { if (outPorts[idx] && t.topic) outPorts[idx].dataset.topic = t.topic; });
+        }
+        updateItem(i, 'ready');
+      } catch (e) {
+        if (!aborted) {
+          updateItem(i, 'error', e.message || '异常');
+          aborted = true;
+          modal.onCancel?.();
+        }
+      }
+    })());
+    await Promise.allSettled(batch);
+  }
+
+  // Phase 1: start sources (data producers) first
+  await _startBatch(sourceIndices);
+  if (aborted) return;
+
+  // Re-resolve topics so processors can find source output topics
+  _resolveAllTopics();
+
+  // Phase 2: start processors (data consumers)
+  await _startBatch(processorIndices);
   if (!aborted) {
     // Re-resolve topics after all starts complete
     _resolveAllTopics();
