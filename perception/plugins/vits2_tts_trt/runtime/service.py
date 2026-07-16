@@ -103,8 +103,8 @@ async def lifespan(_: FastAPI):
         for text in (
             "你好。",
             "Hello world.",
-            "周末我和Lucy去公园散步，顺便买了一杯coffee。",
-            "开会前请把PPT发给David，他会提前review内容。",
+            "Lucy今天去公园散步并喝coffee。",
+            "David开会前仔细检查PPT。",
         ):
             pcm = _engine.synthesize(text)
             if not pcm:
