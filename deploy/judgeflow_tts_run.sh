@@ -36,6 +36,12 @@ if [ -d /models ]; then
     RUN_ARGS+=(-v /models:/models)
 fi
 
+RUN_ARGS+=(
+    -e ROS_DOMAIN_ID="${ROS_DOMAIN_ID:-42}"
+    -e RMW_IMPLEMENTATION="${RMW_IMPLEMENTATION:-rmw_fastrtps_cpp}"
+    -e FASTDDS_BUILTIN_TRANSPORTS="${FASTDDS_BUILTIN_TRANSPORTS:-DEFAULT}"
+)
+
 RUN_ARGS+=("${IMAGE}")
 
 echo "[judgeflow_tts_run] ${RUN_ARGS[*]}"

@@ -7,6 +7,7 @@ log() { echo "[entrypoint] $*" >&2; }
 
 export LD_PRELOAD=/usr/lib/aarch64-linux-gnu/libgomp.so.1
 log "starting (LD_PRELOAD=${LD_PRELOAD})"
+log "ROS_DOMAIN_ID=${ROS_DOMAIN_ID:-0} RMW_IMPLEMENTATION=${RMW_IMPLEMENTATION:-default}"
 
 if [ "${TTS_REQUIRE_CUDA:-1}" = "1" ]; then
     log "checking CUDA via torch..."
