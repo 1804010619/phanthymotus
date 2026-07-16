@@ -44,7 +44,7 @@ async function _onChannelChange(e) {
   const channel = e.target.value;
   const warnings = {
     preview: '预览版可能不稳定，仅建议用于测试环境。确定切换？',
-    release: '公测版已通过基础测试但可能存在少量问题。确定切换？',
+    release: '正式版已通过基础测试，但未经长期稳定性验证。确定切换？',
   };
   if (warnings[channel] && !confirm(warnings[channel])) {
     // Revert selection
