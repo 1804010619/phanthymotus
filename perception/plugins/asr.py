@@ -859,8 +859,8 @@ class _ASRNode(Node):
                 if trigger_mode == 'asr_kws' and keyword_ipa:
                     text_ipa = _text_to_ipa(text)
                     matched, end_pos = _find_keyword_in_ipa(text_ipa, keyword_ipa, asr_kws_threshold)
+                    log.info(f"[asr] asr_kws: text='{text}' ipa={text_ipa} dist_matched={matched} end={end_pos}")
                     if not matched:
-                        log.debug(f"[asr] asr_kws: no match in '{text}'")
                         continue
                     # Extract text after keyword
                     remaining = _extract_after_keyword(text, keyword_ipa, end_pos)
