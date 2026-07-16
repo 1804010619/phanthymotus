@@ -70,10 +70,9 @@ def _text_to_ipa(text: str) -> list:
         lang = 'cmn' if is_cjk else 'en-us'
         try:
             ipa = phonemize(seg_text, language=lang, backend='espeak',
-                           separator=sep, strip=True, language_switch='remove-flags')
-            # Remove tone/stress marks for fuzzy matching
-            import re
-            ipa = re.sub(r'[ˈˌːˑ̃ˀ¹²³⁴⁵˥˦˧˨˩↓↑]', '', ipa)
+                           separator=sep, strip=True,
+                           with_stress=False, tie=False,
+                           language_switch='remove-flags')
             phones = [p for p in ipa.split() if p]
             ipa_seq.extend(phones)
         except Exception:
