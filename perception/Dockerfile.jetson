@@ -94,17 +94,21 @@ ENV YOLO_CONFIG_DIR=/work
 
 # ── sherpa-onnx (on-device ASR/TTS/KWS, GPU build for JetPack 6) ─
 # PyPI aarch64 wheel is CPU-only. Build from source with CUDA ORT for JP6.
+# Note: pip install . fails when PORTAUDIO=OFF (missing sherpa-onnx-microphone);
+# use setup.py build + copy site-packages instead.
 RUN if [ "${SHERPA_ONNX_ENABLE_GPU}" = "ON" ]; then \
         pip3 uninstall -y sherpa-onnx 2>/dev/null || true; \
         git clone --depth 1 https://github.com/k2-fsa/sherpa-onnx /tmp/sherpa-onnx && \
         cd /tmp/sherpa-onnx && \
-        SHERPA_ONNX_CMAKE_ARGS="-DSHERPA_ONNX_ENABLE_GPU=ON \
+        export SHERPA_ONNX_CMAKE_ARGS="-DSHERPA_ONNX_ENABLE_GPU=ON \
 -DSHERPA_ONNX_LINUX_ARM64_GPU_ONNXRUNTIME_VERSION=${SHERPA_ONNX_GPU_ORT_VERSION} \
 -DBUILD_SHARED_LIBS=ON \
 -DSHERPA_ONNX_ENABLE_PORTAUDIO=OFF \
 -DSHERPA_ONNX_ENABLE_WEBSOCKET=OFF \
--DSHERPA_ONNX_ENABLE_TESTS=OFF" \
-        pip3 install . --no-cache-dir && \
+-DSHERPA_ONNX_ENABLE_TESTS=OFF" && \
+        python3 setup.py build && \
+        SITE=$(python3 -c "import site; print(site.getsitepackages()[0])") && \
+        cp -a build/lib.linux-aarch64-cpython-*/sherpa_onnx "${SITE}/" && \
         rm -rf /tmp/sherpa-onnx; \
     else \
         pip3 install --no-cache-dir -i ${PYPI_MIRROR} sherpa-onnx; \
