@@ -65,7 +65,7 @@ def _text_to_ipa(text: str) -> list:
         segments.append((current.strip(), current_is_cjk))
 
     ipa_seq = []
-    sep = Separator(phone=' ', word=' ', syllable='')
+    sep = Separator(phone=' ', word='  ', syllable='')
     for seg_text, is_cjk in segments:
         lang = 'cmn' if is_cjk else 'en-us'
         try:
