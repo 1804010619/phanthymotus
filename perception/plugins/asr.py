@@ -71,6 +71,9 @@ def _text_to_ipa(text: str) -> list:
         try:
             ipa = phonemize(seg_text, language=lang, backend='espeak',
                            separator=sep, strip=True, language_switch='remove-flags')
+            # Remove tone/stress marks for fuzzy matching
+            import re
+            ipa = re.sub(r'[ˈˌːˑ̃ˀ¹²³⁴⁵˥˦˧˨˩↓↑]', '', ipa)
             phones = [p for p in ipa.split() if p]
             ipa_seq.extend(phones)
         except Exception:
