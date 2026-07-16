@@ -135,8 +135,8 @@ class SherpaOnnxASRAdapter(ASRAdapter):
         n = len(pcm) // 2
         samples = struct.unpack(f'<{n}h', pcm)
         float_samples = [s / 32768.0 for s in samples]
-        # Pad 500ms silence at the end to avoid last-token truncation
-        float_samples += [0.0] * int(SAMPLE_RATE * 0.5)
+        # Pad 1000ms silence at the end to avoid last-token truncation
+        float_samples += [0.0] * int(SAMPLE_RATE * 1.0)
 
         stream = self._recognizer.create_stream()
         stream.accept_waveform(SAMPLE_RATE, float_samples)
