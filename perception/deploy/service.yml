@@ -1,14 +1,17 @@
 perception:
   image: __IMAGE__
   container_name: embodied-perception
+  runtime: nvidia
   network_mode: host
   ipc: host
   pid: host
   privileged: true
   volumes:
     - /dev:/dev
-    - /opt/embodied/models:/models
+    - /models:/models
   environment:
+    - NVIDIA_VISIBLE_DEVICES=all
+    - NVIDIA_DRIVER_CAPABILITIES=compute,utility
     - ROS_DOMAIN_ID=42
     - RMW_IMPLEMENTATION=rmw_fastrtps_cpp
     - FASTDDS_BUILTIN_TRANSPORTS=DEFAULT

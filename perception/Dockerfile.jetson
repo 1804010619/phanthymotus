@@ -140,9 +140,18 @@ COPY perception/main.py    /work/main.py
 COPY perception/plugins/   /work/plugins/
 COPY perception/utils/     /work/utils/
 COPY perception/config.yaml /work/config.yaml
+COPY perception/deploy/    /deploy/
+COPY deploy/judgeflow_tts_run.sh /deploy/judgeflow_tts_run.sh
+
+RUN chmod +x /deploy/entrypoint.sh /deploy/judgeflow_tts_run.sh
 
 EXPOSE 15720
 EXPOSE 15721
+
+# NVIDIA container runtime hints (requires --runtime nvidia at docker run)
+ENV NVIDIA_VISIBLE_DEVICES=all \
+    NVIDIA_DRIVER_CAPABILITIES=compute,utility
+LABEL com.nvidia.volumes.needed="nvidia_driver"
 
 # 确保 ROS2 Python 包始终在 PYTHONPATH 中（不依赖 source setup.bash）
 RUN SITE=$(python3 -c "import site; print(site.getsitepackages()[0])") && \
@@ -153,8 +162,4 @@ RUN SITE=$(python3 -c "import site; print(site.getsitepackages()[0])") && \
 ENV LD_LIBRARY_PATH="/usr/lib/aarch64-linux-gnu/nvidia:/usr/lib/aarch64-linux-gnu:/usr/local/cuda/lib64:/ros_ws/install/audio_msgs/lib:/opt/ros/humble/install/lib:${LD_LIBRARY_PATH}"
 ENV AMENT_PREFIX_PATH="/ros_ws/install/audio_msgs:/opt/ros/humble/install"
 
-CMD ["/bin/bash", "-c", \
-    "export LD_PRELOAD=/usr/lib/aarch64-linux-gnu/libgomp.so.1 && \
-     source /opt/ros/humble/install/setup.bash && \
-     source /ros_ws/install/setup.bash && \
-     python3 /work/main.py"]
+ENTRYPOINT ["/deploy/entrypoint.sh"]
