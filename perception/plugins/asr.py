@@ -408,13 +408,6 @@ def _vad_worker(pcm_q: multiprocessing.Queue, result_q: multiprocessing.Queue,
     _log.info(f"[vad-worker] process started (pid={os.getpid()}, backend=sherpa_onnx, kws={kws_enabled})")
     audio_count = 0
 
-    # Pre-buffer: keep raw PCM frames before VAD detects speech.
-    # seg.samples does NOT include pre-speech audio, so we need this.
-    from collections import deque
-    PREBUF_FRAMES = 15  # ~480ms at 32ms/frame
-    prebuf = deque(maxlen=PREBUF_FRAMES)
-    prebuf_prepended = False
-
     while not stop_evt.is_set():
         try:
             pcm, ts = pcm_q.get(timeout=1)
@@ -461,20 +454,11 @@ def _vad_worker(pcm_q: multiprocessing.Queue, result_q: multiprocessing.Queue,
                 vad.pop()
 
         elif state == 'listening':
-            # Maintain prebuf only while VAD has not yet detected speech
-            if not vad.is_speech_detected():
-                prebuf.append(pcm)
-
-            # Collect completed VAD segments (speech that ended)
+            # Collect completed VAD segments
             while not vad.empty():
                 seg = vad.front
                 seg_pcm = _struct.pack(f'<{len(seg.samples)}h',
                                        *[int(max(-32768, min(32767, s * 32768))) for s in seg.samples])
-                # Prepend prebuf before first segment (covers VAD onset delay)
-                if not prebuf_prepended:
-                    for pb_pcm in prebuf:
-                        speech_buf += pb_pcm
-                    prebuf_prepended = True
                 if not start_ts:
                     start_ts = ts
                 speech_buf += seg_pcm
@@ -488,7 +472,6 @@ def _vad_worker(pcm_q: multiprocessing.Queue, result_q: multiprocessing.Queue,
                     speech_buf = b''
                     start_ts = None
                     end_ts = None
-                    prebuf_prepended = False
                     # Return to waiting for wake word (if KWS enabled)
                     if kws_enabled:
                         state = 'waiting_wake'
