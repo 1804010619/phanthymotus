@@ -74,6 +74,8 @@ TOOLS = [
                 "kws_keywords":  {"type": "string", "description": "Wake word (zh: 'f àn sh ì x iǎo g ǒu @范式小狗', en: '▁FA N C Y ▁RO B O T @FANCY_ROBOT')", "scope": "shared", "x-show-when": {"trigger_mode": "kws"}},
                 "vad_threshold": {"type": "number", "description": "VAD speech threshold (0-1, higher = stricter)", "default": 0.5, "scope": "shared"},
                 "vad_silence_ms":{"type": "integer", "description": "Silence duration (ms) before sentence end", "default": 400, "scope": "shared"},
+                "save_vad_segments": {"type": "boolean", "description": "Save VAD segments as WAV files to /tmp/vad_debug/", "default": False, "scope": "shared"},
+                "max_saved_segments": {"type": "integer", "description": "Max saved VAD segments (oldest deleted when exceeded)", "default": 1000, "scope": "shared"},
             },
             "required": []
         },
@@ -352,7 +354,8 @@ def _build_asr_adapter(cfg: dict) -> Optional[ASRAdapter]:
 def _vad_worker(pcm_q: multiprocessing.Queue, result_q: multiprocessing.Queue,
                 stop_evt: multiprocessing.Event,
                 backend: str, threshold: float, silence_ms: int,
-                kws_cfg: dict = None):
+                kws_cfg: dict = None,
+                save_vad_segments: bool = False, max_saved_segments: int = 1000):
     """Runs in a child process — sherpa-onnx ONNX VAD + optional KWS gate.
 
     Pipeline: Audio → VAD → (KWS gate) → utterance output
@@ -465,6 +468,49 @@ def _vad_worker(pcm_q: multiprocessing.Queue, result_q: multiprocessing.Queue,
     _log.info(f"[vad-worker] process started (pid={os.getpid()}, backend=sherpa_onnx, kws={kws_enabled})")
     audio_count = 0
 
+    # VAD segment saving
+    _VAD_SEG_DIR = '/data/vad_segments'
+    _seg_count = [0]
+
+    def _save_segment(float_samples_list, count_ref):
+        """Save float samples as WAV."""
+        try:
+            import wave as _wave, time as _time2
+            os.makedirs(_VAD_SEG_DIR, exist_ok=True)
+            seg_pcm = _struct.pack(f'<{len(float_samples_list)}h',
+                                   *[int(max(-32768, min(32767, s * 32768))) for s in float_samples_list])
+            fname = os.path.join(_VAD_SEG_DIR, f"seg_{int(_time2.time()*1000)}.wav")
+            with _wave.open(fname, 'wb') as wf:
+                wf.setnchannels(1)
+                wf.setsampwidth(2)
+                wf.setframerate(SAMPLE_RATE)
+                wf.writeframes(seg_pcm)
+            # Enforce max segments limit
+            if count_ref[0] >= max_saved_segments:
+                files = sorted(os.listdir(_VAD_SEG_DIR))
+                for old in files[:len(files) - max_saved_segments + 1]:
+                    os.remove(os.path.join(_VAD_SEG_DIR, old))
+        except Exception:
+            pass
+
+    def _save_segment_pcm(pcm_bytes, count_ref):
+        """Save raw PCM bytes as WAV."""
+        try:
+            import wave as _wave, time as _time2
+            os.makedirs(_VAD_SEG_DIR, exist_ok=True)
+            fname = os.path.join(_VAD_SEG_DIR, f"seg_{int(_time2.time()*1000)}.wav")
+            with _wave.open(fname, 'wb') as wf:
+                wf.setnchannels(1)
+                wf.setsampwidth(2)
+                wf.setframerate(SAMPLE_RATE)
+                wf.writeframes(pcm_bytes)
+            if count_ref[0] >= max_saved_segments:
+                files = sorted(os.listdir(_VAD_SEG_DIR))
+                for old in files[:len(files) - max_saved_segments + 1]:
+                    os.remove(os.path.join(_VAD_SEG_DIR, old))
+        except Exception:
+            pass
+
     while not stop_evt.is_set():
         try:
             pcm, ts = pcm_q.get(timeout=1)
@@ -506,24 +552,12 @@ def _vad_worker(pcm_q: multiprocessing.Queue, result_q: multiprocessing.Queue,
                         end_ts = ts
                         # Reset KWS stream for next wake
                         kws_stream = kws_spotter.create_stream()
-            # Drain any completed VAD segments (discard in wake-wait mode, but save debug)
+            # Drain any completed VAD segments (discard in wake-wait mode)
             while not vad.empty():
                 seg = vad.front
-                # Debug: save VAD segment even in waiting_wake mode
-                try:
-                    import wave as _wave, time as _time2
-                    seg_pcm = _struct.pack(f'<{len(seg.samples)}h',
-                                           *[int(max(-32768, min(32767, s * 32768))) for s in seg.samples])
-                    debug_dir = '/tmp/vad_debug'
-                    os.makedirs(debug_dir, exist_ok=True)
-                    fname = os.path.join(debug_dir, f"vad_seg_{int(_time2.time()*1000)}.wav")
-                    with _wave.open(fname, 'wb') as wf:
-                        wf.setnchannels(1)
-                        wf.setsampwidth(2)
-                        wf.setframerate(SAMPLE_RATE)
-                        wf.writeframes(seg_pcm)
-                except Exception:
-                    pass
+                if save_vad_segments:
+                    _save_segment(seg.samples, _seg_count)
+                    _seg_count[0] += 1
                 vad.pop()
 
         elif state == 'listening':
@@ -541,20 +575,9 @@ def _vad_worker(pcm_q: multiprocessing.Queue, result_q: multiprocessing.Queue,
                 # Output the segment as an utterance
                 if len(speech_buf) > SAMPLE_RATE:  # >500ms
                     _log.info(f"[vad-worker] utterance complete, len={len(speech_buf)} bytes")
-                    # Debug: save utterance as WAV file
-                    try:
-                        import wave as _wave, io as _io, time as _time2
-                        debug_dir = '/tmp/vad_debug'
-                        os.makedirs(debug_dir, exist_ok=True)
-                        fname = os.path.join(debug_dir, f"utt_{int(_time2.time()*1000)}.wav")
-                        with _wave.open(fname, 'wb') as wf:
-                            wf.setnchannels(1)
-                            wf.setsampwidth(2)
-                            wf.setframerate(SAMPLE_RATE)
-                            wf.writeframes(speech_buf)
-                        _log.info(f"[vad-worker] saved debug wav: {fname}")
-                    except Exception as e:
-                        _log.warning(f"[vad-worker] failed to save debug wav: {e}")
+                    if save_vad_segments:
+                        _save_segment_pcm(speech_buf, _seg_count)
+                        _seg_count[0] += 1
                     result_q.put((speech_buf, start_ts or ts, end_ts or ts))
                     speech_buf = b''
                     start_ts = None
@@ -571,7 +594,8 @@ def _vad_worker(pcm_q: multiprocessing.Queue, result_q: multiprocessing.Queue,
 class _ASRNode(Node):
     def __init__(self, input_topic: str, adapter: Optional[ASRAdapter], language: str,
                  vad_backend: str = 'sherpa_onnx', vad_threshold: float = SPEECH_THRESH, vad_silence_ms: int = 400,
-                 kws_cfg: dict = None, node_suffix: str = ''):
+                 kws_cfg: dict = None, node_suffix: str = '',
+                 save_vad_segments: bool = False, max_saved_segments: int = 1000):
         node_name = f"asr_{node_suffix}" if node_suffix else "asr"
         super().__init__(node_name)
         self._input_topic  = input_topic
@@ -586,6 +610,8 @@ class _ASRNode(Node):
         self._vad_threshold = vad_threshold
         self._vad_silence_ms = vad_silence_ms
         self._kws_cfg = kws_cfg or {}
+        self._save_vad_segments = save_vad_segments
+        self._max_saved_segments = max_saved_segments
         self._pcm_queue: Optional[multiprocessing.Queue] = None
         self._utterance_queue: Optional[multiprocessing.Queue] = None
         self._vad_stop: Optional[multiprocessing.Event] = None
@@ -612,7 +638,7 @@ class _ASRNode(Node):
             target=_vad_worker,
             args=(self._pcm_queue, self._utterance_queue, self._vad_stop,
                   self._vad_backend, self._vad_threshold, self._vad_silence_ms,
-                  self._kws_cfg),
+                  self._kws_cfg, self._save_vad_segments, self._max_saved_segments),
             daemon=True, name="vad_worker",
         )
         self._vad_proc.start()
@@ -728,6 +754,8 @@ class ASRPlugin:
         self._vad_threshold = float(vad_cfg.get('threshold', SPEECH_THRESH))
         self._vad_silence_ms = int(vad_cfg.get('silence_ms', 400))
         self._kws_cfg      = plugin_cfg.get('kws', {})
+        self._save_vad_segments = False
+        self._max_saved_segments = 1000
         self._nodes: dict[str, _ASRNode] = {}           # key = instance_id
         self._executor = executor
         log.info(f"[asr] plugin init: model={self._asr_model}, vad={self._vad_backend}, threshold={self._vad_threshold}, "
@@ -838,7 +866,9 @@ class ASRPlugin:
                 node = _ASRNode(input_topic, self._adapter, self._language,
                                 self._vad_backend, self._vad_threshold, self._vad_silence_ms,
                                 kws_cfg=self._kws_cfg,
-                                node_suffix=node_key.replace('/', '_').replace('-', '_'))
+                                node_suffix=node_key.replace('/', '_').replace('-', '_'),
+                                save_vad_segments=self._save_vad_segments,
+                                max_saved_segments=self._max_saved_segments)
                 self._executor.add_node(node)
                 self._nodes[node_key] = node
             else:
@@ -850,6 +880,8 @@ class ASRPlugin:
                 node._vad_threshold = self._vad_threshold
                 node._vad_silence_ms = self._vad_silence_ms
                 node._kws_cfg = self._kws_cfg
+                node._save_vad_segments = self._save_vad_segments
+                node._max_saved_segments = self._max_saved_segments
             return self._nodes[node_key].start()
 
         elif action == "stop":
@@ -885,6 +917,10 @@ class ASRPlugin:
                 self._kws_cfg['kws_model'] = cfg['kws_model']
             if 'kws_keywords' in cfg:
                 self._kws_cfg['keywords'] = [cfg['kws_keywords']]
+            if 'save_vad_segments' in cfg:
+                self._save_vad_segments = bool(cfg['save_vad_segments'])
+            if 'max_saved_segments' in cfg:
+                self._max_saved_segments = int(cfg['max_saved_segments'])
             # ASR model switch — load in background if changed
             if 'asr_model' in cfg and cfg['asr_model'] != self._asr_model:
                 # Stop all running nodes first
