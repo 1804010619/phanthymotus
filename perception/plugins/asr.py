@@ -747,14 +747,19 @@ class _ASRNode(Node):
         self._worker_thread = threading.Thread(target=self._worker, daemon=True)
         self._worker_thread.start()
         self.state = "starting"
+        self._worker_ready = threading.Event()
         log.info("[asr] waiting for first audio chunk...")
         # Block until first audio chunk arrives or stop() cancels
         self._first_chunk_event.wait()
         if self._stop_event.is_set():
             self.state = "idle"
             return {"state": "idle"}
+        # Wait for worker to finish initialization (IPA precompute etc.)
+        self._worker_ready.wait()
+        if self.state == "error":
+            return {"state": "error", "message": "ASR worker failed to initialize (check logs)"}
         self.state = "running"
-        log.info("[asr] started, waiting for audio data...")
+        log.info("[asr] started, receiving audio data")
         return self._status_dict()
 
     def stop(self) -> dict:
@@ -762,9 +767,11 @@ class _ASRNode(Node):
         if self._sub:
             self.destroy_subscription(self._sub); self._sub = None
         self._stop_event.set()
-        # Unblock start() if it's waiting for first chunk
+        # Unblock start() if it's waiting
         if hasattr(self, '_first_chunk_event'):
             self._first_chunk_event.set()
+        if hasattr(self, '_worker_ready'):
+            self._worker_ready.set()
         if self._vad_stop:
             self._vad_stop.set()
         # Cancel feeder threads immediately — avoids BrokenPipeError spam
@@ -817,6 +824,8 @@ class _ASRNode(Node):
         except Exception as e:
             log.error(f"[asr] worker fatal error: {e}", exc_info=True)
             self.state = "error"
+            if hasattr(self, '_worker_ready'):
+                self._worker_ready.set()
 
     def _worker_inner(self):
         # Pre-compute keyword IPA if in asr_kws mode
@@ -831,6 +840,10 @@ class _ASRNode(Node):
             else:
                 log.warning("[asr] asr_kws mode but no keyword configured, falling back to vad mode")
                 trigger_mode = 'vad'
+
+        # Signal that worker init is complete
+        if hasattr(self, '_worker_ready'):
+            self._worker_ready.set()
 
         while not self._stop_event.is_set():
             try:
