@@ -699,7 +699,15 @@ class _ASRNode(Node):
         if self.state == "running":
             return self._status_dict()
         if not self._adapter:
-            raise RuntimeError("ASR adapter not configured")
+            return {"state": "error", "message": "ASR adapter not configured"}
+        try:
+            return self._start_inner()
+        except Exception as e:
+            log.error(f"[asr] start failed: {e}", exc_info=True)
+            self.state = "error"
+            return {"state": "error", "message": str(e)}
+
+    def _start_inner(self) -> dict:
         from audio_msgs.msg import AudioChunk
         log.info(f"[asr] subscribing to topic={self._input_topic}, publishing to={self._output_topic}")
         self._first_chunk_event = threading.Event()
@@ -787,6 +795,13 @@ class _ASRNode(Node):
             pass  # drop if severely behind
 
     def _worker(self):
+        try:
+            self._worker_inner()
+        except Exception as e:
+            log.error(f"[asr] worker fatal error: {e}", exc_info=True)
+            self.state = "error"
+
+    def _worker_inner(self):
         # Pre-compute keyword IPA if in asr_kws mode
         trigger_mode = self._kws_cfg.get('trigger_mode', 'kws')
         keyword_ipa = None
@@ -794,12 +809,7 @@ class _ASRNode(Node):
         if trigger_mode == 'asr_kws':
             kw_text = self._kws_cfg.get('asr_kws_keyword', '')
             if kw_text:
-                try:
-                    keyword_ipa = _text_to_ipa(kw_text)
-                except Exception as e:
-                    log.error(f"[asr] asr_kws: failed to compute IPA for keyword '{kw_text}': {e}")
-                    self.state = "error"
-                    return
+                keyword_ipa = _text_to_ipa(kw_text)
                 log.info(f"[asr] asr_kws mode: keyword='{kw_text}' ipa={keyword_ipa} threshold={asr_kws_threshold}")
             else:
                 log.warning("[asr] asr_kws mode but no keyword configured, falling back to vad mode")
