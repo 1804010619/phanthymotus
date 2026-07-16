@@ -1368,6 +1368,7 @@ async function _startProject() {
       if (startResult && startResult.code !== 200) {
         updateItem(i, 'error', startResult.message || '启动失败');
         _logActivity('error', `${card.toolName} 启动失败: ${startResult.message || '未知错误'}`);
+        if (!aborted) { aborted = true; modal.onCancel?.(); }
         return;
       }
       // Auto-start mic stream for remote_mic card
@@ -1395,7 +1396,11 @@ async function _startProject() {
       }
       updateItem(i, 'ready');
     } catch (e) {
-      if (!aborted) updateItem(i, 'error', e.message || '异常');
+      if (!aborted) {
+        updateItem(i, 'error', e.message || '异常');
+        aborted = true;
+        modal.onCancel?.();
+      }
     }
   });
 
@@ -1409,14 +1414,14 @@ async function _startProject() {
     cancelBtn.textContent = '关闭';
     cancelBtn.onclick = close;
     modal.onCancel = null;
+    // Persist layout and running state
+    await _saveLayout();
+    fetch('/api/config/project-running', {
+      method: 'PUT', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({running: true}),
+    });
+    _logActivity('project', '智能控制已开启');
   }
-  // Persist layout and running state
-  await _saveLayout();
-  fetch('/api/config/project-running', {
-    method: 'PUT', headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({running: true}),
-  });
-  _logActivity('project', '智能控制已开启');
 }
 
 function _stopProject() {

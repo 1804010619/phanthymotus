@@ -555,10 +555,12 @@ class _ASRNode(Node):
         self._worker_thread = threading.Thread(target=self._worker, daemon=True)
         self._worker_thread.start()
         self.state = "starting"
-        log.info("[asr] waiting for first audio chunk (up to 30s)...")
-        # Block until first audio chunk arrives or timeout
-        if not self._first_chunk_event.wait(timeout=30):
-            log.warning("[asr] timeout waiting for first audio chunk — proceeding anyway")
+        log.info("[asr] waiting for first audio chunk...")
+        # Block until first audio chunk arrives (or stop() is called via cancel)
+        self._first_chunk_event.wait()
+        if self._stop_event.is_set():
+            log.info("[asr] start cancelled by stop()")
+            return {"state": "idle"}
         self.state = "running"
         log.info("[asr] started, receiving audio data")
         return self._status_dict()
