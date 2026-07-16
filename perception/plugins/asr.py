@@ -483,10 +483,8 @@ def _vad_worker(pcm_q: multiprocessing.Queue, result_q: multiprocessing.Queue,
             # Collect completed VAD segments
             while not vad.empty():
                 seg = vad.front
-                # Apply AGC gain to segment for ASR
-                seg_agc = [max(-1.0, min(1.0, s * _agc_gain[0])) for s in seg.samples]
-                seg_pcm = _struct.pack(f'<{len(seg_agc)}h',
-                                       *[int(max(-32768, min(32767, s * 32768))) for s in seg_agc])
+                seg_pcm = _struct.pack(f'<{len(seg.samples)}h',
+                                       *[int(max(-32768, min(32767, s * 32768))) for s in seg.samples])
                 if not start_ts:
                     start_ts = ts
                 speech_buf += seg_pcm
