@@ -133,40 +133,19 @@ def _phoneme_sub_cost(a: str, b: str) -> float:
 
 
 def _find_keyword_in_ipa(text_ipa: list, keyword_ipa: list, threshold: float):
-    """Sliding window search for keyword in text IPA. Returns (matched, end_position).
-    Also handles case where ASR truncated the beginning of the keyword.
-    """
+    """Sliding window search for keyword in text IPA. Returns (matched, end_position)."""
     kw_len = len(keyword_ipa)
-    if kw_len == 0:
+    if kw_len == 0 or len(text_ipa) < kw_len:
         return False, -1
 
     best_dist = float('inf')
     best_end = -1
-
-    # Standard sliding window (text >= keyword length)
-    for i in range(max(1, len(text_ipa) - kw_len + 1)):
+    for i in range(len(text_ipa) - kw_len + 1):
         window = text_ipa[i:i + kw_len]
-        if len(window) < kw_len:
-            break
         dist = _phoneme_edit_distance(window, keyword_ipa)
         if dist < best_dist:
             best_dist = dist
             best_end = i + kw_len
-
-    # Handle truncated keyword: match keyword suffix against text prefix
-    # e.g. keyword="范式小狗" but ASR only got "小狗你好"
-    if len(text_ipa) < kw_len:
-        # Try matching text prefix against keyword suffix of same length
-        for trim in range(1, kw_len):
-            kw_suffix = keyword_ipa[trim:]
-            text_prefix = text_ipa[:len(kw_suffix)]
-            if len(text_prefix) < len(kw_suffix):
-                continue
-            dist = _phoneme_edit_distance(text_prefix, kw_suffix)
-            if dist < best_dist:
-                best_dist = dist
-                best_end = len(kw_suffix)
-
     return best_dist <= threshold, best_end
 
 
