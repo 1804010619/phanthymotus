@@ -31,10 +31,10 @@ SILENCE_THRESH = 0.35
 SILENCE_FRAMES = 16
 
 _LOW_LAT_QOS = QoSProfile(
-    reliability=ReliabilityPolicy.RELIABLE,
+    reliability=ReliabilityPolicy.BEST_EFFORT,
     history=HistoryPolicy.KEEP_LAST,
     depth=50,
-    durability=DurabilityPolicy.TRANSIENT_LOCAL,
+    durability=DurabilityPolicy.VOLATILE,
 )
 
 _ASR_PUB_QOS = QoSProfile(
