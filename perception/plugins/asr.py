@@ -751,13 +751,10 @@ class ASRPlugin:
 
         elif action == "start":
             if self._loading:
-                # Wait for model to finish loading (up to 60s)
+                # Wait for model to finish loading
                 import time as _time
-                deadline = _time.time() + 60
-                while self._loading and _time.time() < deadline:
+                while self._loading:
                     _time.sleep(0.5)
-                if self._loading:
-                    return {"state": "loading", "message": "Model is still downloading, please wait..."}
             if self._load_error:
                 return {"state": "error", "message": f"Model failed to load: {self._load_error}"}
             if not self._adapter:
