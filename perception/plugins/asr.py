@@ -150,17 +150,21 @@ def _find_keyword_in_ipa(text_ipa: list, keyword_ipa: list, threshold: float):
 
 
 def _extract_after_keyword(text: str, keyword_ipa: list, end_pos: int) -> str:
-    """Extract text characters after the matched keyword position."""
-    # Map IPA positions back to character positions
-    char_pos = 0
+    """Extract text after the matched keyword position.
+    end_pos is the IPA phoneme index where keyword ends.
+    Maps back to character position by counting phoneme-producing chars.
+    """
     ipa_count = 0
-    for char in text:
+    for i, char in enumerate(text):
         if '\u4e00' <= char <= '\u9fff' or char.isalpha() or '\u3040' <= char <= '\u30ff' or '\uac00' <= char <= '\ud7af':
             ipa_count += 1
         if ipa_count >= end_pos:
-            char_pos = text.index(char) + 1
-            break
-    return text[char_pos:].strip() if char_pos > 0 else ''
+            # Return everything after this character, stripping punctuation prefix
+            remaining = text[i + 1:]
+            # Strip leading punctuation/spaces
+            remaining = remaining.lstrip('，。！？、；：,.!?;: ')
+            return remaining
+    return ''
 
 _ASR_PUB_QOS = QoSProfile(
     reliability=ReliabilityPolicy.BEST_EFFORT,
