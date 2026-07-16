@@ -37,6 +37,79 @@ _LOW_LAT_QOS = QoSProfile(
     durability=DurabilityPolicy.VOLATILE,
 )
 
+
+# ── IPA phoneme matching for asr_kws mode ────────────────────────────────────
+
+_epi_cache = {}
+
+def _get_epi(lang: str):
+    if lang not in _epi_cache:
+        import epitran
+        _epi_cache[lang] = epitran.Epitran(lang)
+    return _epi_cache[lang]
+
+
+def _text_to_ipa(text: str) -> list:
+    """Convert text to IPA phoneme sequence. Auto-detects language per character."""
+    ipa_seq = []
+    for char in text:
+        if '\u4e00' <= char <= '\u9fff':
+            ipa_seq.append(_get_epi('cmn-Hani').transliterate(char))
+        elif '\u3040' <= char <= '\u309f' or '\u30a0' <= char <= '\u30ff':
+            ipa_seq.append(_get_epi('jpn-Hrgn').transliterate(char))
+        elif '\uac00' <= char <= '\ud7af':
+            ipa_seq.append(_get_epi('kor-Hang').transliterate(char))
+        elif char.isalpha():
+            ipa_seq.append(_get_epi('eng-Latn').transliterate(char))
+    return [s for s in ipa_seq if s]
+
+
+def _phoneme_edit_distance(seq1: list, seq2: list) -> float:
+    """Normalized edit distance between two phoneme sequences (0=match, 1=different)."""
+    m, n = len(seq1), len(seq2)
+    if m == 0 or n == 0:
+        return 1.0
+    dp = [[0] * (n + 1) for _ in range(m + 1)]
+    for i in range(m + 1):
+        dp[i][0] = i
+    for j in range(n + 1):
+        dp[0][j] = j
+    for i in range(1, m + 1):
+        for j in range(1, n + 1):
+            cost = 0 if seq1[i - 1] == seq2[j - 1] else 1
+            dp[i][j] = min(dp[i - 1][j] + 1, dp[i][j - 1] + 1, dp[i - 1][j - 1] + cost)
+    return dp[m][n] / max(m, n)
+
+
+def _find_keyword_in_ipa(text_ipa: list, keyword_ipa: list, threshold: float):
+    """Sliding window search for keyword in text IPA. Returns (matched, end_position)."""
+    kw_len = len(keyword_ipa)
+    if kw_len == 0 or len(text_ipa) < kw_len:
+        return False, -1
+    best_dist = float('inf')
+    best_end = -1
+    for i in range(len(text_ipa) - kw_len + 1):
+        window = text_ipa[i:i + kw_len]
+        dist = _phoneme_edit_distance(window, keyword_ipa)
+        if dist < best_dist:
+            best_dist = dist
+            best_end = i + kw_len
+    return best_dist <= threshold, best_end
+
+
+def _extract_after_keyword(text: str, keyword_ipa: list, end_pos: int) -> str:
+    """Extract text characters after the matched keyword position."""
+    # Map IPA positions back to character positions
+    char_pos = 0
+    ipa_count = 0
+    for char in text:
+        if '\u4e00' <= char <= '\u9fff' or char.isalpha() or '\u3040' <= char <= '\u30ff' or '\uac00' <= char <= '\ud7af':
+            ipa_count += 1
+        if ipa_count >= end_pos:
+            char_pos = text.index(char) + 1
+            break
+    return text[char_pos:].strip() if char_pos > 0 else ''
+
 _ASR_PUB_QOS = QoSProfile(
     reliability=ReliabilityPolicy.BEST_EFFORT,
     history=HistoryPolicy.KEEP_LAST,
@@ -69,9 +142,11 @@ TOOLS = [
             "type": "object",
             "properties": {
                 "asr_model":     {"type": "string", "enum": ["paraformer-zh-en", "paraformer-offline", "zipformer-en", "sensevoice-small"], "description": "ASR model (paraformer-zh-en = bilingual streaming, paraformer-offline = bilingual offline, zipformer-en = English streaming, sensevoice-small = multilingual offline)", "default": "sensevoice-small", "scope": "shared"},
-                "trigger_mode":  {"type": "string", "enum": ["vad", "kws"], "description": "Trigger mode (vad = always listen, kws = wake word first)", "default": "kws", "scope": "shared"},
+                "trigger_mode":  {"type": "string", "enum": ["vad", "kws", "asr_kws"], "description": "Trigger mode (vad = always listen, kws = KWS model, asr_kws = ASR + phoneme matching)", "default": "kws", "scope": "shared"},
                 "kws_model":     {"type": "string", "enum": ["zh", "en", "zh-en"], "description": "KWS 模型 (zh=纯中文, en=纯英文, zh-en=双语)", "default": "zh", "scope": "shared", "x-show-when": {"trigger_mode": "kws"}},
                 "kws_keywords":  {"type": "string", "description": "Wake word (zh: 'f àn sh ì x iǎo g ǒu @范式小狗', en: '▁FA N C Y ▁RO B O T @FANCY_ROBOT')", "scope": "shared", "x-show-when": {"trigger_mode": "kws"}},
+                "asr_kws_keyword": {"type": "string", "description": "唤醒词文本（如'范式小狗'、'hello robot'）", "scope": "shared", "x-show-when": {"trigger_mode": "asr_kws"}},
+                "asr_kws_threshold": {"type": "number", "description": "音素匹配阈值（0-1，越小越严格，推荐0.3）", "default": 0.3, "scope": "shared", "x-show-when": {"trigger_mode": "asr_kws"}},
                 "vad_threshold": {"type": "number", "description": "VAD speech threshold (0-1, higher = stricter)", "default": 0.5, "scope": "shared"},
                 "vad_silence_ms":{"type": "integer", "description": "Silence duration (ms) before sentence end", "default": 400, "scope": "shared"},
                 "save_vad_segments": {"type": "boolean", "description": "Save VAD segments as WAV to /opt/embodied/models/vad_segments/", "default": False, "scope": "shared"},
@@ -712,6 +787,19 @@ class _ASRNode(Node):
             pass  # drop if severely behind
 
     def _worker(self):
+        # Pre-compute keyword IPA if in asr_kws mode
+        trigger_mode = self._kws_cfg.get('trigger_mode', 'kws')
+        keyword_ipa = None
+        asr_kws_threshold = float(self._kws_cfg.get('asr_kws_threshold', 0.3))
+        if trigger_mode == 'asr_kws':
+            kw_text = self._kws_cfg.get('asr_kws_keyword', '')
+            if kw_text:
+                keyword_ipa = _text_to_ipa(kw_text)
+                log.info(f"[asr] asr_kws mode: keyword='{kw_text}' ipa={keyword_ipa} threshold={asr_kws_threshold}")
+            else:
+                log.warning("[asr] asr_kws mode but no keyword configured, falling back to vad mode")
+                trigger_mode = 'vad'
+
         while not self._stop_event.is_set():
             try:
                 utterance, start_ts, end_ts = self._utterance_queue.get(timeout=1)
@@ -721,6 +809,21 @@ class _ASRNode(Node):
                 wav   = _pcm16_to_wav(utterance)
                 text  = self._adapter.transcribe(wav, self._language)
                 if not text.strip(): continue
+
+                # ASR-based keyword spotting
+                if trigger_mode == 'asr_kws' and keyword_ipa:
+                    text_ipa = _text_to_ipa(text)
+                    matched, end_pos = _find_keyword_in_ipa(text_ipa, keyword_ipa, asr_kws_threshold)
+                    if not matched:
+                        log.debug(f"[asr] asr_kws: no match in '{text}'")
+                        continue
+                    # Extract text after keyword
+                    remaining = _extract_after_keyword(text, keyword_ipa, end_pos)
+                    log.info(f"[asr] asr_kws TRIGGERED: '{text}' → '{remaining}'")
+                    if not remaining.strip():
+                        continue
+                    text = remaining
+
                 result = {"text": text, "audio_start_ts": start_ts,
                           "audio_end_ts": end_ts, "asr_complete_ts": time.time()}
                 msg = String(); msg.data = json.dumps(result, ensure_ascii=False)
@@ -917,6 +1020,10 @@ class ASRPlugin:
                 self._kws_cfg['kws_model'] = cfg['kws_model']
             if 'kws_keywords' in cfg:
                 self._kws_cfg['keywords'] = [cfg['kws_keywords']]
+            if 'asr_kws_keyword' in cfg:
+                self._kws_cfg['asr_kws_keyword'] = cfg['asr_kws_keyword']
+            if 'asr_kws_threshold' in cfg:
+                self._kws_cfg['asr_kws_threshold'] = float(cfg['asr_kws_threshold'])
             if 'save_vad_segments' in cfg:
                 self._save_vad_segments = bool(cfg['save_vad_segments'])
             if 'max_saved_segments' in cfg:

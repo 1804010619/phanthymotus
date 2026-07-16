@@ -22,6 +22,8 @@ RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} \
     ultralytics
 RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} \
     sherpa-onnx
+RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} \
+    epitran
 
 # Override base image RMW (some ros-base tags ship cyclonedds by default)
 ENV RMW_IMPLEMENTATION=rmw_fastrtps_cpp
