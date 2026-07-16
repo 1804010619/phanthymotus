@@ -25,7 +25,7 @@ cd "$TRT_ROOT"
 TRT_PID=$!
 
 for _ in $(seq 1 120); do
-    if curl -fsS "http://127.0.0.1:${TRT_PORT}/ready" | grep -q True; then
+    if curl -fsS "http://127.0.0.1:${TRT_PORT}/ready" 2>/dev/null | grep -q True; then
         break
     fi
     if ! kill -0 "$TRT_PID" >/dev/null 2>&1; then

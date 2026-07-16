@@ -112,6 +112,7 @@ async def lifespan(_: FastAPI):
     warmup_bytes = 0
     for text in (
         "你好。",
+        "周末我拍了一张selfie发给朋友。",
         "Lucy今天去公园散步并喝coffee，David开会前仔细检查PPT。",
     ):
         case_bytes = 0
