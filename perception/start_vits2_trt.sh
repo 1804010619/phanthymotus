@@ -1,7 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-TRT_PORT=${VITS2_TRT_PORT:-18080}
+MCP_PORT=${MCP_PORT:-15720}
+TRT_PORT=${VITS2_TRT_PORT:-$((MCP_PORT + 10000))}
+if ((TRT_PORT < 1 || TRT_PORT > 65535)); then
+    echo "Invalid VITS2 TensorRT port: ${TRT_PORT}" >&2
+    exit 2
+fi
 TRT_ROOT=/work/plugins/vits2_tts_trt/runtime
 TRT_PID=""
 MAIN_PID=""
