@@ -526,6 +526,7 @@ class _ASRNode(Node):
         self._vad_proc: Optional[multiprocessing.Process] = None
         self._worker_thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
+        self._first_chunk_event = threading.Event()
 
     def start(self) -> dict:
         if self.state == "running":
@@ -534,6 +535,7 @@ class _ASRNode(Node):
             raise RuntimeError("ASR adapter not configured")
         from audio_msgs.msg import AudioChunk
         log.info(f"[asr] subscribing to topic={self._input_topic}, publishing to={self._output_topic}")
+        self._first_chunk_event = threading.Event()
         self._sub = self.create_subscription(AudioChunk, self._input_topic, self._audio_cb, _LOW_LAT_QOS)
         self._stop_event.clear()
         # Start VAD in a child process
@@ -552,8 +554,13 @@ class _ASRNode(Node):
         # Transcription worker thread (reads from utterance_queue)
         self._worker_thread = threading.Thread(target=self._worker, daemon=True)
         self._worker_thread.start()
+        self.state = "starting"
+        log.info("[asr] waiting for first audio chunk (up to 30s)...")
+        # Block until first audio chunk arrives or timeout
+        if not self._first_chunk_event.wait(timeout=30):
+            log.warning("[asr] timeout waiting for first audio chunk — proceeding anyway")
         self.state = "running"
-        log.info("[asr] started, waiting for audio data...")
+        log.info("[asr] started, receiving audio data")
         return self._status_dict()
 
     def stop(self) -> dict:
@@ -561,6 +568,9 @@ class _ASRNode(Node):
         if self._sub:
             self.destroy_subscription(self._sub); self._sub = None
         self._stop_event.set()
+        # Unblock start() if it's waiting for first chunk
+        if hasattr(self, '_first_chunk_event'):
+            self._first_chunk_event.set()
         if self._vad_stop:
             self._vad_stop.set()
         # Cancel feeder threads immediately — avoids BrokenPipeError spam
@@ -583,6 +593,9 @@ class _ASRNode(Node):
     def _audio_cb(self, msg):
         if self._stop_event.is_set():
             return
+        # Signal first chunk arrival to unblock start()
+        if not self._first_chunk_event.is_set():
+            self._first_chunk_event.set()
         # Detect dead VAD subprocess to avoid BrokenPipeError in queue feeder
         if self._vad_proc and not self._vad_proc.is_alive():
             log.warning(f"[asr] VAD worker died (exitcode={self._vad_proc.exitcode}), stopping ASR")
