@@ -79,6 +79,9 @@ ENV YOLO_CONFIG_DIR=/work
 # ── sherpa-onnx (on-device ASR/TTS/KWS) ──────────────────────────
 RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} sherpa-onnx
 
+# ── epitran (IPA phoneme conversion for asr_kws mode) ────────────
+RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} epitran
+
 # ── Application code ───────────────────────────────────────────────
 WORKDIR /work
 COPY perception/main.py    /work/main.py
