@@ -554,6 +554,13 @@ class _ASRNode(Node):
         # Transcription worker thread (reads from utterance_queue)
         self._worker_thread = threading.Thread(target=self._worker, daemon=True)
         self._worker_thread.start()
+        self.state = "starting"
+        log.info("[asr] waiting for first audio chunk...")
+        # Block until first audio chunk arrives or stop() cancels
+        self._first_chunk_event.wait()
+        if self._stop_event.is_set():
+            self.state = "idle"
+            return {"state": "idle"}
         self.state = "running"
         log.info("[asr] started, waiting for audio data...")
         return self._status_dict()
