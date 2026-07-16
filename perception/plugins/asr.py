@@ -460,21 +460,21 @@ def _vad_worker(pcm_q: multiprocessing.Queue, result_q: multiprocessing.Queue,
         denoised = denoiser.run(float_samples, SAMPLE_RATE)
         float_samples = list(denoised.samples)
 
-        # AGC: normalize RMS to consistent level regardless of distance
+        # Feed VAD with denoised signal (no AGC — AGC would distort VAD energy detection)
+        vad.accept_waveform(float_samples)
+
+        # AGC: normalize RMS for KWS/ASR (applied after VAD, before KWS)
         rms = (sum(s * s for s in float_samples) / max(len(float_samples), 1)) ** 0.5
         if rms > 1e-6:
             desired_gain = _agc_target / rms
             desired_gain = min(desired_gain, _AGC_MAX_GAIN)
             _agc_gain[0] += _AGC_SMOOTHING * (desired_gain - _agc_gain[0])
-        float_samples = [max(-1.0, min(1.0, s * _agc_gain[0])) for s in float_samples]
-
-        # Feed VAD
-        vad.accept_waveform(float_samples)
+        agc_samples = [max(-1.0, min(1.0, s * _agc_gain[0])) for s in float_samples]
 
         if state == 'waiting_wake':
-            # Feed KWS continuously (not gated by VAD) to avoid missing wake word onset
+            # Feed KWS with AGC-normalized audio for better detection at distance
             if kws_spotter:
-                kws_stream.accept_waveform(SAMPLE_RATE, float_samples)
+                kws_stream.accept_waveform(SAMPLE_RATE, agc_samples)
                 while kws_spotter.is_ready(kws_stream):
                     kws_spotter.decode_stream(kws_stream)
                 result = kws_spotter.get_result(kws_stream)
@@ -515,8 +515,10 @@ def _vad_worker(pcm_q: multiprocessing.Queue, result_q: multiprocessing.Queue,
             # Collect completed VAD segments
             while not vad.empty():
                 seg = vad.front
-                seg_pcm = _struct.pack(f'<{len(seg.samples)}h',
-                                       *[int(max(-32768, min(32767, s * 32768))) for s in seg.samples])
+                # Apply AGC gain to segment for ASR
+                seg_agc = [max(-1.0, min(1.0, s * _agc_gain[0])) for s in seg.samples]
+                seg_pcm = _struct.pack(f'<{len(seg_agc)}h',
+                                       *[int(max(-32768, min(32767, s * 32768))) for s in seg_agc])
                 if not start_ts:
                     start_ts = ts
                 speech_buf += seg_pcm
