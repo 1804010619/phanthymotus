@@ -794,7 +794,12 @@ class _ASRNode(Node):
         if trigger_mode == 'asr_kws':
             kw_text = self._kws_cfg.get('asr_kws_keyword', '')
             if kw_text:
-                keyword_ipa = _text_to_ipa(kw_text)
+                try:
+                    keyword_ipa = _text_to_ipa(kw_text)
+                except Exception as e:
+                    log.error(f"[asr] asr_kws: failed to compute IPA for keyword '{kw_text}': {e}")
+                    self.state = "error"
+                    return
                 log.info(f"[asr] asr_kws mode: keyword='{kw_text}' ipa={keyword_ipa} threshold={asr_kws_threshold}")
             else:
                 log.warning("[asr] asr_kws mode but no keyword configured, falling back to vad mode")
