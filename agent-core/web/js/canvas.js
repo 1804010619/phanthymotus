@@ -1409,6 +1409,9 @@ async function _startProject() {
     // Re-resolve topics after all starts complete
     _resolveAllTopics();
     _redrawConnections();
+    // Ensure button shows running state
+    _syncProjectBtn();
+    document.querySelectorAll('.canvas-exec-btn').forEach(btn => btn.classList.remove('locked'));
     // Update cancel button to close button
     const cancelBtn = modal.querySelector('.startup-cancel-btn');
     cancelBtn.textContent = '关闭';
