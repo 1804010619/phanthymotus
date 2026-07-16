@@ -40,28 +40,43 @@ _LOW_LAT_QOS = QoSProfile(
 
 # ── IPA phoneme matching for asr_kws mode ────────────────────────────────────
 
-_epi_cache = {}
-
-def _get_epi(lang: str):
-    if lang not in _epi_cache:
-        import epitran
-        _epi_cache[lang] = epitran.Epitran(lang)
-    return _epi_cache[lang]
-
-
 def _text_to_ipa(text: str) -> list:
-    """Convert text to IPA phoneme sequence. Auto-detects language per character."""
-    ipa_seq = []
+    """Convert text to IPA phoneme sequence using phonemizer (espeak-ng backend).
+    Returns a list of IPA phoneme strings (one per word/character).
+    """
+    from phonemizer import phonemize
+    from phonemizer.separator import Separator
+
+    # Separate Chinese and non-Chinese segments
+    segments = []
+    current = ''
+    current_is_cjk = None
     for char in text:
-        if '\u4e00' <= char <= '\u9fff':
-            ipa_seq.append(_get_epi('cmn-Hani').transliterate(char))
-        elif '\u3040' <= char <= '\u309f' or '\u30a0' <= char <= '\u30ff':
-            ipa_seq.append(_get_epi('jpn-Hrgn').transliterate(char))
-        elif '\uac00' <= char <= '\ud7af':
-            ipa_seq.append(_get_epi('kor-Hang').transliterate(char))
-        elif char.isalpha():
-            ipa_seq.append(_get_epi('eng-Latn').transliterate(char))
-    return [s for s in ipa_seq if s]
+        is_cjk = '\u4e00' <= char <= '\u9fff'
+        if current_is_cjk is None:
+            current_is_cjk = is_cjk
+        if is_cjk != current_is_cjk:
+            if current.strip():
+                segments.append((current.strip(), current_is_cjk))
+            current = ''
+            current_is_cjk = is_cjk
+        current += char
+    if current.strip():
+        segments.append((current.strip(), current_is_cjk))
+
+    ipa_seq = []
+    sep = Separator(phone=' ', word=' ', syllable='')
+    for seg_text, is_cjk in segments:
+        lang = 'cmn' if is_cjk else 'en-us'
+        try:
+            ipa = phonemize(seg_text, language=lang, backend='espeak',
+                           separator=sep, strip=True, language_switch='remove-flags')
+            phones = [p for p in ipa.split() if p]
+            ipa_seq.extend(phones)
+        except Exception:
+            # Fallback: use characters as-is
+            ipa_seq.extend(list(seg_text))
+    return ipa_seq
 
 
 def _phoneme_edit_distance(seq1: list, seq2: list) -> float:

@@ -79,8 +79,10 @@ ENV YOLO_CONFIG_DIR=/work
 # ── sherpa-onnx (on-device ASR/TTS/KWS) ──────────────────────────
 RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} sherpa-onnx
 
-# ── pypinyin (Chinese text to pinyin for asr_kws phoneme matching) ─
-RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} epitran importlib-resources
+# ── phonemizer (multilingual IPA via espeak-ng for asr_kws mode) ──
+RUN apt-get update && apt-get install -y --no-install-recommends espeak-ng && \
+    rm -rf /var/lib/apt/lists/*
+RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} phonemizer
 
 # ── Application code ───────────────────────────────────────────────
 WORKDIR /work
