@@ -74,7 +74,7 @@ TOOLS = [
                 "kws_keywords":  {"type": "string", "description": "Wake word (zh: 'f àn sh ì x iǎo g ǒu @范式小狗', en: '▁FA N C Y ▁RO B O T @FANCY_ROBOT')", "scope": "shared", "x-show-when": {"trigger_mode": "kws"}},
                 "vad_threshold": {"type": "number", "description": "VAD speech threshold (0-1, higher = stricter)", "default": 0.5, "scope": "shared"},
                 "vad_silence_ms":{"type": "integer", "description": "Silence duration (ms) before sentence end", "default": 400, "scope": "shared"},
-                "save_vad_segments": {"type": "boolean", "description": "Save VAD segments as WAV files to /tmp/vad_debug/", "default": False, "scope": "shared"},
+                "save_vad_segments": {"type": "boolean", "description": "Save VAD segments as WAV to /opt/embodied/models/vad_segments/", "default": False, "scope": "shared"},
                 "max_saved_segments": {"type": "integer", "description": "Max saved VAD segments (oldest deleted when exceeded)", "default": 1000, "scope": "shared"},
             },
             "required": []
@@ -469,7 +469,7 @@ def _vad_worker(pcm_q: multiprocessing.Queue, result_q: multiprocessing.Queue,
     audio_count = 0
 
     # VAD segment saving
-    _VAD_SEG_DIR = '/data/vad_segments'
+    _VAD_SEG_DIR = '/models/vad_segments'
     _seg_count = [0]
 
     def _save_segment(float_samples_list, count_ref):
