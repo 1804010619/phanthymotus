@@ -340,20 +340,6 @@ def _vad_worker(pcm_q: multiprocessing.Queue, result_q: multiprocessing.Queue,
     vad = sherpa_onnx.VoiceActivityDetector(vad_config, buffer_size_in_seconds=30)
     _log.info(f"[vad-worker] sherpa-onnx VAD initialized (threshold={threshold}, silence_ms={silence_ms})")
 
-    # ── Initialize GTCRN denoiser ──
-    denoise_model_dir = '/models/sherpa-onnx/denoise'
-    ensure_model("denoise", denoise_model_dir)
-    denoise_model_path = os.path.join(denoise_model_dir, "gtcrn_simple.onnx")
-    denoiser = sherpa_onnx.OnlineSpeechDenoiser(
-        sherpa_onnx.OnlineSpeechDenoiserConfig(
-            model=sherpa_onnx.OfflineSpeechDenoiserModelConfig(
-                gtcrn=sherpa_onnx.OfflineSpeechDenoiserGtcrnModelConfig(model=denoise_model_path),
-                num_threads=1, provider="cpu",
-            )
-        )
-    )
-    _log.info("[vad-worker] GTCRN denoiser initialized")
-
     # ── Initialize KWS (optional) ──
     kws_spotter = None
     kws_stream = None
@@ -432,12 +418,6 @@ def _vad_worker(pcm_q: multiprocessing.Queue, result_q: multiprocessing.Queue,
     _log.info(f"[vad-worker] process started (pid={os.getpid()}, backend=sherpa_onnx, kws={kws_enabled})")
     audio_count = 0
 
-    # AGC (Automatic Gain Control) parameters
-    _agc_target = 2000.0 / 32768.0   # target RMS (~6% full scale, typical speech level)
-    _AGC_MAX_GAIN = 20.0             # max amplification to prevent noise blowup
-    _AGC_SMOOTHING = 0.3             # gain smoothing (0-1, lower = smoother transitions)
-    _agc_gain = [1.0]                # mutable container for current gain
-
     while not stop_evt.is_set():
         try:
             pcm, ts = pcm_q.get(timeout=1)
@@ -456,25 +436,13 @@ def _vad_worker(pcm_q: multiprocessing.Queue, result_q: multiprocessing.Queue,
         samples = _struct.unpack(f'<{n}h', pcm)
         float_samples = [s / 32768.0 for s in samples]
 
-        # Denoise before VAD/KWS
-        denoised = denoiser.run(float_samples, SAMPLE_RATE)
-        float_samples = list(denoised.samples)
-
-        # Feed VAD with denoised signal (no AGC — AGC would distort VAD energy detection)
+        # Feed VAD
         vad.accept_waveform(float_samples)
-
-        # AGC: normalize RMS for KWS/ASR (applied after VAD, before KWS)
-        rms = (sum(s * s for s in float_samples) / max(len(float_samples), 1)) ** 0.5
-        if rms > 1e-6:
-            desired_gain = _agc_target / rms
-            desired_gain = min(desired_gain, _AGC_MAX_GAIN)
-            _agc_gain[0] += _AGC_SMOOTHING * (desired_gain - _agc_gain[0])
-        agc_samples = [max(-1.0, min(1.0, s * _agc_gain[0])) for s in float_samples]
 
         if state == 'waiting_wake':
             # Feed KWS with AGC-normalized audio for better detection at distance
             if kws_spotter:
-                kws_stream.accept_waveform(SAMPLE_RATE, agc_samples)
+                kws_stream.accept_waveform(SAMPLE_RATE, float_samples)
                 while kws_spotter.is_ready(kws_stream):
                     kws_spotter.decode_stream(kws_stream)
                 result = kws_spotter.get_result(kws_stream)
