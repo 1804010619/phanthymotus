@@ -1333,12 +1333,10 @@ async function _startProject() {
   // Enable execute buttons
   document.querySelectorAll('.canvas-exec-btn').forEach(btn => btn.classList.remove('locked'));
 
-  // Start all cards on canvas, resolving input_topic(s) from connections
-  for (const card of _cards) {
-    // Collect ALL inbound connections to support multiple input topics (deduplicate)
+  // Collect start args for all cards
+  const startItems = _cards.map(card => {
     const inConns = _connections.filter(c => c.toCardId === card.id);
     const topics = [...new Set(inConns.map(conn => conn.fromTopic || '').filter(Boolean))];
-
     let args;
     if (topics.length > 1) {
       args = { input_topics: topics };
@@ -1348,41 +1346,72 @@ async function _startProject() {
       args = {};
     }
     args.instance_id = card.id;
-    const startResult = await _triggerAction(card.mcpId, card.toolName, 'start', args);
-    if (startResult && startResult.code !== 200) {
-      const msg = `${card.toolName} 启动失败: ${startResult.message || '未知错误'}`;
-      _logActivity('error', msg);
-      _flashStartError(msg);
-    }
-    // Auto-start mic stream when remote_mic card starts
-    if (card.toolName === 'remote_mic' && !isMicActive()) {
-      const wsProto = location.protocol === 'https:' ? 'wss' : 'ws';
-      const wsUrl = `${wsProto}://${location.host}/ws/mic`;
-      try {
-        await toggleMicStream(wsUrl, (active) => {
-          const micBtn = card.el?.querySelector('.canvas-mic-btn');
-          if (micBtn) {
-            micBtn.textContent = active ? '\u23F9 停止录音' : '\uD83C\uDF99 开始录音';
-            micBtn.classList.toggle('recording', active);
-          }
-        });
-      } catch (err) {
-        _logActivity('error', '麦克风启动失败: ' + err.message);
+    return { card, args };
+  });
+
+  // Show startup modal
+  const { modal, updateItem, close } = _showStartupModal(startItems);
+  let aborted = false;
+
+  modal.onCancel = () => {
+    aborted = true;
+    close();
+    _stopProject();
+  };
+
+  // Start all cards in parallel
+  const promises = startItems.map(async ({ card, args }, i) => {
+    updateItem(i, 'starting');
+    try {
+      const startResult = await _triggerAction(card.mcpId, card.toolName, 'start', args);
+      if (aborted) return;
+      if (startResult && startResult.code !== 200) {
+        updateItem(i, 'error', startResult.message || '启动失败');
+        _logActivity('error', `${card.toolName} 启动失败: ${startResult.message || '未知错误'}`);
+        return;
       }
+      // Auto-start mic stream for remote_mic card
+      if (card.toolName === 'remote_mic' && !isMicActive()) {
+        const wsProto = location.protocol === 'https:' ? 'wss' : 'ws';
+        const wsUrl = `${wsProto}://${location.host}/ws/mic`;
+        try {
+          await toggleMicStream(wsUrl, (active) => {
+            const micBtn = card.el?.querySelector('.canvas-mic-btn');
+            if (micBtn) {
+              micBtn.textContent = active ? '\u23F9 停止录音' : '\uD83C\uDF99 开始录音';
+              micBtn.classList.toggle('recording', active);
+            }
+          });
+        } catch (err) {
+          _logActivity('error', '麦克风启动失败: ' + err.message);
+        }
+      }
+      // Update card.topicOut from start response
+      const parsed = _parseMcpCallResult(startResult);
+      if (parsed?.topic_out?.some(t => t.topic)) {
+        card.topicOut = parsed.topic_out;
+        const outPorts = [...card.el.querySelectorAll('.canvas-port.out')];
+        parsed.topic_out.forEach((t, idx) => { if (outPorts[idx] && t.topic) outPorts[idx].dataset.topic = t.topic; });
+      }
+      updateItem(i, 'ready');
+    } catch (e) {
+      if (!aborted) updateItem(i, 'error', e.message || '异常');
     }
-    // Update card.topicOut from start response (multiInstance tools return real topic paths on start)
-    const parsed = _parseMcpCallResult(startResult);
-    if (parsed?.topic_out?.some(t => t.topic)) {
-      card.topicOut = parsed.topic_out;
-      const outPorts = [...card.el.querySelectorAll('.canvas-port.out')];
-      parsed.topic_out.forEach((t, i) => { if (outPorts[i] && t.topic) outPorts[i].dataset.topic = t.topic; });
-      _resolveAllTopics();  // re-propagate updated topic paths into conn.fromTopic before next card starts
-      _redrawConnections();
-    }
+  });
+
+  await Promise.allSettled(promises);
+  if (!aborted) {
+    // Re-resolve topics after all starts complete
+    _resolveAllTopics();
+    _redrawConnections();
+    // Update cancel button to close button
+    const cancelBtn = modal.querySelector('.startup-cancel-btn');
+    cancelBtn.textContent = '关闭';
+    cancelBtn.onclick = close;
+    modal.onCancel = null;
   }
-  // Immediately persist layout so monitor-dashboard can read inferred topic paths
+  // Persist layout and running state
   await _saveLayout();
-  // 持久化运行状态
   fetch('/api/config/project-running', {
     method: 'PUT', headers: {'Content-Type': 'application/json'},
     body: JSON.stringify({running: true}),
@@ -1448,6 +1477,48 @@ async function _triggerAction(mcpId, toolName, action, extraArgs = {}) {
     console.error(`[canvas] ${action} call failed:`, err);
     return null;
   }
+}
+
+// ── Startup Modal ──────────────────────────────────────────────────────────────
+function _showStartupModal(items) {
+  const overlay = document.createElement('div');
+  overlay.className = 'modal-overlay';
+  const modal = document.createElement('div');
+  modal.className = 'modal';
+  modal.style.width = '420px';
+  modal.innerHTML = `
+    <div class="modal-header">
+      <span class="modal-title">启动智能控制</span>
+    </div>
+    <ul class="startup-modal-list"></ul>
+    <div class="startup-modal-footer">
+      <button class="startup-cancel-btn">取消启动</button>
+    </div>`;
+  overlay.appendChild(modal);
+  const list = modal.querySelector('.startup-modal-list');
+  const dots = [];
+  const statuses = [];
+  items.forEach(({ card }) => {
+    const li = document.createElement('li');
+    li.className = 'startup-modal-item';
+    li.innerHTML = `<span class="startup-dot"></span><span class="startup-name">${card.toolName}</span><span class="startup-status">等待启动</span>`;
+    list.appendChild(li);
+    dots.push(li.querySelector('.startup-dot'));
+    statuses.push(li.querySelector('.startup-status'));
+  });
+  document.body.appendChild(overlay);
+
+  const STATUS_TEXT = { starting: '启动中...', ready: '已就绪', error: '启动失败' };
+  function updateItem(i, state, msg) {
+    dots[i].className = 'startup-dot ' + state;
+    statuses[i].textContent = msg || STATUS_TEXT[state] || '';
+  }
+  function close() {
+    overlay.remove();
+  }
+  const cancelBtn = modal.querySelector('.startup-cancel-btn');
+  cancelBtn.addEventListener('click', () => { if (modal.onCancel) modal.onCancel(); });
+  return { modal, updateItem, close };
 }
 
 /**

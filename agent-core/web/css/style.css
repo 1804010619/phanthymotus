@@ -4381,3 +4381,66 @@ html, body {
   color: var(--text-dim);
 }
 
+/* ── Startup Modal ──────────────────────────────────────────────────────────── */
+.startup-modal-list {
+  list-style: none;
+  padding: 14px 22px;
+  margin: 0;
+}
+.startup-modal-item {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 9px 0;
+  font-size: 13px;
+  color: var(--text);
+  border-bottom: 1px solid var(--border);
+}
+.startup-modal-item:last-child { border-bottom: none; }
+.startup-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: var(--text-muted);
+  opacity: 0.4;
+  transition: background 0.3s, opacity 0.3s;
+  flex-shrink: 0;
+}
+.startup-dot.starting {
+  background: var(--accent);
+  opacity: 1;
+  animation: pulse-dot 1s infinite;
+}
+.startup-dot.ready { background: #22c55e; opacity: 1; }
+.startup-dot.error { background: #ef4444; opacity: 1; }
+@keyframes pulse-dot {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.35; }
+}
+.startup-name { font-weight: 600; min-width: 80px; }
+.startup-status {
+  color: var(--text-muted);
+  font-size: 12px;
+  margin-left: auto;
+}
+.startup-modal-footer {
+  display: flex;
+  justify-content: center;
+  padding: 14px 22px;
+  border-top: 1px solid var(--border);
+}
+.startup-cancel-btn {
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 7px 20px;
+  font-size: 13px;
+  color: var(--text-muted);
+  cursor: pointer;
+  transition: border-color 0.15s, color 0.15s;
+}
+.startup-cancel-btn:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
