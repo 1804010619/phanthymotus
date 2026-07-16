@@ -410,7 +410,7 @@ def _vad_worker(pcm_q: multiprocessing.Queue, result_q: multiprocessing.Queue,
 
     # Pre-buffer: keep last N frames so first word isn't cut off by VAD onset delay
     from collections import deque
-    PREBUF_FRAMES = 25  # ~800ms at 32ms/frame (1024B chunks) — covers VAD onset lag
+    PREBUF_FRAMES = 15  # ~480ms at 32ms/frame — covers VAD onset lag without overlap
     prebuf = deque(maxlen=PREBUF_FRAMES)
     prebuf_used = False  # whether we already prepended prebuf to current utterance
 
