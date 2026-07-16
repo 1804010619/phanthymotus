@@ -89,6 +89,12 @@ fi
 if [ -n "${SKIP_VOP_DEPS:-}" ]; then
     extra_build_args+=("SKIP_VOP_DEPS=${SKIP_VOP_DEPS}")
 fi
+if [ -n "${ROS_BASE:-}" ]; then
+    extra_build_args+=("ROS_BASE=${ROS_BASE}")
+fi
+if [ -n "${PYTORCH_DONOR:-}" ]; then
+    extra_build_args+=("PYTORCH_DONOR=${PYTORCH_DONOR}")
+fi
 
 do_build "${DOCKERFILE}" "${BUILD_CONTEXT}" "${FULL_IMAGE}" "${extra_build_args[@]}"
 

@@ -1,25 +1,45 @@
 # ── Jetson GPU variant (JetPack 6) ───────────────────────────────────
-# Base: jetson-base:jp6-torch (PyTorch + ROS2 Humble on L4T r36.4)
+# Self-contained: builds jp6-torch from dustynv images (no private registry required).
+# Matches local Jetson test: JP6 + CUDA PyTorch + GPU sherpa-onnx + TTS cuda in config.yaml.
 #
-# Build context: repo root (phanthy-motus/) so we can access both
-# src/perception_stack/ and deploy/ros-base/audio_msgs/
-#
-# Usage:
+# Build context: repo root (phanthy-motus/)
 #   ./deploy/build_perception.sh --variant jetson --mirror tuna
 #
-# If jp6-torch is not yet in the private registry, build it locally first:
-#   ./deploy/prepare_jp_v6_local.sh
+# Optional: skip inline base build if you already have jp6-torch locally:
 #   export BASE_IMAGE=local/phanthy-motus/jetson-base:jp6-torch
 #   ./deploy/build_perception.sh --variant jetson
 # ────────────────────────────────────────────────────────────────────
 
 ARG PYPI_MIRROR=https://pypi.tuna.tsinghua.edu.cn/simple/
 ARG APT_MIRROR=mirrors.tuna.tsinghua.edu.cn
-ARG BASE_IMAGE=bj-warehouse.tencentcloudcr.com/phanthy-motus/jetson-base:jp6-torch
+ARG ROS_BASE=docker.m.daocloud.io/dustynv/ros:humble-desktop-l4t-r36.4.0
+ARG PYTORCH_DONOR=docker.m.daocloud.io/dustynv/l4t-pytorch:r36.4.0
+ARG BASE_IMAGE=
 ARG SHERPA_ONNX_ENABLE_GPU=ON
 ARG SHERPA_ONNX_GPU_ORT_VERSION=1.18.1
 ARG SKIP_VOP_DEPS=ON
-FROM ${BASE_IMAGE}
+
+# ── Stage: jp6-torch (same as deploy/prepare_jp_v6_local.sh) ───────
+FROM ${PYTORCH_DONOR} AS pytorch-donor
+FROM ${ROS_BASE} AS jp6-torch-built
+RUN rm -f /etc/apt/sources.list.d/* && rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/* && \
+    apt-get -o Acquire::AllowInsecureRepositories=true update && \
+    apt-get install -y --no-install-recommends --allow-unauthenticated libopenblas-base && \
+    rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*
+COPY --from=pytorch-donor /usr/local/lib/python3.10/dist-packages/ /tmp/pt-donor/
+RUN cd /tmp/pt-donor && \
+    mkdir -p /usr/local/lib/python3.10/dist-packages && \
+    for item in torch torchgen torchvision triton; do \
+        if [ -e "$item" ]; then cp -a "$item" /usr/local/lib/python3.10/dist-packages/; fi; \
+    done && \
+    shopt -s nullglob && \
+    for item in torch-*.dist-info torchvision-*.dist-info triton-*.dist-info; do \
+        cp -a "$item" /usr/local/lib/python3.10/dist-packages/; \
+    done && \
+    rm -rf /tmp/pt-donor
+
+# Use pre-built BASE_IMAGE when set; otherwise use inline jp6-torch-built
+FROM ${BASE_IMAGE:-jp6-torch-built}
 ARG PYPI_MIRROR APT_MIRROR SHERPA_ONNX_ENABLE_GPU SHERPA_ONNX_GPU_ORT_VERSION SKIP_VOP_DEPS
 
 # jp6/dustynv base sets PIP_INDEX_URL=jetson.webredirect.org (often unreachable)
@@ -56,7 +76,7 @@ RUN cd /ros_ws && \
 
 # ── Python deps ────────────────────────────────────────────────────
 RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} \
-    pyyaml requests websockets webrtcvad websocket-client dashscope && \
+    pyyaml requests websockets webrtcvad websocket-client dashscope psutil && \
     pip3 install --no-cache-dir --no-deps -i ${PYPI_MIRROR} silero-vad
 
 # ── HTMSG deps (KISS-ICP + future semantic) ──────────────────────
