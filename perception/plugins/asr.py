@@ -408,12 +408,6 @@ def _vad_worker(pcm_q: multiprocessing.Queue, result_q: multiprocessing.Queue,
     _log.info(f"[vad-worker] process started (pid={os.getpid()}, backend=sherpa_onnx, kws={kws_enabled})")
     audio_count = 0
 
-    # Pre-buffer: keep last N frames so first word isn't cut off by VAD onset delay
-    from collections import deque
-    PREBUF_FRAMES = 15  # ~480ms at 32ms/frame — covers VAD onset lag without overlap
-    prebuf = deque(maxlen=PREBUF_FRAMES)
-    prebuf_used = False  # whether we already prepended prebuf to current utterance
-
     while not stop_evt.is_set():
         try:
             pcm, ts = pcm_q.get(timeout=1)
@@ -453,32 +447,20 @@ def _vad_worker(pcm_q: multiprocessing.Queue, result_q: multiprocessing.Queue,
                         speech_buf = pcm  # include current frame (user may already be speaking)
                         start_ts = ts
                         end_ts = ts
-                        prebuf_used = True  # don't use prebuf for KWS wake (already have context)
                         # Reset KWS stream for next wake
                         kws_stream = kws_spotter.create_stream()
             # Drain any completed VAD segments (discard in wake-wait mode)
             while not vad.empty():
                 vad.pop()
-            prebuf.append((pcm, ts))
 
         elif state == 'listening':
-            # Only update pre-buffer when VAD has NOT detected speech onset yet,
-            # so prebuf retains the frames *before* speech started.
-            if not vad.is_speech_detected():
-                prebuf.append((pcm, ts))
-
             # Collect completed VAD segments (speech that ended)
+            # Note: sherpa-onnx VAD internally buffers pre-speech audio,
+            # so seg.samples already contains the full speech onset.
             while not vad.empty():
                 seg = vad.front
                 seg_pcm = _struct.pack(f'<{len(seg.samples)}h',
                                        *[int(max(-32768, min(32767, s * 32768))) for s in seg.samples])
-                # Prepend pre-buffer on first speech detection to recover onset audio
-                if not speech_buf and not prebuf_used:
-                    for pb_pcm, pb_ts in prebuf:
-                        speech_buf += pb_pcm
-                    if prebuf:
-                        start_ts = prebuf[0][1]
-                    prebuf_used = True
                 if not start_ts:
                     start_ts = ts
                 speech_buf += seg_pcm
@@ -492,7 +474,6 @@ def _vad_worker(pcm_q: multiprocessing.Queue, result_q: multiprocessing.Queue,
                     speech_buf = b''
                     start_ts = None
                     end_ts = None
-                    prebuf_used = False
                     # Return to waiting for wake word (if KWS enabled)
                     if kws_enabled:
                         state = 'waiting_wake'
