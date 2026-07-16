@@ -70,7 +70,8 @@ TOOLS = [
             "properties": {
                 "asr_model":     {"type": "string", "enum": ["paraformer-zh-en", "zipformer-en", "sensevoice-small"], "description": "ASR model (paraformer-zh-en = bilingual streaming, zipformer-en = English only, sensevoice-small = multilingual non-autoregressive)", "default": "paraformer-zh-en", "scope": "shared"},
                 "trigger_mode":  {"type": "string", "enum": ["vad", "kws"], "description": "Trigger mode (vad = always listen, kws = wake word first)", "default": "kws", "scope": "shared"},
-                "kws_keywords":  {"type": "string", "description": "Wake word (pinyin format, e.g. 'x iǎo f àn x iǎo f àn @小范小范')", "scope": "shared", "x-show-when": {"trigger_mode": "kws"}},
+                "kws_model":     {"type": "string", "enum": ["zh", "en", "zh-en"], "description": "KWS 模型 (zh=纯中文, en=纯英文, zh-en=双语)", "default": "zh", "scope": "shared", "x-show-when": {"trigger_mode": "kws"}},
+                "kws_keywords":  {"type": "string", "description": "Wake word (zh: pinyin e.g. 'f àn sh ì x iǎo g ǒu @范式小狗', zh-en: phone+ppinyin, en: BPE)", "scope": "shared", "x-show-when": {"trigger_mode": "kws"}},
                 "vad_threshold": {"type": "number", "description": "VAD speech threshold (0-1, higher = stricter)", "default": 0.5, "scope": "shared"},
                 "vad_silence_ms":{"type": "integer", "description": "Silence duration (ms) before sentence end", "default": 400, "scope": "shared"},
             },
@@ -344,8 +345,17 @@ def _vad_worker(pcm_q: multiprocessing.Queue, result_q: multiprocessing.Queue,
     kws_stream = None
     kws_enabled = (kws_cfg.get('trigger_mode', 'kws') == 'kws') if kws_cfg else False
     if kws_enabled:
-        kws_model_dir = kws_cfg.get('model_dir', '/models/sherpa-onnx/kws')
-        ensure_model("kws", kws_model_dir)
+        # Select KWS model based on kws_model config
+        kws_model_variant = kws_cfg.get('kws_model', 'zh')
+        if kws_model_variant == 'zh':
+            kws_model_dir = '/models/sherpa-onnx/kws_zh'
+            ensure_model("kws_zh", kws_model_dir)
+        elif kws_model_variant == 'en':
+            kws_model_dir = '/models/sherpa-onnx/kws_en'
+            ensure_model("kws_en", kws_model_dir)
+        else:  # zh-en
+            kws_model_dir = kws_cfg.get('model_dir', '/models/sherpa-onnx/kws')
+            ensure_model("kws", kws_model_dir)
         keywords = kws_cfg.get('keywords', [])
         if keywords:
             import glob as _glob
@@ -794,6 +804,8 @@ class ASRPlugin:
                 self._vad_silence_ms = int(cfg['vad_silence_ms'])
             if 'trigger_mode' in cfg:
                 self._kws_cfg['trigger_mode'] = cfg['trigger_mode']
+            if 'kws_model' in cfg:
+                self._kws_cfg['kws_model'] = cfg['kws_model']
             if 'kws_keywords' in cfg:
                 self._kws_cfg['keywords'] = [cfg['kws_keywords']]
             # ASR model switch — load in background if changed
