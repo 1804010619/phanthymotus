@@ -23,6 +23,10 @@ RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} \
 RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} \
     sherpa-onnx
 
+# Override base image RMW (some ros-base tags ship cyclonedds by default)
+ENV RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+ENV ROS_DOMAIN_ID=42
+
 WORKDIR /work
 COPY main.py    /work/main.py
 COPY plugins/   /work/plugins/
