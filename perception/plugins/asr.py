@@ -432,6 +432,12 @@ def _vad_worker(pcm_q: multiprocessing.Queue, result_q: multiprocessing.Queue,
     _log.info(f"[vad-worker] process started (pid={os.getpid()}, backend=sherpa_onnx, kws={kws_enabled})")
     audio_count = 0
 
+    # AGC (Automatic Gain Control) parameters
+    _agc_target = 2000.0 / 32768.0   # target RMS (~6% full scale, typical speech level)
+    _AGC_MAX_GAIN = 20.0             # max amplification to prevent noise blowup
+    _AGC_SMOOTHING = 0.3             # gain smoothing (0-1, lower = smoother transitions)
+    _agc_gain = [1.0]                # mutable container for current gain
+
     while not stop_evt.is_set():
         try:
             pcm, ts = pcm_q.get(timeout=1)
@@ -453,6 +459,14 @@ def _vad_worker(pcm_q: multiprocessing.Queue, result_q: multiprocessing.Queue,
         # Denoise before VAD/KWS
         denoised = denoiser.run(float_samples, SAMPLE_RATE)
         float_samples = list(denoised.samples)
+
+        # AGC: normalize RMS to consistent level regardless of distance
+        rms = (sum(s * s for s in float_samples) / max(len(float_samples), 1)) ** 0.5
+        if rms > 1e-6:
+            desired_gain = _agc_target / rms
+            desired_gain = min(desired_gain, _AGC_MAX_GAIN)
+            _agc_gain[0] += _AGC_SMOOTHING * (desired_gain - _agc_gain[0])
+        float_samples = [max(-1.0, min(1.0, s * _agc_gain[0])) for s in float_samples]
 
         # Feed VAD
         vad.accept_waveform(float_samples)
@@ -477,8 +491,24 @@ def _vad_worker(pcm_q: multiprocessing.Queue, result_q: multiprocessing.Queue,
                         end_ts = ts
                         # Reset KWS stream for next wake
                         kws_stream = kws_spotter.create_stream()
-            # Drain any completed VAD segments (discard in wake-wait mode)
+            # Drain any completed VAD segments (discard in wake-wait mode, but save debug)
             while not vad.empty():
+                seg = vad.front
+                # Debug: save VAD segment even in waiting_wake mode
+                try:
+                    import wave as _wave, time as _time2
+                    seg_pcm = _struct.pack(f'<{len(seg.samples)}h',
+                                           *[int(max(-32768, min(32767, s * 32768))) for s in seg.samples])
+                    debug_dir = '/tmp/vad_debug'
+                    os.makedirs(debug_dir, exist_ok=True)
+                    fname = os.path.join(debug_dir, f"vad_seg_{int(_time2.time()*1000)}.wav")
+                    with _wave.open(fname, 'wb') as wf:
+                        wf.setnchannels(1)
+                        wf.setsampwidth(2)
+                        wf.setframerate(SAMPLE_RATE)
+                        wf.writeframes(seg_pcm)
+                except Exception:
+                    pass
                 vad.pop()
 
         elif state == 'listening':
@@ -496,6 +526,20 @@ def _vad_worker(pcm_q: multiprocessing.Queue, result_q: multiprocessing.Queue,
                 # Output the segment as an utterance
                 if len(speech_buf) > SAMPLE_RATE:  # >500ms
                     _log.info(f"[vad-worker] utterance complete, len={len(speech_buf)} bytes")
+                    # Debug: save utterance as WAV file
+                    try:
+                        import wave as _wave, io as _io, time as _time2
+                        debug_dir = '/tmp/vad_debug'
+                        os.makedirs(debug_dir, exist_ok=True)
+                        fname = os.path.join(debug_dir, f"utt_{int(_time2.time()*1000)}.wav")
+                        with _wave.open(fname, 'wb') as wf:
+                            wf.setnchannels(1)
+                            wf.setsampwidth(2)
+                            wf.setframerate(SAMPLE_RATE)
+                            wf.writeframes(speech_buf)
+                        _log.info(f"[vad-worker] saved debug wav: {fname}")
+                    except Exception as e:
+                        _log.warning(f"[vad-worker] failed to save debug wav: {e}")
                     result_q.put((speech_buf, start_ts or ts, end_ts or ts))
                     speech_buf = b''
                     start_ts = None
