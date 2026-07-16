@@ -9,8 +9,7 @@ ARG VITS2_RUNTIME_SHA256=83a24d5d4a7ace48ab533cc255654bb0d79e3bd728125da01ffd1ab
 
 USER root
 
-# ROS Jazzy uses the Ubuntu 24.04 system Python. TensorRT remains isolated in
-# the NGC Python environment and is never imported by the ROS process.
+# ROS Jazzy and TensorRT use the Ubuntu 24.04 system Python in one process.
 RUN . /etc/os-release && test "$VERSION_CODENAME" = noble && \
     sed -i 's|http://ports.ubuntu.com/ubuntu-ports|https://mirrors.tuna.tsinghua.edu.cn/ubuntu-ports|g' \
       /etc/apt/sources.list /etc/apt/sources.list.d/ubuntu.sources 2>/dev/null || true
@@ -88,7 +87,6 @@ ENV LD_LIBRARY_PATH=/usr/local/lib:/ros_ws/install/audio_msgs/lib:/opt/ros/jazzy
     MIX_VITS_TRT_ENGINE_DIR=/models/vits2-mix/engines \
     MIX_VITS_MAX_TEXT_TOKENS=64 \
     MIX_VITS_MAX_FRAMES=2048 \
-    VITS2_TRT_PORT=18080 \
     TTS_PLUGIN=vits2_tts_trt \
     DEFAULT_TTS_PLUGIN=vits2_tts_trt \
     OMP_NUM_THREADS=1 \

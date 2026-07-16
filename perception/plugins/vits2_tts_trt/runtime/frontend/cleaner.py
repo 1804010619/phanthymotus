@@ -1,4 +1,4 @@
-from frontend import chinese, english, cleaned_text_to_sequence, cleaned_text_to_sequence_mix
+from . import chinese, english, cleaned_text_to_sequence, cleaned_text_to_sequence_mix
 language_module_map = {"ZH": chinese, "EN": english}
 
 
@@ -36,7 +36,7 @@ def clean_text_mix(text):
         langs = ["EN"] * len(phones)
         return norm_text, phones, tones, langs, word2ph
 
-    from frontend.unified_g2p import unified_g2p
+    from .unified_g2p import unified_g2p
     norm_text = chinese.mix_normalize(text)
     phones, tones, langs, word2ph = unified_g2p(norm_text)
     return norm_text, phones, tones, langs, word2ph

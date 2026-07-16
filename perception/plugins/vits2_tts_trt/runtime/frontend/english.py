@@ -3,7 +3,7 @@ import os
 import re
 import inflect
 
-from frontend.symbols import punctuation, symbols
+from .symbols import punctuation, symbols
 
 current_file_path = os.path.dirname(__file__)
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))

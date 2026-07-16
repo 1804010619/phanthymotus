@@ -5,12 +5,12 @@ import runpy
 import jieba
 from pypinyin import lazy_pinyin, Style, load_phrases_dict
 
-from frontend.symbols import punctuation
-from frontend.tone_sandhi import ToneSandhi
+from .symbols import punctuation
+from .tone_sandhi import ToneSandhi
 
 from tn.chinese.normalizer import Normalizer as ZhNormalizer
 
-from frontend.heteronym import custom_dict, jieba_phrases
+from .heteronym import custom_dict, jieba_phrases
 
 
 def _load_phrase_pinyin_data():
@@ -236,7 +236,7 @@ def mix_normalize(text: str) -> str:
     WeText handles camelCase (ChatGPT→chat GPT, MacBook→Mac book) and
     acronyms (GPT→G P T, CEO→C E O) natively, so no preprocessing is needed.
     """
-    from frontend.english import replace_punctuation as en_replace_punct
+    from .english import replace_punctuation as en_replace_punct
     text = _normalizer.normalize(text)
     text = _post_replace(text)
     text = en_replace_punct(text)
@@ -250,7 +250,7 @@ def get_bert_feature(text, word2ph):
 
 
 if __name__ == "__main__":
-    from frontend.chinese_bert import get_bert_feature
+    from .chinese_bert import get_bert_feature
 
     text = "啊！但是《原神》是由,米哈\游自主，  [研发]的一款全.新开放世界.冒险游戏"
     text = text_normalize(text)

@@ -1,18 +1,27 @@
-"""HTTP adapter for the isolated JetPack 6 TensorRT TTS runtime."""
+"""In-process adapter for the JetPack 6 VITS2 TensorRT runtime."""
 
 from __future__ import annotations
 
-import json
 import logging
 import os
-import struct
+import re
+import threading
 from abc import ABC, abstractmethod
-from urllib.error import HTTPError, URLError
-from urllib.request import Request, urlopen
+
+from .runtime.backends.trt_tts_engine import TensorRTTTSEngine
 
 
 SAMPLE_RATE = 16000
 CHUNK_BYTES = 3200
+MAX_CHUNK_TOKENS = int(os.getenv("MIX_VITS_MAX_TEXT_TOKENS", "64"))
+MODEL_CONFIG = os.getenv("MIX_VITS_CONFIG_PATH", "/models/vits2-mix/config.json")
+ENGINE_DIR = os.getenv("MIX_VITS_TRT_ENGINE_DIR", "/models/vits2-mix/engines")
+WARMUP_CASES = (
+    "你好。",
+    "晚上我用FaceTime和家人视频聊天。",
+    "周末我拍了一张selfie发给朋友。",
+    "Lucy今天去公园散步并喝coffee，David开会前仔细检查PPT。",
+)
 log = logging.getLogger(__name__)
 
 
@@ -27,79 +36,109 @@ class TTSAdapter(ABC):
     def warmup(self) -> int:
         return 0
 
+    def set_speed(self, speed: float) -> None:
+        del speed
+
+
+def _language_kind(char: str) -> str | None:
+    if "\u4e00" <= char <= "\u9fff":
+        return "ZH"
+    if char.isascii() and char.isalnum():
+        return "EN"
+    return None
+
+
+def _preferred_split(text: str) -> int:
+    midpoint = len(text) // 2
+    boundaries = []
+    previous_kind = None
+    for index, char in enumerate(text):
+        kind = _language_kind(char)
+        if kind is None:
+            continue
+        if previous_kind is not None and kind != previous_kind:
+            boundaries.append(index)
+        previous_kind = kind
+    usable = [index for index in boundaries if 1 < index < len(text) - 1]
+    if usable:
+        return min(usable, key=lambda index: abs(index - midpoint))
+    return max(1, midpoint)
+
 
 class Vits2TensorRTAdapter(TTSAdapter):
-    def __init__(
-        self,
-        backend_url: str,
-        speed: float = 1.0,
-        timeout: float = 295.0,
-    ):
-        if speed <= 0:
-            raise ValueError("TTS speed must be greater than zero")
-        self._backend_url = backend_url.rstrip("/")
-        self._speed = float(speed)
-        self._timeout = float(timeout)
+    def __init__(self, speed: float = 1.0):
+        self._lock = threading.Lock()
+        self.set_speed(speed)
+        self._engine = TensorRTTTSEngine(MODEL_CONFIG, ENGINE_DIR)
 
-    def _request(self, path: str, payload: dict | None = None):
-        data = None
-        headers = {}
-        if payload is not None:
-            data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-            headers["Content-Type"] = "application/json"
-        request = Request(f"{self._backend_url}{path}", data=data, headers=headers)
-        try:
-            return urlopen(request, timeout=self._timeout)
-        except HTTPError as exc:
-            raise RuntimeError(
-                f"TensorRT backend rejected request: HTTP {exc.code}"
-            ) from exc
-        except URLError as exc:
-            raise RuntimeError(f"TensorRT backend unavailable: {exc.reason}") from exc
+    def set_speed(self, speed: float) -> None:
+        speed = float(speed)
+        if speed <= 0 or speed > 4:
+            raise ValueError("TTS speed must be greater than zero and at most four")
+        with self._lock:
+            self._speed = speed
 
-    def warmup(self) -> int:
-        with self._request("/ready") as response:
-            if response.status != 200 or response.read().strip() != b"True":
-                raise RuntimeError("TensorRT backend is not ready")
-        return 0
+    def _iter_unit_chunks(self, text: str):
+        text_ids = self._engine._get_text_ids(text)
+        if len(text_ids[0]) <= MAX_CHUNK_TOKENS:
+            yield text, text_ids
+            return
+        if len(text) <= 1:
+            raise ValueError("Unable to split text within TensorRT profile")
+        split_at = _preferred_split(text)
+        left, right = text[:split_at].strip(), text[split_at:].strip()
+        if not left or not right:
+            raise ValueError("Unable to split text within TensorRT profile")
+        yield from self._iter_unit_chunks(left)
+        yield from self._iter_unit_chunks(right)
+
+    def _iter_text_chunks(self, text: str):
+        units = re.findall(r".*?[。！？!?；;，,：:\n]+|.+$", text, flags=re.DOTALL)
+        for unit in units:
+            if unit.strip():
+                yield from self._iter_unit_chunks(unit.strip())
 
     def synthesize(self, text: str) -> bytes:
         return b"".join(self.synthesize_stream(text))
 
     def synthesize_stream(self, text: str):
-        if not text.strip():
+        text = re.sub(r"\s+", " ", text).strip()
+        if not text:
             raise ValueError("TTS text must not be empty")
-        payload = {"text": text, "speed": self._speed}
-        with self._request("/synthesize/stream", payload) as response:
-            sample_rate = int(response.headers.get("X-Sample-Rate", SAMPLE_RATE))
-            if sample_rate != SAMPLE_RATE:
-                raise RuntimeError(
-                    f"TensorRT backend sample rate must be {SAMPLE_RATE}, got {sample_rate}"
+        silence = b"\x00\x00" * (SAMPLE_RATE // 10)
+        with self._lock:
+            for chunk_index, (chunk, text_ids) in enumerate(
+                self._iter_text_chunks(text)
+            ):
+                token_count = len(text_ids[0])
+                log.info(
+                    "text redacted: chars=%d chunk=%d tokens=%d",
+                    len(text),
+                    chunk_index,
+                    token_count,
                 )
-            pending = bytearray()
-            while True:
-                block = response.read(CHUNK_BYTES)
-                if not block:
-                    break
-                pending.extend(block)
-                while len(pending) >= CHUNK_BYTES:
-                    yield bytes(pending[:CHUNK_BYTES])
-                    del pending[:CHUNK_BYTES]
-            if pending:
-                if len(pending) % struct.calcsize("h"):
-                    raise RuntimeError("TensorRT backend returned misaligned PCM")
-                yield bytes(pending)
+                if chunk_index:
+                    yield silence
+                pcm = self._engine.synthesize(
+                    chunk,
+                    text_ids=text_ids,
+                    length_scale=1.0 / self._speed,
+                )
+                for offset in range(0, len(pcm), CHUNK_BYTES):
+                    yield pcm[offset : offset + CHUNK_BYTES]
+
+    def warmup(self) -> int:
+        warmup_bytes = 0
+        for text in WARMUP_CASES:
+            case_bytes = sum(len(pcm) for pcm in self.synthesize_stream(text))
+            if not case_bytes:
+                raise RuntimeError("TensorRT warmup produced no audio")
+            warmup_bytes += case_bytes
+        return warmup_bytes
 
 
 def build_adapter(cfg: dict) -> TTSAdapter:
     speaker_id = int(cfg.get("speaker_id", 0))
     if speaker_id != 0:
         raise ValueError("The VITS2 model supports only speaker_id=0")
-    return Vits2TensorRTAdapter(
-        backend_url=os.getenv(
-            "VITS2_TRT_BACKEND_URL",
-            cfg.get("backend_url", "http://127.0.0.1:18080"),
-        ),
-        speed=float(cfg.get("speed", 1.0)),
-        timeout=float(cfg.get("request_timeout", 295.0)),
-    )
+    return Vits2TensorRTAdapter(speed=float(cfg.get("speed", 1.0)))

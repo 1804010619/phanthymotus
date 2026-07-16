@@ -33,8 +33,8 @@ from g2p_en import G2p
 from pypinyin import lazy_pinyin, Style
 from pypinyin.seg.simpleseg import seg
 
-from frontend.symbols import punctuation
-from frontend.english import eng_dict, refine_ph, post_replace_ph, arpa
+from .symbols import punctuation
+from .english import eng_dict, refine_ph, post_replace_ph, arpa
 
 current_file_path = os.path.dirname(__file__)
 with open(os.path.join(current_file_path, "opencpop-strict.txt")) as _f:
@@ -332,7 +332,7 @@ def unified_g2p(text: str):
 # ──────────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     # mix_normalize is defined in text/chinese.py; import lazily here
-    from frontend.chinese import mix_normalize
+    from .chinese import mix_normalize
 
     test_cases = [
         "昨天CEO在MacBook上review了我们的PPT。",

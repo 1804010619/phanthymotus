@@ -101,8 +101,8 @@ class TensorRTTTSEngine:
             )
 
     def _get_text_ids(self, text):
-        from frontend import cleaned_text_to_sequence_mix
-        from frontend.cleaner import clean_text_mix
+        from ..frontend import cleaned_text_to_sequence_mix
+        from ..frontend.cleaner import clean_text_mix
 
         _, phones, tones, langs, _ = clean_text_mix(text)
         ids = cleaned_text_to_sequence_mix(phones, tones, langs)

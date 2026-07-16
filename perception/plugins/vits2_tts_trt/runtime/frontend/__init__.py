@@ -1,5 +1,5 @@
 """Text frontend entry — sequence conversion only (no BERT)."""
-from frontend.symbols import (
+from .symbols import (
     symbols, num_tones, num_languages, punctuation,
     language_id_map, language_tone_start_map,
 )

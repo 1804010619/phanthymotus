@@ -1,4 +1,4 @@
-"""Independent ROS2/MCP plugin for isolated VITS2 TensorRT synthesis."""
+"""ROS2/MCP plugin for in-process VITS2 TensorRT synthesis."""
 
 from __future__ import annotations
 
@@ -178,12 +178,12 @@ class TTSPlugin:
                 started = time.monotonic()
                 warmup_bytes = self._adapter.warmup()
                 log.info(
-                    "[vits2_tts_trt] backend ready: bytes=%d elapsed=%.3fs",
+                    "[vits2_tts_trt] engine ready: bytes=%d elapsed=%.3fs",
                     warmup_bytes,
                     time.monotonic() - started,
                 )
         except Exception as exc:
-            log.exception("[vits2_tts_trt] failed to connect to backend")
+            log.exception("[vits2_tts_trt] failed to load engine")
             self._adapter = None
             self._load_error = str(exc)
             raise RuntimeError("VITS2 model load or warmup failed") from exc
@@ -320,10 +320,11 @@ class TTSPlugin:
                 self._cfg["speaker_id"] = int(args["speaker_id"])
             if "speed" in args:
                 self._cfg["speed"] = float(args["speed"])
-            adapter = build_adapter(self._cfg)
+            if int(self._cfg.get("speaker_id", 0)) != 0:
+                raise ValueError("The VITS2 model supports only speaker_id=0")
+            self._adapter.set_speed(float(self._cfg.get("speed", 1.0)))
             for key in list(self._nodes):
                 self._remove_node(key)
-            self._adapter = adapter
             self._load_error = None
             return {"status": "configured"}
 
