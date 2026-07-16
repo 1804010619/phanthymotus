@@ -204,11 +204,12 @@ def _split_acronym(m):
 
 def text_normalize(text):
     text = preprocess_text(text)
+    for name, replacement in KNOWN_ACRONYMS.items():
+        text = re.sub(rf"\b{re.escape(name)}\b", replacement, text, flags=re.I)
     # Split acronyms before normalization so G2P reads them letter-by-letter
     text = ACRONYM_SPLIT_RE.sub(_split_acronym, text)
-    # Always use WeText TN for pure English
-    text = get_normalizer().normalize(text)
-    text = wetext_post_replace(text)
+    text = normalize_numbers(text)
+    text = expand_abbreviations(text)
     text = replace_punctuation(text)
     text = PUNCT_SPACE_RE.sub(r"\1 \2", text)
     text = SPACE_RE.sub(" ", text).strip()

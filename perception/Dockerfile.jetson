@@ -76,7 +76,7 @@ RUN cp /opt/vits2-runtime/runtime/frontend_assets/cmudict.rep \
     EN_TN_CACHE_DIR=/models/vits2-mix/tn_cache \
     TN_CACHE_DIR=/models/vits2-mix/tn_cache \
     VITS2_FRONTEND_DATA_DIR=/models/vits2-mix/frontend_data \
-    /usr/bin/python3 -c "from frontend.cleaner import clean_text_mix; [clean_text_mix(t) for t in ('你好。','Hello。','今天AI助手ready了。','他警惕地观察。')]"
+    /usr/bin/python3 -c "from frontend.cleaner import clean_text_mix; [clean_text_mix(t) for t in ('你好。','今天AI助手ready了。','Lucy今天喝coffee。','他警惕地观察。')]"
 
 ENV LD_LIBRARY_PATH=/usr/local/lib:/ros_ws/install/audio_msgs/lib:/opt/ros/jazzy/lib:${LD_LIBRARY_PATH} \
     AMENT_PREFIX_PATH=/ros_ws/install/audio_msgs:/opt/ros/jazzy \

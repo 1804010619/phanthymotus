@@ -31,7 +31,10 @@ def clean_text_mix(text):
         return norm_text, phones, tones, langs, word2ph
 
     if has_en and not has_zh:
-        raise ValueError("Pure English input is not supported")
+        norm_text = english.text_normalize(text)
+        phones, tones, word2ph = english.g2p(norm_text)
+        langs = ["EN"] * len(phones)
+        return norm_text, phones, tones, langs, word2ph
 
     from frontend.unified_g2p import unified_g2p
     norm_text = chinese.mix_normalize(text)

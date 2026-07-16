@@ -37,55 +37,75 @@ class SynthesizeRequest(BaseModel):
     speed: float = Field(1.0, gt=0.0, le=4.0)
 
 
-def _token_count(text: str) -> int:
-    return len(_engine._get_text_ids(text)[0])
+def _with_blanks(values):
+    result = [0]
+    for value in values:
+        result.extend((value, 0))
+    return tuple(result)
 
 
-def _iter_text_chunks(text: str):
+def _split_text_ids(text_ids):
+    token_count = len(text_ids[0])
+    if token_count <= MAX_CHUNK_TOKENS:
+        yield text_ids
+        return
+
+    if _engine.add_blank:
+        # _get_text_ids inserts zero between every phone. Split the original
+        # phone streams and restore boundary blanks for every TensorRT call.
+        # Prefer a nearby ZH/EN transition over cutting inside a language span.
+        streams = tuple(values[1::2] for values in text_ids)
+        phones_per_chunk = (MAX_CHUNK_TOKENS - 1) // 2
+        language_ids = streams[2]
+        offset = 0
+        while offset < len(streams[0]):
+            limit = min(offset + phones_per_chunk, len(streams[0]))
+            if limit == len(streams[0]):
+                end = limit
+            else:
+                minimum_boundary = offset + max(8, phones_per_chunk // 2)
+                boundaries = [
+                    index
+                    for index in range(minimum_boundary, limit + 1)
+                    if language_ids[index - 1] != language_ids[index]
+                ]
+                end = boundaries[-1] if boundaries else limit
+            yield tuple(
+                _with_blanks(values[offset:end])
+                for values in streams
+            )
+            offset = end
+        return
+
+    for offset in range(0, token_count, MAX_CHUNK_TOKENS):
+        yield tuple(
+            tuple(values[offset:offset + MAX_CHUNK_TOKENS])
+            for values in text_ids
+        )
+
+
+def _iter_text_id_chunks(text: str):
+    """Normalize one sentence at a time and lazily yield safe ID chunks."""
     units = re.findall(r".*?[。！？!?；;\n]+|.+$", text, flags=re.DOTALL)
-    current = ""
     for unit in units:
-        candidate = current + unit
-        if _token_count(candidate) <= MAX_CHUNK_TOKENS:
-            current = candidate
-            continue
-        if current.strip():
-            yield current.strip()
-            current = ""
-        remainder = unit.strip()
-        while remainder:
-            if _token_count(remainder) <= MAX_CHUNK_TOKENS:
-                current = remainder
-                break
-            low, high = 1, len(remainder)
-            while low < high:
-                middle = (low + high + 1) // 2
-                if _token_count(remainder[:middle]) <= MAX_CHUNK_TOKENS:
-                    low = middle
-                else:
-                    high = middle - 1
-            if low < 1:
-                raise ValueError("Unable to split text within TensorRT profile")
-            yield remainder[:low].strip()
-            remainder = remainder[low:].strip()
-    if current.strip():
-        yield current.strip()
+        if unit.strip():
+            yield from _split_text_ids(_engine._get_text_ids(unit.strip()))
 
 
 def _stream_pcm(text: str, speed: float):
     silence = b"\x00\x00" * (SAMPLE_RATE // 10)
     with _lock:
-        for chunk_index, chunk in enumerate(_iter_text_chunks(text)):
-            token_count = _token_count(chunk)
-            if token_count > MAX_CHUNK_TOKENS:
-                raise ValueError("Text segmentation exceeded TensorRT profile")
+        for chunk_index, text_ids in enumerate(_iter_text_id_chunks(text)):
+            token_count = len(text_ids[0])
             log.info(
                 "text redacted: chars=%d chunk=%d tokens=%d",
                 len(text), chunk_index, token_count,
             )
             if chunk_index:
                 yield silence
-            pcm = _engine.synthesize(chunk, length_scale=1.0 / speed)
+            pcm = _engine.synthesize(
+                "", text_ids=text_ids, length_scale=1.0 / speed
+            )
             for offset in range(0, len(pcm), CHUNK_BYTES):
                 yield pcm[offset:offset + CHUNK_BYTES]
 
