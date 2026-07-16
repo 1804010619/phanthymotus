@@ -195,6 +195,14 @@
   <div class="modal deploy-modal">
     <div class="modal-header">
       <span class="modal-title">部署服务</span>
+      <div class="deploy-channel-selector" id="deploy-channel-selector">
+        <label class="deploy-channel-label">更新通道</label>
+        <select id="deploy-channel-select" class="deploy-channel-select">
+          <option value="ga">GA（稳定版）</option>
+          <option value="release">Release（公测版）</option>
+          <option value="preview">Preview（预览版）</option>
+        </select>
+      </div>
       <button class="btn-icon" id="deploy-close">✕</button>
     </div>
     <div class="modal-body deploy-modal-body">

@@ -31,6 +31,7 @@ _DB_DEFAULTS = {
     'core': {
         'main_loop_enable': True,
         'configured': False,
+        'update_channel': 'ga',  # preview | release | ga
     },
     'services': {
         'llm': {'url': '', 'key': '', 'model': ''},
