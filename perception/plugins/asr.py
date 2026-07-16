@@ -385,8 +385,8 @@ def _vad_worker(pcm_q: multiprocessing.Queue, result_q: multiprocessing.Queue,
                     keywords_file=kws_keywords_file,
                     num_threads=1,
                     provider="cpu",
-                    keywords_score=1.0,
-                    keywords_threshold=0.25,
+                    keywords_score=1.5,
+                    keywords_threshold=0.1,
                 )
                 kws_stream = kws_spotter.create_stream()
                 _log.info(f"[vad-worker] KWS initialized, keywords={keywords}")
