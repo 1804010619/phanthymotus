@@ -149,22 +149,30 @@ def _find_keyword_in_ipa(text_ipa: list, keyword_ipa: list, threshold: float):
     return best_dist <= threshold, best_end
 
 
-def _extract_after_keyword(text: str, keyword_ipa: list, end_pos: int) -> str:
-    """Extract text after the matched keyword position.
-    end_pos is the IPA phoneme index where keyword ends.
-    Maps back to character position by counting phoneme-producing chars.
+def _extract_after_keyword(text: str, keyword_text: str, end_pos: int) -> str:
+    """Extract text after the matched keyword.
+    Uses keyword text length to determine how many characters to skip,
+    then handles the case where ASR text has slightly different char count.
     """
-    ipa_count = 0
+    # Count phoneme-producing characters in original text up to end_pos
+    # Simpler approach: use the keyword character length as skip count
+    kw_chars = len([c for c in keyword_text if '\u4e00' <= c <= '\u9fff' or c.isalpha()])
+
+    # Skip that many phoneme-producing characters in text
+    skipped = 0
+    cut_idx = 0
     for i, char in enumerate(text):
-        if '\u4e00' <= char <= '\u9fff' or char.isalpha() or '\u3040' <= char <= '\u30ff' or '\uac00' <= char <= '\ud7af':
-            ipa_count += 1
-        if ipa_count >= end_pos:
-            # Return everything after this character, stripping punctuation prefix
-            remaining = text[i + 1:]
-            # Strip leading punctuation/spaces
-            remaining = remaining.lstrip('，。！？、；：,.!?;: ')
-            return remaining
-    return ''
+        if '\u4e00' <= char <= '\u9fff' or char.isalpha():
+            skipped += 1
+        if skipped >= kw_chars:
+            cut_idx = i + 1
+            break
+
+    if cut_idx == 0:
+        return ''
+    remaining = text[cut_idx:]
+    remaining = remaining.lstrip('，。！？、；：,.!?;: ')
+    return remaining
 
 _ASR_PUB_QOS = QoSProfile(
     reliability=ReliabilityPolicy.BEST_EFFORT,
@@ -902,7 +910,7 @@ class _ASRNode(Node):
                     if not matched:
                         continue
                     # Extract text after keyword
-                    remaining = _extract_after_keyword(text, keyword_ipa, end_pos)
+                    remaining = _extract_after_keyword(text, kw_text, end_pos)
                     log.info(f"[asr] asr_kws TRIGGERED: '{text}' → '{remaining}'")
                     if not remaining.strip():
                         continue
