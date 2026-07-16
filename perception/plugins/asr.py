@@ -73,6 +73,9 @@ def _text_to_ipa(text: str) -> list:
                            separator=sep, strip=True,
                            with_stress=False, tie=False,
                            language_switch='remove-flags')
+            # Remove tone numbers and diacritics for fuzzy matching
+            import re
+            ipa = re.sub(r'[0-9˥˦˧˨˩¹²³⁴⁵]', '', ipa)
             phones = [p for p in ipa.split() if p]
             ipa_seq.extend(phones)
         except Exception:
@@ -82,7 +85,7 @@ def _text_to_ipa(text: str) -> list:
 
 
 def _phoneme_edit_distance(seq1: list, seq2: list) -> float:
-    """Normalized edit distance between two phoneme sequences (0=match, 1=different)."""
+    """Normalized edit distance with phoneme similarity (0=match, 1=different)."""
     m, n = len(seq1), len(seq2)
     if m == 0 or n == 0:
         return 1.0
@@ -93,9 +96,40 @@ def _phoneme_edit_distance(seq1: list, seq2: list) -> float:
         dp[0][j] = j
     for i in range(1, m + 1):
         for j in range(1, n + 1):
-            cost = 0 if seq1[i - 1] == seq2[j - 1] else 1
+            cost = _phoneme_sub_cost(seq1[i - 1], seq2[j - 1])
             dp[i][j] = min(dp[i - 1][j] + 1, dp[i][j - 1] + 1, dp[i - 1][j - 1] + cost)
     return dp[m][n] / max(m, n)
+
+
+# Similar phoneme groups — substitution cost 0.3 instead of 1.0
+_SIMILAR_GROUPS = [
+    {'t', 'd'},       # alveolar stops
+    {'p', 'b'},       # bilabial stops
+    {'k', 'g'},       # velar stops
+    {'f', 'v'},       # labiodental fricatives
+    {'s', 'z'},       # alveolar fricatives
+    {'s.', 'z.'},     # retroflex fricatives
+    {'ɕ', 'ʃ', 'ʂ'}, # postalveolar/retroflex sibilants
+    {'tsh', 'dz'},    # affricates
+    {'n', 'ŋ'},       # nasals
+    {'l', 'r', 'ɹ'},  # liquids
+    {'t', 'tsh'},     # stop ~ affricate
+    {'f', 't'},       # common confusion in noisy env
+    {'x', 'h'},       # velar/glottal fricatives
+    {'ɑu', 'au', 'ɑo', 'ao'},  # diphthong variants
+    {'ou', 'uo'},     # vowel variants
+    {'i', 'i.'},      # apical vowel variant
+]
+
+
+def _phoneme_sub_cost(a: str, b: str) -> float:
+    """Substitution cost: 0 if same, 0.3 if similar, 1.0 otherwise."""
+    if a == b:
+        return 0
+    for group in _SIMILAR_GROUPS:
+        if a in group and b in group:
+            return 0.3
+    return 1.0
 
 
 def _find_keyword_in_ipa(text_ipa: list, keyword_ipa: list, threshold: float):
