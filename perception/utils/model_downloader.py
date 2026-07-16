@@ -42,6 +42,10 @@ MODELS = {
         "url": f"{COS_BASE}/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17.zip",
         "check_file": "tokens.txt",
     },
+    "asr_paraformer_offline": {
+        "url": f"{COS_BASE}/sherpa-onnx-paraformer-zh-small-2024-03-09.tar.bz2",
+        "check_file": "tokens.txt",
+    },
     "tts": {
         "url": f"{COS_BASE}/matcha-icefall-zh-en.tar.bz2",
         "check_file": "model-steps-3.onnx",

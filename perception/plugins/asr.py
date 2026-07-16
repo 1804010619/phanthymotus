@@ -68,7 +68,7 @@ TOOLS = [
         "configSchema": {
             "type": "object",
             "properties": {
-                "asr_model":     {"type": "string", "enum": ["paraformer-zh-en", "zipformer-en", "sensevoice-small"], "description": "ASR model (paraformer-zh-en = bilingual streaming, zipformer-en = English only, sensevoice-small = multilingual non-autoregressive)", "default": "paraformer-zh-en", "scope": "shared"},
+                "asr_model":     {"type": "string", "enum": ["paraformer-zh-en", "paraformer-offline", "zipformer-en", "sensevoice-small"], "description": "ASR model (paraformer-zh-en = bilingual streaming, paraformer-offline = bilingual offline, zipformer-en = English streaming, sensevoice-small = multilingual offline)", "default": "sensevoice-small", "scope": "shared"},
                 "trigger_mode":  {"type": "string", "enum": ["vad", "kws"], "description": "Trigger mode (vad = always listen, kws = wake word first)", "default": "kws", "scope": "shared"},
                 "kws_model":     {"type": "string", "enum": ["zh", "en", "zh-en"], "description": "KWS 模型 (zh=纯中文, en=纯英文, zh-en=双语)", "default": "zh", "scope": "shared", "x-show-when": {"trigger_mode": "kws"}},
                 "kws_keywords":  {"type": "string", "description": "Wake word (zh: 'f àn sh ì x iǎo g ǒu @范式小狗', en: '▁FA N C Y ▁RO B O T @FANCY_ROBOT')", "scope": "shared", "x-show-when": {"trigger_mode": "kws"}},
@@ -261,15 +261,62 @@ class SherpaOnnxSenseVoiceAdapter(ASRAdapter):
         return text.strip()
 
 
+class SherpaOnnxOfflineParaformerAdapter(ASRAdapter):
+    """Offline non-streaming Paraformer (zh+en, small).
+
+    Better accuracy than streaming version — no tail truncation.
+    Uses sherpa_onnx.OfflineRecognizer.from_paraformer.
+    """
+
+    def __init__(self, model_dir: str, hw_provider: str = "cuda", num_threads: int = 2):
+        from utils.model_downloader import ensure_model
+        ensure_model("asr_paraformer_offline", model_dir)
+
+        import sherpa_onnx
+        model_path = os.path.join(model_dir, "model.int8.onnx")
+        if not os.path.exists(model_path):
+            model_path = os.path.join(model_dir, "model.onnx")
+        tokens_path = os.path.join(model_dir, "tokens.txt")
+
+        self._recognizer = sherpa_onnx.OfflineRecognizer.from_paraformer(
+            paraformer=model_path,
+            tokens=tokens_path,
+            num_threads=num_threads,
+            provider=hw_provider,
+            sample_rate=SAMPLE_RATE,
+            decoding_method="greedy_search",
+        )
+        log.info(f"[asr] sherpa-onnx offline paraformer adapter loaded: model={model_path}, provider={hw_provider}")
+
+    def transcribe(self, wav_bytes: bytes, language: str) -> str:
+        import io as _io, wave as _wave
+        with _wave.open(_io.BytesIO(wav_bytes)) as wf:
+            pcm = wf.readframes(wf.getnframes())
+        n = len(pcm) // 2
+        samples = struct.unpack(f'<{n}h', pcm)
+        float_samples = [s / 32768.0 for s in samples]
+
+        stream = self._recognizer.create_stream()
+        stream.accept_waveform(SAMPLE_RATE, float_samples)
+        self._recognizer.decode_streams([stream])
+        text = stream.result.text
+        return text.strip()
+
+
 # ASR model registry
 ASR_MODELS = {
     "paraformer-zh-en": {
-        "label": "Paraformer Bilingual (zh+en)",
+        "label": "Paraformer Bilingual (zh+en, streaming)",
         "adapter": SherpaOnnxASRAdapter,
         "default_model_dir": "/models/sherpa-onnx/asr",
     },
+    "paraformer-offline": {
+        "label": "Paraformer Offline (zh+en, small)",
+        "adapter": SherpaOnnxOfflineParaformerAdapter,
+        "default_model_dir": "/models/sherpa-onnx/asr-paraformer-offline",
+    },
     "zipformer-en": {
-        "label": "Zipformer English",
+        "label": "Zipformer English (streaming)",
         "adapter": SherpaOnnxZipformerAdapter,
         "default_model_dir": "/models/sherpa-onnx/asr-en",
     },
