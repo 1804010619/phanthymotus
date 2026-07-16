@@ -628,6 +628,16 @@ class _TTSNode(Node):
         }
 
 
+def _warmup_tts_adapter(adapter: TTSAdapter, text: str = "。") -> None:
+    """Run one silent synthesis to warm up ORT/CUDA before the first speak request."""
+    import time as _time
+
+    t0 = _time.monotonic()
+    pcm = adapter._synthesize_segment(text)
+    elapsed = _time.monotonic() - t0
+    log.info(f"[tts] warmup done in {elapsed:.2f}s ({len(pcm)} bytes)")
+
+
 # ── Plugin ────────────────────────────────────────────────────────────────────
 
 class TTSPlugin:
@@ -643,6 +653,11 @@ class TTSPlugin:
             log.error(f"[tts] failed to load model: {e}", exc_info=True)
             self._adapter = None
             self._load_error = str(e)
+        if self._adapter and plugin_cfg.get("warmup", True):
+            try:
+                _warmup_tts_adapter(self._adapter, plugin_cfg.get("warmup_text", "。"))
+            except Exception as e:
+                log.warning(f"[tts] warmup failed (non-fatal): {e}", exc_info=True)
         self._nodes: dict[str, _TTSNode] = {}
         self._instance_configs: dict[str, dict] = {}
         self._executor = executor

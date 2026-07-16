@@ -27,6 +27,8 @@ plugins:
     num_threads: 2
     speaker_id: 0
     speed: 1.0
+    warmup: true
+    warmup_text: "。"
 
   htmsg:
     enabled: false
