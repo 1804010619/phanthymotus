@@ -632,10 +632,22 @@ def _warmup_tts_adapter(adapter: TTSAdapter, text: str = "。") -> None:
     """Run one silent synthesis to warm up ORT/CUDA before the first speak request."""
     import time as _time
 
+    log.info(f"[tts] warmup starting: text={text!r}")
     t0 = _time.monotonic()
     pcm = adapter._synthesize_segment(text)
     elapsed = _time.monotonic() - t0
     log.info(f"[tts] warmup done in {elapsed:.2f}s ({len(pcm)} bytes)")
+
+
+def _start_warmup_background(adapter: TTSAdapter, text: str = "。") -> None:
+    """Warm up in a background thread so MCP can become ready first."""
+    def _run() -> None:
+        try:
+            _warmup_tts_adapter(adapter, text)
+        except Exception as e:
+            log.warning(f"[tts] warmup failed (non-fatal): {e}", exc_info=True)
+
+    threading.Thread(target=_run, daemon=True, name="tts-warmup").start()
 
 
 # ── Plugin ────────────────────────────────────────────────────────────────────
@@ -654,10 +666,7 @@ class TTSPlugin:
             self._adapter = None
             self._load_error = str(e)
         if self._adapter and plugin_cfg.get("warmup", True):
-            try:
-                _warmup_tts_adapter(self._adapter, plugin_cfg.get("warmup_text", "。"))
-            except Exception as e:
-                log.warning(f"[tts] warmup failed (non-fatal): {e}", exc_info=True)
+            _start_warmup_background(self._adapter, plugin_cfg.get("warmup_text", "。"))
         self._nodes: dict[str, _TTSNode] = {}
         self._instance_configs: dict[str, dict] = {}
         self._executor = executor
