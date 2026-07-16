@@ -340,6 +340,20 @@ def _vad_worker(pcm_q: multiprocessing.Queue, result_q: multiprocessing.Queue,
     vad = sherpa_onnx.VoiceActivityDetector(vad_config, buffer_size_in_seconds=30)
     _log.info(f"[vad-worker] sherpa-onnx VAD initialized (threshold={threshold}, silence_ms={silence_ms})")
 
+    # ── Initialize GTCRN denoiser ──
+    denoise_model_dir = '/models/sherpa-onnx/denoise'
+    ensure_model("denoise", denoise_model_dir)
+    denoise_model_path = os.path.join(denoise_model_dir, "gtcrn_simple.onnx")
+    denoiser = sherpa_onnx.OnlineSpeechDenoiser(
+        sherpa_onnx.OnlineSpeechDenoiserConfig(
+            model=sherpa_onnx.OfflineSpeechDenoiserModelConfig(
+                gtcrn=sherpa_onnx.OfflineSpeechDenoiserGtcrnModelConfig(model=denoise_model_path),
+                num_threads=1, provider="cpu",
+            )
+        )
+    )
+    _log.info("[vad-worker] GTCRN denoiser initialized")
+
     # ── Initialize KWS (optional) ──
     kws_spotter = None
     kws_stream = None
@@ -435,6 +449,10 @@ def _vad_worker(pcm_q: multiprocessing.Queue, result_q: multiprocessing.Queue,
         import struct as _struct
         samples = _struct.unpack(f'<{n}h', pcm)
         float_samples = [s / 32768.0 for s in samples]
+
+        # Denoise before VAD/KWS
+        denoised = denoiser.run(float_samples, SAMPLE_RATE)
+        float_samples = list(denoised.samples)
 
         # Feed VAD
         vad.accept_waveform(float_samples)

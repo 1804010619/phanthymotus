@@ -68,6 +68,11 @@ MODELS = {
         "check_file": "silero_vad.onnx",
         "single_file": True,  # Not an archive, just a single file download
     },
+    "denoise": {
+        "url": f"{COS_BASE}/gtcrn_simple.onnx",
+        "check_file": "gtcrn_simple.onnx",
+        "single_file": True,
+    },
 }
 
 
