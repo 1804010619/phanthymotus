@@ -100,10 +100,6 @@ def get_normalizer():
     return _normalizer
 
 
-# Eager init: preload WeText normalizer at module load time
-get_normalizer()
-
-
 def preprocess_text(text):
     return text.translate(PREPROCESS_TRANSLATION)
 

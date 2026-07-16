@@ -41,9 +41,8 @@ def _token_count(text: str) -> int:
     return len(_engine._get_text_ids(text)[0])
 
 
-def _split_text(text: str) -> list[str]:
+def _iter_text_chunks(text: str):
     units = re.findall(r".*?[。！？!?；;\n]+|.+$", text, flags=re.DOTALL)
-    chunks: list[str] = []
     current = ""
     for unit in units:
         candidate = current + unit
@@ -51,7 +50,7 @@ def _split_text(text: str) -> list[str]:
             current = candidate
             continue
         if current.strip():
-            chunks.append(current.strip())
+            yield current.strip()
             current = ""
         remainder = unit.strip()
         while remainder:
@@ -67,24 +66,23 @@ def _split_text(text: str) -> list[str]:
                     high = middle - 1
             if low < 1:
                 raise ValueError("Unable to split text within TensorRT profile")
-            chunks.append(remainder[:low].strip())
+            yield remainder[:low].strip()
             remainder = remainder[low:].strip()
     if current.strip():
-        chunks.append(current.strip())
-    counts = [_token_count(chunk) for chunk in chunks]
-    if not chunks or any(count > MAX_CHUNK_TOKENS for count in counts):
-        raise ValueError("Text segmentation exceeded TensorRT profile")
-    log.info(
-        "text redacted: chars=%d tokens=%d chunks=%d chunk_tokens=%s",
-        len(text), sum(counts), len(chunks), counts,
-    )
-    return chunks
+        yield current.strip()
 
 
 def _stream_pcm(text: str, speed: float):
     silence = b"\x00\x00" * (SAMPLE_RATE // 10)
     with _lock:
-        for chunk_index, chunk in enumerate(_split_text(text)):
+        for chunk_index, chunk in enumerate(_iter_text_chunks(text)):
+            token_count = _token_count(chunk)
+            if token_count > MAX_CHUNK_TOKENS:
+                raise ValueError("Text segmentation exceeded TensorRT profile")
+            log.info(
+                "text redacted: chars=%d chunk=%d tokens=%d",
+                len(text), chunk_index, token_count,
+            )
             if chunk_index:
                 yield silence
             pcm = _engine.synthesize(chunk, length_scale=1.0 / speed)
@@ -97,12 +95,11 @@ async def lifespan(_: FastAPI):
     global _engine, _ready
     _ready = False
     _engine = TensorRTTTSEngine(MODEL_CONFIG, ENGINE_DIR)
-    # Warm Chinese, English, and mixed-language paths before advertising ready.
+    # Warm Chinese and mixed-language paths before advertising ready.
     warmup_bytes = 0
     with _lock:
         for text in (
             "你好。",
-            "Hello world.",
             "Lucy今天去公园散步并喝coffee。",
             "David开会前仔细检查PPT。",
         ):

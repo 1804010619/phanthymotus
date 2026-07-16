@@ -291,10 +291,12 @@ class TTSPlugin:
 
         if action == "stop":
             if instance_id and instance_id in self._nodes:
-                self._remove_node(instance_id)
+                # Keep the publisher alive so a subsequent start for the same
+                # instance reuses its DDS discovery state.
+                self._nodes[instance_id].stop()
             elif not instance_id:
-                for key in list(self._nodes):
-                    self._remove_node(key)
+                for node in self._nodes.values():
+                    node.stop()
             return {"state": "idle"}
 
         if action == "speak":
