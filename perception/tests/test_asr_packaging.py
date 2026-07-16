@@ -18,12 +18,12 @@ class ASRPackagingTest(unittest.TestCase):
         )
         self.assertNotIn("COPY perception/models", dockerfile)
 
-    def test_default_config_targets_asr_offline_benchmark(self):
+    def test_ocr_leaderboard_config_keeps_asr_offline_settings_but_disables_it(self):
         config = (REPO_ROOT / "perception" / "config.yaml").read_text(
             encoding="utf-8"
         )
 
-        self.assertIn("  asr:\n    enabled: true\n    mode: offline", config)
+        self.assertIn("  asr:\n    enabled: false\n    mode: offline", config)
         self.assertIn("model_path: /models/sherpa-onnx/asr-offline", config)
         self.assertIn("    kws:\n      enabled: false", config)
         for plugin in ("tts", "htmsg", "vop"):

@@ -2,7 +2,7 @@ mcp_port: 15720
 
 plugins:
   asr:
-    enabled: true
+    enabled: false
     mode: offline               # offline | streaming (online/segmented are legacy aliases)
     model_path: /models/sherpa-onnx/asr-offline
     asr_model: paraformer-zh-en   # paraformer-zh-en | zipformer-en
@@ -60,4 +60,5 @@ plugins:
     model_dir: /models/ocr/ppocrv6-tiny
     language: zh
     use_angle_cls: true
-    num_threads: 2
+    num_threads: 1
+    max_side_len: 1600
