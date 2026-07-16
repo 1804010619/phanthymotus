@@ -605,12 +605,20 @@ function _openToolConfigModal(mcpId, toolName, configSchema) {
 
     // Save to per-tool API
     try {
-      await fetch(`/api/canvas/tool-config/${encodeURIComponent(mcpId)}/${encodeURIComponent(toolName)}`, {
+      const resp = await fetch(`/api/canvas/tool-config/${encodeURIComponent(mcpId)}/${encodeURIComponent(toolName)}`, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(values),
       });
-    } catch (err) { console.error('[config] save failed:', err); }
+      if (!resp.ok) {
+        alert(`配置保存失败 (HTTP ${resp.status})`);
+        return;
+      }
+    } catch (err) {
+      alert('配置保存失败: ' + err.message);
+      console.error('[config] save failed:', err);
+      return;
+    }
 
     // Update local cache
     _toolConfigs[configKey] = values;
@@ -847,12 +855,20 @@ export function openInstanceConfigModal(mcpId, toolName, instanceId, configSchem
     });
 
     try {
-      await fetch(`/api/canvas/tool-config/${encodeURIComponent(mcpId)}/${encodeURIComponent(toolName)}/${encodeURIComponent(instanceId)}`, {
+      const resp = await fetch(`/api/canvas/tool-config/${encodeURIComponent(mcpId)}/${encodeURIComponent(toolName)}/${encodeURIComponent(instanceId)}`, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(values),
       });
-    } catch (err) { console.error('[config] instance save failed:', err); }
+      if (!resp.ok) {
+        alert(`配置保存失败 (HTTP ${resp.status})`);
+        return;
+      }
+    } catch (err) {
+      alert('配置保存失败: ' + err.message);
+      console.error('[config] instance save failed:', err);
+      return;
+    }
 
     _toolConfigs[configKey] = values;
     close();
