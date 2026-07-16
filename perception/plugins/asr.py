@@ -37,6 +37,143 @@ _LOW_LAT_QOS = QoSProfile(
     durability=DurabilityPolicy.VOLATILE,
 )
 
+
+# ── IPA phoneme matching for asr_kws mode ────────────────────────────────────
+
+def _text_to_ipa(text: str) -> list:
+    """Convert text to IPA phoneme sequence using phonemizer (espeak-ng backend).
+    Returns a list of IPA phoneme strings (one per word/character).
+    """
+    from phonemizer import phonemize
+    from phonemizer.separator import Separator
+
+    # Separate Chinese and non-Chinese segments
+    segments = []
+    current = ''
+    current_is_cjk = None
+    for char in text:
+        is_cjk = '\u4e00' <= char <= '\u9fff'
+        if current_is_cjk is None:
+            current_is_cjk = is_cjk
+        if is_cjk != current_is_cjk:
+            if current.strip():
+                segments.append((current.strip(), current_is_cjk))
+            current = ''
+            current_is_cjk = is_cjk
+        current += char
+    if current.strip():
+        segments.append((current.strip(), current_is_cjk))
+
+    ipa_seq = []
+    sep = Separator(phone=' ', word='  ', syllable='')
+    for seg_text, is_cjk in segments:
+        lang = 'cmn' if is_cjk else 'en-us'
+        try:
+            ipa = phonemize(seg_text, language=lang, backend='espeak',
+                           separator=sep, strip=True,
+                           with_stress=False, tie=False,
+                           language_switch='remove-flags')
+            # Remove tone numbers and diacritics for fuzzy matching
+            import re
+            ipa = re.sub(r'[0-9˥˦˧˨˩¹²³⁴⁵]', '', ipa)
+            phones = [p for p in ipa.split() if p]
+            ipa_seq.extend(phones)
+        except Exception:
+            # Fallback: use characters as-is
+            ipa_seq.extend(list(seg_text))
+    return ipa_seq
+
+
+def _phoneme_edit_distance(seq1: list, seq2: list) -> float:
+    """Normalized edit distance with phoneme similarity (0=match, 1=different)."""
+    m, n = len(seq1), len(seq2)
+    if m == 0 or n == 0:
+        return 1.0
+    dp = [[0] * (n + 1) for _ in range(m + 1)]
+    for i in range(m + 1):
+        dp[i][0] = i
+    for j in range(n + 1):
+        dp[0][j] = j
+    for i in range(1, m + 1):
+        for j in range(1, n + 1):
+            cost = _phoneme_sub_cost(seq1[i - 1], seq2[j - 1])
+            dp[i][j] = min(dp[i - 1][j] + 1, dp[i][j - 1] + 1, dp[i - 1][j - 1] + cost)
+    return dp[m][n] / max(m, n)
+
+
+# Similar phoneme groups — substitution cost 0.3 instead of 1.0
+_SIMILAR_GROUPS = [
+    {'t', 'd'},       # alveolar stops
+    {'p', 'b'},       # bilabial stops
+    {'k', 'g'},       # velar stops
+    {'f', 'v'},       # labiodental fricatives
+    {'s', 'z'},       # alveolar fricatives
+    {'s.', 'z.'},     # retroflex fricatives
+    {'ɕ', 'ʃ', 'ʂ'}, # postalveolar/retroflex sibilants
+    {'tsh', 'dz'},    # affricates
+    {'n', 'ŋ'},       # nasals
+    {'l', 'r', 'ɹ'},  # liquids
+    {'t', 'tsh'},     # stop ~ affricate
+    {'f', 't'},       # common confusion in noisy env
+    {'x', 'h'},       # velar/glottal fricatives
+    {'ɑu', 'au', 'ɑo', 'ao'},  # diphthong variants
+    {'ou', 'uo'},     # vowel variants
+    {'i', 'i.'},      # apical vowel variant
+]
+
+
+def _phoneme_sub_cost(a: str, b: str) -> float:
+    """Substitution cost: 0 if same, 0.3 if similar, 1.0 otherwise."""
+    if a == b:
+        return 0
+    for group in _SIMILAR_GROUPS:
+        if a in group and b in group:
+            return 0.3
+    return 1.0
+
+
+def _find_keyword_in_ipa(text_ipa: list, keyword_ipa: list, threshold: float):
+    """Sliding window search for keyword in text IPA. Returns (matched, end_position)."""
+    kw_len = len(keyword_ipa)
+    if kw_len == 0 or len(text_ipa) < kw_len:
+        return False, -1
+
+    best_dist = float('inf')
+    best_end = -1
+    for i in range(len(text_ipa) - kw_len + 1):
+        window = text_ipa[i:i + kw_len]
+        dist = _phoneme_edit_distance(window, keyword_ipa)
+        if dist < best_dist:
+            best_dist = dist
+            best_end = i + kw_len
+    return best_dist <= threshold, best_end
+
+
+def _extract_after_keyword(text: str, keyword_text: str, end_pos: int) -> str:
+    """Extract text after the matched keyword.
+    Uses keyword text length to determine how many characters to skip,
+    then handles the case where ASR text has slightly different char count.
+    """
+    # Count phoneme-producing characters in original text up to end_pos
+    # Simpler approach: use the keyword character length as skip count
+    kw_chars = len([c for c in keyword_text if '\u4e00' <= c <= '\u9fff' or c.isalpha()])
+
+    # Skip that many phoneme-producing characters in text
+    skipped = 0
+    cut_idx = 0
+    for i, char in enumerate(text):
+        if '\u4e00' <= char <= '\u9fff' or char.isalpha():
+            skipped += 1
+        if skipped >= kw_chars:
+            cut_idx = i + 1
+            break
+
+    if cut_idx == 0:
+        return ''
+    remaining = text[cut_idx:]
+    remaining = remaining.lstrip('，。！？、；：,.!?;: ')
+    return remaining
+
 _ASR_PUB_QOS = QoSProfile(
     reliability=ReliabilityPolicy.BEST_EFFORT,
     history=HistoryPolicy.KEEP_LAST,
@@ -69,9 +206,11 @@ TOOLS = [
             "type": "object",
             "properties": {
                 "asr_model":     {"type": "string", "enum": ["paraformer-zh-en", "paraformer-offline", "zipformer-en", "sensevoice-small"], "description": "ASR model (paraformer-zh-en = bilingual streaming, paraformer-offline = bilingual offline, zipformer-en = English streaming, sensevoice-small = multilingual offline)", "default": "sensevoice-small", "scope": "shared"},
-                "trigger_mode":  {"type": "string", "enum": ["vad", "kws"], "description": "Trigger mode (vad = always listen, kws = wake word first)", "default": "kws", "scope": "shared"},
+                "trigger_mode":  {"type": "string", "enum": ["vad", "kws", "asr_kws"], "description": "Trigger mode (vad = always listen, kws = KWS model, asr_kws = ASR + phoneme matching)", "default": "kws", "scope": "shared"},
                 "kws_model":     {"type": "string", "enum": ["zh", "en", "zh-en"], "description": "KWS 模型 (zh=纯中文, en=纯英文, zh-en=双语)", "default": "zh", "scope": "shared", "x-show-when": {"trigger_mode": "kws"}},
                 "kws_keywords":  {"type": "string", "description": "Wake word (zh: 'f àn sh ì x iǎo g ǒu @范式小狗', en: '▁FA N C Y ▁RO B O T @FANCY_ROBOT')", "scope": "shared", "x-show-when": {"trigger_mode": "kws"}},
+                "asr_kws_keyword": {"type": "string", "description": "唤醒词文本（如'范式小狗'、'hello robot'）", "scope": "shared", "x-show-when": {"trigger_mode": "asr_kws"}},
+                "asr_kws_threshold": {"type": "number", "description": "音素匹配阈值（0-1，越小越严格，推荐0.3）", "default": 0.3, "scope": "shared", "x-show-when": {"trigger_mode": "asr_kws"}},
                 "vad_threshold": {"type": "number", "description": "VAD speech threshold (0-1, higher = stricter)", "default": 0.5, "scope": "shared"},
                 "vad_silence_ms":{"type": "integer", "description": "Silence duration (ms) before sentence end", "default": 400, "scope": "shared"},
                 "save_vad_segments": {"type": "boolean", "description": "Save VAD segments as WAV to /opt/embodied/models/vad_segments/", "default": False, "scope": "shared"},
@@ -624,7 +763,15 @@ class _ASRNode(Node):
         if self.state == "running":
             return self._status_dict()
         if not self._adapter:
-            raise RuntimeError("ASR adapter not configured")
+            return {"state": "error", "message": "ASR adapter not configured"}
+        try:
+            return self._start_inner()
+        except Exception as e:
+            log.error(f"[asr] start failed: {e}", exc_info=True)
+            self.state = "error"
+            return {"state": "error", "message": str(e)}
+
+    def _start_inner(self) -> dict:
         from audio_msgs.msg import AudioChunk
         log.info(f"[asr] subscribing to topic={self._input_topic}, publishing to={self._output_topic}")
         self._first_chunk_event = threading.Event()
@@ -647,14 +794,19 @@ class _ASRNode(Node):
         self._worker_thread = threading.Thread(target=self._worker, daemon=True)
         self._worker_thread.start()
         self.state = "starting"
+        self._worker_ready = threading.Event()
         log.info("[asr] waiting for first audio chunk...")
         # Block until first audio chunk arrives or stop() cancels
         self._first_chunk_event.wait()
         if self._stop_event.is_set():
             self.state = "idle"
             return {"state": "idle"}
+        # Wait for worker to finish initialization (IPA precompute etc.)
+        self._worker_ready.wait()
+        if self.state == "error":
+            return {"state": "error", "message": "ASR worker failed to initialize (check logs)"}
         self.state = "running"
-        log.info("[asr] started, waiting for audio data...")
+        log.info("[asr] started, receiving audio data")
         return self._status_dict()
 
     def stop(self) -> dict:
@@ -662,9 +814,11 @@ class _ASRNode(Node):
         if self._sub:
             self.destroy_subscription(self._sub); self._sub = None
         self._stop_event.set()
-        # Unblock start() if it's waiting for first chunk
+        # Unblock start() if it's waiting
         if hasattr(self, '_first_chunk_event'):
             self._first_chunk_event.set()
+        if hasattr(self, '_worker_ready'):
+            self._worker_ready.set()
         if self._vad_stop:
             self._vad_stop.set()
         # Cancel feeder threads immediately — avoids BrokenPipeError spam
@@ -712,6 +866,32 @@ class _ASRNode(Node):
             pass  # drop if severely behind
 
     def _worker(self):
+        try:
+            self._worker_inner()
+        except Exception as e:
+            log.error(f"[asr] worker fatal error: {e}", exc_info=True)
+            self.state = "error"
+            if hasattr(self, '_worker_ready'):
+                self._worker_ready.set()
+
+    def _worker_inner(self):
+        # Pre-compute keyword IPA if in asr_kws mode
+        trigger_mode = self._kws_cfg.get('trigger_mode', 'kws')
+        keyword_ipa = None
+        asr_kws_threshold = float(self._kws_cfg.get('asr_kws_threshold', 0.3))
+        if trigger_mode == 'asr_kws':
+            kw_text = self._kws_cfg.get('asr_kws_keyword', '')
+            if kw_text:
+                keyword_ipa = _text_to_ipa(kw_text)
+                log.info(f"[asr] asr_kws mode: keyword='{kw_text}' ipa={keyword_ipa} threshold={asr_kws_threshold}")
+            else:
+                log.warning("[asr] asr_kws mode but no keyword configured, falling back to vad mode")
+                trigger_mode = 'vad'
+
+        # Signal that worker init is complete
+        if hasattr(self, '_worker_ready'):
+            self._worker_ready.set()
+
         while not self._stop_event.is_set():
             try:
                 utterance, start_ts, end_ts = self._utterance_queue.get(timeout=1)
@@ -721,6 +901,21 @@ class _ASRNode(Node):
                 wav   = _pcm16_to_wav(utterance)
                 text  = self._adapter.transcribe(wav, self._language)
                 if not text.strip(): continue
+
+                # ASR-based keyword spotting
+                if trigger_mode == 'asr_kws' and keyword_ipa:
+                    text_ipa = _text_to_ipa(text)
+                    matched, end_pos = _find_keyword_in_ipa(text_ipa, keyword_ipa, asr_kws_threshold)
+                    log.info(f"[asr] asr_kws: text='{text}' ipa={text_ipa} dist_matched={matched} end={end_pos}")
+                    if not matched:
+                        continue
+                    # Extract text after keyword
+                    remaining = _extract_after_keyword(text, kw_text, end_pos)
+                    log.info(f"[asr] asr_kws TRIGGERED: '{text}' → '{remaining}'")
+                    if not remaining.strip():
+                        continue
+                    text = remaining
+
                 result = {"text": text, "audio_start_ts": start_ts,
                           "audio_end_ts": end_ts, "asr_complete_ts": time.time()}
                 msg = String(); msg.data = json.dumps(result, ensure_ascii=False)
@@ -917,6 +1112,10 @@ class ASRPlugin:
                 self._kws_cfg['kws_model'] = cfg['kws_model']
             if 'kws_keywords' in cfg:
                 self._kws_cfg['keywords'] = [cfg['kws_keywords']]
+            if 'asr_kws_keyword' in cfg:
+                self._kws_cfg['asr_kws_keyword'] = cfg['asr_kws_keyword']
+            if 'asr_kws_threshold' in cfg:
+                self._kws_cfg['asr_kws_threshold'] = float(cfg['asr_kws_threshold'])
             if 'save_vad_segments' in cfg:
                 self._save_vad_segments = bool(cfg['save_vad_segments'])
             if 'max_saved_segments' in cfg:

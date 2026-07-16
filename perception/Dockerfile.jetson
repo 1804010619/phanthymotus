@@ -79,6 +79,11 @@ ENV YOLO_CONFIG_DIR=/work
 # ── sherpa-onnx (on-device ASR/TTS/KWS) ──────────────────────────
 RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} sherpa-onnx
 
+# ── phonemizer (multilingual IPA via espeak-ng for asr_kws mode) ──
+RUN apt-get update && apt-get install -y --no-install-recommends espeak-ng && \
+    rm -rf /var/lib/apt/lists/*
+RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} phonemizer
+
 # ── Application code ───────────────────────────────────────────────
 WORKDIR /work
 COPY perception/main.py    /work/main.py
