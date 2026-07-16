@@ -37,65 +37,58 @@ class SynthesizeRequest(BaseModel):
     speed: float = Field(1.0, gt=0.0, le=4.0)
 
 
-def _with_blanks(values):
-    result = [0]
-    for value in values:
-        result.extend((value, 0))
-    return tuple(result)
+def _language_kind(char: str) -> str | None:
+    if "\u4e00" <= char <= "\u9fff":
+        return "ZH"
+    if char.isascii() and char.isalnum():
+        return "EN"
+    return None
 
 
-def _split_text_ids(text_ids):
-    token_count = len(text_ids[0])
-    if token_count <= MAX_CHUNK_TOKENS:
-        yield text_ids
+def _preferred_split(text: str) -> int:
+    midpoint = len(text) // 2
+    boundaries = []
+    previous_kind = None
+    for index, char in enumerate(text):
+        kind = _language_kind(char)
+        if kind is None:
+            continue
+        if previous_kind is not None and kind != previous_kind:
+            boundaries.append(index)
+        previous_kind = kind
+    usable = [index for index in boundaries if 1 < index < len(text) - 1]
+    if usable:
+        return min(usable, key=lambda index: abs(index - midpoint))
+    return max(1, midpoint)
+
+
+def _iter_unit_chunks(text: str):
+    text_ids = _engine._get_text_ids(text)
+    if len(text_ids[0]) <= MAX_CHUNK_TOKENS:
+        yield text, text_ids
         return
-
-    if _engine.add_blank:
-        # _get_text_ids inserts zero between every phone. Split the original
-        # phone streams and restore boundary blanks for every TensorRT call.
-        # Prefer a nearby ZH/EN transition over cutting inside a language span.
-        streams = tuple(values[1::2] for values in text_ids)
-        phones_per_chunk = (MAX_CHUNK_TOKENS - 1) // 2
-        language_ids = streams[2]
-        offset = 0
-        while offset < len(streams[0]):
-            limit = min(offset + phones_per_chunk, len(streams[0]))
-            if limit == len(streams[0]):
-                end = limit
-            else:
-                minimum_boundary = offset + max(8, phones_per_chunk // 2)
-                boundaries = [
-                    index
-                    for index in range(minimum_boundary, limit + 1)
-                    if language_ids[index - 1] != language_ids[index]
-                ]
-                end = boundaries[-1] if boundaries else limit
-            yield tuple(
-                _with_blanks(values[offset:end])
-                for values in streams
-            )
-            offset = end
-        return
-
-    for offset in range(0, token_count, MAX_CHUNK_TOKENS):
-        yield tuple(
-            tuple(values[offset:offset + MAX_CHUNK_TOKENS])
-            for values in text_ids
-        )
+    if len(text) <= 1:
+        raise ValueError("Unable to split text within TensorRT profile")
+    split_at = _preferred_split(text)
+    left, right = text[:split_at].strip(), text[split_at:].strip()
+    if not left or not right:
+        raise ValueError("Unable to split text within TensorRT profile")
+    yield from _iter_unit_chunks(left)
+    yield from _iter_unit_chunks(right)
 
 
-def _iter_text_id_chunks(text: str):
-    """Normalize one sentence at a time and lazily yield safe ID chunks."""
-    units = re.findall(r".*?[。！？!?；;\n]+|.+$", text, flags=re.DOTALL)
+def _iter_text_chunks(text: str):
+    """Lazily split by punctuation, language boundary, then midpoint."""
+    units = re.findall(r".*?[。！？!?；;，,：:\n]+|.+$", text, flags=re.DOTALL)
     for unit in units:
         if unit.strip():
-            yield from _split_text_ids(_engine._get_text_ids(unit.strip()))
+            yield from _iter_unit_chunks(unit.strip())
 
 
 def _stream_pcm(text: str, speed: float):
     silence = b"\x00\x00" * (SAMPLE_RATE // 10)
     with _lock:
-        for chunk_index, text_ids in enumerate(_iter_text_id_chunks(text)):
+        for chunk_index, (chunk, text_ids) in enumerate(_iter_text_chunks(text)):
             token_count = len(text_ids[0])
             log.info(
                 "text redacted: chars=%d chunk=%d tokens=%d",
@@ -104,7 +97,7 @@ def _stream_pcm(text: str, speed: float):
             if chunk_index:
                 yield silence
             pcm = _engine.synthesize(
-                "", text_ids=text_ids, length_scale=1.0 / speed
+                chunk, text_ids=text_ids, length_scale=1.0 / speed
             )
             for offset in range(0, len(pcm), CHUNK_BYTES):
                 yield pcm[offset:offset + CHUNK_BYTES]
@@ -115,18 +108,18 @@ async def lifespan(_: FastAPI):
     global _engine, _ready
     _ready = False
     _engine = TensorRTTTSEngine(MODEL_CONFIG, ENGINE_DIR)
-    # Warm Chinese and mixed-language paths before advertising ready.
+    # Warm the same streaming and profile-splitting path used by requests.
     warmup_bytes = 0
-    with _lock:
-        for text in (
-            "你好。",
-            "Lucy今天去公园散步并喝coffee。",
-            "David开会前仔细检查PPT。",
-        ):
-            pcm = _engine.synthesize(text)
-            if not pcm:
-                raise RuntimeError("TensorRT warmup produced no audio")
-            warmup_bytes += len(pcm)
+    for text in (
+        "你好。",
+        "Lucy今天去公园散步并喝coffee，David开会前仔细检查PPT。",
+    ):
+        case_bytes = 0
+        for pcm in _stream_pcm(text, speed=1.0):
+            case_bytes += len(pcm)
+        if not case_bytes:
+            raise RuntimeError("TensorRT warmup produced no audio")
+        warmup_bytes += case_bytes
     _ready = True
     log.info("VITS2 TensorRT backend ready: warmup_bytes=%d", warmup_bytes)
     try:
