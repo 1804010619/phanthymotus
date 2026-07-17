@@ -508,13 +508,20 @@ class _TTSNode(Node):
 
                 def _produce_audio():
                     synth_t0 = _time.monotonic()
+                    chunk_count = 0
                     try:
                         for chunk in self._adapter.synthesize_segments_stream(segments):
+                            if chunk_count == 0:
+                                log.info(f"[tts] synthesis produced first chunk ({len(chunk)} bytes), topic={self._output_topic}")
+                            chunk_count += 1
                             if self._stop_event.is_set() or not _queue_put(chunk):
                                 break
                     except Exception as exc:
+                        log.error(f"[tts] synthesis failed (hw_provider may be unavailable): {exc}", exc_info=True)
                         producer_error.append(exc)
                     finally:
+                        if chunk_count == 0:
+                            log.warning(f"[tts] synthesis produced 0 chunks — no audio will be published")
                         synth_elapsed[0] = _time.monotonic() - synth_t0
                         _queue_put(stream_end)
 
@@ -549,6 +556,7 @@ class _TTSNode(Node):
                             if len(prebuf) >= PREBUF_FRAMES:
                                 # Flush pre-buffer and start real-time clock
                                 t0 = _time.monotonic()
+                                log.info(f"[tts] publishing first frame to ROS2 topic={self._output_topic}, subscribers={self._pub.get_subscription_count()}")
                                 for pf in prebuf:
                                     msg = AudioChunk()
                                     msg.header.stamp = self.get_clock().now().to_msg()
