@@ -264,6 +264,7 @@ class Event:
         while True:
             ev = await collector.next_trigger()
             self._current_turn = []  # 本轮消息，无论成功失败都会保存
+            collector.set_busy(True)
             try:
                 await self._one_turn(ev)
             except asyncio.CancelledError:
@@ -277,6 +278,7 @@ class Event:
                 })
                 await push_event({'type': 'error', 'payload': {'message': str(e)}})
             finally:
+                collector.set_busy(False)
                 # 无论成功失败，只要有消息就持久化
                 if self._current_turn:
                     self._save_current_turn(ev)
