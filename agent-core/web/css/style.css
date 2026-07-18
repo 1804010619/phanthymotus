@@ -4782,6 +4782,9 @@ html, body {
     top: 50%;
     left: 50%;
     transform: translate(-50%, -50%);
+    background: transparent !important;
+    border-radius: 50%;
+    inset: auto;
   }
   .btn-icon { min-width: 44px; min-height: 44px; }
   .activity-collapse-btn { min-width: 44px; min-height: 44px; padding: 8px; }
@@ -4863,7 +4866,8 @@ html, body {
 
   .sidebar { max-width: 85vw; }
 
-  .canvas-controls { bottom: 8px; right: 8px; }
+  .canvas-controls { bottom: 66px; right: 12px; }
+  .canvas-top-control { top: 60px; }
   .canvas-top-control { top: 8px; left: 8px; right: 8px; }
 }
 
