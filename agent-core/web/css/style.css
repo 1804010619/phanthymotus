@@ -4701,8 +4701,10 @@ html, body {
   .canvas-card-body { padding: 8px 10px; }
   .canvas-card-footer { padding: 6px 10px; }
   .canvas-controls {
-    bottom: calc(90px + env(safe-area-inset-bottom, 0px));
+    position: fixed;
+    bottom: calc(56px + env(safe-area-inset-bottom, 0px) + 10px);
     right: 12px;
+    z-index: 50;
   }
 
   /* ── Activity strip → right drawer ── */
