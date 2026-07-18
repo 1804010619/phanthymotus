@@ -121,6 +121,11 @@ export async function initCanvas(initialMcps) {
       _ty   = layoutJson.data.transform.ty   ?? 0;
       _applyTransform();
     }
+
+    // On mobile, auto-fit cards to viewport instead of using saved desktop transform
+    if (window.innerWidth <= 768 && _cards.length > 0) {
+      _fitToViewport();
+    }
   } catch { /* start empty */ }
 
   // Restore project running state from backend
@@ -201,6 +206,31 @@ export function updateCanvasMcps(mcps) {
 function _applyTransform() {
   _viewport.style.transform = `translate(${_tx}px, ${_ty}px) scale(${_zoom})`;
   if (_zoomLabel) _zoomLabel.textContent = Math.round(_zoom * 100) + '%';
+}
+
+function _fitToViewport() {
+  if (!_cards.length) return;
+  const rect = _canvasEl.getBoundingClientRect();
+  const padding = 30;
+  // Find bounding box of all cards in world coords (with port margins)
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+  const cardW = window.innerWidth <= 768 ? 220 : 260;
+  for (const c of _cards) {
+    minX = Math.min(minX, c.x - 20); // port extends left
+    minY = Math.min(minY, c.y);
+    maxX = Math.max(maxX, c.x + cardW + 20); // port extends right
+    maxY = Math.max(maxY, c.y + 160);
+  }
+  const contentW = maxX - minX;
+  const contentH = maxY - minY;
+  const availW = rect.width - padding * 2;
+  const availH = rect.height - padding * 2;
+  _zoom = Math.min(availW / contentW, availH / contentH, 1);
+  _zoom = Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, _zoom));
+  // Center content
+  _tx = padding + (availW - contentW * _zoom) / 2 - minX * _zoom;
+  _ty = padding + (availH - contentH * _zoom) / 2 - minY * _zoom;
+  _applyTransform();
 }
 
 // ── Touch helpers ─────────────────────────────────────────────────────────────

@@ -17,7 +17,7 @@ export function initMobile() {
     _overlay = document.createElement('div');
     _overlay.id = 'mobile-overlay';
     _overlay.className = 'mobile-overlay';
-    document.getElementById('app').appendChild(_overlay);
+    document.body.appendChild(_overlay);
   }
   _overlay.addEventListener('click', _closeAll);
 
@@ -25,6 +25,17 @@ export function initMobile() {
   const hamburger = document.getElementById('mobile-hamburger');
   if (hamburger) {
     hamburger.addEventListener('click', _toggleMenu);
+  }
+
+  // Close menu when any topbar action button is clicked
+  const topbarActions = document.querySelector('.topbar-actions');
+  if (topbarActions) {
+    topbarActions.addEventListener('click', (e) => {
+      if (e.target.classList.contains('topbar-btn')) {
+        topbarActions.classList.remove('mobile-menu-open');
+        if (_overlay) _overlay.classList.remove('active');
+      }
+    });
   }
 
   // Sidebar toggle button
@@ -56,6 +67,10 @@ function _toggleMenu() {
   const actions = document.querySelector('.topbar-actions');
   if (!actions) return;
   const open = actions.classList.toggle('mobile-menu-open');
+  // Close sidebar if it was open
+  const sidebar = document.getElementById('sidebar');
+  if (sidebar) sidebar.classList.remove('mobile-open');
+
   if (open) {
     _overlay.classList.add('active');
   } else {
