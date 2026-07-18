@@ -4852,6 +4852,10 @@ html, body {
   .history-list { width: 100%; min-width: unset; max-height: 35vh; border-right: none; border-bottom: 1px solid var(--border); }
   .history-chat { flex: 1; }
 
+  /* Deploy confirm: responsive versions */
+  .deploy-confirm-item-versions { flex-wrap: wrap; }
+  .deploy-confirm-tag { font-size: 11px; word-break: break-all; max-width: 100%; }
+
   /* ── Touch targets ── */
   .topbar-btn,
   .btn-ghost { min-height: 44px; padding: 10px 14px; }
