@@ -4701,7 +4701,7 @@ html, body {
   .canvas-card-body { padding: 8px 10px; }
   .canvas-card-footer { padding: 6px 10px; }
   .canvas-controls {
-    bottom: calc(66px + env(safe-area-inset-bottom, 0px));
+    bottom: calc(90px + env(safe-area-inset-bottom, 0px));
     right: 12px;
   }
 
