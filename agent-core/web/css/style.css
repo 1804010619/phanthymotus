@@ -4586,6 +4586,46 @@ html, body {
   font-weight: 300;
 }
 
+/* ── Mobile update banner (in settings panel) ── */
+.mobile-update-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px 16px;
+  margin-bottom: 16px;
+  background: var(--yellow-bg);
+  border: 1px solid var(--yellow);
+  border-radius: var(--radius-sm);
+  font-size: 13px;
+  color: var(--yellow);
+}
+.mobile-update-banner.hidden { display: none; }
+.mobile-update-text { flex: 1; font-weight: 500; }
+.mobile-update-btn {
+  background: var(--yellow);
+  color: #fff;
+  border: none;
+  border-radius: var(--radius-xs);
+  padding: 6px 14px;
+  font-size: 12px;
+  font-weight: 500;
+  cursor: pointer;
+  margin-left: 12px;
+}
+
+/* ── Tabbar badge (red dot) ── */
+.tabbar-badge {
+  position: absolute;
+  top: -2px;
+  right: -6px;
+  width: 8px;
+  height: 8px;
+  background: var(--red);
+  border-radius: 50%;
+}
+.tabbar-badge.hidden { display: none; }
+.tabbar-icon { position: relative; }
+
 /* ── Sidebar brand (hidden on desktop, shown on mobile) ── */
 .sidebar-brand { display: none; }
 .sidebar-logo { width: 32px; height: 32px; border-radius: 6px; }
@@ -4780,7 +4820,7 @@ html, body {
     white-space: nowrap;
     max-width: 100%;
   }
-  .canvas-ctrl-btn { width: 44px; height: 44px; font-size: 20px; }
+  .canvas-ctrl-btn { width: 32px; height: 32px; font-size: 16px; }
   .canvas-port::after {
     content: '';
     position: absolute;

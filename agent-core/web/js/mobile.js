@@ -60,6 +60,9 @@ export function initMobile() {
       _closeLogDrawer();
     }
   });
+
+  // Observe desktop update-banner for mobile mirroring
+  _observeUpdateBanner();
 }
 
 // ── Tab Bar ──────────────────────────────────────────────────────────────────
@@ -236,4 +239,43 @@ function _closeAll() {
   if (detail) detail.classList.remove('mobile-open');
   _closeLogDrawer();
   if (_overlay) _overlay.classList.remove('active');
+}
+
+// ── Update Banner Mirroring ──────────────────────────────────────────────────
+
+function _observeUpdateBanner() {
+  const desktopBanner = document.getElementById('update-banner');
+  if (!desktopBanner) return;
+
+  const mobileBanner = document.getElementById('mobile-update-banner');
+  const mobileText = document.getElementById('mobile-update-text');
+  const mobileBtn = document.getElementById('mobile-update-btn');
+  const badge = document.getElementById('settings-badge');
+
+  function sync() {
+    const hasUpdate = !desktopBanner.classList.contains('hidden');
+    if (hasUpdate) {
+      const text = document.getElementById('update-banner-text')?.textContent || '';
+      if (mobileText) mobileText.textContent = text;
+      if (mobileBanner) mobileBanner.classList.remove('hidden');
+      if (badge) badge.classList.remove('hidden');
+    } else {
+      if (mobileBanner) mobileBanner.classList.add('hidden');
+      if (badge) badge.classList.add('hidden');
+    }
+  }
+
+  // Mirror click to desktop update button
+  if (mobileBtn) {
+    mobileBtn.addEventListener('click', () => {
+      document.getElementById('btn-update')?.click();
+    });
+  }
+
+  // Observe class changes on desktop banner
+  const observer = new MutationObserver(sync);
+  observer.observe(desktopBanner, { attributes: true, attributeFilter: ['class'] });
+
+  // Initial sync
+  sync();
 }

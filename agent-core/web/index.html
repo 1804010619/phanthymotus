@@ -144,6 +144,10 @@
     <!-- Mobile Settings Panel (shown when settings tab active) -->
     <div class="mobile-settings-panel hidden" id="mobile-settings-panel">
       <h2 class="settings-title">设置</h2>
+      <div class="mobile-update-banner hidden" id="mobile-update-banner">
+        <span class="mobile-update-text" id="mobile-update-text"></span>
+        <button class="mobile-update-btn" id="mobile-update-btn">更新</button>
+      </div>
       <div class="settings-list">
         <button class="settings-item" data-action="network">
           <span class="settings-item-label">网络</span>
@@ -189,7 +193,7 @@
       <span class="tabbar-label">监控</span>
     </button>
     <button class="tabbar-btn" data-tab="settings">
-      <span class="tabbar-icon">⚙</span>
+      <span class="tabbar-icon">⚙<span class="tabbar-badge hidden" id="settings-badge"></span></span>
       <span class="tabbar-label">设置</span>
     </button>
   </nav>
