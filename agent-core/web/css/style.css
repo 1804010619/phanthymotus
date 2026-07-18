@@ -4696,6 +4696,14 @@ html, body {
     left: 50%;
     transform: translate(-50%, -50%);
   }
+  .canvas-port {
+    width: 10px;
+    height: 10px;
+    border-width: 1.5px;
+    box-shadow: none;
+  }
+  .canvas-port::before { inset: -16px; }
+  .canvas-port.executor { width: 11px; height: 11px; border-width: 1.5px; }
   .btn-icon { min-width: 44px; min-height: 44px; }
   .activity-collapse-btn { min-width: 44px; min-height: 44px; padding: 8px; }
 
