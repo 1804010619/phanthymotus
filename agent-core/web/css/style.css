@@ -4740,7 +4740,16 @@ html, body {
   .mobile-hint { display: block; }
   .canvas-card { width: 220px; font-size: 12px; }
   .canvas-card-header { padding: 8px 10px; touch-action: none; }
-  .canvas-top-control { top: 12px; left: 60px; right: 60px; transform: none; text-align: center; pointer-events: none; }
+  .canvas-top-control {
+    position: fixed;
+    top: 12px;
+    left: 60px;
+    right: 60px;
+    transform: none;
+    text-align: center;
+    pointer-events: none;
+    z-index: 57;
+  }
   .canvas-main-btn {
     pointer-events: auto;
     padding: 8px 18px;
