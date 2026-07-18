@@ -1,6 +1,6 @@
 /**
  * mobile.js — Mobile-native navigation with bottom tab bar.
- * Handles: sidebar drawer, tab switching (配置/监控/设置), overlay, activity strip.
+ * Handles: sidebar drawer (fab), tab switching, log drawer, settings panel.
  */
 
 import { enterMonitorMode, exitMonitorMode } from './monitor-mode.js';
@@ -22,10 +22,16 @@ export function initMobile() {
   }
   _overlay.addEventListener('click', _closeAll);
 
-  // Sidebar toggle button
-  const sidebarToggle = document.getElementById('mobile-sidebar-toggle');
-  if (sidebarToggle) {
-    sidebarToggle.addEventListener('click', _toggleSidebar);
+  // Sidebar fab (configure tab only)
+  const sidebarFab = document.getElementById('mobile-sidebar-fab');
+  if (sidebarFab) {
+    sidebarFab.addEventListener('click', _toggleSidebar);
+  }
+
+  // Log fab → toggle activity drawer
+  const logFab = document.getElementById('mobile-log-fab');
+  if (logFab) {
+    logFab.addEventListener('click', _toggleLogDrawer);
   }
 
   // Tab bar
@@ -34,27 +40,15 @@ export function initMobile() {
   // Settings panel actions
   _initSettings();
 
-  // Activity strip: tap header to expand/collapse on mobile
-  const activityHeader = document.getElementById('activity-toggle');
-  if (activityHeader) {
-    activityHeader.addEventListener('click', _toggleActivity);
-  }
-
   // Listen for breakpoint changes
   MQ.addEventListener('change', (e) => {
     _isMobile = e.matches;
     if (!_isMobile) {
       _closeAll();
-      // Reset to configure mode view when going back to desktop
       _hideSettingsPanel();
+      _closeLogDrawer();
     }
   });
-
-  // On mobile, start with activity strip collapsed
-  if (_isMobile) {
-    const strip = document.getElementById('activity-strip');
-    if (strip) strip.classList.remove('mobile-expanded');
-  }
 }
 
 // ── Tab Bar ──────────────────────────────────────────────────────────────────
@@ -79,8 +73,21 @@ function _switchTab(tab) {
     b.classList.toggle('active', b.dataset.tab === tab)
   );
 
-  // Close sidebar if open
+  // Close drawers
   closeSidebarMobile();
+  _closeLogDrawer();
+
+  // Sidebar fab: only in configure
+  const sidebarFab = document.getElementById('mobile-sidebar-fab');
+  if (sidebarFab) {
+    sidebarFab.classList.toggle('hidden', tab !== 'configure');
+  }
+
+  // Log fab: in configure and monitor
+  const logFab = document.getElementById('mobile-log-fab');
+  if (logFab) {
+    logFab.classList.toggle('hidden', tab === 'settings');
+  }
 
   const settingsPanel = document.getElementById('mobile-settings-panel');
 
@@ -103,7 +110,6 @@ function _showSettingsPanel() {
     panel.classList.remove('hidden');
     panel.classList.add('active');
   }
-  // Hide canvas/sidebar/monitor but keep in DOM
   app?.classList.add('settings-active');
 }
 
@@ -132,7 +138,6 @@ function _initSettings() {
 }
 
 function _triggerSettingsAction(action) {
-  // Programmatically click the corresponding topbar button
   const btnMap = {
     'network': 'btn-network',
     'history': 'btn-history',
@@ -173,6 +178,24 @@ export function closeSidebarMobile() {
   if (_overlay) _overlay.classList.remove('active');
 }
 
+// ── Log Drawer (Activity Strip) ──────────────────────────────────────────────
+
+function _toggleLogDrawer() {
+  const strip = document.getElementById('activity-strip');
+  if (!strip) return;
+  const open = strip.classList.toggle('mobile-log-open');
+  if (open) {
+    _overlay.classList.add('active');
+  } else {
+    _overlay.classList.remove('active');
+  }
+}
+
+function _closeLogDrawer() {
+  const strip = document.getElementById('activity-strip');
+  if (strip) strip.classList.remove('mobile-log-open');
+}
+
 // ── Detail Panel ─────────────────────────────────────────────────────────────
 
 export function openDetailPanelMobile() {
@@ -181,7 +204,6 @@ export function openDetailPanelMobile() {
   if (detail) {
     detail.classList.add('mobile-open');
     _overlay.classList.add('active');
-    // Close sidebar if open
     const sidebar = document.getElementById('sidebar');
     if (sidebar) sidebar.classList.remove('mobile-open');
   }
@@ -194,14 +216,6 @@ export function closeDetailPanelMobile() {
   if (_overlay) _overlay.classList.remove('active');
 }
 
-// ── Activity Strip ───────────────────────────────────────────────────────────
-
-function _toggleActivity() {
-  if (!_isMobile) return;
-  const strip = document.getElementById('activity-strip');
-  if (strip) strip.classList.toggle('mobile-expanded');
-}
-
 // ── Close All ────────────────────────────────────────────────────────────────
 
 function _closeAll() {
@@ -209,5 +223,6 @@ function _closeAll() {
   if (sidebar) sidebar.classList.remove('mobile-open');
   const detail = document.getElementById('detail-panel');
   if (detail) detail.classList.remove('mobile-open');
+  _closeLogDrawer();
   if (_overlay) _overlay.classList.remove('active');
 }
