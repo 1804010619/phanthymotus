@@ -4700,7 +4700,10 @@ html, body {
   .canvas-card-header { padding: 8px 10px; }
   .canvas-card-body { padding: 8px 10px; }
   .canvas-card-footer { padding: 6px 10px; }
-  .canvas-controls { bottom: 66px; right: 12px; }
+  .canvas-controls {
+    bottom: calc(66px + env(safe-area-inset-bottom, 0px));
+    right: 12px;
+  }
 
   /* ── Activity strip → right drawer ── */
   .activity-strip {
@@ -4788,7 +4791,12 @@ html, body {
     inset: auto;
   }
   .btn-icon { min-width: 44px; min-height: 44px; }
-  .activity-collapse-btn { min-width: 44px; min-height: 44px; padding: 8px; }
+  .activity-collapse-btn {
+    min-width: 44px;
+    min-height: 44px;
+    padding: 8px;
+    transform: rotate(-90deg);
+  }
 
   /* ── Mobile add button visible ── */
   .mobile-add-btn { display: flex; }
@@ -4803,13 +4811,13 @@ html, body {
     bottom: 0;
     left: 0;
     right: 0;
-    height: 56px;
+    height: calc(56px + env(safe-area-inset-bottom, 0px));
     background: var(--bg-card);
     border-top: 1px solid var(--border);
     box-shadow: 0 -1px 8px rgba(0,0,0,.06);
     z-index: 58;
     padding: 0;
-    padding-bottom: env(safe-area-inset-bottom, 0);
+    padding-bottom: env(safe-area-inset-bottom, 0px);
   }
   .tabbar-btn {
     flex: 1;

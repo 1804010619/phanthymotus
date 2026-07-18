@@ -34,6 +34,17 @@ export function initMobile() {
     logFab.addEventListener('click', _toggleLogDrawer);
   }
 
+  // Activity strip collapse button → close drawer on mobile
+  const collapseBtn = document.getElementById('activity-collapse-btn');
+  if (collapseBtn) {
+    collapseBtn.addEventListener('click', (e) => {
+      if (!_isMobile) return;
+      e.stopPropagation();
+      _closeLogDrawer();
+      if (_overlay) _overlay.classList.remove('active');
+    });
+  }
+
   // Tab bar
   _initTabBar();
 
