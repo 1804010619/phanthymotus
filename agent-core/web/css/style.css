@@ -4499,10 +4499,10 @@ html, body {
 .mobile-overlay {
   display: none;
   position: fixed;
-  top: var(--topbar-h);
+  top: 44px;
   left: 0;
   right: 0;
-  bottom: 0;
+  bottom: 56px;
   background: rgba(0,0,0,.65);
   z-index: 59;
   -webkit-tap-highlight-color: transparent;
@@ -4532,46 +4532,95 @@ html, body {
 .mobile-hint { display: none; }
 .desktop-hint { display: block; }
 
+/* ── Mobile tabbar (hidden on desktop) ── */
+.mobile-tabbar { display: none; }
+
+/* ── Mobile settings panel (hidden on desktop) ── */
+.mobile-settings-panel {
+  display: none;
+  flex-direction: column;
+  flex: 1;
+  background: var(--bg);
+  overflow-y: auto;
+  padding: 24px 16px;
+}
+.mobile-settings-panel.active { display: flex; }
+.settings-title {
+  font-size: 20px;
+  font-weight: 700;
+  color: var(--text);
+  margin-bottom: 20px;
+}
+.settings-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  background: var(--bg-card);
+  border-radius: var(--radius);
+  border: 1px solid var(--border);
+  overflow: hidden;
+}
+.settings-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 16px 18px;
+  border: none;
+  background: var(--bg-card);
+  color: var(--text);
+  font-size: 15px;
+  font-weight: 500;
+  cursor: pointer;
+  text-align: left;
+  border-bottom: 1px solid var(--border);
+  min-height: 52px;
+}
+.settings-item:last-child { border-bottom: none; }
+.settings-item:active { background: var(--bg-hover); }
+.settings-item-arrow {
+  color: var(--text-dim);
+  font-size: 18px;
+  font-weight: 300;
+}
+
+/* ── Sidebar brand (hidden on desktop, shown on mobile) ── */
+.sidebar-brand { display: none; }
+.sidebar-logo { width: 32px; height: 32px; border-radius: 6px; }
+.sidebar-brand-text { font-size: 15px; font-weight: 700; }
+
 /* ══════════════════════════════════════════════════════════════════════════
    BREAKPOINT: ≤768px (Tablet / Large Phone)
 ══════════════════════════════════════════════════════════════════════════ */
 @media (max-width: 768px) {
 
-  /* ── Topbar ── */
-  .topbar { padding: 0 12px; gap: 8px; position: relative; z-index: 61; }
-  .brand-tagline { display: none; }
-  .mobile-hamburger,
+  /* ── Topbar → minimal (only sidebar toggle) ── */
+  .topbar {
+    padding: 0 12px;
+    gap: 8px;
+    position: relative;
+    z-index: 61;
+    height: 44px;
+  }
+  .topbar-brand { display: none; }
+  .mode-toggle-group { display: none; }
+  .mobile-hamburger { display: none; }
   .mobile-sidebar-toggle { display: flex; }
   .topbar-actions { display: none; }
-  .topbar-actions.mobile-menu-open {
-    display: flex;
-    flex-direction: column;
-    position: fixed;
-    top: var(--topbar-h);
-    right: 0;
-    background: var(--bg-card);
-    border: 1px solid var(--border);
-    border-radius: 0 0 var(--radius) var(--radius);
-    box-shadow: var(--shadow-md);
-    padding: 8px;
-    z-index: 70;
-    width: 160px;
-    gap: 4px;
-  }
-  .topbar-actions.mobile-menu-open .topbar-btn {
-    width: 100%;
-    text-align: left;
-    padding: 10px 14px;
-    min-height: 44px;
-  }
-  .topbar-actions.mobile-menu-open .update-banner { width: 100%; }
+  .topbar-actions.mobile-menu-open { display: none; }
 
   /* ── Sidebar → left drawer ── */
+  .sidebar-brand {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 14px 16px;
+    border-bottom: 1px solid var(--border);
+  }
   .sidebar {
     position: fixed;
-    top: var(--topbar-h);
+    top: 44px;
     left: 0;
-    bottom: 0;
+    bottom: 56px;
     width: 85vw;
     max-width: 320px;
     z-index: 60;
@@ -4616,14 +4665,14 @@ html, body {
   .canvas-card-body { padding: 8px 10px; }
   .canvas-card-footer { padding: 6px 10px; }
 
-  /* ── Activity strip → fixed bottom sheet ── */
+  /* ── Activity strip → fixed bottom sheet (above tabbar) ── */
   .activity-strip {
     position: fixed;
-    bottom: 0;
+    bottom: 56px;
     left: 0;
     right: 0;
     height: auto;
-    max-height: 50vh;
+    max-height: 40vh;
     min-height: 36px;
     z-index: 55;
     border-top: 1px solid var(--border);
@@ -4712,6 +4761,59 @@ html, body {
 
   /* ── Tool detail modal ── */
   .tool-detail-modal { width: 90vw; max-width: 90vw; }
+
+  /* ── Bottom Tab Bar ── */
+  .mobile-tabbar {
+    display: flex;
+    position: fixed;
+    bottom: 0;
+    left: 0;
+    right: 0;
+    height: 56px;
+    background: var(--bg-card);
+    border-top: 1px solid var(--border);
+    box-shadow: 0 -1px 8px rgba(0,0,0,.06);
+    z-index: 58;
+    padding: 0;
+    padding-bottom: env(safe-area-inset-bottom, 0);
+  }
+  .tabbar-btn {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 2px;
+    border: none;
+    background: none;
+    color: var(--text-dim);
+    font-size: 10px;
+    font-weight: 500;
+    cursor: pointer;
+    padding: 6px 0;
+    transition: color 0.15s;
+    -webkit-tap-highlight-color: transparent;
+  }
+  .tabbar-btn.active {
+    color: var(--accent);
+  }
+  .tabbar-icon {
+    font-size: 20px;
+    line-height: 1;
+  }
+  .tabbar-label {
+    font-size: 10px;
+    line-height: 1;
+  }
+
+  /* ── Settings panel visible on settings tab ── */
+  .mobile-settings-panel.active {
+    display: flex;
+  }
+  #app.settings-active .canvas-area { display: none !important; }
+  #app.settings-active .sidebar { display: none !important; }
+  #app.settings-active .monitor-dashboard { display: none !important; }
+  #app.settings-active .activity-strip { display: none !important; }
 }
 
 /* ══════════════════════════════════════════════════════════════════════════
