@@ -4740,7 +4740,14 @@ html, body {
   .mobile-hint { display: block; }
   .canvas-card { width: 220px; font-size: 12px; }
   .canvas-card-header { padding: 8px 10px; touch-action: none; }
-  .canvas-top-control { top: 56px; left: 8px; right: 8px; transform: none; text-align: center; }
+  .canvas-top-control { top: 12px; left: 60px; right: 60px; transform: none; text-align: center; pointer-events: none; }
+  .canvas-main-btn {
+    pointer-events: auto;
+    padding: 8px 18px;
+    font-size: 12px;
+    border-radius: var(--radius-sm);
+    box-shadow: var(--shadow-sm);
+  }
   .canvas-card-body { padding: 8px 10px; }
   .canvas-card-footer { padding: 6px 10px; }
   .canvas-controls {
