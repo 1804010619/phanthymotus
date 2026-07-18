@@ -4739,7 +4739,8 @@ html, body {
   .desktop-hint { display: none; }
   .mobile-hint { display: block; }
   .canvas-card { width: 220px; font-size: 12px; }
-  .canvas-card-header { padding: 8px 10px; }
+  .canvas-card-header { padding: 8px 10px; touch-action: none; }
+  .canvas-top-control { top: 56px; left: 8px; right: 8px; transform: none; text-align: center; }
   .canvas-card-body { padding: 8px 10px; }
   .canvas-card-footer { padding: 6px 10px; }
   .canvas-controls {
@@ -4971,7 +4972,6 @@ html, body {
   .sidebar { max-width: 85vw; }
 
   .canvas-controls { bottom: 66px; right: 12px; }
-  .canvas-top-control { top: 60px; }
-  .canvas-top-control { top: 8px; left: 8px; right: 8px; }
+  .canvas-top-control { top: 60px; left: 50%; transform: translateX(-50%); }
 }
 
