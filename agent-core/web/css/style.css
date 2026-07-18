@@ -4988,6 +4988,6 @@ html, body {
   .sidebar { max-width: 85vw; }
 
   .canvas-controls { bottom: 66px; right: 12px; }
-  .canvas-top-control { top: 60px; left: 50%; transform: translateX(-50%); }
+  .canvas-top-control { top: 12px; }
 }
 
