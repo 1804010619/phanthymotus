@@ -31,6 +31,7 @@
         <button class="mode-toggle-btn" data-mode="monitor">监控</button>
       </div>
     </div>
+    <button class="mobile-sidebar-toggle" id="mobile-sidebar-toggle" aria-label="工具列表">☰</button>
     <div class="topbar-actions">
       <div id="update-banner" class="update-banner hidden">
         <span id="update-banner-text"></span>
@@ -42,6 +43,7 @@
       <button class="btn-ghost topbar-btn" id="btn-skills">技能</button>
       <button class="btn-ghost topbar-btn" id="btn-deploy">部署 ▾</button>
     </div>
+    <button class="mobile-hamburger" id="mobile-hamburger" aria-label="菜单">⋮</button>
   </header>
 
   <!-- Body: Drivers Sidebar + Flow + Detail Panel -->
@@ -93,7 +95,8 @@
       </div>
       <div class="canvas-empty" id="canvas-empty">
         <div class="placeholder-icon">⬡</div>
-        <p>从左侧拖入能力卡片</p>
+        <p class="desktop-hint">从左侧拖入能力卡片</p>
+        <p class="mobile-hint">点击 ☰ 打开工具列表，点击 + 添加卡片</p>
         <p style="font-size:12px;color:var(--text-dim);margin-top:4px">构建你的数据流编排</p>
       </div>
       <div class="canvas-top-control" id="canvas-top-control">
@@ -137,6 +140,9 @@
     </div>
     <div class="activity-log" id="activity-log"></div>
   </div>
+
+  <!-- Mobile overlay backdrop -->
+  <div class="mobile-overlay" id="mobile-overlay"></div>
 
 </div>
 

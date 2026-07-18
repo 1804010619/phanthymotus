@@ -34,6 +34,28 @@ let _projectRunning = false;
 export function isProjectRunning() { return _projectRunning; }
 export function redrawCanvas() { _redrawConnections(); }
 
+/**
+ * Programmatically add a card to the canvas (used by mobile tap-to-add).
+ * Returns true if added, false if rejected.
+ */
+export function addCardFromSidebar({ mcpId, toolName, driverName, hasConfig, multiInstance }) {
+  if (_projectRunning) return false;
+  if (hasConfig && !isToolConfigured(mcpId, toolName)) return false;
+  if (!multiInstance) {
+    const existing = _cards.find(c => c.mcpId === mcpId && c.toolName === toolName);
+    if (existing) return false;
+  }
+  // Position at viewport center in world coordinates
+  const rect = _canvasEl.getBoundingClientRect();
+  const cx = (rect.width / 2 - _tx) / _zoom;
+  const cy = (rect.height / 2 - _ty) / _zoom;
+  let x = cx - 130, y = cy - 70;
+  ({ x, y } = _findNonOverlappingPos(x, y));
+  const id = 'card-' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+  _addCard({ id, mcpId, toolName, driverName, x, y }, true);
+  return true;
+}
+
 // ── Viewport transform state ──────────────────────────────────────────────────
 let _zoom = 1;
 let _tx   = 0;
@@ -181,6 +203,19 @@ function _applyTransform() {
   if (_zoomLabel) _zoomLabel.textContent = Math.round(_zoom * 100) + '%';
 }
 
+// ── Touch helpers ─────────────────────────────────────────────────────────────
+function _getTouchDist(touches) {
+  const dx = touches[0].clientX - touches[1].clientX;
+  const dy = touches[0].clientY - touches[1].clientY;
+  return Math.hypot(dx, dy);
+}
+function _getTouchCenter(touches) {
+  return {
+    x: (touches[0].clientX + touches[1].clientX) / 2,
+    y: (touches[0].clientY + touches[1].clientY) / 2
+  };
+}
+
 function _zoomAt(clientX, clientY, delta) {
   const rect    = _canvasEl.getBoundingClientRect();
   const mouseX  = clientX - rect.left;
@@ -207,6 +242,41 @@ function _setupZoomPan() {
     _zoomAt(e.clientX, e.clientY, delta);
     _debouncedSave();
   }, { passive: false });
+
+  // ── Pinch-to-zoom (mobile two-finger gesture) ──
+  let _pinchDist = 0;
+  let _pinchCenter = { x: 0, y: 0 };
+  let _pinching = false;
+
+  _canvasEl.addEventListener('touchstart', (e) => {
+    if (e.touches.length === 2) {
+      e.preventDefault();
+      _pinching = true;
+      _panning = false; // cancel any single-finger pan
+      _pinchDist = _getTouchDist(e.touches);
+      _pinchCenter = _getTouchCenter(e.touches);
+    }
+  }, { passive: false });
+
+  _canvasEl.addEventListener('touchmove', (e) => {
+    if (e.touches.length === 2 && _pinching) {
+      e.preventDefault();
+      const dist = _getTouchDist(e.touches);
+      const center = _getTouchCenter(e.touches);
+      const scale = dist / _pinchDist;
+      const delta = (scale - 1) * 0.5;
+      _zoomAt(center.x, center.y, delta);
+      _pinchDist = dist;
+      _pinchCenter = center;
+    }
+  }, { passive: false });
+
+  _canvasEl.addEventListener('touchend', (e) => {
+    if (e.touches.length < 2) {
+      _pinching = false;
+      _debouncedSave();
+    }
+  });
 
   // Left-click drag on canvas background = pan (like a map)
   let _panning    = false;
