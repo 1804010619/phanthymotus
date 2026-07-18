@@ -4537,6 +4537,7 @@ html, body {
 .mobile-tabbar { display: none; }
 .mobile-sidebar-fab { display: none; }
 .mobile-log-fab { display: none; }
+.monitor-log-btn { display: none; }
 
 /* ── Mobile settings panel (hidden on desktop) ── */
 .mobile-settings-panel {
@@ -4788,14 +4789,31 @@ html, body {
     gap: 8px;
   }
   .monitor-dashboard-header {
-    padding: 12px 12px 8px;
-    padding-right: 70px;
+    padding: 12px 12px 10px;
+    min-height: 48px;
+    display: flex;
+    align-items: center;
     position: sticky;
     top: 0;
     z-index: 10;
     background: var(--bg);
   }
   .monitor-reset-btn { display: none; }
+  .monitor-log-btn {
+    margin-left: auto;
+    padding: 6px 12px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    background: var(--bg-card);
+    color: var(--text-muted);
+    font-size: 12px;
+    font-weight: 500;
+    cursor: pointer;
+  }
+  .monitor-log-btn:active { background: var(--bg-hover); }
+
+  /* Hide floating log fab in monitor mode (use inline button instead) */
+  #app.monitor-active .mobile-log-fab { display: none !important; }
 
   /* ── Modals → native full-page view (above tabbar) ── */
   .modal-overlay {

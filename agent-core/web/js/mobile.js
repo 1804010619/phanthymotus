@@ -34,6 +34,12 @@ export function initMobile() {
     logFab.addEventListener('click', _toggleLogDrawer);
   }
 
+  // Monitor inline log button → same action
+  const monitorLogBtn = document.getElementById('monitor-log-btn');
+  if (monitorLogBtn) {
+    monitorLogBtn.addEventListener('click', _toggleLogDrawer);
+  }
+
   // Activity strip collapse button → close drawer on mobile
   const collapseBtn = document.getElementById('activity-collapse-btn');
   if (collapseBtn) {
