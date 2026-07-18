@@ -278,9 +278,27 @@ function _observeUpdateBanner() {
     });
   }
 
-  // Observe class changes on desktop banner
+  // Observe class changes on desktop banner (show/hide)
   const observer = new MutationObserver(sync);
   observer.observe(desktopBanner, { attributes: true, attributeFilter: ['class'] });
+
+  // Observe text changes in desktop banner text (progress updates)
+  const desktopText = document.getElementById('update-banner-text');
+  if (desktopText && mobileText) {
+    const textObserver = new MutationObserver(() => {
+      mobileText.textContent = desktopText.textContent;
+    });
+    textObserver.observe(desktopText, { childList: true, characterData: true, subtree: true });
+  }
+
+  // Observe disabled state on desktop button (syncs to mobile button)
+  const desktopBtn = document.getElementById('btn-update');
+  if (desktopBtn && mobileBtn) {
+    const btnObserver = new MutationObserver(() => {
+      mobileBtn.disabled = desktopBtn.disabled;
+    });
+    btnObserver.observe(desktopBtn, { attributes: true, attributeFilter: ['disabled'] });
+  }
 
   // Initial sync
   sync();
