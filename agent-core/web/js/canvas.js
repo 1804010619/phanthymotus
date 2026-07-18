@@ -928,7 +928,7 @@ function _fmtColorClass(fmt) {
 // ── Port drag-to-connect ──────────────────────────────────────────────────────
 
 function _setupPortDrag() {
-  document.addEventListener('mousemove', (e) => {
+  document.addEventListener('pointermove', (e) => {
     if (!_draggingConn) return;
     const vpRect = _viewport.getBoundingClientRect();
     const x2 = (e.clientX - vpRect.left) / _zoom;
@@ -983,7 +983,7 @@ function _setupPortDrag() {
     }
   });
 
-  document.addEventListener('mouseup', (e) => {
+  document.addEventListener('pointerup', (e) => {
     if (!_draggingConn) return;
 
     // Remove highlights
@@ -1068,8 +1068,8 @@ function _setupPortDrag() {
     _draggingConn = null;
   });
 
-  // Delegate mousedown on out ports and executor ports
-  _viewport.addEventListener('mousedown', (e) => {
+  // Delegate pointerdown on out ports and executor ports
+  _viewport.addEventListener('pointerdown', (e) => {
     const outPort = e.target.closest('.canvas-port.out');
     const execPort = !outPort ? e.target.closest('.canvas-port.executor') : null;
     if (!outPort && !execPort) return;

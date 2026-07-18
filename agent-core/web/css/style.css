@@ -989,6 +989,7 @@ html, body {
   flex-shrink: 0;
   pointer-events: all;
   box-shadow: 0 1px 4px rgba(0,0,0,.12);
+  touch-action: none;
 }
 /* Transparent hit-area expansion — makes port much easier to grab */
 .canvas-port::before {
