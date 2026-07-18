@@ -34,6 +34,28 @@ let _projectRunning = false;
 export function isProjectRunning() { return _projectRunning; }
 export function redrawCanvas() { _redrawConnections(); }
 
+/**
+ * Programmatically add a card to the canvas (used by mobile tap-to-add).
+ * Returns true if added, false if rejected.
+ */
+export function addCardFromSidebar({ mcpId, toolName, driverName, hasConfig, multiInstance }) {
+  if (_projectRunning) return false;
+  if (hasConfig && !isToolConfigured(mcpId, toolName)) return false;
+  if (!multiInstance) {
+    const existing = _cards.find(c => c.mcpId === mcpId && c.toolName === toolName);
+    if (existing) return false;
+  }
+  // Position at viewport center in world coordinates
+  const rect = _canvasEl.getBoundingClientRect();
+  const cx = (rect.width / 2 - _tx) / _zoom;
+  const cy = (rect.height / 2 - _ty) / _zoom;
+  let x = cx - 130, y = cy - 70;
+  ({ x, y } = _findNonOverlappingPos(x, y));
+  const id = 'card-' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+  _addCard({ id, mcpId, toolName, driverName, x, y }, true);
+  return true;
+}
+
 // ── Viewport transform state ──────────────────────────────────────────────────
 let _zoom = 1;
 let _tx   = 0;
@@ -98,6 +120,11 @@ export async function initCanvas(initialMcps) {
       _tx   = layoutJson.data.transform.tx   ?? 0;
       _ty   = layoutJson.data.transform.ty   ?? 0;
       _applyTransform();
+    }
+
+    // On mobile, auto-fit cards to viewport instead of using saved desktop transform
+    if (window.innerWidth <= 768 && _cards.length > 0) {
+      _fitToViewport();
     }
   } catch { /* start empty */ }
 
@@ -181,6 +208,44 @@ function _applyTransform() {
   if (_zoomLabel) _zoomLabel.textContent = Math.round(_zoom * 100) + '%';
 }
 
+function _fitToViewport() {
+  if (!_cards.length) return;
+  const rect = _canvasEl.getBoundingClientRect();
+  const padding = 30;
+  // Find bounding box of all cards in world coords (with port margins)
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+  const cardW = window.innerWidth <= 768 ? 220 : 260;
+  for (const c of _cards) {
+    minX = Math.min(minX, c.x - 20); // port extends left
+    minY = Math.min(minY, c.y);
+    maxX = Math.max(maxX, c.x + cardW + 20); // port extends right
+    maxY = Math.max(maxY, c.y + 160);
+  }
+  const contentW = maxX - minX;
+  const contentH = maxY - minY;
+  const availW = rect.width - padding * 2;
+  const availH = rect.height - padding * 2;
+  _zoom = Math.min(availW / contentW, availH / contentH, 1);
+  _zoom = Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, _zoom));
+  // Center content
+  _tx = padding + (availW - contentW * _zoom) / 2 - minX * _zoom;
+  _ty = padding + (availH - contentH * _zoom) / 2 - minY * _zoom;
+  _applyTransform();
+}
+
+// ── Touch helpers ─────────────────────────────────────────────────────────────
+function _getTouchDist(touches) {
+  const dx = touches[0].clientX - touches[1].clientX;
+  const dy = touches[0].clientY - touches[1].clientY;
+  return Math.hypot(dx, dy);
+}
+function _getTouchCenter(touches) {
+  return {
+    x: (touches[0].clientX + touches[1].clientX) / 2,
+    y: (touches[0].clientY + touches[1].clientY) / 2
+  };
+}
+
 function _zoomAt(clientX, clientY, delta) {
   const rect    = _canvasEl.getBoundingClientRect();
   const mouseX  = clientX - rect.left;
@@ -207,6 +272,41 @@ function _setupZoomPan() {
     _zoomAt(e.clientX, e.clientY, delta);
     _debouncedSave();
   }, { passive: false });
+
+  // ── Pinch-to-zoom (mobile two-finger gesture) ──
+  let _pinchDist = 0;
+  let _pinchCenter = { x: 0, y: 0 };
+  let _pinching = false;
+
+  _canvasEl.addEventListener('touchstart', (e) => {
+    if (e.touches.length === 2) {
+      e.preventDefault();
+      _pinching = true;
+      _panning = false; // cancel any single-finger pan
+      _pinchDist = _getTouchDist(e.touches);
+      _pinchCenter = _getTouchCenter(e.touches);
+    }
+  }, { passive: false });
+
+  _canvasEl.addEventListener('touchmove', (e) => {
+    if (e.touches.length === 2 && _pinching) {
+      e.preventDefault();
+      const dist = _getTouchDist(e.touches);
+      const center = _getTouchCenter(e.touches);
+      const scale = dist / _pinchDist;
+      const delta = (scale - 1) * 0.5;
+      _zoomAt(center.x, center.y, delta);
+      _pinchDist = dist;
+      _pinchCenter = center;
+    }
+  }, { passive: false });
+
+  _canvasEl.addEventListener('touchend', (e) => {
+    if (e.touches.length < 2) {
+      _pinching = false;
+      _debouncedSave();
+    }
+  });
 
   // Left-click drag on canvas background = pan (like a map)
   let _panning    = false;
@@ -828,7 +928,7 @@ function _fmtColorClass(fmt) {
 // ── Port drag-to-connect ──────────────────────────────────────────────────────
 
 function _setupPortDrag() {
-  document.addEventListener('mousemove', (e) => {
+  document.addEventListener('pointermove', (e) => {
     if (!_draggingConn) return;
     const vpRect = _viewport.getBoundingClientRect();
     const x2 = (e.clientX - vpRect.left) / _zoom;
@@ -883,7 +983,7 @@ function _setupPortDrag() {
     }
   });
 
-  document.addEventListener('mouseup', (e) => {
+  document.addEventListener('pointerup', (e) => {
     if (!_draggingConn) return;
 
     // Remove highlights
@@ -968,8 +1068,8 @@ function _setupPortDrag() {
     _draggingConn = null;
   });
 
-  // Delegate mousedown on out ports and executor ports
-  _viewport.addEventListener('mousedown', (e) => {
+  // Delegate pointerdown on out ports and executor ports
+  _viewport.addEventListener('pointerdown', (e) => {
     const outPort = e.target.closest('.canvas-port.out');
     const execPort = !outPort ? e.target.closest('.canvas-port.executor') : null;
     if (!outPort && !execPort) return;

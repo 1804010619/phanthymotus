@@ -13,6 +13,7 @@ import { initMonitorMode }   from './monitor-mode.js';
 import { initSkills }        from './skills.js';
 import { initHistory }       from './history.js';
 import { initNetwork }       from './network.js';
+import { initMobile }        from './mobile.js';
 import './agent-definition.js';
 
 let _allMcps   = [];
@@ -20,6 +21,7 @@ let _topicStatuses = {};
 const _pingedIds = new Set();
 
 async function main() {
+  initMobile();
   initSidebar();
   initDetailPanel();
   initMonitorMode();
