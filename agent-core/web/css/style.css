@@ -4700,6 +4700,7 @@ html, body {
   .canvas-card-header { padding: 8px 10px; }
   .canvas-card-body { padding: 8px 10px; }
   .canvas-card-footer { padding: 6px 10px; }
+  .canvas-controls { bottom: 66px; right: 12px; }
 
   /* ── Activity strip → right drawer ── */
   .activity-strip {
