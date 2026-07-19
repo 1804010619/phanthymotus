@@ -9,6 +9,7 @@ import event
 import collector
 import scheduler
 import topic_subscriber
+from channel.manager import manager as channel_manager
 
 
 def _init_resource_files():
@@ -149,6 +150,44 @@ def _register_core_mcp(silent=False):
                     'required': ['action', 'text'],
                 },
                 'topic_out': [{'topic': '/remote_control/message', 'format': 'data/json'}],
+            },
+            {
+                'name': 'channel_request',
+                'type': 'sensor',
+                'description': 'Channel message input — receive messages from Telegram/Slack and other platforms',
+                'inputSchema': {'type': 'object', 'properties': {}},
+                'configSchema': {
+                    'type': 'object',
+                    'properties': {
+                        'channel_id': {
+                            'type': 'string',
+                            'description': 'Select a channel (configure in Channel settings first)',
+                            'format': 'channel-select',
+                            'scope': 'instance',
+                        },
+                    },
+                },
+                'multiInstance': True,
+                'topic_out': [{'format': 'data/json'}],
+            },
+            {
+                'name': 'channel_reply',
+                'type': 'actuator',
+                'description': 'Channel message output — send Agent replies to Telegram/Slack and other platforms',
+                'inputSchema': {'type': 'object', 'properties': {}},
+                'configSchema': {
+                    'type': 'object',
+                    'properties': {
+                        'channel_id': {
+                            'type': 'string',
+                            'description': 'Select a channel (configure in Channel settings first)',
+                            'format': 'channel-select',
+                            'scope': 'instance',
+                        },
+                    },
+                },
+                'multiInstance': True,
+                'topic_in': [{'format': 'data/json'}],
             }
         ],
         'topic_out': [{'topic': '/decision_core', 'format': 'data/json'}, {'topic': '/remote_control/mic', 'format': 'audio/pcm-16k'}, {'topic': '/remote_control/message', 'format': 'data/json'}],
@@ -204,6 +243,9 @@ async def lifespan(app):
     # 启动 collector（信息整理器）
     collector.start()
 
+    # 启动 Channel Manager（消息平台适配器）
+    await channel_manager.start()
+
     async with event.llm:
         tasks = [
             asyncio.create_task(event.llm.run_forever()),
@@ -214,6 +256,7 @@ async def lifespan(app):
         finally:
             for t in tasks:
                 t.cancel()
+            await channel_manager.stop()
             await loop.run_in_executor(None, ros2_bridge.stop)
 
 
@@ -268,6 +311,9 @@ app_api.include_router(api.history.router)
 
 import api.network
 app_api.include_router(api.network.router)
+
+import api.channel
+app_api.include_router(api.channel.router)
 
 app = fastapi.FastAPI(lifespan=lifespan)
 app.mount('/api', app_api)
