@@ -41,6 +41,7 @@
       <button class="btn-ghost topbar-btn" id="btn-history">历史日志</button>
       <button class="btn-ghost topbar-btn" id="btn-agent-def">智能体定义</button>
       <button class="btn-ghost topbar-btn" id="btn-skills">技能</button>
+      <button class="btn-ghost topbar-btn" id="btn-channels">渠道</button>
       <button class="btn-ghost topbar-btn" id="btn-deploy">部署 ▾</button>
     </div>
     <button class="mobile-hamburger" id="mobile-hamburger" aria-label="菜单">⋮</button>
@@ -393,6 +394,24 @@
       <div class="network-section">
         <div class="network-section-header">已保存的网络</div>
         <div class="network-saved-list" id="network-saved-list"></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Channel Settings Modal -->
+<div class="modal-overlay hidden" id="channel-overlay">
+  <div class="modal channel-modal">
+    <div class="modal-header">
+      <span class="modal-title">Channels</span>
+      <button class="btn-icon" id="channel-close">✕</button>
+    </div>
+    <div class="modal-body channel-body">
+      <div class="channel-toolbar">
+        <button class="btn-primary btn-sm" id="channel-add-btn">+ Add Channel</button>
+      </div>
+      <div class="channel-list" id="channel-list">
+        <div class="channel-empty">Loading...</div>
       </div>
     </div>
   </div>

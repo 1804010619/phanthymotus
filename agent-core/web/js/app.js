@@ -13,6 +13,7 @@ import { initMonitorMode }   from './monitor-mode.js';
 import { initSkills }        from './skills.js';
 import { initHistory }       from './history.js';
 import { initNetwork }       from './network.js';
+import { initChannels }      from './channels.js';
 import { initMobile }        from './mobile.js';
 import './agent-definition.js';
 
@@ -29,6 +30,7 @@ async function main() {
   initSkills();
   initHistory();
   initNetwork();
+  initChannels();
 
   initActivityLog();
 
