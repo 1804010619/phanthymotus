@@ -31,6 +31,9 @@ async function main() {
     return;
   }
 
+  // Auth passed — show app
+  document.getElementById('app').style.display = '';
+
   initMobile();
   initSidebar();
   initDetailPanel();
