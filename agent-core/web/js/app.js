@@ -32,6 +32,9 @@ async function main() {
   initNetwork();
   initChannels();
 
+  // Settings dropdown (web topbar)
+  _initSettingsDropdown();
+
   initActivityLog();
 
   // Connect motus WebSocket for activity log
@@ -293,6 +296,31 @@ async function _pingOne(mcp) {
 
 async function updateModelLabel() {
   // no-op: model label removed from topbar
+}
+
+function _initSettingsDropdown() {
+  const btn = document.getElementById('topbar-settings-btn');
+  const dropdown = document.getElementById('topbar-settings-dropdown');
+  if (!btn || !dropdown) return;
+
+  btn.addEventListener('click', (e) => {
+    e.stopPropagation();
+    dropdown.classList.toggle('hidden');
+  });
+
+  document.addEventListener('click', (e) => {
+    if (!e.target.closest('#topbar-settings')) {
+      dropdown.classList.add('hidden');
+    }
+  });
+
+  dropdown.querySelectorAll('.settings-dropdown-item').forEach(item => {
+    item.addEventListener('click', () => {
+      const targetId = item.dataset.target;
+      document.getElementById(targetId)?.click();
+      dropdown.classList.add('hidden');
+    });
+  });
 }
 
 main();
