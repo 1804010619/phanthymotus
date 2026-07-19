@@ -343,8 +343,12 @@ function _showLoginScreen() {
     loginEl.className = 'login-screen';
     loginEl.innerHTML = `
       <div class="login-card">
-        <img class="login-logo" src="https://agi-phanthy-dev-1252788780.cos.ap-beijing.myqcloud.com/public/PhanthyMotus_Final_Refined_logo.png" alt="PhanthyMotus">
-        <h1 class="login-title">PhanthyMotus</h1>
+        <div class="login-brand">
+          <img class="login-logo" src="https://agi-phanthy-dev-1252788780.cos.ap-beijing.myqcloud.com/public/PhanthyMotus_Final_Refined_logo.png" alt="PhanthyMotus">
+          <div class="login-brand-text">
+            <span class="brand-name">Phanthy</span><span class="brand-name-accent">Motus</span>
+          </div>
+        </div>
         <p class="login-subtitle">Enter access token to continue</p>
         <input type="password" class="login-input" id="login-token-input" placeholder="Access Token" autocomplete="off" />
         <button class="login-btn" id="login-btn">Login</button>

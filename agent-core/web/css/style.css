@@ -5170,16 +5170,19 @@ html, body {
   max-width: 360px;
   width: 90%;
 }
-.login-logo {
-  width: 64px;
-  height: 64px;
-  margin-bottom: 16px;
+.login-brand {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 20px;
 }
-.login-title {
-  font-size: 1.5rem;
+.login-logo {
+  width: 36px;
+  height: 36px;
+}
+.login-brand-text {
+  font-size: 1.3rem;
   font-weight: 700;
-  margin: 0 0 4px;
-  color: var(--text);
 }
 .login-subtitle {
   font-size: 0.85rem;
