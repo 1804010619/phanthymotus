@@ -23,9 +23,10 @@ let _topicStatuses = {};
 const _pingedIds = new Set();
 
 async function main() {
-  // Auth gate: check token before loading app
+  // Auth gate: check if auth is required
   const token = getToken();
-  if (!token || !(await verifyToken(token))) {
+  const noTokenValid = await verifyToken('');  // If no-token passes, auth is disabled
+  if (!noTokenValid && (!token || !(await verifyToken(token)))) {
     _showLoginScreen();
     return;
   }

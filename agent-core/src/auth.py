@@ -18,42 +18,53 @@ from fastapi.responses import JSONResponse
 
 
 _token: str = ''
+_auth_enabled: bool = False
 
 
 def init():
     """Initialize access token (call during startup)."""
-    global _token
+    global _token, _auth_enabled
     # Priority 1: env var
     token = os.environ.get('ACCESS_TOKEN', '').strip()
     if token:
         _token = token
-        print(f'[auth] Using ACCESS_TOKEN from environment')
+        _auth_enabled = True
+        print(f'[auth] Token authentication enabled (from environment)')
         return
 
     # Priority 2: DB
     token = config.main.get('access_token', '')
     if token:
         _token = token
+        _auth_enabled = True
         print(f'[auth] Access token: {_token}')
         return
 
-    # Auto-generate
-    _token = secrets.token_urlsafe(24)
-    config.main['access_token'] = _token
-    print(f'[auth] Generated access token: {_token}')
-    print(f'[auth] Use this token to access the Dashboard and API')
+    # No token configured — auth disabled
+    _auth_enabled = False
+    print(f'[auth] No ACCESS_TOKEN configured — authentication disabled')
+    print(f'[auth] Set ACCESS_TOKEN env var to enable authentication')
 
 
 def get_token() -> str:
     return _token
 
 
+def is_enabled() -> bool:
+    return _auth_enabled
+
+
 def verify(token: str) -> bool:
+    if not _auth_enabled:
+        return True
     return bool(token) and token == _token
 
 
 async def auth_middleware(request: Request, call_next):
     """FastAPI middleware: enforce token auth on /api/* and /ws/* paths."""
+    if not _auth_enabled:
+        return await call_next(request)
+
     path = request.url.path
 
     # Static files and HTML — no auth needed
@@ -83,6 +94,8 @@ async def auth_middleware(request: Request, call_next):
 
 def check_ws_token(websocket: WebSocket) -> bool:
     """Check token in WebSocket query params."""
+    if not _auth_enabled:
+        return True
     token = websocket.query_params.get('token', '')
     return verify(token)
 
