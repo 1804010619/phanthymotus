@@ -10,9 +10,7 @@ Open: static files, /ws/mic
 """
 
 import os
-import secrets
 
-import config
 from fastapi import Request, WebSocket
 from fastapi.responses import JSONResponse
 
@@ -24,20 +22,12 @@ _auth_enabled: bool = False
 def init():
     """Initialize access token (call during startup)."""
     global _token, _auth_enabled
-    # Priority 1: env var
+    # Only source: ACCESS_TOKEN environment variable
     token = os.environ.get('ACCESS_TOKEN', '').strip()
     if token:
         _token = token
         _auth_enabled = True
         print(f'[auth] Token authentication enabled (from environment)')
-        return
-
-    # Priority 2: DB
-    token = config.main.get('access_token', '')
-    if token:
-        _token = token
-        _auth_enabled = True
-        print(f'[auth] Access token: {_token}')
         return
 
     # No token configured — auth disabled
