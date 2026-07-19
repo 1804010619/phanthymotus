@@ -368,11 +368,9 @@ class _HTTPOnlyStaticFiles(fastapi.staticfiles.StaticFiles):
 
         async def send_no_cache(message):
             if message['type'] == 'http.response.start':
-                path = scope.get('path', '')
-                if path.endswith('.js') or path.endswith('.css'):
-                    headers = dict(message.get('headers', []))
-                    headers[b'cache-control'] = b'no-cache, no-store, must-revalidate'
-                    message = {**message, 'headers': list(headers.items())}
+                headers = dict(message.get('headers', []))
+                headers[b'cache-control'] = b'no-cache, no-store, must-revalidate'
+                message = {**message, 'headers': list(headers.items())}
             await send(message)
 
         await super().__call__(scope, receive, send_no_cache)
