@@ -2,10 +2,9 @@
 auth.py — Access token authentication for Dashboard and API.
 
 Token source: /opt/phanthy-motus/.env file (volume-mounted from host).
-Read on every request so changes take effect immediately without restart.
+Read once at startup. Restart container to apply .env changes.
 """
 
-import os
 import pathlib
 
 from fastapi import Request, WebSocket
@@ -16,9 +15,12 @@ _ENV_PATH = pathlib.Path('/opt/phanthy-motus/.env')
 # Fallback for local dev
 _ENV_PATH_DEV = pathlib.Path('.env')
 
+_token: str = ''
+_auth_enabled: bool = False
 
-def _read_token() -> str:
-    """Read ACCESS_TOKEN from .env file (host volume mount)."""
+
+def _read_token_from_env() -> str:
+    """Read ACCESS_TOKEN from .env file."""
     env_file = _ENV_PATH if _ENV_PATH.exists() else _ENV_PATH_DEV
     if not env_file.exists():
         return ''
@@ -30,32 +32,33 @@ def _read_token() -> str:
 
 
 def init():
-    """Print auth status on startup."""
-    token = _read_token()
-    if token:
-        print(f'[auth] Token authentication enabled (from {_ENV_PATH})')
+    """Read token from .env and cache it. Called once at startup."""
+    global _token, _auth_enabled
+    _token = _read_token_from_env()
+    _auth_enabled = bool(_token)
+    if _auth_enabled:
+        print(f'[auth] Token authentication enabled')
     else:
         print(f'[auth] No ACCESS_TOKEN in .env — authentication disabled')
 
 
 def get_token() -> str:
-    return _read_token()
+    return _token
 
 
 def is_enabled() -> bool:
-    return bool(_read_token())
+    return _auth_enabled
 
 
 def verify(token: str) -> bool:
-    current = _read_token()
-    if not current:
-        return True  # Auth disabled
-    return bool(token) and token == current
+    if not _auth_enabled:
+        return True
+    return bool(token) and token == _token
 
 
 async def auth_middleware(request: Request, call_next):
     """FastAPI middleware: enforce token auth on /api/* and /ws/* paths."""
-    if not is_enabled():
+    if not _auth_enabled:
         return await call_next(request)
 
     path = request.url.path
@@ -86,7 +89,7 @@ async def auth_middleware(request: Request, call_next):
 
 def check_ws_token(websocket: WebSocket) -> bool:
     """Check token in WebSocket query params."""
-    if not is_enabled():
+    if not _auth_enabled:
         return True
     token = websocket.query_params.get('token', '')
     return verify(token)
