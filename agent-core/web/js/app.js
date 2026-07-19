@@ -3,6 +3,7 @@
  * Mounts canvas, sidebar, deploy panel, settings panel, and activity log.
  */
 
+import { getToken, setToken, verifyToken } from './auth.js';
 import { initSidebar, renderSidebar } from './sidebar.js';
 import { initCanvas, updateCanvasMcps } from './canvas.js';
 import { initDeployPanel, showDeployConfirmModal } from './deploy-panel.js';
@@ -22,6 +23,13 @@ let _topicStatuses = {};
 const _pingedIds = new Set();
 
 async function main() {
+  // Auth gate: check token before loading app
+  const token = getToken();
+  if (!token || !(await verifyToken(token))) {
+    _showLoginScreen();
+    return;
+  }
+
   initMobile();
   initSidebar();
   initDetailPanel();
@@ -321,6 +329,56 @@ function _initSettingsDropdown() {
       dropdown.classList.add('hidden');
     });
   });
+}
+
+function _showLoginScreen() {
+  const app = document.getElementById('app');
+  if (app) app.style.display = 'none';
+
+  let loginEl = document.getElementById('login-screen');
+  if (!loginEl) {
+    loginEl = document.createElement('div');
+    loginEl.id = 'login-screen';
+    loginEl.className = 'login-screen';
+    loginEl.innerHTML = `
+      <div class="login-card">
+        <img class="login-logo" src="https://agi-phanthy-dev-1252788780.cos.ap-beijing.myqcloud.com/public/PhanthyMotus_Final_Refined_logo.png" alt="PhanthyMotus">
+        <h1 class="login-title">PhanthyMotus</h1>
+        <p class="login-subtitle">Enter access token to continue</p>
+        <input type="password" class="login-input" id="login-token-input" placeholder="Access Token" autocomplete="off" />
+        <button class="login-btn" id="login-btn">Login</button>
+        <p class="login-hint" id="login-hint"></p>
+        <p class="login-footer">Token is shown in server console on startup</p>
+      </div>
+    `;
+    document.body.appendChild(loginEl);
+  }
+  loginEl.style.display = 'flex';
+
+  const input = document.getElementById('login-token-input');
+  const btn = document.getElementById('login-btn');
+  const hint = document.getElementById('login-hint');
+
+  async function doLogin() {
+    const val = input.value.trim();
+    if (!val) { hint.textContent = 'Please enter a token'; return; }
+    hint.textContent = 'Verifying...';
+    btn.disabled = true;
+    const valid = await verifyToken(val);
+    if (valid) {
+      setToken(val);
+      loginEl.style.display = 'none';
+      if (app) app.style.display = '';
+      main();
+    } else {
+      hint.textContent = 'Invalid token';
+      btn.disabled = false;
+    }
+  }
+
+  btn.addEventListener('click', doLogin);
+  input.addEventListener('keydown', (e) => { if (e.key === 'Enter') doLogin(); });
+  input.focus();
 }
 
 main();

@@ -5,6 +5,7 @@ import shutil
 import subprocess
 
 import config
+import auth
 import event
 import collector
 import scheduler
@@ -211,6 +212,9 @@ async def _heartbeat_core_mcp():
 
 @contextlib.asynccontextmanager
 async def lifespan(app):
+    # 初始化 access token 认证
+    auth.init()
+
     # 初始化资源文件（从 defaults 拷贝缺失文件）
     _init_resource_files()
 
@@ -316,7 +320,13 @@ import api.channel
 app_api.include_router(api.channel.router)
 
 app = fastapi.FastAPI(lifespan=lifespan)
+app.middleware('http')(auth.auth_middleware)
 app.mount('/api', app_api)
+
+# Auth verify endpoint (must be on main app to match /api/auth/verify path through middleware)
+@app_api.get('/auth/verify')
+async def _auth_verify():
+    return {'code': 200, 'valid': True}
 
 import api.motus_stream
 app.include_router(api.motus_stream.router)
