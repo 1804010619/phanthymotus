@@ -163,6 +163,7 @@ function _triggerSettingsAction(action) {
     'history': 'btn-history',
     'agent-def': 'btn-agent-def',
     'skills': 'btn-skills',
+    'channels': 'btn-channels',
     'deploy': 'btn-deploy',
   };
   const btnId = btnMap[action];

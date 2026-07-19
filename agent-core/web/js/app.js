@@ -13,6 +13,7 @@ import { initMonitorMode }   from './monitor-mode.js';
 import { initSkills }        from './skills.js';
 import { initHistory }       from './history.js';
 import { initNetwork }       from './network.js';
+import { initChannels }      from './channels.js';
 import { initMobile }        from './mobile.js';
 import './agent-definition.js';
 
@@ -29,6 +30,10 @@ async function main() {
   initSkills();
   initHistory();
   initNetwork();
+  initChannels();
+
+  // Settings dropdown (web topbar)
+  _initSettingsDropdown();
 
   initActivityLog();
 
@@ -291,6 +296,31 @@ async function _pingOne(mcp) {
 
 async function updateModelLabel() {
   // no-op: model label removed from topbar
+}
+
+function _initSettingsDropdown() {
+  const btn = document.getElementById('topbar-settings-btn');
+  const dropdown = document.getElementById('topbar-settings-dropdown');
+  if (!btn || !dropdown) return;
+
+  btn.addEventListener('click', (e) => {
+    e.stopPropagation();
+    dropdown.classList.toggle('hidden');
+  });
+
+  document.addEventListener('click', (e) => {
+    if (!e.target.closest('#topbar-settings')) {
+      dropdown.classList.add('hidden');
+    }
+  });
+
+  dropdown.querySelectorAll('.settings-dropdown-item').forEach(item => {
+    item.addEventListener('click', () => {
+      const targetId = item.dataset.target;
+      document.getElementById(targetId)?.click();
+      dropdown.classList.add('hidden');
+    });
+  });
 }
 
 main();

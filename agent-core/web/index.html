@@ -27,8 +27,14 @@
     <!-- Mode toggle: 配置 / 监控 -->
     <div class="mode-toggle-group" id="mode-toggle-group">
       <div class="mode-toggle" id="mode-toggle">
-        <button class="mode-toggle-btn active" data-mode="configure">配置</button>
-        <button class="mode-toggle-btn" data-mode="monitor">监控</button>
+        <button class="mode-toggle-btn active" data-mode="configure">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v18"/><path d="M5 8v8"/><path d="M19 6v12"/><circle cx="12" cy="8" r="2"/><circle cx="5" cy="14" r="2"/><circle cx="19" cy="10" r="2"/></svg>
+          配置
+        </button>
+        <button class="mode-toggle-btn" data-mode="monitor">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8"/><path d="M12 17v4"/><path d="M7 13V9"/><path d="M12 13V7"/><path d="M17 13v-2"/></svg>
+          监控
+        </button>
       </div>
     </div>
     <button class="mobile-sidebar-toggle" id="mobile-sidebar-toggle" aria-label="工具列表">☰</button>
@@ -37,11 +43,27 @@
         <span id="update-banner-text"></span>
         <button class="btn-update" id="btn-update">更新</button>
       </div>
-      <button class="btn-ghost topbar-btn" id="btn-network">网络</button>
-      <button class="btn-ghost topbar-btn" id="btn-history">历史日志</button>
-      <button class="btn-ghost topbar-btn" id="btn-agent-def">智能体定义</button>
-      <button class="btn-ghost topbar-btn" id="btn-skills">技能</button>
-      <button class="btn-ghost topbar-btn" id="btn-deploy">部署 ▾</button>
+      <div class="topbar-settings" id="topbar-settings">
+        <button class="topbar-settings-btn" id="topbar-settings-btn">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15 1.65 1.65 0 0 0 3.17 14H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68 1.65 1.65 0 0 0 10 3.17V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+          <span>设置</span>
+        </button>
+        <div class="topbar-settings-dropdown hidden" id="topbar-settings-dropdown">
+          <button class="settings-dropdown-item" data-target="btn-network">网络</button>
+          <button class="settings-dropdown-item" data-target="btn-history">历史日志</button>
+          <button class="settings-dropdown-item" data-target="btn-agent-def">智能体定义</button>
+          <button class="settings-dropdown-item" data-target="btn-skills">技能</button>
+          <button class="settings-dropdown-item" data-target="btn-channels">渠道</button>
+          <button class="settings-dropdown-item" data-target="btn-deploy">部署</button>
+        </div>
+      </div>
+      <!-- Hidden buttons for existing JS handlers -->
+      <button class="btn-ghost topbar-btn hidden" id="btn-network">网络</button>
+      <button class="btn-ghost topbar-btn hidden" id="btn-history">历史日志</button>
+      <button class="btn-ghost topbar-btn hidden" id="btn-agent-def">智能体定义</button>
+      <button class="btn-ghost topbar-btn hidden" id="btn-skills">技能</button>
+      <button class="btn-ghost topbar-btn hidden" id="btn-channels">渠道</button>
+      <button class="btn-ghost topbar-btn hidden" id="btn-deploy">部署 ▾</button>
     </div>
     <button class="mobile-hamburger" id="mobile-hamburger" aria-label="菜单">⋮</button>
   </header>
@@ -164,6 +186,10 @@
         </button>
         <button class="settings-item" data-action="skills">
           <span class="settings-item-label">技能</span>
+          <span class="settings-item-arrow">›</span>
+        </button>
+        <button class="settings-item" data-action="channels">
+          <span class="settings-item-label">渠道</span>
           <span class="settings-item-arrow">›</span>
         </button>
         <button class="settings-item" data-action="deploy">
@@ -398,12 +424,30 @@
   </div>
 </div>
 
+<!-- Channel Settings Modal -->
+<div class="modal-overlay hidden" id="channel-overlay">
+  <div class="modal channel-modal">
+    <div class="modal-header">
+      <span class="modal-title">Channels</span>
+      <button class="btn-icon" id="channel-close">✕</button>
+    </div>
+    <div class="modal-body channel-body">
+      <div class="channel-toolbar">
+        <button class="btn-primary btn-sm" id="channel-add-btn">+ Add Channel</button>
+      </div>
+      <div class="channel-list" id="channel-list">
+        <div class="channel-empty">Loading...</div>
+      </div>
+    </div>
+  </div>
+</div>
+
 <script type="importmap">
 { "imports": {
     "three": "https://cdn.jsdelivr.net/npm/three@0.164/build/three.module.js",
     "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.164/examples/jsm/"
 } }
 </script>
-<script type="module" src="/js/app.js"></script>
+<script type="module" src="/js/app.js?v=2"></script>
 </body>
 </html>
