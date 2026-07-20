@@ -166,7 +166,9 @@ class ChannelManager:
 
         cls = _ADAPTER_CLASSES.get(platform)
         if cls is None:
-            print(f'[channel] no adapter class for platform: {platform}')
+            msg = f'[channel] No adapter for platform: {platform}. Supported: telegram, slack, feishu'
+            print(msg)
+            await self._push_error(msg)
             return
 
         adapter = cls(
@@ -180,8 +182,21 @@ class ChannelManager:
             self._adapters[channel_id] = adapter
             _update_status(channel_id, 'connected')
         except Exception as e:
-            print(f'[channel] failed to start {channel_id}: {e}')
-            _update_status(channel_id, f'error:{e}')
+            error_msg = f'[channel] Failed to start {channel_id} ({platform}): {e}'
+            print(error_msg)
+            await self._push_error(error_msg)
+            _update_status(channel_id, f'error')
+
+    async def _push_error(self, message: str):
+        """Push error to frontend activity stream."""
+        try:
+            from api.motus_stream import push_event
+            await push_event({
+                'type': 'error',
+                'payload': {'message': message},
+            })
+        except Exception:
+            pass
 
     async def restart_adapter(self, channel_id: str):
         """重启指定 adapter（配置更新后调用）。"""
@@ -292,18 +307,36 @@ class ChannelManager:
         Called by channel_reply tool dispatch."""
         ctx = self._last_context.get(channel_id)
         if not ctx:
-            return f'No conversation context for channel "{channel_id}". A user must send a message first.'
+            return (
+                f'Error: No conversation context for channel "{channel_id}". '
+                f'A user must send a message to the bot first. '
+                f'The bot can only reply to conversations that have been initiated by a user.'
+            )
 
         adapter = self._adapters.get(channel_id)
         if not adapter:
-            return f'Channel not found or not running: {channel_id}'
+            return (
+                f'Error: Channel "{channel_id}" is not running. '
+                f'Check Settings → Channels to ensure it is enabled and connected.'
+            )
 
         chat_id = ctx['chat_id']
         try:
             await adapter.send_message(OutboundMessage(chat_id=chat_id, text=text))
             return f'Reply sent ({len(text)} chars)'
         except Exception as e:
-            return f'Reply failed: {e}'
+            error_msg = str(e)
+            # Extract actionable hint from the error
+            if '99991672' in error_msg or 'Permission denied' in error_msg or 'Access denied' in error_msg:
+                result = (
+                    f'Error: Permission denied when sending message. '
+                    f'Grant "im:message:send_as_bot" permission in Feishu Developer Console, '
+                    f'then publish the app version.'
+                )
+            else:
+                result = f'Error sending reply: {error_msg}'
+            await self._push_error(result)
+            return result
 
     async def send_to_channel_any(self, text: str) -> str:
         """Send to the most recent channel with conversation context."""

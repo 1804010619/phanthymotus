@@ -426,23 +426,24 @@ def all_schemas() -> list[dict]:
 
 
 async def _dispatch_internal(mcp_id: str, tool_name: str, args: dict) -> str:
-    """Dispatch tool call for internal (agentcore) tools."""
+    """Dispatch tool call for internal (agentcore/channel) tools."""
     if tool_name == 'channel_reply':
         action = args.get('action', '')
         if action == 'send':
             text = args.get('text', '')
             if not text:
-                return 'Missing required field: text'
+                return 'Error: "text" field is required.'
             from channel.manager import manager as channel_mgr
-            # Find which channel this tool instance is configured for
-            # Use the first available channel with context, or check all
-            channels_with_context = [cid for cid in channel_mgr._last_context]
+            channels_with_context = list(channel_mgr._last_context.keys())
             if not channels_with_context:
-                return 'No active conversation. A user must send a message first.'
-            # Send to the most recent channel that has context
-            channel_id = channels_with_context[-1] if channels_with_context else ''
+                return (
+                    'Error: No active conversation context. '
+                    'A user must send a message to the bot first before it can reply. '
+                    'Ask the user to send a message in Feishu/Telegram/Slack.'
+                )
+            channel_id = channels_with_context[-1]
             return await channel_mgr.send_to_channel(channel_id, text)
-        return f'Unknown action: {action}'
+        return f'Error: Unknown action "{action}". Use action="send" with a "text" field.'
 
-    # Default: return info for other agentcore tools
+    # Default: return info for other internal tools
     return json.dumps({'status': 'ok', 'tool': tool_name})
