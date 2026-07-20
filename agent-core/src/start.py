@@ -162,7 +162,7 @@ def _register_core_mcp(silent=False):
                     'properties': {
                         'channel_id': {
                             'type': 'string',
-                            'description': 'Select a channel (configure in Channel settings first)',
+                            'description': 'Select a channel (configure in Settings → Channels first)',
                             'format': 'channel-select',
                             'scope': 'instance',
                         },
@@ -181,7 +181,7 @@ def _register_core_mcp(silent=False):
                     'properties': {
                         'channel_id': {
                             'type': 'string',
-                            'description': 'Select a channel (configure in Channel settings first)',
+                            'description': 'Select a channel (configure in Settings → Channels first)',
                             'format': 'channel-select',
                             'scope': 'instance',
                         },
