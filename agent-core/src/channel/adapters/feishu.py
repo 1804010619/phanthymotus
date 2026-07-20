@@ -98,8 +98,16 @@ class FeishuAdapter(ChannelAdapter):
     # ── Webhook handling ─────────────────────────────────────────────────────
 
     async def handle_webhook(self, request) -> dict:
-        """Process inbound webhook from Feishu platform."""
+        """Process inbound webhook from Feishu platform (direct mode)."""
         body = await request.body()
+        return await self._process_webhook_body(body)
+
+    async def handle_webhook_body(self, headers: dict, body: str):
+        """Process webhook forwarded from relay server."""
+        await self._process_webhook_body(body.encode() if isinstance(body, str) else body)
+
+    async def _process_webhook_body(self, body: bytes) -> dict:
+        """Core webhook processing logic."""
         data = json.loads(body)
 
         # Challenge verification (initial webhook URL setup)

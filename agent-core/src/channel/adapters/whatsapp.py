@@ -78,18 +78,25 @@ class WhatsAppAdapter(ChannelAdapter):
     # ── Webhook handling ─────────────────────────────────────────────────────
 
     async def handle_webhook(self, request) -> dict:
-        """Process inbound webhook from WhatsApp/Meta."""
+        """Process inbound webhook from WhatsApp/Meta (direct mode)."""
+        body = await request.body()
         # Verify signature
         app_secret = self.config.get('app_secret', '')
         if app_secret:
             signature = request.headers.get('x-hub-signature-256', '')
-            body = await request.body()
             if not self._verify_signature(app_secret, body, signature):
                 return {'error': 'invalid signature'}
-            data = json.loads(body)
-        else:
-            body = await request.body()
-            data = json.loads(body)
+        return await self._process_webhook_body(body)
+
+    async def handle_webhook_body(self, headers: dict, body: str):
+        """Process webhook forwarded from relay server."""
+        raw = body.encode() if isinstance(body, str) else body
+        # Signature already verified by relay or skipped
+        await self._process_webhook_body(raw)
+
+    async def _process_webhook_body(self, body: bytes) -> dict:
+        """Core webhook processing logic."""
+        data = json.loads(body)
 
         # Parse webhook payload
         entries = data.get('entry', [])

@@ -97,6 +97,7 @@ class ChannelManager:
         self._adapters: dict[str, ChannelAdapter] = {}  # channel_id → adapter
         self._active_input_channels: set[str] = set()
         self._active_output_channels: set[str] = set()
+        self._relay_client = None
 
     def sync_from_canvas(self):
         """从 canvas layout 读取 channel_msg_input/output 卡片的 instance config，
@@ -145,10 +146,25 @@ class ChannelManager:
         for ch_cfg in _get_channel_configs():
             if ch_cfg.get('enabled'):
                 await self._start_adapter(ch_cfg)
+
+        # Start relay client for channels in relay mode
+        relay_channels = set()
+        for ch_cfg in _get_channel_configs():
+            if ch_cfg.get('enabled') and ch_cfg.get('config', {}).get('mode') == 'relay':
+                relay_channels.add(ch_cfg['id'])
+
+        if relay_channels:
+            from channel.relay_client import RelayClient
+            self._relay_client = RelayClient(on_webhook=self._on_relay_webhook)
+            self._relay_client.set_channels(relay_channels)
+            await self._relay_client.start()
+
         print(f'[channel] manager started, {len(self._adapters)} adapters running')
 
     async def stop(self):
         """关闭所有运行中的 adapters。"""
+        if self._relay_client:
+            await self._relay_client.stop()
         for adapter in list(self._adapters.values()):
             try:
                 await adapter.stop()
@@ -156,6 +172,19 @@ class ChannelManager:
                 print(f'[channel] stop adapter {adapter.channel_id} error: {e}')
         self._adapters.clear()
         print('[channel] manager stopped')
+
+    async def _on_relay_webhook(self, platform: str, channel_id: str, headers: dict, body: str):
+        """Handle webhook forwarded from relay server."""
+        adapter = self._adapters.get(channel_id)
+        if adapter is None:
+            print(f'[channel] relay webhook for unknown channel: {channel_id}')
+            return
+
+        if not hasattr(adapter, 'handle_webhook_body'):
+            print(f'[channel] adapter {channel_id} does not support relay webhooks')
+            return
+
+        await adapter.handle_webhook_body(headers, body)
 
     async def _start_adapter(self, ch_cfg: dict):
         """为单个 channel 配置启动 adapter。"""
