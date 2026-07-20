@@ -226,6 +226,45 @@ async def init_all() -> None:
     if tasks:
         await asyncio.gather(*tasks)
 
+    # Register internal MCPs (transport='internal') into registry for tool schema lookup
+    _register_internal_mcps()
+
+
+def _register_internal_mcps():
+    """Register internal MCPs (agentcore, channel) into registry so their
+    tool schemas are available for _get_bound_tool_schemas() in llm.py."""
+    mcp_list = config.main.get('services', {}).get('mcp', [])
+    for m in mcp_list:
+        if m.get('transport') != 'internal':
+            continue
+        mcp_id = m.get('id', '')
+        if not mcp_id or mcp_id in registry:
+            continue
+        tools = m.get('tools', [])
+        schemas = {}
+        input_schemas = {}
+        for tool in tools:
+            if not isinstance(tool, dict):
+                continue
+            tool_name = tool.get('name', '')
+            full_name = f'mcp__{mcp_id}__{tool_name}'
+            # Build schema in the format LLM expects
+            schema = {
+                'name': full_name,
+                'description': tool.get('description', ''),
+                'parameters': tool.get('inputSchema', {'type': 'object', 'properties': {}}),
+            }
+            schemas[full_name] = schema
+            input_schemas[full_name] = tool.get('inputSchema', {})
+        registry[mcp_id] = {
+            'online': True,
+            'transport': 'internal',
+            'schemas': schemas,
+            'input_schemas': input_schemas,
+            'tool_groups': {},
+            'split_map': {},
+        }
+
 
 # ── 工具调用 ────────────────────────────────────────────────────────────────────
 
