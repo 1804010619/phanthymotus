@@ -1478,7 +1478,7 @@ async function _startProject() {
         if (startResult && startResult.code !== 200) {
           updateItem(i, 'error', startResult.message || '启动失败');
           _logActivity('error', `${card.toolName} 启动失败: ${startResult.message || '未知错误'}`);
-          if (!aborted) { aborted = true; modal.onCancel?.(); }
+          if (!aborted) { aborted = true; _stopProject(); _showStartupError(modal, close); }
           return;
         }
         // Auto-start mic stream for remote_mic card
@@ -1509,7 +1509,8 @@ async function _startProject() {
         if (!aborted) {
           updateItem(i, 'error', e.message || '异常');
           aborted = true;
-          modal.onCancel?.();
+          _stopProject();
+          _showStartupError(modal, close);
         }
       }
     })());
@@ -1608,6 +1609,19 @@ async function _triggerAction(mcpId, toolName, action, extraArgs = {}) {
 }
 
 // ── Startup Modal ──────────────────────────────────────────────────────────────
+
+function _showStartupError(modal, close) {
+  const cancelBtn = modal.querySelector('.startup-cancel-btn');
+  if (cancelBtn) {
+    cancelBtn.textContent = '关闭';
+    cancelBtn.onclick = close;
+  }
+  modal.onCancel = null;
+  // Update modal title to indicate failure
+  const title = modal.querySelector('.modal-title');
+  if (title) title.textContent = '启动失败';
+}
+
 function _showStartupModal(items) {
   const overlay = document.createElement('div');
   overlay.className = 'modal-overlay';
