@@ -234,7 +234,8 @@ class ChannelManager:
 
         # 5. Publish to topic for dashboard and canvas data flow
         from api.inspection import publish_to_topic
-        topic = f'/channel/request/{msg.channel_id}'
+        topic_id = msg.channel_id.replace(' ', '_')
+        topic = f'/channel/request/{topic_id}'
         topic_data = json.dumps({
             'platform': msg.platform,
             'user': msg.display_name,

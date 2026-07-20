@@ -757,7 +757,8 @@ async def mcp_call_tool(mcp_id: str, req: MCPCallRequest):
                         cfg = config.main.get(f'tool_config:agentcore:channel_request:{instance_id}', None)
                         if cfg:
                             channel_id = cfg.get('channel_id', '')
-                topic = f'/channel/request/{channel_id}' if channel_id else '/channel/request'
+                topic_id = channel_id.replace(' ', '_') if channel_id else ''
+                topic = f'/channel/request/{topic_id}' if topic_id else '/channel/request'
                 return {'code': 200, 'data': {'topic_out': [{'topic': topic, 'format': 'data/json'}]}}
             return {'code': 200, 'data': None}
         if req.tool == 'channel_reply':
