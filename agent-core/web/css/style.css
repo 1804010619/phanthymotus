@@ -4463,6 +4463,9 @@ html, body {
   list-style: none;
   padding: 14px 22px;
   margin: 0;
+  flex: 1;
+  overflow-y: auto;
+  min-height: 0;
 }
 .startup-modal-item {
   display: flex;
