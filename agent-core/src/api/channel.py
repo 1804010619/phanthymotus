@@ -145,3 +145,34 @@ async def get_settings():
 async def update_settings(settings: dict):
     config.main['channel_settings'] = settings
     return {'settings': settings}
+
+
+# ── Webhook Receiver ─────────────────────────────────────────────────────────
+
+@router.post('/webhook/{platform}/{channel_id}')
+async def receive_webhook(platform: str, channel_id: str, request: fastapi.Request):
+    """Receive inbound webhook from messaging platforms (Feishu, WhatsApp)."""
+    adapter = manager._adapters.get(channel_id)
+    if adapter is None:
+        raise fastapi.HTTPException(404, f'Channel not found or not running: {channel_id}')
+    if adapter.platform != platform:
+        raise fastapi.HTTPException(400, f'Platform mismatch: expected {adapter.platform}, got {platform}')
+
+    # Delegate to adapter for signature verification + parsing
+    if not hasattr(adapter, 'handle_webhook'):
+        raise fastapi.HTTPException(501, f'Adapter {platform} does not support webhooks')
+
+    return await adapter.handle_webhook(request)
+
+
+@router.get('/webhook/{platform}/{channel_id}')
+async def verify_webhook(platform: str, channel_id: str, request: fastapi.Request):
+    """Handle webhook verification challenges (WhatsApp, etc.)."""
+    adapter = manager._adapters.get(channel_id)
+    if adapter is None:
+        raise fastapi.HTTPException(404, f'Channel not found: {channel_id}')
+
+    if hasattr(adapter, 'handle_verification'):
+        return await adapter.handle_verification(request)
+
+    raise fastapi.HTTPException(501, 'Verification not supported')

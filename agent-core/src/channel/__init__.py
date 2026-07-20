@@ -22,5 +22,17 @@ def _register_builtin_adapters():
     except ImportError:
         print('[channel] slack adapter unavailable (missing slack-sdk)')
 
+    try:
+        from channel.adapters.feishu import FeishuAdapter
+        register_adapter('feishu', FeishuAdapter)
+    except ImportError as e:
+        print(f'[channel] feishu adapter unavailable ({e})')
+
+    try:
+        from channel.adapters.whatsapp import WhatsAppAdapter
+        register_adapter('whatsapp', WhatsAppAdapter)
+    except ImportError as e:
+        print(f'[channel] whatsapp adapter unavailable ({e})')
+
 
 _register_builtin_adapters()
