@@ -75,6 +75,7 @@ function _showAddForm() {
         <select id="channel-form-platform">
           <option value="telegram">Telegram</option>
           <option value="slack">Slack</option>
+          <option value="feishu">Feishu (飞书)</option>
         </select>
       </div>
       <div class="channel-form-row">
@@ -89,6 +90,14 @@ function _showAddForm() {
         <label>App Token</label>
         <input type="password" id="channel-form-app-token" placeholder="Slack App Token (xapp-...)" />
       </div>
+      <div class="channel-form-row hidden" id="channel-form-app-id-row">
+        <label>App ID</label>
+        <input type="text" id="channel-form-app-id" placeholder="App ID" />
+      </div>
+      <div class="channel-form-row hidden" id="channel-form-app-secret-row">
+        <label>App Secret</label>
+        <input type="password" id="channel-form-app-secret" placeholder="App Secret" />
+      </div>
       <div class="channel-form-row">
         <label><input type="checkbox" id="channel-form-enabled" checked /> Enable immediately</label>
       </div>
@@ -102,11 +111,21 @@ function _showAddForm() {
   const form = document.getElementById('channel-add-form');
   const platformSel = document.getElementById('channel-form-platform');
 
-  platformSel.addEventListener('change', () => {
-    const isSlack = platformSel.value === 'slack';
+  function updateFormFields() {
+    const p = platformSel.value;
+    const isSlack = p === 'slack';
+    const isFeishu = p === 'feishu';
+
     document.getElementById('channel-form-app-token-row').classList.toggle('hidden', !isSlack);
-    document.getElementById('channel-form-token-row').querySelector('label').textContent = isSlack ? 'Bot Token (xoxb-...)' : 'Bot Token';
-  });
+    document.getElementById('channel-form-app-id-row').classList.toggle('hidden', !isFeishu);
+    document.getElementById('channel-form-app-secret-row').classList.toggle('hidden', !isFeishu);
+    document.getElementById('channel-form-token-row').querySelector('label').textContent =
+      isSlack ? 'Bot Token (xoxb-...)' : 'Bot Token';
+    document.getElementById('channel-form-token-row').classList.toggle('hidden', isFeishu);
+  }
+
+  platformSel.addEventListener('change', updateFormFields);
+  updateFormFields();
 
   document.getElementById('channel-form-submit').addEventListener('click', () => _submitAdd(form));
   document.getElementById('channel-form-cancel').addEventListener('click', () => form.remove());
@@ -117,16 +136,25 @@ async function _submitAdd(formEl) {
   const id = document.getElementById('channel-form-id').value.trim();
   const token = document.getElementById('channel-form-token').value.trim();
   const appToken = document.getElementById('channel-form-app-token')?.value.trim() || '';
+  const appId = document.getElementById('channel-form-app-id')?.value.trim() || '';
+  const appSecret = document.getElementById('channel-form-app-secret')?.value.trim() || '';
   const enabled = document.getElementById('channel-form-enabled').checked;
 
-  if (!id || !token) {
-    alert('ID and Bot Token are required');
-    return;
-  }
+  if (!id) { alert('ID is required'); return; }
 
-  const config = { bot_token: token };
-  if (platform === 'slack' && appToken) {
-    config.app_token = appToken;
+  const config = {};
+
+  if (platform === 'telegram') {
+    if (!token) { alert('Bot Token is required'); return; }
+    config.bot_token = token;
+  } else if (platform === 'slack') {
+    if (!token) { alert('Bot Token is required'); return; }
+    config.bot_token = token;
+    if (appToken) config.app_token = appToken;
+  } else if (platform === 'feishu') {
+    if (!appId || !appSecret) { alert('App ID and App Secret are required'); return; }
+    config.app_id = appId;
+    config.app_secret = appSecret;
   }
 
   try {

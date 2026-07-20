@@ -264,6 +264,10 @@ async def call_tool(full_name: str, args: dict) -> str:
     if not info:
         return f'MCP {mcp_id} 未注册'
 
+    # Internal tools (agentcore) — dispatch locally
+    if info.get('transport') == 'internal':
+        return await _dispatch_internal(mcp_id, tool_name, args)
+
     url     = info['url']
     timeout = aiohttp.ClientTimeout(total=30)
 
@@ -380,3 +384,26 @@ def all_schemas() -> list[dict]:
                 }}
             schemas.append(schema)
     return schemas
+
+
+async def _dispatch_internal(mcp_id: str, tool_name: str, args: dict) -> str:
+    """Dispatch tool call for internal (agentcore) tools."""
+    if tool_name == 'channel_reply':
+        action = args.get('action', '')
+        if action == 'send':
+            text = args.get('text', '')
+            if not text:
+                return 'Missing required field: text'
+            from channel.manager import manager as channel_mgr
+            # Find which channel this tool instance is configured for
+            # Use the first available channel with context, or check all
+            channels_with_context = [cid for cid in channel_mgr._last_context]
+            if not channels_with_context:
+                return 'No active conversation. A user must send a message first.'
+            # Send to the most recent channel that has context
+            channel_id = channels_with_context[-1] if channels_with_context else ''
+            return await channel_mgr.send_to_channel(channel_id, text)
+        return f'Unknown action: {action}'
+
+    # Default: return info for other agentcore tools
+    return json.dumps({'status': 'ok', 'tool': tool_name})

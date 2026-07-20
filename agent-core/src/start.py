@@ -151,7 +151,23 @@ def _register_core_mcp(silent=False):
                     'required': ['action', 'text'],
                 },
                 'topic_out': [{'topic': '/remote_control/message', 'format': 'data/json'}],
-            },
+            }
+        ],
+        'topic_out': [{'topic': '/decision_core', 'format': 'data/json'}, {'topic': '/remote_control/mic', 'format': 'audio/pcm-16k'}, {'topic': '/remote_control/message', 'format': 'data/json'}],
+        'topic_in': [{'format': 'data/json'}],
+    })
+
+    # Register Channel as independent internal MCP (no MCP-level topics)
+    existing = [m for m in existing if m.get('id') != 'channel']
+    existing.append({
+        'id': 'channel',
+        'name': 'Channel',
+        'transport': 'internal',
+        'url': '',
+        'server_name': 'Channel',
+        'category': 'controller',
+        'online': True,
+        'tools': [
             {
                 'name': 'channel_request',
                 'type': 'sensor',
@@ -162,7 +178,7 @@ def _register_core_mcp(silent=False):
                     'properties': {
                         'channel_id': {
                             'type': 'string',
-                            'description': 'Select a channel (configure in Channel settings first)',
+                            'description': 'Select a channel (configure in Settings → Channels first)',
                             'format': 'channel-select',
                             'scope': 'instance',
                         },
@@ -174,26 +190,31 @@ def _register_core_mcp(silent=False):
             {
                 'name': 'channel_reply',
                 'type': 'actuator',
-                'description': 'Channel message output — send Agent replies to Telegram/Slack and other platforms',
-                'inputSchema': {'type': 'object', 'properties': {}},
+                'description': 'Send a reply message to a messaging channel (Feishu/Telegram/Slack)',
+                'inputSchema': {
+                    'type': 'object',
+                    'properties': {
+                        'action': {'type': 'string', 'enum': ['send'], 'description': 'Action'},
+                        'text': {'type': 'string', 'description': 'Reply text to send to the user'},
+                    },
+                    'required': ['action', 'text'],
+                },
                 'configSchema': {
                     'type': 'object',
                     'properties': {
                         'channel_id': {
                             'type': 'string',
-                            'description': 'Select a channel (configure in Channel settings first)',
+                            'description': 'Select a channel (configure in Settings → Channels first)',
                             'format': 'channel-select',
                             'scope': 'instance',
                         },
                     },
                 },
                 'multiInstance': True,
-                'topic_in': [{'format': 'data/json'}],
-            }
+            },
         ],
-        'topic_out': [{'topic': '/decision_core', 'format': 'data/json'}, {'topic': '/remote_control/mic', 'format': 'audio/pcm-16k'}, {'topic': '/remote_control/message', 'format': 'data/json'}],
-        'topic_in': [{'format': 'data/json'}],
     })
+
     mcp_mgr._save_mcp_list(existing)
     if not silent:
         print(f'[startup] registered core MCP: {CORE_MCP_ID}')

@@ -565,6 +565,37 @@ function _openToolConfigModal(mcpId, toolName, configSchema) {
           input.appendChild(errOpt);
         });
       }
+    } else if (def.format === 'channel-select') {
+      input = document.createElement('select');
+      input.className = 'tool-config-input';
+      input.dataset.key = key;
+      const saved = savedValues[key] || '';
+      const loadingOpt = document.createElement('option');
+      loadingOpt.value = '';
+      loadingOpt.textContent = 'Loading channels...';
+      input.appendChild(loadingOpt);
+      fetch('/api/channel/list').then(r => r.json()).then(data => {
+        input.innerHTML = '';
+        const channels = data.channels || [];
+        const placeholder = document.createElement('option');
+        placeholder.value = '';
+        placeholder.textContent = channels.length ? '-- Select channel --' : '-- No channels configured --';
+        input.appendChild(placeholder);
+        for (const ch of channels) {
+          const opt = document.createElement('option');
+          opt.value = ch.id;
+          opt.textContent = `${ch.id} (${ch.platform})`;
+          if (saved === ch.id) opt.selected = true;
+          input.appendChild(opt);
+        }
+        if (saved) input.value = saved;
+      }).catch(() => {
+        input.innerHTML = '';
+        const errOpt = document.createElement('option');
+        errOpt.value = '';
+        errOpt.textContent = 'Failed to load channels';
+        input.appendChild(errOpt);
+      });
     } else {
       input = document.createElement('input');
       input.className = 'tool-config-input';
@@ -851,6 +882,37 @@ export function openInstanceConfigModal(mcpId, toolName, instanceId, configSchem
           input.appendChild(errOpt);
         });
       }
+    } else if (def.format === 'channel-select') {
+      input = document.createElement('select');
+      input.className = 'tool-config-input';
+      input.dataset.key = key;
+      const saved = savedValues[key] || '';
+      const loadingOpt = document.createElement('option');
+      loadingOpt.value = '';
+      loadingOpt.textContent = 'Loading channels...';
+      input.appendChild(loadingOpt);
+      fetch('/api/channel/list').then(r => r.json()).then(data => {
+        input.innerHTML = '';
+        const channels = data.channels || [];
+        const placeholder = document.createElement('option');
+        placeholder.value = '';
+        placeholder.textContent = channels.length ? '-- Select channel --' : '-- No channels configured --';
+        input.appendChild(placeholder);
+        for (const ch of channels) {
+          const opt = document.createElement('option');
+          opt.value = ch.id;
+          opt.textContent = `${ch.id} (${ch.platform})`;
+          if (saved === ch.id) opt.selected = true;
+          input.appendChild(opt);
+        }
+        if (saved) input.value = saved;
+      }).catch(() => {
+        input.innerHTML = '';
+        const errOpt = document.createElement('option');
+        errOpt.value = '';
+        errOpt.textContent = 'Failed to load channels';
+        input.appendChild(errOpt);
+      });
     } else {
       input = document.createElement('input');
       input.className = 'tool-config-input';

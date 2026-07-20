@@ -13,7 +13,6 @@ import json
 import time
 
 import config
-import event_bus
 from channel.adapter import ChannelAdapter, InboundMessage, OutboundMessage
 from channel import acl
 
@@ -97,6 +96,8 @@ class ChannelManager:
         self._adapters: dict[str, ChannelAdapter] = {}  # channel_id → adapter
         self._active_input_channels: set[str] = set()
         self._active_output_channels: set[str] = set()
+        # Last conversation context per channel (auto-updated on inbound)
+        self._last_context: dict[str, dict] = {}  # channel_id → {chat_id, user_id}
 
     def sync_from_canvas(self):
         """从 canvas layout 读取 channel_msg_input/output 卡片的 instance config，
@@ -108,15 +109,16 @@ class ChannelManager:
         output_channels = set()
 
         for card in cards:
-            if card.get('mcpId') != 'agentcore':
+            if card.get('mcpId') not in ('agentcore', 'channel'):
                 continue
             tool_name = card.get('toolName', '')
             card_id = card.get('id', '')
             if tool_name not in ('channel_request', 'channel_reply'):
                 continue
 
-            # 读取 instance config 获取 channel_id
-            instance_key = f'tool_config:agentcore:{tool_name}:{card_id}'
+            # 读取 instance config 获取 channel_id (check both old and new MCP id)
+            mcp_id = card.get('mcpId', 'channel')
+            instance_key = f'tool_config:{mcp_id}:{tool_name}:{card_id}'
             instance_cfg = config.main.get(instance_key, None)
             channel_id = None
             if instance_cfg:
@@ -225,23 +227,29 @@ class ChannelManager:
         if user['role'] == 'blocked':
             return  # 静默丢弃
 
-        # 4. 注入 event_bus
-        source = f"channel:{msg.platform}:{msg.user_id}"
-        await event_bus.enqueue(
-            source=source,
-            text=f"[{msg.platform} @{msg.display_name}] {msg.text}",
-            payload={
-                'platform': msg.platform,
-                'channel_id': msg.channel_id,
-                'chat_id': msg.chat_id,
-                'user_id': msg.user_id,
-                'display_name': msg.display_name,
-                'user_role': user['role'],
-            }
-        )
+        # 4. Store last conversation context for reply routing
+        self._last_context[msg.channel_id] = {
+            'chat_id': msg.chat_id,
+            'user_id': msg.user_id,
+        }
 
-        # 5. Broadcast to frontend
+        # 5. Publish to topic for dashboard and canvas data flow
+        from api.inspection import publish_to_topic
+        topic_id = msg.channel_id.replace(' ', '_')
+        topic = f'/channel/request/{topic_id}'
+        topic_data = json.dumps({
+            'platform': msg.platform,
+            'user': msg.display_name,
+            'user_id': msg.user_id,
+            'chat_id': msg.chat_id,
+            'text': msg.text,
+            'user_role': user['role'],
+        }, ensure_ascii=False)
+        await publish_to_topic(topic, topic_data)
+
+        # 5. Broadcast to frontend activity stream
         from api.motus_stream import push_event
+        source = f"channel:{msg.platform}:{msg.user_id}"
         await push_event({
             'type': 'trigger',
             'mcp_id': source,
@@ -256,9 +264,8 @@ class ChannelManager:
 
     async def route_reply(self, trigger_event: dict, reply_text: str):
         """
-        在 agent turn 结束后调用：如果 trigger 来自 channel，把回复发回对应平台。
-
-        trigger_event.payload 包含 channel_id, chat_id 等路由信息。
+        Send reply back to the channel that triggered this event.
+        Simple passthrough — no canvas connection check needed.
         """
         source = trigger_event.get('source', '')
         if not source.startswith('channel:'):
@@ -271,10 +278,6 @@ class ChannelManager:
         if not channel_id or not chat_id:
             return
 
-        # 检查 output channel 是否在 canvas 中激活
-        if channel_id not in self.active_output_channels:
-            return
-
         adapter = self._adapters.get(channel_id)
         if adapter is None:
             return
@@ -283,6 +286,32 @@ class ChannelManager:
             await adapter.send_message(OutboundMessage(chat_id=chat_id, text=reply_text))
         except Exception as e:
             print(f'[channel] reply failed ({channel_id}→{chat_id}): {e}')
+
+    async def send_to_channel(self, channel_id: str, text: str) -> str:
+        """Send a message to a channel using the last known chat context.
+        Called by channel_reply tool dispatch."""
+        ctx = self._last_context.get(channel_id)
+        if not ctx:
+            return f'No conversation context for channel "{channel_id}". A user must send a message first.'
+
+        adapter = self._adapters.get(channel_id)
+        if not adapter:
+            return f'Channel not found or not running: {channel_id}'
+
+        chat_id = ctx['chat_id']
+        try:
+            await adapter.send_message(OutboundMessage(chat_id=chat_id, text=text))
+            return f'Reply sent ({len(text)} chars)'
+        except Exception as e:
+            return f'Reply failed: {e}'
+
+    async def send_to_channel_any(self, text: str) -> str:
+        """Send to the most recent channel with conversation context."""
+        if not self._last_context:
+            return 'No active conversation. A user must send a message first.'
+        # Use the most recently updated channel
+        channel_id = list(self._last_context.keys())[-1]
+        return await self.send_to_channel(channel_id, text)
 
     # ── Status ───────────────────────────────────────────────────────────────
 
