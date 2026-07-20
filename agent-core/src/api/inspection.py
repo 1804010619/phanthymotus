@@ -105,26 +105,16 @@ async def register_topic_internal(topic: str, fmt: str, mcp_id: str) -> None:
 
 
 async def publish_to_topic(topic: str, data: str | bytes) -> None:
-    """Publish data to a topic via DDS (ros2_bridge) and WebSocket consumers.
-    This ensures the data reaches both dashboard viewers and any downstream
-    subscribers (decision_core, other processors) via the real DDS bus."""
+    """Publish data to a topic via DDS (ros2_bridge).
+    Data reaches dashboard via DDS → inspection primary sub → WebSocket.
+    Data reaches decision_core via DDS → topic_subscriber → event_bus."""
     if topic not in _topic_registry:
         await register_topic_internal(topic, 'data/json', 'agentcore')
-    raw = data.encode('utf-8') if isinstance(data, str) else data
-    text = raw.decode('utf-8', errors='replace') if isinstance(raw, bytes) else raw
+    text = data.decode('utf-8', errors='replace') if isinstance(data, bytes) else data
 
-    # Publish to DDS (real topic — reaches topic_subscriber, other nodes)
+    # Publish to DDS — inspection sub will push to WebSocket, topic_subscriber to event_bus
     import ros2_bridge
     ros2_bridge.publish(topic, text)
-
-    # Also push to WebSocket consumers directly (for immediate dashboard display)
-    _last_frame[topic] = raw
-    queues = _topic_queues.get(topic, [])
-    for q in list(queues):
-        try:
-            q.put_nowait(raw)
-        except asyncio.QueueFull:
-            pass
 
 
 # ── HTTP: Monitor (legacy, kept for compatibility) ────────────────────────────
