@@ -742,6 +742,10 @@ async def mcp_call_tool(mcp_id: str, req: MCPCallRequest):
                     return {'code': 200, 'data': {'status': 'sent', 'text': text}}
                 return {'code': 200, 'data': {'error': 'Missing text'}}
             return {'code': 200, 'data': None}
+        return await _handle_agentcore_call(req)
+
+    # ── Handle internal channel MCP ──
+    if mcp_id == 'channel':
         if req.tool == 'channel_request':
             action = req.arguments.get('action', 'start')
             if action == 'start':
@@ -749,12 +753,11 @@ async def mcp_call_tool(mcp_id: str, req: MCPCallRequest):
             elif action == 'stop':
                 return {'code': 200, 'data': {'state': 'idle'}}
             elif action == 'info':
-                # Resolve channel_id from arguments or instance config
                 channel_id = req.arguments.get('channel_id', '')
                 if not channel_id:
                     instance_id = req.arguments.get('instance_id', '')
                     if instance_id:
-                        cfg = config.main.get(f'tool_config:agentcore:channel_request:{instance_id}', None)
+                        cfg = config.main.get(f'tool_config:channel:channel_request:{instance_id}', None)
                         if cfg:
                             channel_id = cfg.get('channel_id', '')
                 topic_id = channel_id.replace(' ', '_') if channel_id else ''
@@ -775,7 +778,7 @@ async def mcp_call_tool(mcp_id: str, req: MCPCallRequest):
                 result = await channel_mgr.send_to_channel_any(text)
                 return {'code': 200, 'data': {'result': result}}
             return {'code': 200, 'data': None}
-        return await _handle_agentcore_call(req)
+        return {'code': 200, 'data': None}
 
     mcps = _get_mcp_list()
     target = next((m for m in mcps if m.get('id') == mcp_id), None)
