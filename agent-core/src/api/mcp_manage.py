@@ -749,7 +749,14 @@ async def mcp_call_tool(mcp_id: str, req: MCPCallRequest):
             elif action == 'stop':
                 return {'code': 200, 'data': {'state': 'idle'}}
             elif action == 'info':
+                # Resolve channel_id from arguments or instance config
                 channel_id = req.arguments.get('channel_id', '')
+                if not channel_id:
+                    instance_id = req.arguments.get('instance_id', '')
+                    if instance_id:
+                        cfg = config.main.get(f'tool_config:agentcore:channel_request:{instance_id}', None)
+                        if cfg:
+                            channel_id = cfg.get('channel_id', '')
                 topic = f'/channel/request/{channel_id}' if channel_id else '/channel/request'
                 return {'code': 200, 'data': {'topic_out': [{'topic': topic, 'format': 'data/json'}]}}
             return {'code': 200, 'data': None}
