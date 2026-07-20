@@ -109,15 +109,16 @@ class ChannelManager:
         output_channels = set()
 
         for card in cards:
-            if card.get('mcpId') != 'agentcore':
+            if card.get('mcpId') not in ('agentcore', 'channel'):
                 continue
             tool_name = card.get('toolName', '')
             card_id = card.get('id', '')
             if tool_name not in ('channel_request', 'channel_reply'):
                 continue
 
-            # 读取 instance config 获取 channel_id
-            instance_key = f'tool_config:agentcore:{tool_name}:{card_id}'
+            # 读取 instance config 获取 channel_id (check both old and new MCP id)
+            mcp_id = card.get('mcpId', 'channel')
+            instance_key = f'tool_config:{mcp_id}:{tool_name}:{card_id}'
             instance_cfg = config.main.get(instance_key, None)
             channel_id = None
             if instance_cfg:

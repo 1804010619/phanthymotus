@@ -51,7 +51,7 @@ class FeishuAdapter(ChannelAdapter):
             app_id=app_id,
             app_secret=app_secret,
             event_handler=event_handler,
-            log_level=lark.LogLevel.WARNING,
+            log_level=lark.LogLevel.DEBUG,
         )
 
         # Start in background thread (SDK blocks)
@@ -72,12 +72,15 @@ class FeishuAdapter(ChannelAdapter):
                 # Monkey-patch the SDK's module-level loop reference
                 import lark_oapi.ws.client as ws_mod
                 ws_mod.loop = new_loop
+                print(f'[feishu] SDK thread starting, calling client.start()...')
                 self._client.start()
+                print(f'[feishu] SDK thread client.start() returned (unexpected)')
             except Exception as e:
                 print(f'[feishu] WebSocket thread error: {e}')
                 self._running = False
             finally:
                 new_loop.close()
+                print(f'[feishu] SDK thread exited')
 
         self._thread = threading.Thread(target=_thread_target, daemon=True)
         self._thread.start()
@@ -124,6 +127,8 @@ class FeishuAdapter(ChannelAdapter):
 
     def _handle_message_event(self, data):
         """Handle im.message.receive_v1 event from SDK callback (runs in thread)."""
+        import sys
+        print(f'[feishu] _handle_message_event called', flush=True, file=sys.stderr)
         try:
             event = data.event
             message = event.message
@@ -148,6 +153,8 @@ class FeishuAdapter(ChannelAdapter):
             sender_id = sender.sender_id.open_id or sender.sender_id.user_id or ''
             chat_id = message.chat_id
 
+            print(f'[feishu] parsed: user={sender_id} chat={chat_id} text={text}', flush=True, file=sys.stderr)
+
             msg = InboundMessage(
                 platform='feishu',
                 channel_id=self.channel_id,
@@ -158,7 +165,10 @@ class FeishuAdapter(ChannelAdapter):
             )
 
             # Schedule coroutine from SDK thread to main event loop
-            asyncio.run_coroutine_threadsafe(self._on_message(msg), self._loop)
+            future = asyncio.run_coroutine_threadsafe(self._on_message(msg), self._loop)
+            print(f'[feishu] scheduled _on_message, future={future}', flush=True, file=sys.stderr)
 
         except Exception as e:
-            print(f'[feishu] handle message error: {e}')
+            import traceback
+            print(f'[feishu] handle message error: {e}', flush=True, file=sys.stderr)
+            traceback.print_exc(file=sys.stderr)
