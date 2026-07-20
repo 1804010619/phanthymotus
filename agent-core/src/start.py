@@ -195,6 +195,8 @@ def _register_core_mcp(silent=False):
                     },
                 },
                 'multiInstance': True,
+                'topic_in': [],
+                'topic_out': [],
             }
         ],
         'topic_out': [{'topic': '/decision_core', 'format': 'data/json'}, {'topic': '/remote_control/mic', 'format': 'audio/pcm-16k'}, {'topic': '/remote_control/message', 'format': 'data/json'}],
