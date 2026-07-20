@@ -32,6 +32,9 @@ class FeishuAdapter(ChannelAdapter):
 
         import lark_oapi as lark
 
+        # Store the main event loop for cross-thread scheduling
+        self._loop = asyncio.get_event_loop()
+
         # Create API client for sending messages
         self._api_client = lark.Client.builder() \
             .app_id(app_id) \
@@ -57,15 +60,27 @@ class FeishuAdapter(ChannelAdapter):
         print(f'[feishu] adapter started (WebSocket mode): {self.channel_id}')
 
     async def _run(self):
-        """Run the lark WebSocket client in a thread."""
-        loop = asyncio.get_event_loop()
-        try:
-            await loop.run_in_executor(None, self._client.start)
-        except asyncio.CancelledError:
-            pass
-        except Exception as e:
-            print(f'[feishu] WebSocket error: {e}')
-            self._running = False
+        """Run the lark WebSocket client in a dedicated thread with its own event loop."""
+        import threading
+
+        def _thread_target():
+            # lark SDK uses a module-level event loop (loop.run_until_complete)
+            # Must create a fresh loop for this thread
+            new_loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(new_loop)
+            try:
+                # Monkey-patch the SDK's module-level loop reference
+                import lark_oapi.ws.client as ws_mod
+                ws_mod.loop = new_loop
+                self._client.start()
+            except Exception as e:
+                print(f'[feishu] WebSocket thread error: {e}')
+                self._running = False
+            finally:
+                new_loop.close()
+
+        self._thread = threading.Thread(target=_thread_target, daemon=True)
+        self._thread.start()
 
     async def stop(self) -> None:
         self._running = False
@@ -142,10 +157,8 @@ class FeishuAdapter(ChannelAdapter):
                 text=text,
             )
 
-            # Schedule coroutine from thread
-            import asyncio
-            loop = asyncio.get_event_loop()
-            asyncio.run_coroutine_threadsafe(self._on_message(msg), loop)
+            # Schedule coroutine from SDK thread to main event loop
+            asyncio.run_coroutine_threadsafe(self._on_message(msg), self._loop)
 
         except Exception as e:
             print(f'[feishu] handle message error: {e}')
