@@ -13,7 +13,6 @@ import json
 import time
 
 import config
-import event_bus
 from channel.adapter import ChannelAdapter, InboundMessage, OutboundMessage
 from channel import acl
 
@@ -225,23 +224,22 @@ class ChannelManager:
         if user['role'] == 'blocked':
             return  # 静默丢弃
 
-        # 4. 注入 event_bus
-        source = f"channel:{msg.platform}:{msg.user_id}"
-        await event_bus.enqueue(
-            source=source,
-            text=f"[{msg.platform} @{msg.display_name}] {msg.text}",
-            payload={
-                'platform': msg.platform,
-                'channel_id': msg.channel_id,
-                'chat_id': msg.chat_id,
-                'user_id': msg.user_id,
-                'display_name': msg.display_name,
-                'user_role': user['role'],
-            }
-        )
+        # 4. Publish to topic for dashboard and canvas data flow
+        from api.inspection import publish_to_topic
+        topic = f'/channel/request/{msg.channel_id}'
+        topic_data = json.dumps({
+            'platform': msg.platform,
+            'user': msg.display_name,
+            'user_id': msg.user_id,
+            'chat_id': msg.chat_id,
+            'text': msg.text,
+            'user_role': user['role'],
+        }, ensure_ascii=False)
+        await publish_to_topic(topic, topic_data)
 
-        # 5. Broadcast to frontend
+        # 5. Broadcast to frontend activity stream
         from api.motus_stream import push_event
+        source = f"channel:{msg.platform}:{msg.user_id}"
         await push_event({
             'type': 'trigger',
             'mcp_id': source,
@@ -252,24 +250,12 @@ class ChannelManager:
             }
         })
 
-        # 6. Publish to inspection topic for dashboard rendering
-        from api.inspection import publish_to_topic
-        topic = f'/channel/request/{msg.channel_id}'
-        topic_data = json.dumps({
-            'platform': msg.platform,
-            'user': msg.display_name,
-            'text': msg.text,
-            'chat_id': msg.chat_id,
-        }, ensure_ascii=False)
-        await publish_to_topic(topic, topic_data)
-
     # ── Outbound (Reply Routing) ─────────────────────────────────────────────
 
     async def route_reply(self, trigger_event: dict, reply_text: str):
         """
-        在 agent turn 结束后调用：如果 trigger 来自 channel，把回复发回对应平台。
-
-        trigger_event.payload 包含 channel_id, chat_id 等路由信息。
+        Send reply back to the channel that triggered this event.
+        Simple passthrough — no canvas connection check needed.
         """
         source = trigger_event.get('source', '')
         if not source.startswith('channel:'):
@@ -280,10 +266,6 @@ class ChannelManager:
         chat_id = payload.get('chat_id', '')
 
         if not channel_id or not chat_id:
-            return
-
-        # 检查 output channel 是否在 canvas 中激活
-        if channel_id not in self.active_output_channels:
             return
 
         adapter = self._adapters.get(channel_id)

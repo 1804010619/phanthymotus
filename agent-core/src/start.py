@@ -174,8 +174,17 @@ def _register_core_mcp(silent=False):
             {
                 'name': 'channel_reply',
                 'type': 'actuator',
-                'description': 'Channel message output — send Agent replies to Telegram/Slack and other platforms',
-                'inputSchema': {'type': 'object', 'properties': {}},
+                'description': 'Send a reply message to a messaging channel (Feishu/Telegram/Slack)',
+                'inputSchema': {
+                    'type': 'object',
+                    'properties': {
+                        'action': {'type': 'string', 'enum': ['send'], 'description': 'Action'},
+                        'text': {'type': 'string', 'description': 'Reply text to send'},
+                        'channel_id': {'type': 'string', 'description': 'Target channel ID'},
+                        'chat_id': {'type': 'string', 'description': 'Target chat/conversation ID'},
+                    },
+                    'required': ['action', 'text', 'channel_id', 'chat_id'],
+                },
                 'configSchema': {
                     'type': 'object',
                     'properties': {
