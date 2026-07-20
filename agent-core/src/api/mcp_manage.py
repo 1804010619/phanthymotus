@@ -742,6 +742,31 @@ async def mcp_call_tool(mcp_id: str, req: MCPCallRequest):
                     return {'code': 200, 'data': {'status': 'sent', 'text': text}}
                 return {'code': 200, 'data': {'error': 'Missing text'}}
             return {'code': 200, 'data': None}
+        if req.tool == 'channel_request':
+            action = req.arguments.get('action', 'start')
+            if action == 'start':
+                return {'code': 200, 'data': {'state': 'running'}}
+            elif action == 'stop':
+                return {'code': 200, 'data': {'state': 'idle'}}
+            elif action == 'info':
+                channel_id = req.arguments.get('channel_id', '')
+                topic = f'/channel/request/{channel_id}' if channel_id else '/channel/request'
+                return {'code': 200, 'data': {'topic_out': [{'topic': topic, 'format': 'data/json'}]}}
+            return {'code': 200, 'data': None}
+        if req.tool == 'channel_reply':
+            action = req.arguments.get('action', 'send')
+            if action == 'start':
+                return {'code': 200, 'data': {'state': 'running'}}
+            elif action == 'stop':
+                return {'code': 200, 'data': {'state': 'idle'}}
+            elif action == 'send':
+                text = req.arguments.get('text', '')
+                if not text:
+                    return {'code': 200, 'data': {'error': 'text is required'}}
+                from channel.manager import manager as channel_mgr
+                result = await channel_mgr.send_to_channel_any(text)
+                return {'code': 200, 'data': {'result': result}}
+            return {'code': 200, 'data': None}
         return await _handle_agentcore_call(req)
 
     mcps = _get_mcp_list()

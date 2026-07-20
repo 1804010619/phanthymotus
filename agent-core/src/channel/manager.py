@@ -303,6 +303,14 @@ class ChannelManager:
         except Exception as e:
             return f'Reply failed: {e}'
 
+    async def send_to_channel_any(self, text: str) -> str:
+        """Send to the most recent channel with conversation context."""
+        if not self._last_context:
+            return 'No active conversation. A user must send a message first.'
+        # Use the most recently updated channel
+        channel_id = list(self._last_context.keys())[-1]
+        return await self.send_to_channel(channel_id, text)
+
     # ── Status ───────────────────────────────────────────────────────────────
 
     def get_status(self) -> list[dict]:

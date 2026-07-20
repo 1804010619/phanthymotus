@@ -169,7 +169,7 @@ def _register_core_mcp(silent=False):
                     },
                 },
                 'multiInstance': True,
-                'topic_out': [{'topic': '/channel/request/{channel_id}', 'format': 'data/json'}],
+                'topic_out': [{'format': 'data/json'}],
             },
             {
                 'name': 'channel_reply',
