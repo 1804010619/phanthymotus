@@ -179,9 +179,9 @@ def _register_core_mcp(silent=False):
                     'type': 'object',
                     'properties': {
                         'action': {'type': 'string', 'enum': ['send'], 'description': 'Action'},
-                        'text': {'type': 'string', 'description': 'Reply text to send'},
-                        'channel_id': {'type': 'string', 'description': 'Target channel ID'},
-                        'chat_id': {'type': 'string', 'description': 'Target chat/conversation ID'},
+                        'text': {'type': 'string', 'description': 'Reply text to send to the user'},
+                        'channel_id': {'type': 'string', 'description': 'Channel ID from the incoming message (e.g. "feishu orin")'},
+                        'chat_id': {'type': 'string', 'description': 'Chat ID from the incoming message (e.g. "oc_xxx")'},
                     },
                     'required': ['action', 'text', 'channel_id', 'chat_id'],
                 },
