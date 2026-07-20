@@ -252,6 +252,17 @@ class ChannelManager:
             }
         })
 
+        # 6. Publish to inspection topic for dashboard rendering
+        from api.inspection import publish_to_topic
+        topic = f'/channel/request/{msg.channel_id}'
+        topic_data = json.dumps({
+            'platform': msg.platform,
+            'user': msg.display_name,
+            'text': msg.text,
+            'chat_id': msg.chat_id,
+        }, ensure_ascii=False)
+        await publish_to_topic(topic, topic_data)
+
     # ── Outbound (Reply Routing) ─────────────────────────────────────────────
 
     async def route_reply(self, trigger_event: dict, reply_text: str):

@@ -104,6 +104,21 @@ async def register_topic_internal(topic: str, fmt: str, mcp_id: str) -> None:
     _ensure_primary_sub(topic, fmt, loop)
 
 
+async def publish_to_topic(topic: str, data: str | bytes) -> None:
+    """Publish data to a topic's WebSocket consumers (non-DDS path).
+    Also registers the topic if not yet registered."""
+    if topic not in _topic_registry:
+        await register_topic_internal(topic, 'data/json', 'agentcore')
+    raw = data.encode('utf-8') if isinstance(data, str) else data
+    _last_frame[topic] = raw
+    queues = _topic_queues.get(topic, [])
+    for q in list(queues):
+        try:
+            q.put_nowait(raw)
+        except asyncio.QueueFull:
+            pass
+
+
 # ── HTTP: Monitor (legacy, kept for compatibility) ────────────────────────────
 
 @router.post('/monitor/start')

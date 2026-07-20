@@ -169,7 +169,7 @@ def _register_core_mcp(silent=False):
                     },
                 },
                 'multiInstance': True,
-                'topic_out': [{'topic': '/channel/request', 'format': 'data/json'}],
+                'topic_out': [{'topic': '/channel/request/{channel_id}', 'format': 'data/json'}],
             },
             {
                 'name': 'channel_reply',
@@ -188,7 +188,7 @@ def _register_core_mcp(silent=False):
                     },
                 },
                 'multiInstance': True,
-                'topic_in': [{'topic': '/channel/reply', 'format': 'data/json'}],
+                'topic_in': [{'format': 'data/json'}],
             }
         ],
         'topic_out': [{'topic': '/decision_core', 'format': 'data/json'}, {'topic': '/remote_control/mic', 'format': 'audio/pcm-16k'}, {'topic': '/remote_control/message', 'format': 'data/json'}],
