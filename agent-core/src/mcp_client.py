@@ -392,20 +392,17 @@ async def _dispatch_internal(mcp_id: str, tool_name: str, args: dict) -> str:
         action = args.get('action', '')
         if action == 'send':
             text = args.get('text', '')
-            channel_id = args.get('channel_id', '')
-            chat_id = args.get('chat_id', '')
-            if not text or not channel_id or not chat_id:
-                return 'Missing required fields: text, channel_id, chat_id'
+            if not text:
+                return 'Missing required field: text'
             from channel.manager import manager as channel_mgr
-            from channel.adapter import OutboundMessage
-            adapter = channel_mgr._adapters.get(channel_id)
-            if not adapter:
-                return f'Channel not found or not running: {channel_id}'
-            try:
-                await adapter.send_message(OutboundMessage(chat_id=chat_id, text=text))
-                return f'Reply sent ({len(text)} chars)'
-            except Exception as e:
-                return f'Reply failed: {e}'
+            # Find which channel this tool instance is configured for
+            # Use the first available channel with context, or check all
+            channels_with_context = [cid for cid in channel_mgr._last_context]
+            if not channels_with_context:
+                return 'No active conversation. A user must send a message first.'
+            # Send to the most recent channel that has context
+            channel_id = channels_with_context[-1] if channels_with_context else ''
+            return await channel_mgr.send_to_channel(channel_id, text)
         return f'Unknown action: {action}'
 
     # Default: return info for other agentcore tools

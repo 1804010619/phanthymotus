@@ -96,6 +96,8 @@ class ChannelManager:
         self._adapters: dict[str, ChannelAdapter] = {}  # channel_id → adapter
         self._active_input_channels: set[str] = set()
         self._active_output_channels: set[str] = set()
+        # Last conversation context per channel (auto-updated on inbound)
+        self._last_context: dict[str, dict] = {}  # channel_id → {chat_id, user_id}
 
     def sync_from_canvas(self):
         """从 canvas layout 读取 channel_msg_input/output 卡片的 instance config，
@@ -224,7 +226,13 @@ class ChannelManager:
         if user['role'] == 'blocked':
             return  # 静默丢弃
 
-        # 4. Publish to topic for dashboard and canvas data flow
+        # 4. Store last conversation context for reply routing
+        self._last_context[msg.channel_id] = {
+            'chat_id': msg.chat_id,
+            'user_id': msg.user_id,
+        }
+
+        # 5. Publish to topic for dashboard and canvas data flow
         from api.inspection import publish_to_topic
         topic = f'/channel/request/{msg.channel_id}'
         topic_data = json.dumps({
@@ -276,6 +284,24 @@ class ChannelManager:
             await adapter.send_message(OutboundMessage(chat_id=chat_id, text=reply_text))
         except Exception as e:
             print(f'[channel] reply failed ({channel_id}→{chat_id}): {e}')
+
+    async def send_to_channel(self, channel_id: str, text: str) -> str:
+        """Send a message to a channel using the last known chat context.
+        Called by channel_reply tool dispatch."""
+        ctx = self._last_context.get(channel_id)
+        if not ctx:
+            return f'No conversation context for channel "{channel_id}". A user must send a message first.'
+
+        adapter = self._adapters.get(channel_id)
+        if not adapter:
+            return f'Channel not found or not running: {channel_id}'
+
+        chat_id = ctx['chat_id']
+        try:
+            await adapter.send_message(OutboundMessage(chat_id=chat_id, text=text))
+            return f'Reply sent ({len(text)} chars)'
+        except Exception as e:
+            return f'Reply failed: {e}'
 
     # ── Status ───────────────────────────────────────────────────────────────
 
