@@ -76,7 +76,6 @@ function _showAddForm() {
           <option value="telegram">Telegram</option>
           <option value="slack">Slack</option>
           <option value="feishu">Feishu (飞书)</option>
-          <option value="whatsapp">WhatsApp</option>
         </select>
       </div>
       <div class="channel-form-row">
@@ -99,26 +98,6 @@ function _showAddForm() {
         <label>App Secret</label>
         <input type="password" id="channel-form-app-secret" placeholder="App Secret" />
       </div>
-      <div class="channel-form-row hidden" id="channel-form-verify-token-row">
-        <label>Verify Token</label>
-        <input type="text" id="channel-form-verify-token" placeholder="Verification Token" />
-      </div>
-      <div class="channel-form-row hidden" id="channel-form-phone-row">
-        <label>Phone Number ID</label>
-        <input type="text" id="channel-form-phone" placeholder="WhatsApp Phone Number ID" />
-      </div>
-      <div class="channel-form-row hidden" id="channel-form-mode-row">
-        <label>Connection Mode</label>
-        <select id="channel-form-mode">
-          <option value="direct">Direct (有公网 IP)</option>
-          <option value="relay">Relay (内网中转)</option>
-        </select>
-      </div>
-      <div class="channel-form-row hidden" id="channel-form-webhook-url-row">
-        <label>Webhook URL</label>
-        <div class="channel-webhook-url" id="channel-webhook-url" style="font-size:0.8rem;color:var(--text-muted);word-break:break-all;padding:6px 0;"></div>
-        <div style="font-size:0.7rem;color:var(--text-dim);margin-top:2px;">Copy this URL to your platform's webhook settings</div>
-      </div>
       <div class="channel-form-row">
         <label><input type="checkbox" id="channel-form-enabled" checked /> Enable immediately</label>
       </div>
@@ -136,43 +115,16 @@ function _showAddForm() {
     const p = platformSel.value;
     const isSlack = p === 'slack';
     const isFeishu = p === 'feishu';
-    const isWhatsapp = p === 'whatsapp';
-    const needsWebhook = isFeishu || isWhatsapp;
 
     document.getElementById('channel-form-app-token-row').classList.toggle('hidden', !isSlack);
     document.getElementById('channel-form-app-id-row').classList.toggle('hidden', !isFeishu);
-    document.getElementById('channel-form-app-secret-row').classList.toggle('hidden', !isFeishu && !isWhatsapp);
-    document.getElementById('channel-form-verify-token-row').classList.toggle('hidden', !isFeishu && !isWhatsapp);
-    document.getElementById('channel-form-phone-row').classList.toggle('hidden', !isWhatsapp);
-    document.getElementById('channel-form-mode-row').classList.toggle('hidden', !needsWebhook);
+    document.getElementById('channel-form-app-secret-row').classList.toggle('hidden', !isFeishu);
     document.getElementById('channel-form-token-row').querySelector('label').textContent =
-      isSlack ? 'Bot Token (xoxb-...)' : isWhatsapp ? 'Access Token' : 'Bot Token';
+      isSlack ? 'Bot Token (xoxb-...)' : 'Bot Token';
     document.getElementById('channel-form-token-row').classList.toggle('hidden', isFeishu);
-
-    _updateWebhookUrl();
-  }
-
-  function _updateWebhookUrl() {
-    const p = platformSel.value;
-    const id = document.getElementById('channel-form-id').value.trim() || '<channel_id>';
-    const mode = document.getElementById('channel-form-mode').value;
-    const row = document.getElementById('channel-form-webhook-url-row');
-    const urlEl = document.getElementById('channel-webhook-url');
-
-    if ((p === 'feishu' || p === 'whatsapp') && mode === 'direct') {
-      row.classList.remove('hidden');
-      urlEl.textContent = `${location.origin}/api/channel/webhook/${p}/${id}`;
-    } else if ((p === 'feishu' || p === 'whatsapp') && mode === 'relay') {
-      row.classList.remove('hidden');
-      urlEl.textContent = `https://motus-relay.phanthy.com/webhook/${p}/${id}`;
-    } else {
-      row.classList.add('hidden');
-    }
   }
 
   platformSel.addEventListener('change', updateFormFields);
-  document.getElementById('channel-form-id').addEventListener('input', _updateWebhookUrl);
-  document.getElementById('channel-form-mode').addEventListener('change', _updateWebhookUrl);
   updateFormFields();
 
   document.getElementById('channel-form-submit').addEventListener('click', () => _submitAdd(form));
@@ -186,9 +138,6 @@ async function _submitAdd(formEl) {
   const appToken = document.getElementById('channel-form-app-token')?.value.trim() || '';
   const appId = document.getElementById('channel-form-app-id')?.value.trim() || '';
   const appSecret = document.getElementById('channel-form-app-secret')?.value.trim() || '';
-  const verifyToken = document.getElementById('channel-form-verify-token')?.value.trim() || '';
-  const phoneId = document.getElementById('channel-form-phone')?.value.trim() || '';
-  const mode = document.getElementById('channel-form-mode')?.value || 'direct';
   const enabled = document.getElementById('channel-form-enabled').checked;
 
   if (!id) { alert('ID is required'); return; }
@@ -206,15 +155,6 @@ async function _submitAdd(formEl) {
     if (!appId || !appSecret) { alert('App ID and App Secret are required'); return; }
     config.app_id = appId;
     config.app_secret = appSecret;
-    if (verifyToken) config.verification_token = verifyToken;
-    config.mode = mode;
-  } else if (platform === 'whatsapp') {
-    if (!phoneId || !token) { alert('Phone Number ID and Access Token are required'); return; }
-    config.phone_number_id = phoneId;
-    config.access_token = token;
-    if (verifyToken) config.verify_token = verifyToken;
-    if (appSecret) config.app_secret = appSecret;
-    config.mode = mode;
   }
 
   try {

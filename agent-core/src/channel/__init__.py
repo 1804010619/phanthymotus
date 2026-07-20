@@ -28,11 +28,5 @@ def _register_builtin_adapters():
     except ImportError as e:
         print(f'[channel] feishu adapter unavailable ({e})')
 
-    try:
-        from channel.adapters.whatsapp import WhatsAppAdapter
-        register_adapter('whatsapp', WhatsAppAdapter)
-    except ImportError as e:
-        print(f'[channel] whatsapp adapter unavailable ({e})')
-
 
 _register_builtin_adapters()
