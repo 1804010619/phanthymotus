@@ -258,6 +258,9 @@ async def lifespan(app):
     _ros2_loop = asyncio.get_running_loop()
     await loop.run_in_executor(None, ros2_bridge.start, _ros2_loop)
 
+    # Pre-create audio publisher so DDS discovery completes before first use
+    _ensure_audio_pub()
+
     # 注册 AgentCore 自身为 MCP（含 decision_core 工具）
     await loop.run_in_executor(None, _register_core_mcp)
 
@@ -436,6 +439,18 @@ async def publish_audio_file(file_path: str) -> dict:
             sleep_time = expected_time - elapsed
             if sleep_time > 0.005:
                 await asyncio.sleep(sleep_time)
+
+    # Append silence so VAD detects end-of-speech and flushes the utterance
+    silence_ms = 800  # must exceed vad_silence_ms (default 400ms)
+    silence_bytes = int(16000 * 2 * silence_ms / 1000)  # 16kHz 16-bit mono
+    silence_chunk = [0] * chunk_size
+    for _ in range(silence_bytes // chunk_size):
+        msg = AudioChunk()
+        msg.format = "pcm_16k_16bit_mono"
+        msg.data = silence_chunk
+        pub.publish(msg)
+        chunks_sent += 1
+    await asyncio.sleep(0.1)
 
     duration_s = len(pcm_data) / (16000 * 2)
     return {'code': 200, 'data': {'chunks': chunks_sent, 'duration_s': round(duration_s, 2), 'bytes': len(pcm_data)}}
