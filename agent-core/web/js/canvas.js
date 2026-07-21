@@ -662,6 +662,9 @@ function _buildCardEl({ id, mcpId, toolName, driverName, x, y, topicIn: savedTop
           if (!enumVals.length) return '';
           const opts = enumVals.map(v => `<option value="${_esc(v)}">${_esc(titleMap[v] || v)}</option>`).join('');
           inputHtml = `<select class="canvas-field-input" data-key="${_esc(key)}">${opts}</select>`;
+        } else if (def.format === 'file') {
+          const accept = def.accept || '*/*';
+          inputHtml = `<div class="canvas-field-file"><input type="hidden" class="canvas-field-input" data-key="${_esc(key)}"><button type="button" class="canvas-file-btn" data-accept="${_esc(accept)}">Choose File</button><span class="canvas-file-name"></span></div>`;
         } else {
           const type = def.type === 'number' || def.type === 'integer' ? 'number' : 'text';
           const desc = def.description || '';
@@ -741,6 +744,43 @@ function _buildCardEl({ id, mcpId, toolName, driverName, x, y, topicIn: savedTop
         await _executeCard(el, mcpId, toolName, id);
       });
     }
+
+    // Generic file upload buttons for sensor cards (format: 'file' in schema)
+    el.querySelectorAll('.canvas-file-btn').forEach(btn => {
+      btn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        e.preventDefault();
+        const wrapper = btn.closest('.canvas-field-file');
+        const hiddenInput = wrapper.querySelector('.canvas-field-input');
+        const nameSpan = wrapper.querySelector('.canvas-file-name');
+        const fileInput = document.createElement('input');
+        fileInput.type = 'file';
+        fileInput.accept = btn.dataset.accept || '*/*';
+        fileInput.onchange = async () => {
+          if (!fileInput.files[0]) return;
+          btn.textContent = 'Uploading...';
+          const form = new FormData();
+          form.append('file', fileInput.files[0]);
+          form.append('path', '/tmp/uploads');
+          try {
+            const res = await fetch('/api/file/upload', { method: 'POST', body: form });
+            const data = await res.json();
+            if (data.code === 200) {
+              hiddenInput.value = '/tmp/uploads/' + fileInput.files[0].name;
+              nameSpan.textContent = fileInput.files[0].name;
+              btn.textContent = 'Re-select';
+            } else {
+              btn.textContent = 'Failed';
+              setTimeout(() => { btn.textContent = 'Choose File'; }, 2000);
+            }
+          } catch (err) {
+            btn.textContent = 'Error';
+            setTimeout(() => { btn.textContent = 'Choose File'; }, 2000);
+          }
+        };
+        fileInput.click();
+      });
+    });
   } else {
     // Actuator/processor/default card
     const props   = schema?.properties || {};
@@ -763,6 +803,9 @@ function _buildCardEl({ id, mcpId, toolName, driverName, x, y, topicIn: savedTop
         if (!enumVals.length) return '';  // hide field entirely if no options left
         const opts = enumVals.map(v => `<option value="${_esc(v)}">${_esc(v)}</option>`).join('');
         inputHtml = `<select class="canvas-field-input" data-key="${_esc(key)}">${opts}</select>`;
+      } else if (def.format === 'file') {
+        const accept = def.accept || '*/*';
+        inputHtml = `<div class="canvas-field-file"><input type="hidden" class="canvas-field-input" data-key="${_esc(key)}"><button class="canvas-file-btn" data-accept="${_esc(accept)}">选择文件</button><span class="canvas-file-name"></span></div>`;
       } else {
         const type = def.type === 'number' || def.type === 'integer' ? 'number' : 'text';
         const desc = def.description || '';
@@ -911,6 +954,43 @@ function _buildCardEl({ id, mcpId, toolName, driverName, x, y, topicIn: savedTop
       });
       footer.prepend(micBtn);
     }
+
+    // Generic file upload buttons (format: 'file' in schema)
+    el.querySelectorAll('.canvas-file-btn').forEach(btn => {
+      btn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        e.preventDefault();
+        const wrapper = btn.closest('.canvas-field-file');
+        const hiddenInput = wrapper.querySelector('.canvas-field-input');
+        const nameSpan = wrapper.querySelector('.canvas-file-name');
+        const fileInput = document.createElement('input');
+        fileInput.type = 'file';
+        fileInput.accept = btn.dataset.accept || '*/*';
+        fileInput.onchange = async () => {
+          if (!fileInput.files[0]) return;
+          btn.textContent = 'Uploading...';
+          const form = new FormData();
+          form.append('file', fileInput.files[0]);
+          form.append('path', '/tmp/uploads');
+          try {
+            const res = await fetch('/api/file/upload', { method: 'POST', body: form });
+            const data = await res.json();
+            if (data.code === 200) {
+              hiddenInput.value = '/tmp/uploads/' + fileInput.files[0].name;
+              nameSpan.textContent = fileInput.files[0].name;
+              btn.textContent = 'Re-select';
+            } else {
+              btn.textContent = 'Failed';
+              setTimeout(() => { btn.textContent = 'Choose File'; }, 2000);
+            }
+          } catch (err) {
+            btn.textContent = 'Error';
+            setTimeout(() => { btn.textContent = 'Choose File'; }, 2000);
+          }
+        };
+        fileInput.click();
+      });
+    });
   }
 
   return el;

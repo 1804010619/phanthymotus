@@ -103,22 +103,33 @@ def _phoneme_edit_distance(seq1: list, seq2: list) -> float:
 
 # Similar phoneme groups — substitution cost 0.3 instead of 1.0
 _SIMILAR_GROUPS = [
-    {'t', 'd'},       # alveolar stops
-    {'p', 'b'},       # bilabial stops
-    {'k', 'g'},       # velar stops
-    {'f', 'v'},       # labiodental fricatives
-    {'s', 'z'},       # alveolar fricatives
-    {'s.', 'z.'},     # retroflex fricatives
-    {'ɕ', 'ʃ', 'ʂ'}, # postalveolar/retroflex sibilants
-    {'tsh', 'dz'},    # affricates
-    {'n', 'ŋ'},       # nasals
-    {'l', 'r', 'ɹ'},  # liquids
-    {'t', 'tsh'},     # stop ~ affricate
-    {'f', 't'},       # common confusion in noisy env
-    {'x', 'h'},       # velar/glottal fricatives
+    {'t', 'd'},           # alveolar stops
+    {'p', 'b'},           # bilabial stops
+    {'k', 'g'},           # velar stops
+    {'f', 'v'},           # labiodental fricatives
+    {'s', 'z'},           # alveolar fricatives
+    {'s.', 'z.'},         # retroflex fricatives
+    {'ɕ', 'ʃ', 'ʂ'},     # postalveolar/retroflex sibilants
+    {'tsh', 'dz'},        # affricates
+    {'n', 'ŋ'},           # nasals
+    {'l', 'r', 'ɹ'},      # liquids
+    {'t', 'tsh'},         # stop ~ affricate
+    {'f', 't'},           # common confusion in noisy env
+    {'x', 'h'},           # velar/glottal fricatives
     {'ɑu', 'au', 'ɑo', 'ao'},  # diphthong variants
-    {'ou', 'uo'},     # vowel variants
-    {'i', 'i.'},      # apical vowel variant
+    {'ou', 'uo'},         # vowel variants
+    {'i', 'i.'},          # apical vowel variant
+    # ── Chinese ASR common confusions ──
+    {'a', 'ɑ'},           # open vowels (same sound, different notation)
+    {'an', 'ɑn'},         # front nasal variants
+    {'f', 'kh'},          # 范/康 confusion in noisy env
+    {'f', 'x'},           # 范/欢 confusion
+    {'ts.', 'tɕh'},       # retroflex/palatal affricate confusion
+    {'ɑ', 'ɑu'},          # vowel truncation
+    {'ai', 'a'},          # diphthong simplification
+    {'aiɜ', 'ai', 'a'},   # diphthong variants
+    {'iɜ', 'i'},          # rhotacized vowel
+    {'əɜ', 'ə', 'e'},     # schwa variants
 ]
 
 
@@ -796,13 +807,15 @@ class _ASRNode(Node):
         self.state = "starting"
         self._worker_ready = threading.Event()
         log.info("[asr] waiting for first audio chunk...")
-        # Block until first audio chunk arrives or stop() cancels
-        self._first_chunk_event.wait()
+        # Block until first audio chunk arrives or stop() cancels (timeout to avoid infinite hang)
+        got_chunk = self._first_chunk_event.wait(timeout=10)
         if self._stop_event.is_set():
             self.state = "idle"
             return {"state": "idle"}
+        if not got_chunk:
+            log.warning("[asr] timeout waiting for first audio chunk (10s), starting anyway")
         # Wait for worker to finish initialization (IPA precompute etc.)
-        self._worker_ready.wait()
+        self._worker_ready.wait(timeout=5)
         if self.state == "error":
             return {"state": "error", "message": "ASR worker failed to initialize (check logs)"}
         self.state = "running"
@@ -1132,11 +1145,12 @@ class ASRPlugin:
                 self._load_model_async(self._asr_model)
                 return {"status": "loading", "asr_model": self._asr_model,
                         "message": f"Switching to model '{self._asr_model}', downloading..."}
-            # Stop all nodes (they'll use new config on next start)
-            # Only stop VAD internals — keep node in executor to avoid DDS re-discovery delay
+            # Remove all nodes completely (they'll be recreated on next start with new config)
+            # Must fully remove from executor to avoid rclpy InvalidHandle errors on restart
             for key in list(self._nodes.keys()):
-                node = self._nodes[key]
+                node = self._nodes.pop(key)
                 node.stop()
+                self._executor.remove_node(node)
             return {"status": "configured", "asr_model": self._asr_model}
 
         return None
