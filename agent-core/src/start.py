@@ -421,6 +421,17 @@ async def publish_audio_file(file_path: str) -> dict:
     from audio_msgs.msg import AudioChunk
     chunk_size = 1024  # 512 samples @ 16-bit = 32ms per chunk
     batch_size = 4     # send 4 chunks (~128ms) then pace
+    silence_chunk = [0] * chunk_size
+
+    # Prepend silence to warm up DDS link (avoid losing initial chunks)
+    warmup_chunks = int(0.5 * 16000 * 2 / chunk_size)  # 500ms
+    for _ in range(warmup_chunks):
+        msg = AudioChunk()
+        msg.format = "pcm_16k_16bit_mono"
+        msg.data = silence_chunk
+        pub.publish(msg)
+    await asyncio.sleep(0.3)  # let DDS settle
+
     offset = 0
     chunks_sent = 0
     start_time = time.monotonic()
