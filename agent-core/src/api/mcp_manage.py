@@ -745,9 +745,15 @@ async def mcp_call_tool(mcp_id: str, req: MCPCallRequest):
         if req.tool == 'remote_audio':
             action = req.arguments.get('action', 'start')
             if action == 'start':
-                return {'code': 200, 'data': {'state': 'running', 'upload_path': '/api/remote-audio/upload'}}
+                return {'code': 200, 'data': {'state': 'running'}}
             elif action == 'stop':
                 return {'code': 200, 'data': {'state': 'idle'}}
+            elif action == 'send_audio':
+                audio_file = req.arguments.get('audio_file', '')
+                if not audio_file:
+                    return {'code': 400, 'message': '缺少 audio_file 参数', 'data': None}
+                from start import publish_audio_file
+                return await publish_audio_file(audio_file)
             elif action == 'info':
                 return {'code': 200, 'data': {'state': 'running', 'topic_out': [{'topic': '/remote_control/audio', 'format': 'audio/pcm-16k'}]}}
             return {'code': 200, 'data': None}

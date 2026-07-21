@@ -5,8 +5,12 @@ ARG PYPI_MIRROR
 
 RUN apt-get -o Acquire::AllowInsecureRepositories=true update && \
     apt-get install -y --no-install-recommends --allow-unauthenticated \
-        python3-pip docker.io docker-compose-v2 python3-dbus ffmpeg && \
+        python3-pip docker.io docker-compose-v2 python3-dbus && \
     rm -rf /var/lib/apt/lists/*
+
+# Install static ffmpeg (lightweight, no apt dependencies)
+RUN curl -L https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linuxarm64-gpl.tar.xz \
+    | tar -xJ --strip-components=2 -C /usr/local/bin/ --wildcards '*/bin/ffmpeg'
 
 # Install uv
 RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} uv
