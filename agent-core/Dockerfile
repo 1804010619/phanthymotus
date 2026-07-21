@@ -5,7 +5,7 @@ ARG PYPI_MIRROR
 
 RUN apt-get -o Acquire::AllowInsecureRepositories=true update && \
     apt-get install -y --no-install-recommends --allow-unauthenticated \
-        python3-pip docker.io docker-compose-v2 python3-dbus && \
+        python3-pip docker.io docker-compose-v2 python3-dbus ffmpeg && \
     rm -rf /var/lib/apt/lists/*
 
 # Install uv

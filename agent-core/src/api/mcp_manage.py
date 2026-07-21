@@ -742,6 +742,15 @@ async def mcp_call_tool(mcp_id: str, req: MCPCallRequest):
                     return {'code': 200, 'data': {'status': 'sent', 'text': text}}
                 return {'code': 200, 'data': {'error': 'Missing text'}}
             return {'code': 200, 'data': None}
+        if req.tool == 'remote_audio':
+            action = req.arguments.get('action', 'start')
+            if action == 'start':
+                return {'code': 200, 'data': {'state': 'running', 'upload_path': '/api/remote-audio/upload'}}
+            elif action == 'stop':
+                return {'code': 200, 'data': {'state': 'idle'}}
+            elif action == 'info':
+                return {'code': 200, 'data': {'state': 'running', 'topic_out': [{'topic': '/remote_control/audio', 'format': 'audio/pcm-16k'}]}}
+            return {'code': 200, 'data': None}
         return await _handle_agentcore_call(req)
 
     # ── Handle internal channel MCP ──

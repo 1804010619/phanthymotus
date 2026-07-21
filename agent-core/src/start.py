@@ -151,9 +151,18 @@ def _register_core_mcp(silent=False):
                     'required': ['action', 'text'],
                 },
                 'topic_out': [{'topic': '/remote_control/message', 'format': 'data/json'}],
+            },
+            {
+                'name': 'remote_audio',
+                'type': 'sensor',
+                'description': '远程音频 — 从浏览器上传音频文件，转换为 PCM-16k 发布到 DDS',
+                'inputSchema': {'type': 'object', 'properties': {
+                    'action': {'type': 'string', 'enum': ['send_audio'], 'description': 'Action to perform'},
+                }},
+                'topic_out': [{'topic': '/remote_control/audio', 'format': 'audio/pcm-16k'}],
             }
         ],
-        'topic_out': [{'topic': '/decision_core', 'format': 'data/json'}, {'topic': '/remote_control/mic', 'format': 'audio/pcm-16k'}, {'topic': '/remote_control/message', 'format': 'data/json'}],
+        'topic_out': [{'topic': '/decision_core', 'format': 'data/json'}, {'topic': '/remote_control/mic', 'format': 'audio/pcm-16k'}, {'topic': '/remote_control/message', 'format': 'data/json'}, {'topic': '/remote_control/audio', 'format': 'audio/pcm-16k'}],
         'topic_in': [{'format': 'data/json'}],
     })
 
@@ -361,6 +370,73 @@ import api.motus_stream
 app.include_router(api.motus_stream.router)
 
 app.include_router(api.inspection.ws_router)
+
+# ── Remote Audio upload endpoint (receive audio file, convert to PCM-16k, publish to ROS2) ──
+_audio_pub = None
+
+@app_api.post('/remote-audio/upload')
+async def _remote_audio_upload(file: fastapi.UploadFile = fastapi.File()):
+    """Upload audio file, convert to PCM-16k mono, publish to ROS2 topic."""
+    global _audio_pub
+    import subprocess, tempfile, os
+
+    # Initialize publisher if needed
+    if _audio_pub is None:
+        try:
+            from audio_msgs.msg import AudioChunk
+            import ros2_bridge
+            node = ros2_bridge._node_main
+            if node:
+                from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
+                qos = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT,
+                                 history=HistoryPolicy.KEEP_LAST, depth=200,
+                                 durability=DurabilityPolicy.VOLATILE)
+                _audio_pub = node.create_publisher(AudioChunk, "/remote_control/audio", qos)
+        except Exception as e:
+            return {'code': 500, 'message': f'ROS2 publisher init failed: {e}'}
+
+    if not _audio_pub:
+        return {'code': 500, 'message': 'ROS2 not available'}
+
+    # Save uploaded file to temp
+    suffix = os.path.splitext(file.filename or '')[1] or '.wav'
+    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+        tmp_path = tmp.name
+        content = await file.read()
+        tmp.write(content)
+
+    try:
+        # Convert to PCM-16k mono via ffmpeg
+        proc = subprocess.run(
+            ['ffmpeg', '-y', '-i', tmp_path, '-f', 's16le', '-acodec', 'pcm_s16le',
+             '-ar', '16000', '-ac', '1', 'pipe:1'],
+            capture_output=True, timeout=30,
+        )
+        if proc.returncode != 0:
+            return {'code': 400, 'message': f'ffmpeg error: {proc.stderr.decode()[:200]}'}
+
+        pcm_data = proc.stdout
+        if not pcm_data:
+            return {'code': 400, 'message': 'No audio data after conversion'}
+
+        # Publish PCM chunks to DDS
+        from audio_msgs.msg import AudioChunk
+        chunk_size = 1024
+        offset = 0
+        chunks_sent = 0
+        while offset < len(pcm_data):
+            chunk = pcm_data[offset:offset + chunk_size]
+            offset += chunk_size
+            msg = AudioChunk()
+            msg.format = "pcm_16k_16bit_mono"
+            msg.data = list(chunk)
+            _audio_pub.publish(msg)
+            chunks_sent += 1
+
+        duration_s = len(pcm_data) / (16000 * 2)  # 16kHz, 16-bit = 2 bytes/sample
+        return {'code': 200, 'data': {'chunks': chunks_sent, 'duration_s': round(duration_s, 2), 'bytes': len(pcm_data)}}
+    finally:
+        os.unlink(tmp_path)
 
 # ── Mic WebSocket endpoint (receive browser PCM and publish to ROS2) ──────────
 _mic_pub = None

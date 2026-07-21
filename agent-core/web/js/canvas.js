@@ -911,6 +911,44 @@ function _buildCardEl({ id, mcpId, toolName, driverName, x, y, topicIn: savedTop
       });
       footer.prepend(micBtn);
     }
+
+    // remote_audio 特殊渲染：音频上传按钮
+    if (toolName === 'remote_audio') {
+      const footer = el.querySelector('.canvas-card-footer');
+      const uploadBtn = document.createElement('button');
+      uploadBtn.className = 'canvas-mic-btn';
+      uploadBtn.textContent = '\uD83D\uDCC1 上传音频';
+      uploadBtn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        const input = document.createElement('input');
+        input.type = 'file';
+        input.accept = 'audio/*';
+        input.onchange = async () => {
+          if (!input.files[0]) return;
+          uploadBtn.textContent = '\u23F3 上传中...';
+          const form = new FormData();
+          form.append('file', input.files[0]);
+          try {
+            const res = await fetch('/api/remote-audio/upload', { method: 'POST', body: form });
+            const data = await res.json();
+            if (data.code === 200) {
+              uploadBtn.textContent = '\u2705 已发送';
+              setTimeout(() => { uploadBtn.textContent = '\uD83D\uDCC1 上传音频'; }, 2000);
+            } else {
+              _logActivity('error', 'remote_audio: ' + (data.message || '上传失败'));
+              uploadBtn.textContent = '\u274C 失败';
+              setTimeout(() => { uploadBtn.textContent = '\uD83D\uDCC1 上传音频'; }, 2000);
+            }
+          } catch (err) {
+            _logActivity('error', 'remote_audio: ' + err.message);
+            uploadBtn.textContent = '\u274C 错误';
+            setTimeout(() => { uploadBtn.textContent = '\uD83D\uDCC1 上传音频'; }, 2000);
+          }
+        };
+        input.click();
+      });
+      footer.prepend(uploadBtn);
+    }
   }
 
   return el;
