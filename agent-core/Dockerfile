@@ -3,14 +3,10 @@ ARG ROS_BASE_IMAGE=bj-warehouse.tencentcloudcr.com/phanthy-motus/ros-base:latest
 FROM ${ROS_BASE_IMAGE}
 ARG PYPI_MIRROR
 
+# docker.io, python3-pip, python3-dbus already in ros-base; only add ffmpeg
 RUN apt-get -o Acquire::AllowInsecureRepositories=true update && \
-    apt-get install -y --no-install-recommends --allow-unauthenticated \
-        python3-pip docker.io docker-compose-v2 python3-dbus && \
+    apt-get install -y --no-install-recommends --allow-unauthenticated ffmpeg && \
     rm -rf /var/lib/apt/lists/*
-
-# Install static ffmpeg (lightweight, no apt dependencies)
-RUN curl -L https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linuxarm64-gpl.tar.xz \
-    | tar -xJ --strip-components=2 -C /usr/local/bin/ --wildcards '*/bin/ffmpeg'
 
 # Install uv
 RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} uv
