@@ -16,6 +16,7 @@ import { initHistory }       from './history.js';
 import { initNetwork }       from './network.js';
 import { initChannels }      from './channels.js';
 import { initMobile }        from './mobile.js';
+import { initPerformance }   from './performance.js';
 import './agent-definition.js';
 
 let _allMcps   = [];
@@ -43,6 +44,7 @@ async function main() {
   initHistory();
   initNetwork();
   initChannels();
+  initPerformance();
 
   // Settings dropdown (web topbar)
   _initSettingsDropdown();

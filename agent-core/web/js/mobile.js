@@ -168,6 +168,7 @@ function _triggerSettingsAction(action) {
     'skills': 'btn-skills',
     'channels': 'btn-channels',
     'deploy': 'btn-deploy',
+    'performance': 'btn-performance',
   };
   const btnId = btnMap[action];
   if (btnId) {

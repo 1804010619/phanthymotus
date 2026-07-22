@@ -26,6 +26,7 @@ import event
 import event_bus
 import collector
 import mcp_client
+import perf_log
 import prompt as prompt_mod
 from api.motus_stream import push_event
 
@@ -346,7 +347,22 @@ class Event:
 
     async def _one_turn(self, trigger_event: dict):
         import time as _time
+        from uuid import uuid4
         _turn_t0 = _time.perf_counter()
+
+        # 性能追踪
+        _trace = perf_log.PerfTrace(
+            turn_id=str(uuid4()),
+            llm_start_ts=time.time(),
+            audio_start_ts=trigger_event.get('_perf_audio_start_ts'),
+            audio_end_ts=trigger_event.get('_perf_audio_end_ts'),
+            asr_complete_ts=trigger_event.get('_perf_asr_complete_ts'),
+            trigger_emit_ts=trigger_event.get('_perf_trigger_emit_ts'),
+            collector_receive_ts=trigger_event.get('ts'),
+            source=trigger_event.get('source', ''),
+            trigger_text=trigger_event.get('text', '')[:100],
+        )
+        _tool_names_collected = []
 
         # Log incoming event
         print(f'[decision] received event: source={trigger_event.get("source", "?")} text={trigger_event.get("text", "")[:100]}')
@@ -482,6 +498,15 @@ class Event:
                 name   = call['function']['name']
                 args   = json.loads(call['function']['arguments'] or '{}')
 
+                # 性能追踪：记录工具时间
+                _t_before = time.time()
+                if _trace.tool_start_ts is None:
+                    _trace.tool_start_ts = _t_before
+                _is_tts = ('tts' in name.lower() or 'speaker' in name.lower())
+                if _is_tts:
+                    _trace.tts_start_ts = _t_before
+                _tool_names_collected.append(name)
+
                 await push_event({
                     'type':    'mcp_call',
                     'mcp_id':  name.split('__')[1] if name.startswith('mcp__') else '',
@@ -494,6 +519,12 @@ class Event:
                     result = await mcp_client.call_tool(name, args)
                 else:
                     result = f'未知工具: {name}'
+
+                # 性能追踪：记录工具完成
+                _t_after = time.time()
+                _trace.tool_end_ts = _t_after
+                if _is_tts:
+                    _trace.tts_end_ts = _t_after
 
                 await push_event({
                     'type':    'mcp_result',
@@ -570,3 +601,13 @@ class Event:
         await push_event({'type': 'turn_end', 'payload': {}})
         _turn_elapsed = _time.perf_counter() - _turn_t0
         print(f'[decision] turn complete: {_turn_elapsed:.2f}s total, {round_idx + 1} rounds')
+
+        # 性能追踪：提交记录
+        _trace.llm_end_ts = time.time()
+        _trace.turn_end_ts = _trace.llm_end_ts
+        _trace.round_count = round_idx + 1
+        _trace.tool_names = _tool_names_collected
+        try:
+            perf_log.commit(_trace)
+        except Exception as _pe:
+            print(f'[perf_log] commit error: {_pe}')

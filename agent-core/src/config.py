@@ -102,6 +102,37 @@ def _get_conn() -> sqlite3.Connection:
             UNIQUE(platform, platform_user_id)
         )
     ''')
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS perf_turns (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            turn_id TEXT NOT NULL,
+            created_at REAL NOT NULL,
+            audio_start_ts REAL,
+            audio_end_ts REAL,
+            asr_complete_ts REAL,
+            collector_receive_ts REAL,
+            trigger_emit_ts REAL,
+            llm_start_ts REAL,
+            llm_end_ts REAL,
+            tool_start_ts REAL,
+            tool_end_ts REAL,
+            tts_start_ts REAL,
+            tts_end_ts REAL,
+            turn_end_ts REAL,
+            vad_duration_ms INTEGER,
+            asr_duration_ms INTEGER,
+            collector_delay_ms INTEGER,
+            llm_duration_ms INTEGER,
+            tool_duration_ms INTEGER,
+            tts_duration_ms INTEGER,
+            total_duration_ms INTEGER,
+            round_count INTEGER DEFAULT 1,
+            tool_names TEXT DEFAULT '[]',
+            trigger_text TEXT DEFAULT '',
+            source TEXT DEFAULT ''
+        )
+    ''')
+    conn.execute('CREATE INDEX IF NOT EXISTS idx_perf_created ON perf_turns(created_at)')
     conn.commit()
     return conn
 
