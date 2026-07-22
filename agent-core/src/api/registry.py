@@ -79,6 +79,7 @@ def _build_catalog_sync() -> dict:
                 'created': created,
                 'size': '',
                 'imageRef': t.get('imageRef', ''),
+                'channel': t.get('channel', ''),
             })
 
         entry = {

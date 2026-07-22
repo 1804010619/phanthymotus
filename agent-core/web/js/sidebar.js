@@ -63,8 +63,8 @@ export function renderSidebar(mcps, topicStatuses = {}) {
 
   const allMcps = mcps || [];
   const controllers = allMcps.filter(m => m.category === 'controller');
-  const drivers = allMcps.filter(m => m.category === 'driver');
-  const perceptions = allMcps.filter(m => m.category === 'perception');
+  const drivers = allMcps.filter(m => m.category === 'driver' && m.online === true);
+  const perceptions = allMcps.filter(m => m.category === 'perception' && m.online === true);
 
   _scroll.innerHTML = '';
 
