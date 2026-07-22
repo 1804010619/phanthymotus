@@ -273,10 +273,10 @@ function _renderMyServices() {
   container.querySelectorAll('.svc-ver-opt').forEach(opt => {
     opt.addEventListener('click', () => {
       if (opt.classList.contains('current')) return;
-      const { driverId, fullImage, tag, label } = opt.dataset;
+      const { driverId, fullImage, tag, label, channel } = opt.dataset;
       opt.closest('.svc-ver-dropdown').classList.add('hidden');
       showDeployConfirmModal(
-        [{ label, currentTag: '—', newTag: tag }],
+        [{ label, currentTag: '—', newTag: tag, channel: channel || '' }],
         () => _executeDeploys([[driverId, { image: fullImage }]])
       );
     });
@@ -305,7 +305,7 @@ function _svcRowHTML({ item, id, s, latestTag, currentTag, hasUpdate }) {
       const fullImg = t.imageRef || (imageBase + ':' + t.tag);
       const isCurrent = currentTag && t.tag === currentTag;
       const ch = _channelLabel(t.channel);
-      return `<div class="svc-ver-opt${isCurrent ? ' current' : ''}" data-driver-id="${id}" data-full-image="${fullImg}" data-tag="${t.tag}" data-label="${label}">
+      return `<div class="svc-ver-opt${isCurrent ? ' current' : ''}" data-driver-id="${id}" data-full-image="${fullImg}" data-tag="${t.tag}" data-label="${label}" data-channel="${t.channel || ''}">
         <span class="svc-ver-tag">${t.tag}</span>
         ${ch ? `<span class="svc-ver-channel">${ch}</span>` : ''}
         ${isCurrent ? '<span class="svc-ver-badge">当前</span>' : ''}
@@ -428,9 +428,10 @@ function _renderMarketplace() {
       const image = opt.dataset.fullImage;
       const label = opt.dataset.label;
       const tag = opt.dataset.tag;
+      const channel = opt.dataset.channel || '';
       opt.closest('.mp-card').querySelector('.mp-versions').classList.add('hidden');
       showDeployConfirmModal(
-        [{ label, currentTag: '—', newTag: tag }],
+        [{ label, currentTag: '—', newTag: tag, channel }],
         () => _executeDeploys([[driverId, { image }]])
       );
     });
@@ -452,7 +453,7 @@ function _mpCardHTML(item) {
   const versionOpts = tags.map(t => {
     const fullImg = t.imageRef || (imageBase + ':' + t.tag);
     const ch = _channelLabel(t.channel);
-    return `<div class="mp-version-opt" data-driver-id="${driverId}" data-full-image="${fullImg}" data-tag="${t.tag}" data-label="${label}">
+    return `<div class="mp-version-opt" data-driver-id="${driverId}" data-full-image="${fullImg}" data-tag="${t.tag}" data-label="${label}" data-channel="${t.channel || ''}">
       <span class="mp-version-tag">${t.tag}</span>
       ${ch ? `<span class="svc-ver-channel">${ch}</span>` : ''}
       ${t.created ? `<span class="mp-version-date">${t.created.replace(/\s+\d{2}:\d{2}$/, '')}</span>` : ''}
@@ -539,10 +540,10 @@ function _showInstallSheet(optionsHTML, title) {
 
   overlay.querySelectorAll('.mp-version-opt').forEach(opt => {
     opt.addEventListener('click', () => {
-      const { driverId, fullImage, tag, label } = opt.dataset;
+      const { driverId, fullImage, tag, label, channel } = opt.dataset;
       close();
       showDeployConfirmModal(
-        [{ label, currentTag: '—', newTag: tag }],
+        [{ label, currentTag: '—', newTag: tag, channel: channel || '' }],
         () => _executeDeploys([[driverId, { image: fullImage }]])
       );
     });
@@ -574,18 +575,22 @@ function _showDriverDetail(card) {
     tag: opt.dataset.tag,
     fullImage: opt.dataset.fullImage,
     label: opt.dataset.label,
+    channel: opt.dataset.channel || '',
   }));
 
   const pane = document.getElementById('pane-marketplace');
   // Save current content for back navigation
   const savedHTML = pane.innerHTML;
 
-  const versionsHTML = versions.map(v => `
-    <div class="detail-ver-row" data-full-image="${v.fullImage}" data-tag="${v.tag}" data-label="${v.label}" data-driver-id="${driverId}">
+  const versionsHTML = versions.map(v => {
+    const ch = _channelLabel(v.channel);
+    return `
+    <div class="detail-ver-row" data-full-image="${v.fullImage}" data-tag="${v.tag}" data-label="${v.label}" data-driver-id="${driverId}" data-channel="${v.channel}">
       <span class="detail-ver-tag">${v.tag}</span>
+      ${ch ? `<span class="svc-ver-channel">${ch}</span>` : ''}
       <button class="svc-btn svc-btn-upgrade">部署此版本</button>
-    </div>
-  `).join('');
+    </div>`;
+  }).join('');
 
   pane.innerHTML = `
     <div class="mp-detail">
@@ -614,7 +619,7 @@ function _showDriverDetail(card) {
     btn.addEventListener('click', () => {
       const row = btn.closest('.detail-ver-row');
       showDeployConfirmModal(
-        [{ label: row.dataset.label, currentTag: '—', newTag: row.dataset.tag }],
+        [{ label: row.dataset.label, currentTag: '—', newTag: row.dataset.tag, channel: row.dataset.channel || '' }],
         () => _executeDeploys([[row.dataset.driverId, { image: row.dataset.fullImage }]])
       );
     });
@@ -660,10 +665,10 @@ function _showVersionSheet(optionsHTML) {
   overlay.querySelectorAll('.svc-ver-opt').forEach(opt => {
     opt.addEventListener('click', () => {
       if (opt.classList.contains('current')) return;
-      const { driverId, fullImage, tag, label } = opt.dataset;
+      const { driverId, fullImage, tag, label, channel } = opt.dataset;
       close();
       showDeployConfirmModal(
-        [{ label, currentTag: '—', newTag: tag }],
+        [{ label, currentTag: '—', newTag: tag, channel: channel || '' }],
         () => _executeDeploys([[driverId, { image: fullImage }]])
       );
     });
@@ -714,15 +719,19 @@ export function showDeployConfirmModal(items, onConfirm) {
   const overlay = document.getElementById('deploy-confirm-overlay');
   const body    = document.getElementById('deploy-confirm-body');
 
-  body.innerHTML = items.map(it => `
+  body.innerHTML = items.map(it => {
+    const ch = it.channel ? _channelLabel(it.channel) : '';
+    return `
     <div class="deploy-confirm-item">
       <div class="deploy-confirm-item-name">${it.label}</div>
       <div class="deploy-confirm-item-versions">
         <span class="deploy-confirm-tag current">${it.currentTag || '—'}</span>
         <span class="deploy-confirm-arrow">→</span>
         <span class="deploy-confirm-tag latest">${it.newTag}</span>
+        ${ch ? `<span class="svc-ver-channel">${ch}</span>` : ''}
       </div>
-    </div>`).join('');
+    </div>`;
+  }).join('');
 
   overlay.classList.remove('hidden');
 
