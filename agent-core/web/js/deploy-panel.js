@@ -340,8 +340,10 @@ function _svcRowHTML({ item, id, s, latestTag, currentTag, hasUpdate }) {
       <div class="svc-row-dot ${statusDot}" id="dot-${id}"></div>
       <div class="svc-row-info">
         <span class="svc-row-name">${label}</span>
-        <span class="svc-row-version">${versionText}</span>
-        ${hasUpdate ? `<span class="svc-row-arrow">→</span><span class="svc-row-new-version">${latestTag}</span>` : ''}
+        <div class="svc-row-version-line">
+          <span class="svc-row-version">${versionText}</span>
+          ${hasUpdate ? `<span class="svc-row-arrow">→</span><span class="svc-row-new-version">${latestTag}</span>` : ''}
+        </div>
       </div>
       <div class="svc-row-actions">${actions}</div>
     </div>
