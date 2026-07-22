@@ -251,7 +251,7 @@ function _svcGroupHTML(title, count, cls) {
 
 function _svcRowHTML({ item, id, s, latestTag, currentTag, hasUpdate }) {
   const label = item._cat === 'driver' ? (item.model || item.image) : (item.name || item.image);
-  const isRunning = s.running;
+  const isRunning = s.running || item._cat === 'core';
   const statusDot = isRunning ? 'running' : s.status === 'error' ? 'error' : 'stopped';
   const imageBase = item.full_repo || item.image;
   const tags = item.tags || [];
