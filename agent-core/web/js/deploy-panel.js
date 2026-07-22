@@ -418,16 +418,24 @@ function _renderMarketplace() {
     });
   });
 
+  // Bind card click → detail
+  gridEl.querySelectorAll('.mp-card').forEach(card => {
+    card.addEventListener('click', (e) => {
+      // Don't open detail if clicking install button or version dropdown
+      if (e.target.closest('.mp-install-btn') || e.target.closest('.mp-versions') || e.target.closest('.mp-installed-badge')) return;
+      _showDriverDetail(card);
+    });
+  });
+
   // Bind version options
   gridEl.querySelectorAll('.mp-version-opt').forEach(opt => {
-    opt.addEventListener('click', () => {
+    opt.addEventListener('click', (e) => {
+      e.stopPropagation();
       const driverId = opt.dataset.driverId;
       const image = opt.dataset.fullImage;
       const label = opt.dataset.label;
       const tag = opt.dataset.tag;
-      // Close dropdown
       opt.closest('.mp-card').querySelector('.mp-versions').classList.add('hidden');
-      // Show confirm and deploy
       showDeployConfirmModal(
         [{ label, currentTag: '—', newTag: tag }],
         () => _executeDeploys([[driverId, { image }]])
@@ -445,6 +453,8 @@ function _mpCardHTML(item) {
   const isInstalled = s && (s.running || s.last_deploy);
   const tags = item.tags || [];
   const imageBase = item.full_repo || item.image;
+  const desc = item.description || '';
+  const fullName = item.name || label;
 
   const versionOpts = tags.map(t => {
     const fullImg = t.imageRef || (imageBase + ':' + t.tag);
@@ -455,19 +465,25 @@ function _mpCardHTML(item) {
   }).join('');
 
   const installBtn = isInstalled
-    ? `<span class="mp-installed-badge">已安装</span>`
+    ? `<span class="mp-action-btn mp-installed-badge">已安装</span>`
     : tags.length > 0
-      ? `<button class="mp-install-btn">安装 ▾</button>`
-      : `<span class="mp-no-version">暂无版本</span>`;
+      ? `<button class="mp-action-btn mp-install-btn">安装 ▾</button>`
+      : `<span class="mp-action-btn mp-no-version">暂无版本</span>`;
 
   return `
-    <div class="mp-card" data-driver-id="${driverId}">
-      <div class="mp-card-name">${label}</div>
-      ${provider ? `<div class="mp-card-provider">${provider}</div>` : ''}
+    <div class="mp-card" data-driver-id="${driverId}" data-name="${_escAttr(fullName)}" data-desc="${_escAttr(desc)}" data-provider="${_escAttr(provider)}">
+      <div class="mp-card-body">
+        <div class="mp-card-name">${label}</div>
+        ${provider ? `<div class="mp-card-provider">${provider}</div>` : ''}
+        ${desc ? `<div class="mp-card-desc">${_escHTML(desc)}</div>` : ''}
+      </div>
       <div class="mp-card-action">${installBtn}</div>
       <div class="mp-versions hidden">${versionOpts}</div>
     </div>`;
 }
+
+function _escAttr(s) { return s.replace(/"/g, '&quot;').replace(/</g, '&lt;'); }
+function _escHTML(s) { return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'); }
 
 function _toggleInstallDropdown(btn) {
   const card = btn.closest('.mp-card');
@@ -491,6 +507,68 @@ document.addEventListener('click', (e) => {
     document.querySelectorAll('.svc-ver-dropdown').forEach(d => d.classList.add('hidden'));
   }
 });
+
+// ── Driver detail (in-modal view) ────────────────────────────────────────
+
+function _showDriverDetail(card) {
+  const name = card.dataset.name || '';
+  const desc = card.dataset.desc || '';
+  const provider = card.dataset.provider || '';
+  const driverId = card.dataset.driverId || '';
+  const s = _statuses[driverId];
+  const isInstalled = s && (s.running || s.last_deploy);
+
+  // Get tags from the card's versions dropdown
+  const versions = [...card.querySelectorAll('.mp-version-opt')].map(opt => ({
+    tag: opt.dataset.tag,
+    fullImage: opt.dataset.fullImage,
+    label: opt.dataset.label,
+  }));
+
+  const pane = document.getElementById('pane-marketplace');
+  // Save current content for back navigation
+  const savedHTML = pane.innerHTML;
+
+  const versionsHTML = versions.map(v => `
+    <div class="detail-ver-row" data-full-image="${v.fullImage}" data-tag="${v.tag}" data-label="${v.label}" data-driver-id="${driverId}">
+      <span class="detail-ver-tag">${v.tag}</span>
+      <button class="svc-btn svc-btn-upgrade">部署此版本</button>
+    </div>
+  `).join('');
+
+  pane.innerHTML = `
+    <div class="mp-detail">
+      <button class="mp-detail-back">← 返回</button>
+      <div class="mp-detail-header">
+        <div class="mp-detail-title">${name}</div>
+        ${provider ? `<div class="mp-detail-provider">${provider}</div>` : ''}
+        ${isInstalled ? '<span class="mp-installed-badge" style="margin-top:8px;display:inline-block">已安装</span>' : ''}
+      </div>
+      ${desc ? `<div class="mp-detail-desc">${desc}</div>` : '<div class="mp-detail-desc" style="color:var(--text-dim)">暂无描述</div>'}
+      <div class="mp-detail-versions">
+        <div class="mp-detail-section-title">可用版本</div>
+        ${versionsHTML || '<div style="color:var(--text-dim);font-size:12px">暂无版本</div>'}
+      </div>
+    </div>
+  `;
+
+  // Bind back
+  pane.querySelector('.mp-detail-back').addEventListener('click', () => {
+    pane.innerHTML = savedHTML;
+    _renderMarketplace();
+  });
+
+  // Bind deploy buttons
+  pane.querySelectorAll('.detail-ver-row .svc-btn').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const row = btn.closest('.detail-ver-row');
+      showDeployConfirmModal(
+        [{ label: row.dataset.label, currentTag: '—', newTag: row.dataset.tag }],
+        () => _executeDeploys([[row.dataset.driverId, { image: row.dataset.fullImage }]])
+      );
+    });
+  });
+}
 
 // ══════════════════════════════════════════════════════════════════════════
 //  SHARED UTILITIES

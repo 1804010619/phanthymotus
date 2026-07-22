@@ -2094,58 +2094,75 @@ html, body {
   position: relative;
   display: flex;
   flex-direction: column;
-  align-items: center;
-  padding: 20px 14px 16px;
+  padding: 16px 14px 14px;
   background: var(--bg-card);
   border: 1px solid var(--border);
   border-radius: var(--radius);
-  text-align: center;
+  cursor: pointer;
   transition: border-color .15s, box-shadow .15s;
 }
 .mp-card:hover { border-color: var(--border-med); box-shadow: var(--shadow-sm); }
 
+.mp-card-body { flex: 1; text-align: center; }
 .mp-card-name {
   font-size: 14px;
   font-weight: 600;
   color: var(--text);
-  margin-bottom: 4px;
+  margin-bottom: 3px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 .mp-card-provider {
   font-size: 11px;
   color: var(--text-dim);
-  margin-bottom: 12px;
+  margin-bottom: 6px;
+}
+.mp-card-desc {
+  font-size: 11px;
+  color: var(--text-muted);
+  line-height: 1.4;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  margin-bottom: 4px;
 }
 .mp-card-action {
-  margin-top: auto;
+  margin-top: 10px;
+  text-align: center;
 }
 
-.mp-install-btn {
-  padding: 5px 14px;
+/* Unified action button size */
+.mp-action-btn {
+  display: inline-block;
+  min-width: 72px;
+  padding: 6px 14px;
   font-size: 12px;
   font-weight: 500;
   border-radius: var(--radius-sm);
+  text-align: center;
+  font-family: var(--font-ui);
+  box-sizing: border-box;
+}
+.mp-install-btn {
   border: 1px solid var(--accent);
   background: transparent;
   color: var(--accent);
   cursor: pointer;
   transition: background .15s;
-  font-family: var(--font-ui);
 }
 .mp-install-btn:hover { background: var(--accent-dim); }
 
 .mp-installed-badge {
-  font-size: 11px;
-  font-weight: 500;
   color: var(--green);
-  padding: 4px 10px;
   border: 1px solid rgba(63,185,80,.25);
-  border-radius: var(--radius-sm);
   background: var(--green-bg);
 }
 
 .mp-no-version {
-  font-size: 11px;
   color: var(--text-dim);
+  border: 1px solid var(--border);
+  background: transparent;
 }
 
 .mp-versions {
@@ -2182,6 +2199,67 @@ html, body {
 .mp-version-date {
   font-size: 10px;
   color: var(--text-dim);
+}
+
+/* ── Driver detail (in-pane view) ────────────────────────────────────────── */
+.mp-detail {
+  animation: fadeIn .15s ease;
+}
+@keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
+.mp-detail-back {
+  background: none;
+  border: none;
+  color: var(--accent);
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+  padding: 4px 0;
+  margin-bottom: 16px;
+  font-family: var(--font-ui);
+}
+.mp-detail-back:hover { text-decoration: underline; }
+.mp-detail-header { margin-bottom: 16px; }
+.mp-detail-title {
+  font-size: 18px;
+  font-weight: 700;
+  color: var(--text);
+  margin-bottom: 4px;
+}
+.mp-detail-provider {
+  font-size: 12px;
+  color: var(--text-dim);
+}
+.mp-detail-desc {
+  font-size: 13px;
+  color: var(--text-muted);
+  line-height: 1.6;
+  margin-bottom: 20px;
+  white-space: pre-wrap;
+}
+.mp-detail-section-title {
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--text-dim);
+  text-transform: uppercase;
+  letter-spacing: .8px;
+  margin-bottom: 10px;
+}
+.mp-detail-versions {
+  border-top: 1px solid var(--border);
+  padding-top: 16px;
+}
+.detail-ver-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 0;
+  border-bottom: 1px solid var(--border);
+}
+.detail-ver-row:last-child { border-bottom: none; }
+.detail-ver-tag {
+  font-size: 12px;
+  font-family: var(--font-mono);
+  color: var(--text);
 }
 
 /* ── Deploy confirm modal ─────────────────────────────────────────────────── */
