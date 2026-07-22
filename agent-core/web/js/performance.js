@@ -197,6 +197,8 @@ function _renderWaterfall(turns) {
         <div class="perf-row-detail">
           <table class="perf-detail-table">
             <tbody>${detailRows}</tbody>
+            <tr><td>语音时长</td><td class="perf-detail-val">${_fmtMs(t.audio_duration_ms)}</td></tr>
+            <tr><td>文字长度</td><td class="perf-detail-val">${t.text_length != null ? t.text_length + '字' : '-'}</td></tr>
             <tr><td>轮次</td><td class="perf-detail-val">${t.round_count || '-'}</td></tr>
             <tr><td>工具</td><td class="perf-detail-val perf-detail-tools">${toolNames}</td></tr>
           </table>

@@ -38,6 +38,10 @@ def _extract_perf_timestamps(ev: dict):
     except (ValueError, TypeError):
         return
     for key in ('audio_start_ts', 'audio_end_ts', 'asr_complete_ts'):
+        val = data.get(key)
+        if val and val > 1e9:  # only valid unix timestamps
+            ev[f'_perf_{key}'] = val
+    for key in ('audio_duration_ms', 'text_length'):
         if key in data:
             ev[f'_perf_{key}'] = data[key]
 

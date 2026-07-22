@@ -877,6 +877,8 @@ class _ASRNode(Node):
             return
         pcm = bytes(msg.data)
         ts  = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
+        if ts < 1e9:  # header.stamp not set by publisher
+            ts = time.time()
         try:
             self._pcm_queue.put_nowait((pcm, ts))
         except Exception:
@@ -934,7 +936,9 @@ class _ASRNode(Node):
                     text = remaining
 
                 result = {"text": text, "audio_start_ts": start_ts,
-                          "audio_end_ts": end_ts, "asr_complete_ts": time.time()}
+                          "audio_end_ts": end_ts, "asr_complete_ts": time.time(),
+                          "audio_duration_ms": int(len(utterance) / 32),  # 16kHz 16bit = 32 bytes/ms
+                          "text_length": len(text)}
                 msg = String(); msg.data = json.dumps(result, ensure_ascii=False)
                 self._pub.publish(msg)
                 log.info(f"[asr] {text!r}")

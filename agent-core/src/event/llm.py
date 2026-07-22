@@ -361,6 +361,8 @@ class Event:
             collector_receive_ts=trigger_event.get('ts'),
             source=trigger_event.get('source', ''),
             trigger_text=trigger_event.get('text', '')[:100],
+            audio_duration_ms=trigger_event.get('_perf_audio_duration_ms'),
+            text_length=trigger_event.get('_perf_text_length'),
         )
         _tool_names_collected = []
 

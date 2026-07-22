@@ -129,7 +129,9 @@ def _get_conn() -> sqlite3.Connection:
             round_count INTEGER DEFAULT 1,
             tool_names TEXT DEFAULT '[]',
             trigger_text TEXT DEFAULT '',
-            source TEXT DEFAULT ''
+            source TEXT DEFAULT '',
+            audio_duration_ms INTEGER,
+            text_length INTEGER
         )
     ''')
     conn.execute('CREATE INDEX IF NOT EXISTS idx_perf_created ON perf_turns(created_at)')

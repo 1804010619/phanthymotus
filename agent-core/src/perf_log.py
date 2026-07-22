@@ -38,11 +38,15 @@ class PerfTrace:
     # 元数据
     round_count: int = 1
     tool_names: list = field(default_factory=list)
+    audio_duration_ms: Optional[int] = None
+    text_length: Optional[int] = None
 
 
 def _ms(start: Optional[float], end: Optional[float]) -> Optional[int]:
-    """计算毫秒差值，任一为 None 则返回 None。"""
+    """计算毫秒差值，任一为 None 或无效（<1e9）则返回 None。"""
     if start is None or end is None:
+        return None
+    if start < 1e9 or end < 1e9:
         return None
     return int((end - start) * 1000)
 
@@ -70,8 +74,9 @@ def commit(trace: PerfTrace):
             turn_end_ts,
             vad_duration_ms, asr_duration_ms, collector_delay_ms,
             llm_duration_ms, tool_duration_ms, tts_duration_ms, total_duration_ms,
-            round_count, tool_names, trigger_text, source
-        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',
+            round_count, tool_names, trigger_text, source,
+            audio_duration_ms, text_length
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',
         (
             trace.turn_id, now,
             trace.audio_start_ts, trace.audio_end_ts, trace.asr_complete_ts,
@@ -86,6 +91,8 @@ def commit(trace: PerfTrace):
             json.dumps(trace.tool_names, ensure_ascii=False),
             trace.trigger_text[:200],
             trace.source,
+            trace.audio_duration_ms,
+            trace.text_length,
         ),
     )
     conn.commit()
