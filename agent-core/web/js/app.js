@@ -16,6 +16,7 @@ import { initHistory }       from './history.js';
 import { initNetwork }       from './network.js';
 import { initChannels }      from './channels.js';
 import { initMobile }        from './mobile.js';
+import { initPerformance }   from './performance.js';
 import './agent-definition.js';
 
 let _allMcps   = [];
@@ -43,6 +44,7 @@ async function main() {
   initHistory();
   initNetwork();
   initChannels();
+  initPerformance();
 
   // Settings dropdown (web topbar)
   _initSettingsDropdown();
@@ -69,7 +71,15 @@ async function main() {
 
   // Poll every 10s
   setInterval(async () => {
-    _allMcps = await _fetchMcps();
+    const fresh = await _fetchMcps();
+    // Preserve online status from previous ping results
+    const oldMap = Object.fromEntries(_allMcps.map(m => [m.id, m]));
+    for (const m of fresh) {
+      if (m.online == null && oldMap[m.id]?.online != null) {
+        m.online = oldMap[m.id].online;
+      }
+    }
+    _allMcps = fresh;
     await fetchTopicStatuses();
     renderSidebar(_allMcps, _topicStatuses);
     updateCanvasMcps(_allMcps);

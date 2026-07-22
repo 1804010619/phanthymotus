@@ -26,6 +26,7 @@ import event
 import event_bus
 import collector
 import mcp_client
+import perf_log
 import prompt as prompt_mod
 from api.motus_stream import push_event
 
@@ -346,7 +347,27 @@ class Event:
 
     async def _one_turn(self, trigger_event: dict):
         import time as _time
+        from uuid import uuid4
         _turn_t0 = _time.perf_counter()
+
+        # 性能追踪（开放 span 式）
+        _trace_id = str(uuid4())
+        _turn_start_ts = time.time()
+        _spans = []  # 收集所有 span
+        _tool_names_collected = []
+
+        # 从 trigger_event 中提取 perception 上报的 spans
+        _perf_spans_from_perception = trigger_event.get('_perf_spans', [])
+        for ps in _perf_spans_from_perception:
+            ps['component'] = ps.get('component', 'perception')
+            _spans.append(ps)
+
+        # collector_wait span
+        _collector_receive = trigger_event.get('ts')
+        _trigger_emit = trigger_event.get('_perf_trigger_emit_ts')
+        if _collector_receive and _trigger_emit:
+            _spans.append({'span': 'event_queue', 'component': 'core',
+                           'start_ts': _collector_receive, 'end_ts': _trigger_emit})
 
         # Log incoming event
         print(f'[decision] received event: source={trigger_event.get("source", "?")} text={trigger_event.get("text", "")[:100]}')
@@ -420,6 +441,7 @@ class Event:
 
             # ── 调用 LLM（含上下文溢出恢复）───────────────────────────────
             _round_t0 = _time.perf_counter()
+            _round_start_ts = time.time()
             try:
                 response = await client.llm(
                     message_list = messages,
@@ -459,6 +481,9 @@ class Event:
 
             # Log LLM response
             _round_elapsed = _time.perf_counter() - _round_t0
+            _round_end_ts = time.time()
+            _spans.append({'span': f'llm_round_{round_idx}', 'component': 'core',
+                           'start_ts': _round_start_ts, 'end_ts': _round_end_ts})
             resp_text = (response.get('content') or '')[:200]
             resp_tools = []
             for c in (response.get('tool_calls') or []):
@@ -482,6 +507,10 @@ class Event:
                 name   = call['function']['name']
                 args   = json.loads(call['function']['arguments'] or '{}')
 
+                # 性能追踪：记录工具时间
+                _t_before = time.time()
+                _tool_names_collected.append(name)
+
                 await push_event({
                     'type':    'mcp_call',
                     'mcp_id':  name.split('__')[1] if name.startswith('mcp__') else '',
@@ -494,6 +523,14 @@ class Event:
                     result = await mcp_client.call_tool(name, args)
                 else:
                     result = f'未知工具: {name}'
+
+                # 性能追踪：记录工具完成
+                _t_after = time.time()
+                # 工具 span 名称：mcp__mcp-123__tool_name → tool:tool_name
+                _short = name.split('__')[-1] if name.startswith('mcp__') else name
+                _span_name = f'tool:{_short}'
+                _spans.append({'span': _span_name, 'component': 'core',
+                               'start_ts': _t_before, 'end_ts': _t_after})
 
                 await push_event({
                     'type':    'mcp_result',
@@ -570,3 +607,17 @@ class Event:
         await push_event({'type': 'turn_end', 'payload': {}})
         _turn_elapsed = _time.perf_counter() - _turn_t0
         print(f'[decision] turn complete: {_turn_elapsed:.2f}s total, {round_idx + 1} rounds')
+
+        # 性能追踪：提交 spans
+        _turn_end_ts = time.time()
+        _spans.append({'span': 'turn_total', 'component': 'core',
+                       'start_ts': _turn_start_ts, 'end_ts': _turn_end_ts})
+        try:
+            perf_log.commit_spans(
+                trace_id=_trace_id,
+                spans=_spans,
+                source=trigger_event.get('source', ''),
+                trigger_text=trigger_event.get('text', '')[:100],
+            )
+        except Exception as _pe:
+            print(f'[perf_log] commit error: {_pe}')

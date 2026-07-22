@@ -70,6 +70,24 @@ def _push_factory(topic: str):
                 q.put_nowait(data)
             except asyncio.QueueFull:
                 pass  # drop frame for slow consumer
+        # 处理 perf_span 类型消息（来自 perception TTS 等组件）
+        if topic == '/perception/perf_spans':
+            try:
+                import json, perf_log
+                text = data.decode('utf-8') if isinstance(data, bytes) else data
+                span_data = json.loads(text)
+                if span_data.get('type') == 'perf_span':
+                    # 关联到最近的 turn
+                    import config
+                    conn = config._get_conn()
+                    row = conn.execute(
+                        'SELECT turn_id FROM perf_turns ORDER BY created_at DESC LIMIT 1'
+                    ).fetchone()
+                    conn.close()
+                    if row:
+                        perf_log.commit_spans(row[0], [span_data], source='perception')
+            except Exception:
+                pass
     return _push
 
 

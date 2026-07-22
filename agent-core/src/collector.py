@@ -10,6 +10,7 @@ collector.py — 信息整理器。
 
 import asyncio
 import datetime
+import json as _json
 import time
 from collections import deque
 
@@ -25,6 +26,38 @@ _last_accepted: dict[str, float] = {}
 _THROTTLE_INTERVAL = 1.0  # 每个 source 最多 1 条/秒
 # Agent loop busy flag — 忙时不发射 trigger，让事件继续积累
 _busy: bool = False
+
+
+def _extract_perf_timestamps(ev: dict):
+    """从 ASR 事件 JSON 中提取性能 span 数据。"""
+    text = ev.get('text', '')
+    if not text or not text.startswith('{'):
+        return
+    try:
+        data = _json.loads(text)
+    except (ValueError, TypeError):
+        return
+
+    # 新格式：perception 直接上报 spans 数组
+    if 'spans' in data:
+        ev['_perf_spans'] = data['spans']
+        return
+
+    # 旧格式兼容：从 audio_start_ts 等字段构造 spans
+    spans = []
+    audio_start = data.get('audio_start_ts')
+    audio_end = data.get('audio_end_ts')
+    asr_complete = data.get('asr_complete_ts')
+
+    if audio_start and audio_start > 1e9 and audio_end and audio_end > 1e9:
+        spans.append({'span': 'vad_collect', 'start_ts': audio_start, 'end_ts': audio_end,
+                      'meta': {'audio_ms': data.get('audio_duration_ms')}})
+    if audio_end and audio_end > 1e9 and asr_complete and asr_complete > 1e9:
+        spans.append({'span': 'asr_inference', 'start_ts': audio_end, 'end_ts': asr_complete,
+                      'meta': {'text_length': data.get('text_length')}})
+
+    if spans:
+        ev['_perf_spans'] = spans
 
 
 def set_busy(busy: bool):
@@ -59,6 +92,9 @@ async def _drain_loop():
         ev = await event_bus.dequeue()
         source = ev.get('source', 'unknown')
         now = ev.get('ts', time.time())
+
+        # 尝试从 ASR JSON 事件中提取性能时间戳
+        _extract_perf_timestamps(ev)
 
         last_ts = _last_accepted.get(source, 0)
         if now - last_ts < _THROTTLE_INTERVAL:
@@ -103,7 +139,13 @@ async def _trigger_loop():
             'text': formatted,
             'payload': {'event_count': len(batch), 'sources': [e['source'] for e in batch]},
             'ts': batch[-1]['ts'],  # 使用最后一个事件的时间戳
+            '_perf_trigger_emit_ts': time.time(),
         }
+        # 传递 perception spans（取 batch 中最后一个含 spans 的事件）
+        for ev in reversed(batch):
+            if '_perf_spans' in ev:
+                trigger['_perf_spans'] = ev['_perf_spans']
+                break
         await _output.put(trigger)
 
 
