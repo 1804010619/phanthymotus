@@ -3,9 +3,11 @@ ARG ROS_BASE_IMAGE=bj-warehouse.tencentcloudcr.com/phanthy-motus/ros-base:latest
 FROM ${ROS_BASE_IMAGE}
 ARG PYPI_MIRROR
 
-# docker.io, python3-pip, python3-dbus already in ros-base; only add ffmpeg
+# Install ffmpeg + docker CLI (docker.io installed separately to avoid libc trigger under QEMU)
 RUN apt-get -o Acquire::AllowInsecureRepositories=true update && \
     apt-get install -y --no-install-recommends --allow-unauthenticated ffmpeg && \
+    apt-get install -y --no-install-recommends --allow-unauthenticated --no-triggers docker.io docker-compose-v2 && \
+    apt-get install -y --no-install-recommends --allow-unauthenticated python3-pip python3-dbus && \
     rm -rf /var/lib/apt/lists/*
 
 # Install uv

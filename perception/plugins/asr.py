@@ -825,7 +825,11 @@ class _ASRNode(Node):
     def stop(self) -> dict:
         # Stop subscription first to prevent new audio_cb calls
         if self._sub:
-            self.destroy_subscription(self._sub); self._sub = None
+            try:
+                self.destroy_subscription(self._sub)
+            except Exception:
+                pass  # may already be invalid
+            self._sub = None
         self._stop_event.set()
         # Unblock start() if it's waiting
         if hasattr(self, '_first_chunk_event'):
@@ -1145,12 +1149,11 @@ class ASRPlugin:
                 self._load_model_async(self._asr_model)
                 return {"status": "loading", "asr_model": self._asr_model,
                         "message": f"Switching to model '{self._asr_model}', downloading..."}
-            # Remove all nodes completely (they'll be recreated on next start with new config)
-            # Must fully remove from executor to avoid rclpy InvalidHandle errors on restart
+            # Stop all nodes but keep them in executor (preserves publisher for DDS discovery)
+            # Only stop VAD/subscription internals — node + publisher stay alive
             for key in list(self._nodes.keys()):
-                node = self._nodes.pop(key)
+                node = self._nodes[key]
                 node.stop()
-                self._executor.remove_node(node)
             return {"status": "configured", "asr_model": self._asr_model}
 
         return None
