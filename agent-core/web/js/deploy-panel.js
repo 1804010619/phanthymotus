@@ -451,7 +451,7 @@ function _mpCardHTML(item) {
 
   const versionOpts = tags.map(t => {
     const fullImg = t.imageRef || (imageBase + ':' + t.tag);
-    const ch = _channelLabel(t.tag);
+    const ch = _channelLabel(t.channel);
     return `<div class="mp-version-opt" data-driver-id="${driverId}" data-full-image="${fullImg}" data-tag="${t.tag}" data-label="${label}">
       <span class="mp-version-tag">${t.tag}</span>
       ${ch ? `<span class="svc-ver-channel">${ch}</span>` : ''}
