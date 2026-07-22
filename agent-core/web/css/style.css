@@ -5682,6 +5682,58 @@ html, body {
   text-align: center;
   padding: 40px 0;
 }
+.perf-row-group {
+  border-radius: 6px;
+  transition: background 0.15s;
+}
+.perf-row-group:hover {
+  background: var(--bg-2);
+}
+.perf-row-group .perf-row {
+  cursor: pointer;
+}
+.perf-row-expand {
+  font-size: 0.7rem;
+  color: var(--text-dim);
+  transition: transform 0.2s;
+  margin-left: 4px;
+}
+.perf-row-group.expanded .perf-row-expand {
+  transform: rotate(90deg);
+}
+.perf-row-detail {
+  display: none;
+  padding: 6px 12px 10px 190px;
+}
+.perf-row-group.expanded .perf-row-detail {
+  display: block;
+}
+.perf-detail-table {
+  font-size: 0.75rem;
+  border-collapse: collapse;
+  width: 100%;
+  max-width: 360px;
+}
+.perf-detail-table td {
+  padding: 3px 8px;
+  border-bottom: 1px solid var(--border);
+}
+.perf-detail-val {
+  font-family: var(--font-mono);
+  text-align: right;
+  color: var(--text);
+}
+.perf-detail-tools {
+  font-size: 0.68rem;
+  color: var(--text-dim);
+  word-break: break-all;
+  text-align: left !important;
+  max-width: 200px;
+}
+.perf-bar-segment:hover {
+  opacity: 0.8;
+  outline: 1px solid rgba(255,255,255,0.5);
+}
 
 @media (max-width: 768px) {
   .performance-modal {

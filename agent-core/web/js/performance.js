@@ -152,7 +152,7 @@ function _renderWaterfall(turns) {
   // 找出最大 total 用于归一化
   const maxTotal = Math.max(...turns.map(t => t.total_duration_ms || 1));
 
-  const rows = turns.map(t => {
+  const rows = turns.map((t, idx) => {
     const stages = [
       { key: 'vad_duration_ms', ...STAGE_COLORS.vad },
       { key: 'asr_duration_ms', ...STAGE_COLORS.asr },
@@ -175,16 +175,32 @@ function _renderWaterfall(turns) {
     const text = (t.trigger_text || '').slice(0, 30);
     const totalStr = _fmtMs(t.total_duration_ms);
 
+    // 详情展开区域
+    const detailRows = stages
+      .map(st => `<tr><td><span class="perf-legend-dot" style="background:${st.color}"></span> ${st.label}</td><td class="perf-detail-val">${_fmtMs(t[st.key])}</td></tr>`)
+      .join('');
+    const toolNames = (t.tool_names || []).join(', ') || '-';
+
     return `
-      <div class="perf-row">
-        <div class="perf-row-meta">
-          <span class="perf-row-time">${timeStr}</span>
-          <span class="perf-row-text" title="${t.trigger_text || ''}">${text}</span>
+      <div class="perf-row-group" data-idx="${idx}">
+        <div class="perf-row" onclick="this.parentElement.classList.toggle('expanded')">
+          <div class="perf-row-meta">
+            <span class="perf-row-time">${timeStr}</span>
+            <span class="perf-row-text" title="${t.trigger_text || ''}">${text}</span>
+          </div>
+          <div class="perf-row-bar" style="width:${barWidth}%">
+            ${segments}
+          </div>
+          <span class="perf-row-total">${totalStr}</span>
+          <span class="perf-row-expand">▸</span>
         </div>
-        <div class="perf-row-bar" style="width:${barWidth}%">
-          ${segments}
+        <div class="perf-row-detail">
+          <table class="perf-detail-table">
+            <tbody>${detailRows}</tbody>
+            <tr><td>轮次</td><td class="perf-detail-val">${t.round_count || '-'}</td></tr>
+            <tr><td>工具</td><td class="perf-detail-val perf-detail-tools">${toolNames}</td></tr>
+          </table>
         </div>
-        <span class="perf-row-total">${totalStr}</span>
       </div>
     `;
   }).join('');
