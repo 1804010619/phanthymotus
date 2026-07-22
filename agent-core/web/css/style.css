@@ -1916,6 +1916,9 @@ html, body {
 .svc-btn-start { color: var(--green); border-color: rgba(63,185,80,.3); }
 .svc-btn-start:hover:not(:disabled) { background: var(--green-bg); border-color: var(--green); }
 
+.svc-btn-remove { color: var(--text-dim); }
+.svc-btn-remove:hover:not(:disabled) { color: var(--red); border-color: var(--red); }
+
 /* ══════════════════════════════════════════════════════════════════════════
    TAB 2: 驱动市场
 ══════════════════════════════════════════════════════════════════════════ */

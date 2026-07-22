@@ -197,9 +197,9 @@ function _renderMyServices() {
 
     const entry = { item, id, s, latestTag, currentTag, hasUpdate };
 
-    if (s.running && hasUpdate) {
+    if ((s.running || item._cat === 'core') && hasUpdate) {
       updatable.push(entry);
-    } else if (s.running) {
+    } else if (s.running || item._cat === 'core') {
       running.push(entry);
     } else {
       stopped.push(entry);
@@ -236,6 +236,9 @@ function _renderMyServices() {
   container.querySelectorAll('[data-action="start"]').forEach(btn => {
     btn.addEventListener('click', () => _startDriver(btn.dataset.driverId, btn.dataset.image, btn));
   });
+  container.querySelectorAll('[data-action="remove"]').forEach(btn => {
+    btn.addEventListener('click', () => _removeDriver(btn.dataset.driverId, btn));
+  });
 }
 
 function _svcGroupHTML(title, count, cls) {
@@ -261,11 +264,12 @@ function _svcRowHTML({ item, id, s, latestTag, currentTag, hasUpdate }) {
   if (isRunning) {
     actions += `<button class="svc-btn svc-btn-stop" data-action="stop" data-driver-id="${id}">停止</button>`;
   } else {
-    // Stopped: show start
+    // Stopped: show start + remove
     const lastImage = s.running_image || s.last_deploy?.image || s.image || '';
     if (lastImage) {
       actions += `<button class="svc-btn svc-btn-start" data-action="start" data-driver-id="${id}" data-image="${lastImage}">启动</button>`;
     }
+    actions += `<button class="svc-btn svc-btn-remove" data-action="remove" data-driver-id="${id}">卸载</button>`;
   }
 
   const versionText = currentTag || (s.running_image?.split(':').pop()) || '—';
@@ -528,6 +532,18 @@ async function _startDriver(driverId, image, btn) {
   } catch (e) {
     _appendLog(driverId, `✗ 网络错误: ${e.message}`, 'error');
   }
+}
+
+async function _removeDriver(driverId, btn) {
+  if (!confirm('确定卸载此服务？将移除容器并释放空间。')) return;
+  btn.disabled = true;
+  btn.textContent = '卸载中…';
+  try {
+    await fetch(`/api/drivers/${driverId}/remove`, { method: 'POST' });
+  } catch (e) {
+    console.error('[deploy] remove', e);
+  }
+  setTimeout(async () => { await _loadStatuses(); _render(); }, 1500);
 }
 
 // ── Confirm all pending deploys ───────────────────────────────────────────

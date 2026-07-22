@@ -240,6 +240,21 @@ def _stop_sync(driver_id: str) -> dict:
         raise RuntimeError(str(e))
 
 
+def _remove_sync(driver_id: str) -> dict:
+    """Stop and remove container."""
+    import docker as docker_sdk
+    try:
+        client = _docker()
+        name = _container_name(driver_id)
+        container = client.containers.get(name)
+        container.remove(force=True)
+        return {'status': 'removed'}
+    except docker_sdk.errors.NotFound:
+        return {'status': 'not_found'}
+    except Exception as e:
+        raise RuntimeError(str(e))
+
+
 async def _run_in_executor(fn, *args):
     loop = asyncio.get_event_loop()
     return await loop.run_in_executor(None, fn, *args)
@@ -437,6 +452,21 @@ async def driver_stop(driver_id: str):
         return {'code': 200, 'data': result}
     except Exception as e:
         return {'code': 500, 'message': str(e)}
+
+
+@router.post('/{driver_id}/remove')
+async def driver_remove(driver_id: str):
+    """Stop + remove container, clear last_deploy from manifest."""
+    try:
+        result = await _run_in_executor(_remove_sync, driver_id)
+    except Exception as e:
+        return {'code': 500, 'message': str(e)}
+    manifest = _load_manifest()
+    entry = next((d for d in manifest if d.get('id') == driver_id), None)
+    if entry:
+        entry.pop('last_deploy', None)
+        _save_manifest(manifest)
+    return {'code': 200, 'data': result}
 
 
 @router.get('/{driver_id}/status')
