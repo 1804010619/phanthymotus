@@ -108,7 +108,7 @@ async function checkForUpdate() {
 
     // Find services that have a newer image available vs what's running
     const updatable = json.data.filter(d => {
-      if (!d.running) return false;  // 只提示正在运行的服务
+      if (!d.running && d.category !== 'core') return false;  // core is always running if responding
       if (!d.image || !d.running_image) return false;
       const latestTag  = _tagFromImage(d.image);
       const runningTag = _tagFromImage(d.running_image);

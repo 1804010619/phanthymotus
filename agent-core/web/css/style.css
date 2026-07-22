@@ -1885,6 +1885,7 @@ html, body {
   align-items: center;
   gap: 6px;
   flex-shrink: 0;
+  flex-wrap: wrap;
 }
 
 .svc-btn {

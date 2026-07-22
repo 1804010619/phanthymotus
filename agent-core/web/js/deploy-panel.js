@@ -318,7 +318,7 @@ function _svcRowHTML({ item, id, s, latestTag, currentTag, hasUpdate }) {
   }
   if (hasUpdate) {
     const latestImage = tags[0]?.imageRef || (imageBase + ':' + latestTag);
-    actions += `<button class="svc-btn svc-btn-upgrade" data-action="upgrade" data-driver-id="${id}" data-current-tag="${currentTag}" data-latest-tag="${latestTag}" data-latest-image="${latestImage}" data-label="${label}">升级到 ${latestTag}</button>`;
+    actions += `<button class="svc-btn svc-btn-upgrade" data-action="upgrade" data-driver-id="${id}" data-current-tag="${currentTag}" data-latest-tag="${latestTag}" data-latest-image="${latestImage}" data-label="${label}">升级</button>`;
   }
   if (item._cat === 'core') {
     // Core cannot stop itself — no stop button
