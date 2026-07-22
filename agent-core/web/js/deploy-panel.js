@@ -487,14 +487,70 @@ function _escHTML(s) { return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').rep
 function _toggleInstallDropdown(btn) {
   const card = btn.closest('.mp-card');
   const dropdown = card.querySelector('.mp-versions');
-  const wasHidden = dropdown.classList.contains('hidden');
 
-  // Close all other dropdowns
-  document.querySelectorAll('.mp-versions').forEach(d => d.classList.add('hidden'));
-
-  if (wasHidden) {
-    dropdown.classList.remove('hidden');
+  if (window.innerWidth <= 768) {
+    // Mobile: use bottom action sheet
+    const label = card.querySelector('.mp-card-name')?.textContent || '';
+    _showInstallSheet(dropdown.innerHTML, label);
+    return;
   }
+
+  // Desktop: position fixed dropdown
+  const wasHidden = dropdown.classList.contains('hidden');
+  document.querySelectorAll('.mp-versions').forEach(d => d.classList.add('hidden'));
+  if (wasHidden) {
+    const rect = btn.getBoundingClientRect();
+    dropdown.classList.remove('hidden');
+    dropdown.style.position = 'fixed';
+    dropdown.style.left = '';
+    dropdown.style.transform = '';
+    const ddHeight = dropdown.offsetHeight;
+    const spaceBelow = window.innerHeight - rect.bottom;
+    if (spaceBelow < ddHeight + 10) {
+      dropdown.style.top = (rect.top - ddHeight - 4) + 'px';
+    } else {
+      dropdown.style.top = (rect.bottom + 4) + 'px';
+    }
+    dropdown.style.right = (window.innerWidth - rect.right) + 'px';
+  }
+}
+
+function _showInstallSheet(optionsHTML, title) {
+  document.getElementById('ver-sheet-overlay')?.remove();
+
+  const overlay = document.createElement('div');
+  overlay.id = 'ver-sheet-overlay';
+  overlay.className = 'ver-sheet-overlay';
+  overlay.innerHTML = `
+    <div class="ver-sheet">
+      <div class="ver-sheet-header">
+        <span class="ver-sheet-title">${title || '选择版本'}</span>
+        <button class="ver-sheet-close">✕</button>
+      </div>
+      <div class="ver-sheet-body">${optionsHTML}</div>
+    </div>
+  `;
+  document.body.appendChild(overlay);
+  requestAnimationFrame(() => overlay.classList.add('active'));
+
+  const close = () => {
+    overlay.classList.remove('active');
+    setTimeout(() => overlay.remove(), 200);
+  };
+
+  overlay.querySelector('.ver-sheet-close').addEventListener('click', close);
+  overlay.addEventListener('click', (e) => { if (e.target === overlay) close(); });
+
+  overlay.querySelectorAll('.mp-version-opt').forEach(opt => {
+    opt.addEventListener('click', () => {
+      const { driverId, fullImage, tag, label } = opt.dataset;
+      close();
+      showDeployConfirmModal(
+        [{ label, currentTag: '—', newTag: tag }],
+        () => _executeDeploys([[driverId, { image: fullImage }]])
+      );
+    });
+  });
 }
 
 // Close marketplace dropdowns when clicking outside

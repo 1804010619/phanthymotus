@@ -2037,6 +2037,26 @@ html, body {
   font-size: 11px;
   padding: 3px 8px;
 }
+.ver-sheet-body .mp-version-opt {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 14px 20px;
+  min-height: 48px;
+  cursor: pointer;
+  transition: background .1s;
+}
+.ver-sheet-body .mp-version-opt:hover { background: var(--bg-hover); }
+.ver-sheet-body .mp-version-tag {
+  font-size: 14px;
+  font-family: var(--font-mono);
+  color: var(--text);
+}
+.ver-sheet-body .mp-version-date {
+  font-size: 11px;
+  color: var(--text-dim);
+}
 
 /* ══════════════════════════════════════════════════════════════════════════
    TAB 2: 驱动市场
@@ -2179,17 +2199,14 @@ html, body {
 }
 
 .mp-versions {
-  position: absolute;
-  top: calc(100% + 4px);
-  left: 50%;
-  transform: translateX(-50%);
-  min-width: 180px;
+  position: fixed;
+  min-width: 240px;
   background: var(--bg-card);
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);
   box-shadow: var(--shadow-lg);
-  z-index: 9999;
-  max-height: 200px;
+  z-index: 10000;
+  max-height: 220px;
   overflow-y: auto;
 }
 .mp-versions.hidden { display: none; }
@@ -5207,12 +5224,8 @@ html, body {
   .marketplace-filters { gap: 6px; }
   .mp-chip { min-height: 32px; padding: 6px 12px; font-size: 12px; }
 
-  /* Marketplace version dropdown */
-  .mp-versions {
-    min-width: 160px;
-    max-height: 160px;
-  }
-  .mp-version-opt { padding: 10px 12px; min-height: 40px; }
+  /* Marketplace version dropdown: hidden on mobile (replaced by sheet) */
+  .mp-versions { display: none !important; }
 
   /* ── Touch targets ── */
   .topbar-btn,
