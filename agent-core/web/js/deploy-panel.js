@@ -691,7 +691,8 @@ function _updateStatusDots() {
   for (const [id, s] of Object.entries(_statuses)) {
     const dot = document.getElementById(`dot-${id}`);
     if (dot) {
-      dot.className = 'svc-row-dot ' + (s.running ? 'running' : s.status === 'error' ? 'error' : 'stopped');
+      const isRunning = s.running || s.category === 'core';
+      dot.className = 'svc-row-dot ' + (isRunning ? 'running' : s.status === 'error' ? 'error' : 'stopped');
     }
   }
 }
