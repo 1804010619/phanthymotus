@@ -2122,11 +2122,11 @@ html, body {
 .mp-card-provider {
   font-size: 10px;
   font-weight: 500;
-  color: var(--text-dim);
-  background: var(--bg-secondary);
-  border: 1px solid var(--border);
+  color: var(--text-muted);
+  background: var(--bg-hover);
+  border: none;
   border-radius: 10px;
-  padding: 1px 8px;
+  padding: 2px 8px;
   white-space: nowrap;
   flex-shrink: 0;
 }
