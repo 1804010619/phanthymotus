@@ -301,12 +301,6 @@ function _svcRowHTML({ item, id, s, latestTag, currentTag, hasUpdate }) {
   let actions = '';
   // Version switcher (dropdown)
   if (tags.length > 1) {
-    const _channelLabel = (tag) => {
-      if (tag.startsWith('ga.')) return '稳定';
-      if (tag.startsWith('release.')) return '正式';
-      if (tag.startsWith('preview.')) return '预览';
-      return '';
-    };
     const versionOpts = tags.map(t => {
       const fullImg = t.imageRef || (imageBase + ':' + t.tag);
       const isCurrent = currentTag && t.tag === currentTag;
@@ -457,8 +451,10 @@ function _mpCardHTML(item) {
 
   const versionOpts = tags.map(t => {
     const fullImg = t.imageRef || (imageBase + ':' + t.tag);
+    const ch = _channelLabel(t.tag);
     return `<div class="mp-version-opt" data-driver-id="${driverId}" data-full-image="${fullImg}" data-tag="${t.tag}" data-label="${label}">
       <span class="mp-version-tag">${t.tag}</span>
+      ${ch ? `<span class="svc-ver-channel">${ch}</span>` : ''}
       ${t.created ? `<span class="mp-version-date">${t.created.replace(/\s+\d{2}:\d{2}$/, '')}</span>` : ''}
     </div>`;
   }).join('');
@@ -677,6 +673,13 @@ function _showVersionSheet(optionsHTML) {
 function _driverIdForItem(item, category) {
   if (category === 'driver') return `${item.provider}-${item.model}`;
   return item.image;
+}
+
+function _channelLabel(tag) {
+  if (tag.startsWith('ga.')) return 'GA';
+  if (tag.startsWith('release.')) return 'Release';
+  if (tag.startsWith('preview.')) return 'Preview';
+  return '';
 }
 
 function _updateStatusDots() {
