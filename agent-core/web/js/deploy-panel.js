@@ -676,7 +676,7 @@ function _driverIdForItem(item, category) {
 }
 
 function _channelLabel(tag) {
-  if (tag.startsWith('ga.')) return 'GA';
+  if (tag.startsWith('ga.')) return 'Stable';
   if (tag.startsWith('release.')) return 'Release';
   if (tag.startsWith('preview.')) return 'Preview';
   return '';
