@@ -239,6 +239,29 @@ function _renderMyServices() {
   container.querySelectorAll('[data-action="remove"]').forEach(btn => {
     btn.addEventListener('click', () => _removeDriver(btn.dataset.driverId, btn));
   });
+  // Version switcher dropdowns
+  container.querySelectorAll('[data-action="switch-version"]').forEach(btn => {
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const wrap = btn.closest('.svc-ver-wrap');
+      const dd = wrap.querySelector('.svc-ver-dropdown');
+      const wasHidden = dd.classList.contains('hidden');
+      // Close all others
+      container.querySelectorAll('.svc-ver-dropdown').forEach(d => d.classList.add('hidden'));
+      if (wasHidden) dd.classList.remove('hidden');
+    });
+  });
+  container.querySelectorAll('.svc-ver-opt').forEach(opt => {
+    opt.addEventListener('click', () => {
+      if (opt.classList.contains('current')) return;
+      const { driverId, fullImage, tag, label } = opt.dataset;
+      opt.closest('.svc-ver-dropdown').classList.add('hidden');
+      showDeployConfirmModal(
+        [{ label, currentTag: '—', newTag: tag }],
+        () => _executeDeploys([[driverId, { image: fullImage }]])
+      );
+    });
+  });
 }
 
 function _svcGroupHTML(title, count, cls) {
@@ -257,9 +280,24 @@ function _svcRowHTML({ item, id, s, latestTag, currentTag, hasUpdate }) {
   const tags = item.tags || [];
 
   let actions = '';
+  // Version switcher (dropdown)
+  if (tags.length > 1) {
+    const versionOpts = tags.map(t => {
+      const fullImg = t.imageRef || (imageBase + ':' + t.tag);
+      const isCurrent = currentTag && t.tag === currentTag;
+      return `<div class="svc-ver-opt${isCurrent ? ' current' : ''}" data-driver-id="${id}" data-full-image="${fullImg}" data-tag="${t.tag}" data-label="${label}">
+        <span class="svc-ver-tag">${t.tag}</span>
+        ${isCurrent ? '<span class="svc-ver-badge">当前</span>' : ''}
+      </div>`;
+    }).join('');
+    actions += `<div class="svc-ver-wrap">
+      <button class="svc-btn svc-btn-ver" data-action="switch-version">切换版本 ▾</button>
+      <div class="svc-ver-dropdown hidden">${versionOpts}</div>
+    </div>`;
+  }
   if (hasUpdate) {
     const latestImage = tags[0]?.imageRef || (imageBase + ':' + latestTag);
-    actions = `<button class="svc-btn svc-btn-upgrade" data-action="upgrade" data-driver-id="${id}" data-current-tag="${currentTag}" data-latest-tag="${latestTag}" data-latest-image="${latestImage}" data-label="${label}">升级到 ${latestTag}</button>`;
+    actions += `<button class="svc-btn svc-btn-upgrade" data-action="upgrade" data-driver-id="${id}" data-current-tag="${currentTag}" data-latest-tag="${latestTag}" data-latest-image="${latestImage}" data-label="${label}">升级到 ${latestTag}</button>`;
   }
   if (item._cat === 'core') {
     // Core cannot stop itself — no stop button
@@ -421,6 +459,9 @@ function _toggleInstallDropdown(btn) {
 document.addEventListener('click', (e) => {
   if (!e.target.closest('.mp-card')) {
     document.querySelectorAll('.mp-versions').forEach(d => d.classList.add('hidden'));
+  }
+  if (!e.target.closest('.svc-ver-wrap')) {
+    document.querySelectorAll('.svc-ver-dropdown').forEach(d => d.classList.add('hidden'));
   }
 });
 

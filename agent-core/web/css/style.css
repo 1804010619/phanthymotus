@@ -1919,6 +1919,49 @@ html, body {
 .svc-btn-remove { color: var(--text-dim); }
 .svc-btn-remove:hover:not(:disabled) { color: var(--red); border-color: var(--red); }
 
+/* Version switcher in My Services */
+.svc-ver-wrap { position: relative; }
+.svc-btn-ver { color: var(--text-muted); }
+.svc-ver-dropdown {
+  position: absolute;
+  top: calc(100% + 4px);
+  right: 0;
+  min-width: 200px;
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  box-shadow: var(--shadow-lg);
+  z-index: 9999;
+  max-height: 200px;
+  overflow-y: auto;
+}
+.svc-ver-dropdown.hidden { display: none; }
+.svc-ver-opt {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 8px 12px;
+  cursor: pointer;
+  transition: background .1s;
+}
+.svc-ver-opt:hover { background: var(--bg-hover); }
+.svc-ver-opt.current { opacity: .5; cursor: default; }
+.svc-ver-opt.current:hover { background: transparent; }
+.svc-ver-tag {
+  font-size: 12px;
+  font-family: var(--font-mono);
+  color: var(--text);
+}
+.svc-ver-badge {
+  font-size: 10px;
+  font-weight: 600;
+  color: var(--green);
+  background: var(--green-bg);
+  border-radius: 3px;
+  padding: 1px 5px;
+}
+
 /* ══════════════════════════════════════════════════════════════════════════
    TAB 2: 驱动市场
 ══════════════════════════════════════════════════════════════════════════ */
