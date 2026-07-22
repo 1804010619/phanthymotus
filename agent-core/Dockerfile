@@ -3,11 +3,14 @@ ARG ROS_BASE_IMAGE=bj-warehouse.tencentcloudcr.com/phanthy-motus/ros-base:latest
 FROM ${ROS_BASE_IMAGE}
 ARG PYPI_MIRROR
 
-# Install ffmpeg + docker CLI (docker.io installed separately to avoid libc trigger under QEMU)
+# Install ffmpeg + docker CLI
+# docker.io triggers libc-bin post-install which segfaults under QEMU;
+# install it last and ignore the trigger failure, then force-configure
 RUN apt-get -o Acquire::AllowInsecureRepositories=true update && \
-    apt-get install -y --no-install-recommends --allow-unauthenticated ffmpeg && \
-    apt-get install -y --no-install-recommends --allow-unauthenticated --no-triggers docker.io docker-compose-v2 && \
-    apt-get install -y --no-install-recommends --allow-unauthenticated python3-pip python3-dbus && \
+    apt-get install -y --no-install-recommends --allow-unauthenticated \
+        python3-pip python3-dbus ffmpeg && \
+    apt-get install -y --no-install-recommends --allow-unauthenticated \
+        docker.io docker-compose-v2 || true && \
     rm -rf /var/lib/apt/lists/*
 
 # Install uv
