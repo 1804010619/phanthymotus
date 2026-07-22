@@ -245,15 +245,20 @@ function _renderMyServices() {
       e.stopPropagation();
       const wrap = btn.closest('.svc-ver-wrap');
       const dd = wrap.querySelector('.svc-ver-dropdown');
+
+      if (window.innerWidth <= 768) {
+        // Mobile: show bottom action sheet
+        _showVersionSheet(dd.innerHTML, wrap.dataset.driverId || '');
+        return;
+      }
+
+      // Desktop: position fixed dropdown
       const wasHidden = dd.classList.contains('hidden');
-      // Close all others
       document.querySelectorAll('.svc-ver-dropdown').forEach(d => d.classList.add('hidden'));
       if (wasHidden) {
-        // Position fixed relative to button
         const rect = btn.getBoundingClientRect();
         dd.classList.remove('hidden');
         const ddHeight = dd.offsetHeight;
-        // Prefer dropping up if near bottom, else drop down
         const spaceBelow = window.innerHeight - rect.bottom;
         if (spaceBelow < ddHeight + 10) {
           dd.style.top = (rect.top - ddHeight - 4) + 'px';
@@ -490,6 +495,51 @@ document.addEventListener('click', (e) => {
 // ══════════════════════════════════════════════════════════════════════════
 //  SHARED UTILITIES
 // ══════════════════════════════════════════════════════════════════════════
+
+// ── Mobile: bottom action sheet for version selection ─────────────────────
+
+function _showVersionSheet(optionsHTML) {
+  // Remove existing sheet if any
+  document.getElementById('ver-sheet-overlay')?.remove();
+
+  const overlay = document.createElement('div');
+  overlay.id = 'ver-sheet-overlay';
+  overlay.className = 'ver-sheet-overlay';
+  overlay.innerHTML = `
+    <div class="ver-sheet">
+      <div class="ver-sheet-header">
+        <span class="ver-sheet-title">选择版本</span>
+        <button class="ver-sheet-close">✕</button>
+      </div>
+      <div class="ver-sheet-body">${optionsHTML}</div>
+    </div>
+  `;
+  document.body.appendChild(overlay);
+
+  // Animate in
+  requestAnimationFrame(() => overlay.classList.add('active'));
+
+  const close = () => {
+    overlay.classList.remove('active');
+    setTimeout(() => overlay.remove(), 200);
+  };
+
+  overlay.querySelector('.ver-sheet-close').addEventListener('click', close);
+  overlay.addEventListener('click', (e) => { if (e.target === overlay) close(); });
+
+  // Bind version option clicks
+  overlay.querySelectorAll('.svc-ver-opt').forEach(opt => {
+    opt.addEventListener('click', () => {
+      if (opt.classList.contains('current')) return;
+      const { driverId, fullImage, tag, label } = opt.dataset;
+      close();
+      showDeployConfirmModal(
+        [{ label, currentTag: '—', newTag: tag }],
+        () => _executeDeploys([[driverId, { image: fullImage }]])
+      );
+    });
+  });
+}
 
 function _driverIdForItem(item, category) {
   if (category === 'driver') return `${item.provider}-${item.model}`;

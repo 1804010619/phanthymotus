@@ -1973,6 +1973,71 @@ html, body {
   flex-shrink: 0;
 }
 
+/* ── Mobile version action sheet ─────────────────────────────────────────── */
+.ver-sheet-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0,0,0,.4);
+  z-index: 10001;
+  display: flex;
+  align-items: flex-end;
+  opacity: 0;
+  transition: opacity .2s;
+}
+.ver-sheet-overlay.active { opacity: 1; }
+.ver-sheet {
+  width: 100%;
+  background: var(--bg-card);
+  border-radius: 16px 16px 0 0;
+  max-height: 60vh;
+  display: flex;
+  flex-direction: column;
+  transform: translateY(100%);
+  transition: transform .25s ease;
+}
+.ver-sheet-overlay.active .ver-sheet { transform: translateY(0); }
+.ver-sheet-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 16px 20px 12px;
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+.ver-sheet-title {
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--text);
+}
+.ver-sheet-close {
+  background: none;
+  border: none;
+  font-size: 18px;
+  color: var(--text-muted);
+  cursor: pointer;
+  padding: 4px 8px;
+}
+.ver-sheet-body {
+  overflow-y: auto;
+  padding: 8px 0;
+  -webkit-overflow-scrolling: touch;
+}
+.ver-sheet-body .svc-ver-opt {
+  padding: 14px 20px;
+  min-height: 48px;
+}
+.ver-sheet-body .svc-ver-tag {
+  font-size: 14px;
+}
+.ver-sheet-body .svc-ver-badge {
+  font-size: 11px;
+  padding: 3px 8px;
+}
+.ver-sheet-body .svc-ver-channel {
+  font-size: 11px;
+  padding: 3px 8px;
+}
+
 /* ══════════════════════════════════════════════════════════════════════════
    TAB 2: 驱动市场
 ══════════════════════════════════════════════════════════════════════════ */
@@ -5027,14 +5092,9 @@ html, body {
   .svc-btn { min-height: 36px; padding: 6px 14px; font-size: 12px; }
   .svc-group-header { margin-bottom: 6px; }
 
-  /* Version dropdown: use absolute on mobile (modal is full-screen, no clip) */
+  /* Version dropdown: hidden on mobile (replaced by action sheet) */
   .svc-ver-dropdown {
-    position: absolute !important;
-    top: calc(100% + 4px) !important;
-    right: 0 !important;
-    left: auto !important;
-    min-width: 200px;
-    max-height: 180px;
+    display: none !important;
   }
 
   /* Marketplace: 2-column grid */
