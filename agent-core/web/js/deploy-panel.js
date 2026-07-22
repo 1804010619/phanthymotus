@@ -361,11 +361,10 @@ function _svcRowHTML({ item, id, s, latestTag, currentTag, hasUpdate }) {
 function _renderMarketplace() {
   const q = (document.getElementById('marketplace-search')?.value || '').trim().toLowerCase();
 
-  // Merge all non-core categories for the marketplace
+  // Merge driver + perception for marketplace (core is managed in My Services only)
   const allItems = [
     ...(_catalog.driver || []).map(it => ({ ...it, _cat: 'driver' })),
     ...(_catalog.perception || []).map(it => ({ ...it, _cat: 'perception' })),
-    ...(_catalog.core || []).map(it => ({ ...it, _cat: 'core' })),
   ];
 
   // Build provider list for filter chips
