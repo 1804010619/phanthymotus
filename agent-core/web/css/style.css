@@ -5166,14 +5166,19 @@ html, body {
   /* My Services: rows stack actions */
   .svc-row {
     flex-wrap: wrap;
-    gap: 8px;
+    gap: 6px;
     padding: 10px 12px;
   }
+  .svc-row-dot {
+    order: 0;
+    align-self: center;
+    margin-right: 4px;
+  }
   .svc-row-info {
-    flex-basis: 100%;
+    flex: 1;
+    min-width: 0;
     order: 1;
   }
-  .svc-row-dot { order: 0; }
   .svc-row-actions {
     order: 2;
     flex-basis: 100%;
