@@ -4998,6 +4998,64 @@ html, body {
   .deploy-confirm-item-versions { flex-wrap: wrap; }
   .deploy-confirm-tag { font-size: 11px; word-break: break-all; max-width: 100%; }
 
+  /* ── Deploy modal: mobile adaptations ── */
+  .deploy-tabs { padding: 0 16px; }
+  .deploy-tab { padding: 10px 14px; font-size: 14px; min-height: 44px; }
+  .deploy-tab-pane { padding: 16px; max-height: calc(100vh - 180px); }
+
+  .deploy-channel-selector { margin-right: 8px; }
+  .deploy-channel-label { display: none; }
+  .deploy-channel-select { font-size: 11px; padding: 4px 6px; }
+
+  /* My Services: rows stack actions */
+  .svc-row {
+    flex-wrap: wrap;
+    gap: 8px;
+    padding: 10px 12px;
+  }
+  .svc-row-info {
+    flex-basis: 100%;
+    order: 1;
+  }
+  .svc-row-dot { order: 0; }
+  .svc-row-actions {
+    order: 2;
+    flex-basis: 100%;
+    flex-wrap: wrap;
+    padding-left: 20px;
+  }
+  .svc-btn { min-height: 36px; padding: 6px 14px; font-size: 12px; }
+  .svc-group-header { margin-bottom: 6px; }
+
+  /* Version dropdown: use absolute on mobile (modal is full-screen, no clip) */
+  .svc-ver-dropdown {
+    position: absolute !important;
+    top: calc(100% + 4px) !important;
+    right: 0 !important;
+    left: auto !important;
+    min-width: 200px;
+    max-height: 180px;
+  }
+
+  /* Marketplace: 2-column grid */
+  .marketplace-grid {
+    grid-template-columns: repeat(2, 1fr);
+    gap: 8px;
+  }
+  .mp-card { padding: 16px 10px 14px; }
+  .mp-card-name { font-size: 13px; }
+  .mp-install-btn { min-height: 36px; padding: 6px 12px; }
+  .marketplace-search-bar input { min-height: 40px; font-size: 14px; }
+  .marketplace-filters { gap: 6px; }
+  .mp-chip { min-height: 32px; padding: 6px 12px; font-size: 12px; }
+
+  /* Marketplace version dropdown */
+  .mp-versions {
+    min-width: 160px;
+    max-height: 160px;
+  }
+  .mp-version-opt { padding: 10px 12px; min-height: 40px; }
+
   /* ── Touch targets ── */
   .topbar-btn,
   .btn-ghost { min-height: 44px; padding: 10px 14px; }
