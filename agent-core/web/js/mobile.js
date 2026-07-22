@@ -97,6 +97,9 @@ function _switchTab(tab) {
   closeSidebarMobile();
   _closeLogDrawer();
 
+  // Close any open modal overlays
+  document.querySelectorAll('.modal-overlay:not(.hidden)').forEach(o => o.classList.add('hidden'));
+
   // Sidebar fab: only in configure
   const sidebarFab = document.getElementById('mobile-sidebar-fab');
   if (sidebarFab) {
