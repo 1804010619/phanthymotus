@@ -526,8 +526,9 @@ class Event:
 
                 # 性能追踪：记录工具完成
                 _t_after = time.time()
-                # 工具 span 名称：mcp__mcp-123__tool_name → tool_name
-                _span_name = name.split('__')[-1] if name.startswith('mcp__') else name
+                # 工具 span 名称：mcp__mcp-123__tool_name → tool:tool_name
+                _short = name.split('__')[-1] if name.startswith('mcp__') else name
+                _span_name = f'tool:{_short}'
                 _spans.append({'span': _span_name, 'component': 'core',
                                'start_ts': _t_before, 'end_ts': _t_after})
 

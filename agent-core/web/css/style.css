@@ -5675,13 +5675,84 @@ html, body {
   white-space: nowrap;
 }
 .perf-row-bar {
+  display: none;
+}
+/* Gantt chart */
+.perf-gantt {
+  display: grid;
+  grid-template-columns: auto 1fr auto;
+  gap: 3px 6px;
+  align-items: center;
+  padding: 6px 0;
+}
+.perf-gantt-row {
+  display: contents;
+}
+.perf-gantt-label {
+  font-size: 0.68rem;
+  color: var(--text-dim);
+  text-align: right;
+  white-space: nowrap;
+}
+.perf-gantt-track {
   position: relative;
-  height: 16px;
+  height: 14px;
+  width: 100%;
+  background: var(--bg-3);
   border-radius: 3px;
   overflow: hidden;
+}
+.perf-gantt-bar {
+  position: absolute;
+  top: 0;
+  height: 100%;
+  border-radius: 3px;
+  min-width: 3px;
+  transition: opacity 0.15s;
+}
+.perf-gantt-bar:hover {
+  opacity: 0.8;
+  box-shadow: 0 0 0 1px rgba(255,255,255,0.6);
+}
+.perf-gantt-dur {
+  font-size: 0.68rem;
+  font-family: var(--font-mono);
+  color: var(--text-dim);
+  min-width: 45px;
+  text-align: left;
+}
+.perf-row-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  cursor: pointer;
+  padding: 6px 4px;
+  border-radius: 4px;
+}
+.perf-row-header:hover {
+  background: var(--bg-2);
+}
+.perf-row-chips {
+  display: flex;
+  gap: 4px;
   flex: 1;
   min-width: 0;
-  background: var(--bg-3);
+  overflow: hidden;
+}
+.perf-chip {
+  font-size: 0.65rem;
+  padding: 1px 6px;
+  border-radius: 3px;
+  color: #fff;
+  white-space: nowrap;
+  opacity: 0.85;
+}
+.perf-row-group .perf-gantt {
+  display: none;
+}
+.perf-row-group.expanded .perf-gantt {
+  display: grid;
+  padding: 8px 0;
 }
 .perf-span-seg {
   position: absolute;
@@ -5735,7 +5806,7 @@ html, body {
 }
 .perf-row-detail {
   display: none;
-  padding: 6px 12px 10px 190px;
+  padding: 6px 12px 10px 12px;
 }
 .perf-row-group.expanded .perf-row-detail {
   display: block;
@@ -5744,16 +5815,26 @@ html, body {
   font-size: 0.75rem;
   border-collapse: collapse;
   width: 100%;
-  max-width: 360px;
+  max-width: 500px;
 }
+.perf-detail-table th,
 .perf-detail-table td {
-  padding: 3px 8px;
+  padding: 4px 12px;
   border-bottom: 1px solid var(--border);
+}
+.perf-detail-table th {
+  font-weight: 500;
+  color: var(--text-dim);
+  text-align: right;
+}
+.perf-detail-table th:first-child {
+  text-align: left;
 }
 .perf-detail-val {
   font-family: var(--font-mono);
   text-align: right;
   color: var(--text);
+  min-width: 60px;
 }
 .perf-detail-tools {
   font-size: 0.68rem;

@@ -162,7 +162,17 @@ def aggregate(start: float = 0, end: float = 0) -> dict:
         ).fetchone()
         p95_ms = p95_row[0] if p95_row else avg_ms
 
-        by_span[span_name] = {'avg_ms': avg_ms, 'p95_ms': p95_ms, 'count': cnt}
+        # 平均开始偏移（相对于每个 trace 中最早 span 的 start_ts）
+        offset_row = conn.execute(
+            f'''SELECT AVG((s.start_ts - t_min.min_start) * 1000) FROM perf_spans s
+                INNER JOIN (SELECT trace_id, MIN(start_ts) as min_start FROM perf_spans GROUP BY trace_id) t_min
+                ON s.trace_id = t_min.trace_id
+                {where} AND s.span = ?''',
+            params + [span_name],
+        ).fetchone()
+        avg_offset_ms = int(offset_row[0]) if offset_row and offset_row[0] else 0
+
+        by_span[span_name] = {'avg_ms': avg_ms, 'p95_ms': p95_ms, 'count': cnt, 'avg_offset_ms': avg_offset_ms}
 
     conn.close()
     return {'count': turn_count, 'by_span': by_span}

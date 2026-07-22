@@ -227,6 +227,7 @@ class _TTSNode(Node):
                 import time as _time
                 t_start = _time.monotonic()
                 t_start_wall = _time.time()  # wall-clock for perf span
+                t0_wall = None  # wall-clock when playback starts (prebuf complete)
                 total = 0
                 buf   = b''
                 t0    = None  # wall-clock start of playback
@@ -249,6 +250,7 @@ class _TTSNode(Node):
                             if len(prebuf) >= PREBUF_FRAMES:
                                 # Flush pre-buffer and start real-time clock
                                 t0 = _time.monotonic()
+                                t0_wall = _time.time()
                                 for pf in prebuf:
                                     msg = AudioChunk()
                                     msg.header.stamp = self.get_clock().now().to_msg()
@@ -295,19 +297,27 @@ class _TTSNode(Node):
                     msg.data   = list(buf)
                     self._pub.publish(msg)
                 log.info(f"[tts] spoke {len(text)} chars → {total} bytes ({frames_sent} frames) in {_time.monotonic() - t_start:.2f}s")
-                # 上报 TTS perf span
+                # 上报 TTS perf spans（生成 + 播放）
                 try:
                     import json as _json
-                    perf_msg = String()
-                    perf_msg.data = _json.dumps({
-                        "type": "perf_span",
-                        "span": "tts_synthesis",
-                        "component": "perception",
-                        "start_ts": t_start_wall,
-                        "end_ts": _time.time(),
-                        "meta": {"chars": len(text), "frames": frames_sent}
-                    })
-                    self._perf_pub.publish(perf_msg)
+                    t_end_wall = _time.time()
+                    spans = []
+                    if t0_wall:
+                        spans.append({"type": "perf_span", "span": "tts_generate", "component": "perception",
+                                      "start_ts": t_start_wall, "end_ts": t0_wall,
+                                      "meta": {"chars": len(text)}})
+                        spans.append({"type": "perf_span", "span": "tts_playback", "component": "perception",
+                                      "start_ts": t0_wall, "end_ts": t_end_wall,
+                                      "meta": {"frames": frames_sent}})
+                    else:
+                        # 没有 prebuf（极短文本），合并为一个 span
+                        spans.append({"type": "perf_span", "span": "tts_generate", "component": "perception",
+                                      "start_ts": t_start_wall, "end_ts": t_end_wall,
+                                      "meta": {"chars": len(text), "frames": frames_sent}})
+                    for sp in spans:
+                        perf_msg = String()
+                        perf_msg.data = _json.dumps(sp)
+                        self._perf_pub.publish(perf_msg)
                 except Exception:
                     pass
             except Exception as e:
