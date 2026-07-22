@@ -166,10 +166,12 @@ function _renderMyServices() {
     ...(_catalog.perception || []).map(it => ({ ...it, _cat: 'perception' })),
   ];
 
-  // Only show items that have been deployed (have a status entry)
+  // Only show items that have actually been deployed (not just synced from catalog)
   const deployed = allItems.filter(item => {
     const id = _driverIdForItem(item, item._cat);
-    return _statuses[id] !== undefined;
+    const s = _statuses[id];
+    if (!s) return false;
+    return s.running || s.last_deploy || item._cat === 'core';
   });
 
   if (deployed.length === 0) {
@@ -369,7 +371,7 @@ function _mpCardHTML(item) {
   const provider = item.provider || '';
   const driverId = _driverIdForItem(item, cat);
   const s = _statuses[driverId];
-  const isInstalled = s !== undefined;
+  const isInstalled = s && (s.running || s.last_deploy);
   const tags = item.tags || [];
   const imageBase = item.full_repo || item.image;
 
