@@ -5615,6 +5615,19 @@ html, body {
 .perf-avg-breakdown {
   margin-top: 4px;
 }
+.perf-avg-detail {
+  margin-top: 12px;
+}
+.perf-avg-detail table {
+  max-width: 400px;
+}
+.perf-avg-detail th {
+  font-size: 0.72rem;
+  color: var(--text-dim);
+  text-align: left;
+  padding: 4px 8px;
+  border-bottom: 1px solid var(--border);
+}
 .perf-bar {
   display: flex;
   height: 20px;
@@ -5662,12 +5675,31 @@ html, body {
   white-space: nowrap;
 }
 .perf-row-bar {
-  display: flex;
+  position: relative;
   height: 16px;
   border-radius: 3px;
   overflow: hidden;
   flex: 1;
   min-width: 0;
+  background: var(--bg-3);
+}
+.perf-span-seg {
+  position: absolute;
+  top: 0;
+  height: 100%;
+  border-radius: 2px;
+  min-width: 2px;
+}
+.perf-span-seg:hover {
+  opacity: 0.8;
+  outline: 1px solid rgba(255,255,255,0.6);
+  z-index: 1;
+}
+.perf-detail-meta {
+  font-size: 0.65rem;
+  color: var(--text-dim);
+  max-width: 200px;
+  word-break: break-all;
 }
 .perf-row-total {
   font-size: 0.75rem;

@@ -29,7 +29,7 @@ _busy: bool = False
 
 
 def _extract_perf_timestamps(ev: dict):
-    """从 ASR 事件 JSON 中提取性能时间戳并附加到事件 dict。"""
+    """从 ASR 事件 JSON 中提取性能 span 数据。"""
     text = ev.get('text', '')
     if not text or not text.startswith('{'):
         return
@@ -37,13 +37,27 @@ def _extract_perf_timestamps(ev: dict):
         data = _json.loads(text)
     except (ValueError, TypeError):
         return
-    for key in ('audio_start_ts', 'audio_end_ts', 'asr_complete_ts'):
-        val = data.get(key)
-        if val and val > 1e9:  # only valid unix timestamps
-            ev[f'_perf_{key}'] = val
-    for key in ('audio_duration_ms', 'text_length'):
-        if key in data:
-            ev[f'_perf_{key}'] = data[key]
+
+    # 新格式：perception 直接上报 spans 数组
+    if 'spans' in data:
+        ev['_perf_spans'] = data['spans']
+        return
+
+    # 旧格式兼容：从 audio_start_ts 等字段构造 spans
+    spans = []
+    audio_start = data.get('audio_start_ts')
+    audio_end = data.get('audio_end_ts')
+    asr_complete = data.get('asr_complete_ts')
+
+    if audio_start and audio_start > 1e9 and audio_end and audio_end > 1e9:
+        spans.append({'span': 'vad_collect', 'start_ts': audio_start, 'end_ts': audio_end,
+                      'meta': {'audio_ms': data.get('audio_duration_ms')}})
+    if audio_end and audio_end > 1e9 and asr_complete and asr_complete > 1e9:
+        spans.append({'span': 'asr_inference', 'start_ts': audio_end, 'end_ts': asr_complete,
+                      'meta': {'text_length': data.get('text_length')}})
+
+    if spans:
+        ev['_perf_spans'] = spans
 
 
 def set_busy(busy: bool):
@@ -127,12 +141,10 @@ async def _trigger_loop():
             'ts': batch[-1]['ts'],  # 使用最后一个事件的时间戳
             '_perf_trigger_emit_ts': time.time(),
         }
-        # 传递 ASR 性能时间戳（取 batch 中最后一个含时间戳的事件）
+        # 传递 perception spans（取 batch 中最后一个含 spans 的事件）
         for ev in reversed(batch):
-            if '_perf_audio_start_ts' in ev:
-                for k in ('_perf_audio_start_ts', '_perf_audio_end_ts', '_perf_asr_complete_ts'):
-                    if k in ev:
-                        trigger[k] = ev[k]
+            if '_perf_spans' in ev:
+                trigger['_perf_spans'] = ev['_perf_spans']
                 break
         await _output.put(trigger)
 

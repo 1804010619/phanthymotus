@@ -350,21 +350,24 @@ class Event:
         from uuid import uuid4
         _turn_t0 = _time.perf_counter()
 
-        # 性能追踪
-        _trace = perf_log.PerfTrace(
-            turn_id=str(uuid4()),
-            llm_start_ts=time.time(),
-            audio_start_ts=trigger_event.get('_perf_audio_start_ts'),
-            audio_end_ts=trigger_event.get('_perf_audio_end_ts'),
-            asr_complete_ts=trigger_event.get('_perf_asr_complete_ts'),
-            trigger_emit_ts=trigger_event.get('_perf_trigger_emit_ts'),
-            collector_receive_ts=trigger_event.get('ts'),
-            source=trigger_event.get('source', ''),
-            trigger_text=trigger_event.get('text', '')[:100],
-            audio_duration_ms=trigger_event.get('_perf_audio_duration_ms'),
-            text_length=trigger_event.get('_perf_text_length'),
-        )
+        # 性能追踪（开放 span 式）
+        _trace_id = str(uuid4())
+        _turn_start_ts = time.time()
+        _spans = []  # 收集所有 span
         _tool_names_collected = []
+
+        # 从 trigger_event 中提取 perception 上报的 spans
+        _perf_spans_from_perception = trigger_event.get('_perf_spans', [])
+        for ps in _perf_spans_from_perception:
+            ps['component'] = ps.get('component', 'perception')
+            _spans.append(ps)
+
+        # collector_wait span
+        _collector_receive = trigger_event.get('ts')
+        _trigger_emit = trigger_event.get('_perf_trigger_emit_ts')
+        if _collector_receive and _trigger_emit:
+            _spans.append({'span': 'collector_wait', 'component': 'core',
+                           'start_ts': _collector_receive, 'end_ts': _trigger_emit})
 
         # Log incoming event
         print(f'[decision] received event: source={trigger_event.get("source", "?")} text={trigger_event.get("text", "")[:100]}')
@@ -438,6 +441,7 @@ class Event:
 
             # ── 调用 LLM（含上下文溢出恢复）───────────────────────────────
             _round_t0 = _time.perf_counter()
+            _round_start_ts = time.time()
             try:
                 response = await client.llm(
                     message_list = messages,
@@ -477,6 +481,9 @@ class Event:
 
             # Log LLM response
             _round_elapsed = _time.perf_counter() - _round_t0
+            _round_end_ts = time.time()
+            _spans.append({'span': f'llm_round_{round_idx}', 'component': 'core',
+                           'start_ts': _round_start_ts, 'end_ts': _round_end_ts})
             resp_text = (response.get('content') or '')[:200]
             resp_tools = []
             for c in (response.get('tool_calls') or []):
@@ -502,11 +509,6 @@ class Event:
 
                 # 性能追踪：记录工具时间
                 _t_before = time.time()
-                if _trace.tool_start_ts is None:
-                    _trace.tool_start_ts = _t_before
-                _is_tts = ('tts' in name.lower() or 'speaker' in name.lower())
-                if _is_tts:
-                    _trace.tts_start_ts = _t_before
                 _tool_names_collected.append(name)
 
                 await push_event({
@@ -524,9 +526,8 @@ class Event:
 
                 # 性能追踪：记录工具完成
                 _t_after = time.time()
-                _trace.tool_end_ts = _t_after
-                if _is_tts:
-                    _trace.tts_end_ts = _t_after
+                _spans.append({'span': f'tool:{name}', 'component': 'core',
+                               'start_ts': _t_before, 'end_ts': _t_after})
 
                 await push_event({
                     'type':    'mcp_result',
@@ -604,12 +605,16 @@ class Event:
         _turn_elapsed = _time.perf_counter() - _turn_t0
         print(f'[decision] turn complete: {_turn_elapsed:.2f}s total, {round_idx + 1} rounds')
 
-        # 性能追踪：提交记录
-        _trace.llm_end_ts = time.time()
-        _trace.turn_end_ts = _trace.llm_end_ts
-        _trace.round_count = round_idx + 1
-        _trace.tool_names = _tool_names_collected
+        # 性能追踪：提交 spans
+        _turn_end_ts = time.time()
+        _spans.append({'span': 'turn_total', 'component': 'core',
+                       'start_ts': _turn_start_ts, 'end_ts': _turn_end_ts})
         try:
-            perf_log.commit(_trace)
+            perf_log.commit_spans(
+                trace_id=_trace_id,
+                spans=_spans,
+                source=trigger_event.get('source', ''),
+                trigger_text=trigger_event.get('text', '')[:100],
+            )
         except Exception as _pe:
             print(f'[perf_log] commit error: {_pe}')

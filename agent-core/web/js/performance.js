@@ -1,17 +1,20 @@
 /**
- * performance.js — 性能分析 Dashboard
- *
- * 展示每次 turn 各阶段耗时的瀑布图、趋势和聚合统计。
+ * performance.js — 性能分析 Dashboard（开放 Span 式）
  */
 
-const STAGE_COLORS = {
-  vad:       { color: '#6366f1', label: 'VAD' },
-  asr:       { color: '#8b5cf6', label: 'ASR' },
-  collector: { color: '#94a3b8', label: '调度' },
-  llm:       { color: '#f59e0b', label: 'LLM' },
-  tool:      { color: '#10b981', label: '工具' },
-  tts:       { color: '#06b6d4', label: 'TTS' },
+const COMPONENT_COLORS = {
+  perception: { base: '#8b5cf6', shades: ['#6366f1', '#8b5cf6', '#a78bfa'] },
+  core:       { base: '#f59e0b', shades: ['#f59e0b', '#d97706', '#b45309'] },
+  driver:     { base: '#10b981', shades: ['#10b981', '#059669', '#047857'] },
 };
+
+function _spanColor(span, component) {
+  const colors = COMPONENT_COLORS[component] || COMPONENT_COLORS.core;
+  // Vary shade by span name hash
+  let h = 0;
+  for (let i = 0; i < span.length; i++) h = ((h << 5) - h + span.charCodeAt(i)) | 0;
+  return colors.shades[Math.abs(h) % colors.shades.length];
+}
 
 let _refreshTimer = null;
 let _currentRange = '24h';
@@ -20,22 +23,13 @@ export function initPerformance() {
   const overlay = document.getElementById('performance-overlay');
   if (!overlay) return;
 
-  // Close button
   document.getElementById('performance-close')?.addEventListener('click', _close);
-  overlay.addEventListener('click', (e) => {
-    if (e.target === overlay) _close();
-  });
-
-  // Range selector
+  overlay.addEventListener('click', (e) => { if (e.target === overlay) _close(); });
   document.getElementById('perf-range')?.addEventListener('change', (e) => {
     _currentRange = e.target.value;
     _load();
   });
-
-  // Refresh button
   document.getElementById('perf-refresh')?.addEventListener('click', _load);
-
-  // Settings dropdown trigger
   document.getElementById('btn-performance')?.addEventListener('click', _open);
 }
 
@@ -47,30 +41,26 @@ function _open() {
 
 function _close() {
   document.getElementById('performance-overlay')?.classList.add('hidden');
-  if (_refreshTimer) {
-    clearInterval(_refreshTimer);
-    _refreshTimer = null;
-  }
+  if (_refreshTimer) { clearInterval(_refreshTimer); _refreshTimer = null; }
 }
 
 function _rangeToTs() {
   const now = Date.now() / 1000;
   const map = { '1h': 3600, '6h': 21600, '24h': 86400, '7d': 604800 };
-  const offset = map[_currentRange] || 86400;
-  return { start: now - offset, end: 0 };
+  return { start: now - (map[_currentRange] || 86400), end: 0 };
 }
 
 async function _load() {
   const { start, end } = _rangeToTs();
   try {
-    const [turnsRes, aggRes] = await Promise.all([
-      fetch(`/api/performance/latest?n=50`),
+    const [latestRes, aggRes] = await Promise.all([
+      fetch('/api/performance/latest?n=50'),
       fetch(`/api/performance/aggregate?start=${start}&end=${end}`),
     ]);
-    const turns = await turnsRes.json();
+    const latest = await latestRes.json();
     const agg = await aggRes.json();
     _renderSummary(agg);
-    _renderWaterfall(Array.isArray(turns) ? turns : (turns.turns || []));
+    _renderWaterfall(Array.isArray(latest) ? latest : []);
   } catch (e) {
     console.error('[performance] load error:', e);
   }
@@ -85,8 +75,8 @@ function _renderSummary(agg) {
     return;
   }
 
-  const avg = agg.avg || {};
-  const p95 = agg.p95 || {};
+  const bySpan = agg.by_span || {};
+  const spanNames = Object.keys(bySpan);
 
   el.innerHTML = `
     <div class="perf-cards">
@@ -94,50 +84,33 @@ function _renderSummary(agg) {
         <div class="perf-card-value">${agg.count}</div>
         <div class="perf-card-label">总轮次</div>
       </div>
-      <div class="perf-card">
-        <div class="perf-card-value">${_fmtMs(avg.total_duration_ms)}</div>
+      ${bySpan['turn_total'] ? `<div class="perf-card">
+        <div class="perf-card-value">${_fmtMs(bySpan['turn_total'].avg_ms)}</div>
         <div class="perf-card-label">平均总耗时</div>
       </div>
       <div class="perf-card">
-        <div class="perf-card-value">${_fmtMs(p95.total_duration_ms)}</div>
+        <div class="perf-card-value">${_fmtMs(bySpan['turn_total'].p95_ms)}</div>
         <div class="perf-card-label">P95 总耗时</div>
-      </div>
-      <div class="perf-card">
-        <div class="perf-card-value">${_fmtMs(avg.llm_duration_ms)}</div>
-        <div class="perf-card-label">平均 LLM</div>
-      </div>
+      </div>` : ''}
     </div>
-    <div class="perf-legend">
-      ${Object.values(STAGE_COLORS).map(s =>
-        `<span class="perf-legend-item"><span class="perf-legend-dot" style="background:${s.color}"></span>${s.label}</span>`
-      ).join('')}
-    </div>
-    <div class="perf-avg-breakdown">
-      ${_renderBreakdownBar(avg)}
+    <div class="perf-avg-detail">
+      <table class="perf-detail-table">
+        <thead><tr><th>阶段</th><th>平均</th><th>P95</th><th>次数</th></tr></thead>
+        <tbody>
+          ${spanNames.filter(n => n !== 'turn_total').map(name => {
+            const s = bySpan[name];
+            const color = _spanColor(name, name.startsWith('vad') || name.startsWith('asr') || name.startsWith('kws') || name.startsWith('tts') ? 'perception' : 'core');
+            return `<tr>
+              <td><span class="perf-legend-dot" style="background:${color}"></span> ${name}</td>
+              <td class="perf-detail-val">${_fmtMs(s.avg_ms)}</td>
+              <td class="perf-detail-val">${_fmtMs(s.p95_ms)}</td>
+              <td class="perf-detail-val">${s.count}</td>
+            </tr>`;
+          }).join('')}
+        </tbody>
+      </table>
     </div>
   `;
-}
-
-function _renderBreakdownBar(avg) {
-  const stages = [
-    { key: 'vad_duration_ms', ...STAGE_COLORS.vad },
-    { key: 'asr_duration_ms', ...STAGE_COLORS.asr },
-    { key: 'collector_delay_ms', ...STAGE_COLORS.collector },
-    { key: 'llm_duration_ms', ...STAGE_COLORS.llm },
-    { key: 'tool_duration_ms', ...STAGE_COLORS.tool },
-    { key: 'tts_duration_ms', ...STAGE_COLORS.tts },
-  ];
-  const total = stages.reduce((s, st) => s + (avg[st.key] || 0), 0);
-  if (total === 0) return '';
-
-  const segments = stages
-    .filter(st => avg[st.key] > 0)
-    .map(st => {
-      const pct = ((avg[st.key] / total) * 100).toFixed(1);
-      return `<div class="perf-bar-segment" style="width:${pct}%;background:${st.color}" title="${st.label}: ${avg[st.key]}ms (${pct}%)"></div>`;
-    }).join('');
-
-  return `<div class="perf-bar">${segments}</div>`;
 }
 
 function _renderWaterfall(turns) {
@@ -149,37 +122,36 @@ function _renderWaterfall(turns) {
     return;
   }
 
-  // 找出最大 total 用于归一化
-  const maxTotal = Math.max(...turns.map(t => t.total_duration_ms || 1));
-
   const rows = turns.map((t, idx) => {
-    const stages = [
-      { key: 'vad_duration_ms', ...STAGE_COLORS.vad },
-      { key: 'asr_duration_ms', ...STAGE_COLORS.asr },
-      { key: 'collector_delay_ms', ...STAGE_COLORS.collector },
-      { key: 'llm_duration_ms', ...STAGE_COLORS.llm },
-      { key: 'tool_duration_ms', ...STAGE_COLORS.tool },
-      { key: 'tts_duration_ms', ...STAGE_COLORS.tts },
-    ];
-    const rowTotal = stages.reduce((s, st) => s + (t[st.key] || 0), 0);
-    const barWidth = rowTotal > 0 ? ((rowTotal / maxTotal) * 100).toFixed(1) : 0;
-
-    const segments = stages
-      .filter(st => t[st.key] > 0)
-      .map(st => {
-        const pct = ((t[st.key] / rowTotal) * 100).toFixed(1);
-        return `<div class="perf-bar-segment" style="width:${pct}%;background:${st.color}" title="${st.label}: ${t[st.key]}ms"></div>`;
-      }).join('');
-
+    const spans = t.spans || [];
+    const totalMs = t.total_duration_ms || 0;
     const timeStr = new Date(t.created_at * 1000).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
-    const text = (t.trigger_text || '').slice(0, 30);
-    const totalStr = _fmtMs(t.total_duration_ms);
+    const text = (t.trigger_text || '').replace(/<[^>]*>/g, '').slice(0, 30);
 
-    // 详情展开区域
-    const detailRows = stages
-      .map(st => `<tr><td><span class="perf-legend-dot" style="background:${st.color}"></span> ${st.label}</td><td class="perf-detail-val">${_fmtMs(t[st.key])}</td></tr>`)
-      .join('');
-    const toolNames = (t.tool_names || []).join(', ') || '-';
+    // Build waterfall bar from spans (use relative positions)
+    let barHtml = '';
+    if (spans.length && totalMs > 0) {
+      const minStart = Math.min(...spans.map(s => s.start_ts).filter(Boolean));
+      const totalSec = totalMs / 1000;
+      barHtml = spans.map(s => {
+        if (!s.duration_ms || !s.start_ts) return '';
+        const left = ((s.start_ts - minStart) / totalSec * 100).toFixed(1);
+        const width = (s.duration_ms / totalMs * 100).toFixed(1);
+        const color = _spanColor(s.span, s.component);
+        return `<div class="perf-span-seg" style="left:${left}%;width:${width}%;background:${color}" title="${s.span}: ${s.duration_ms}ms"></div>`;
+      }).join('');
+    }
+
+    // Detail rows
+    const detailRows = spans.map(s => {
+      const color = _spanColor(s.span, s.component);
+      const meta = s.meta && Object.keys(s.meta).length ? JSON.stringify(s.meta) : '';
+      return `<tr>
+        <td><span class="perf-legend-dot" style="background:${color}"></span> ${s.span}</td>
+        <td class="perf-detail-val">${_fmtMs(s.duration_ms)}</td>
+        <td class="perf-detail-val perf-detail-meta">${meta}</td>
+      </tr>`;
+    }).join('');
 
     return `
       <div class="perf-row-group" data-idx="${idx}">
@@ -188,19 +160,16 @@ function _renderWaterfall(turns) {
             <span class="perf-row-time">${timeStr}</span>
             <span class="perf-row-text" title="${t.trigger_text || ''}">${text}</span>
           </div>
-          <div class="perf-row-bar" style="width:${barWidth}%">
-            ${segments}
+          <div class="perf-row-bar">
+            ${barHtml}
           </div>
-          <span class="perf-row-total">${totalStr}</span>
+          <span class="perf-row-total">${_fmtMs(totalMs)}</span>
           <span class="perf-row-expand">▸</span>
         </div>
         <div class="perf-row-detail">
           <table class="perf-detail-table">
+            <thead><tr><th>Span</th><th>耗时</th><th>元数据</th></tr></thead>
             <tbody>${detailRows}</tbody>
-            <tr><td>语音时长</td><td class="perf-detail-val">${_fmtMs(t.audio_duration_ms)}</td></tr>
-            <tr><td>文字长度</td><td class="perf-detail-val">${t.text_length != null ? t.text_length + '字' : '-'}</td></tr>
-            <tr><td>轮次</td><td class="perf-detail-val">${t.round_count || '-'}</td></tr>
-            <tr><td>工具</td><td class="perf-detail-val perf-detail-tools">${toolNames}</td></tr>
           </table>
         </div>
       </div>
