@@ -1923,15 +1923,13 @@ html, body {
 .svc-ver-wrap { position: relative; }
 .svc-btn-ver { color: var(--text-muted); }
 .svc-ver-dropdown {
-  position: absolute;
-  top: calc(100% + 6px);
-  right: 0;
+  position: fixed;
   min-width: 240px;
   background: var(--bg-card);
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);
   box-shadow: var(--shadow-lg);
-  z-index: 9999;
+  z-index: 10000;
   max-height: 220px;
   overflow-y: auto;
   overflow-x: hidden;

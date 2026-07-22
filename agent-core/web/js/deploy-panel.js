@@ -247,8 +247,22 @@ function _renderMyServices() {
       const dd = wrap.querySelector('.svc-ver-dropdown');
       const wasHidden = dd.classList.contains('hidden');
       // Close all others
-      container.querySelectorAll('.svc-ver-dropdown').forEach(d => d.classList.add('hidden'));
-      if (wasHidden) dd.classList.remove('hidden');
+      document.querySelectorAll('.svc-ver-dropdown').forEach(d => d.classList.add('hidden'));
+      if (wasHidden) {
+        // Position fixed relative to button
+        const rect = btn.getBoundingClientRect();
+        dd.classList.remove('hidden');
+        const ddHeight = dd.offsetHeight;
+        // Prefer dropping up if near bottom, else drop down
+        const spaceBelow = window.innerHeight - rect.bottom;
+        if (spaceBelow < ddHeight + 10) {
+          dd.style.top = (rect.top - ddHeight - 4) + 'px';
+        } else {
+          dd.style.top = (rect.bottom + 4) + 'px';
+        }
+        dd.style.right = (window.innerWidth - rect.right) + 'px';
+        dd.style.left = '';
+      }
     });
   });
   container.querySelectorAll('.svc-ver-opt').forEach(opt => {
