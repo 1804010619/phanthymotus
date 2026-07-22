@@ -304,7 +304,7 @@ function _svcRowHTML({ item, id, s, latestTag, currentTag, hasUpdate }) {
     const versionOpts = tags.map(t => {
       const fullImg = t.imageRef || (imageBase + ':' + t.tag);
       const isCurrent = currentTag && t.tag === currentTag;
-      const ch = _channelLabel(t.tag);
+      const ch = _channelLabel(t.channel);
       return `<div class="svc-ver-opt${isCurrent ? ' current' : ''}" data-driver-id="${id}" data-full-image="${fullImg}" data-tag="${t.tag}" data-label="${label}">
         <span class="svc-ver-tag">${t.tag}</span>
         ${ch ? `<span class="svc-ver-channel">${ch}</span>` : ''}
@@ -675,10 +675,10 @@ function _driverIdForItem(item, category) {
   return item.image;
 }
 
-function _channelLabel(tag) {
-  if (tag.startsWith('ga.')) return 'Stable';
-  if (tag.startsWith('release.')) return 'Release';
-  if (tag.startsWith('preview.')) return 'Preview';
+function _channelLabel(channel) {
+  if (channel === 'ga') return 'Stable';
+  if (channel === 'release') return 'Release';
+  if (channel === 'preview') return 'Preview';
   return '';
 }
 
