@@ -23,23 +23,28 @@ def _get_conn():
 
 
 def commit_spans(trace_id: str, spans: list[dict], source: str = '', trigger_text: str = ''):
-    """写入一组 spans 到 perf_spans 表，同时写 perf_turns 索引。"""
+    """写入一组 spans 到 perf_spans 表，同时写/更新 perf_turns 索引。"""
     if not spans:
         return
     now = time.time()
     conn = _get_conn()
 
-    # 计算 total_duration
-    starts = [s['start_ts'] for s in spans if s.get('start_ts') and s['start_ts'] > 1e9]
-    ends = [s['end_ts'] for s in spans if s.get('end_ts') and s['end_ts'] > 1e9]
-    total_ms = int((max(ends) - min(starts)) * 1000) if starts and ends else None
+    # 检查 turn 是否已存在（TTS 等异步 span 会后到）
+    existing = conn.execute(
+        'SELECT id FROM perf_turns WHERE turn_id=?', (trace_id,)
+    ).fetchone()
 
-    # 写 perf_turns 索引
-    conn.execute(
-        '''INSERT INTO perf_turns (turn_id, created_at, source, trigger_text, total_duration_ms)
-           VALUES (?, ?, ?, ?, ?)''',
-        (trace_id, now, source, trigger_text[:200], total_ms),
-    )
+    if not existing:
+        # 计算 total_duration
+        starts = [s['start_ts'] for s in spans if s.get('start_ts') and s['start_ts'] > 1e9]
+        ends = [s['end_ts'] for s in spans if s.get('end_ts') and s['end_ts'] > 1e9]
+        total_ms = int((max(ends) - min(starts)) * 1000) if starts and ends else None
+        # 新建 perf_turns 记录
+        conn.execute(
+            '''INSERT INTO perf_turns (turn_id, created_at, source, trigger_text, total_duration_ms)
+               VALUES (?, ?, ?, ?, ?)''',
+            (trace_id, now, source, trigger_text[:200], total_ms),
+        )
 
     # 写 perf_spans
     for s in spans:

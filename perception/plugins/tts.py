@@ -167,6 +167,7 @@ class _TTSNode(Node):
         self._stop_event   = threading.Event()
         from audio_msgs.msg import AudioChunk
         self._pub = self.create_publisher(AudioChunk, self._output_topic, _LOW_LAT_QOS)
+        self._perf_pub = self.create_publisher(String, '/perception/perf_spans', _LOW_LAT_QOS)
         if input_topic:
             self._sub = self.create_subscription(String, self._input_topic, self._text_cb, _LOW_LAT_QOS)
         else:
@@ -225,6 +226,7 @@ class _TTSNode(Node):
             try:
                 import time as _time
                 t_start = _time.monotonic()
+                t_start_wall = _time.time()  # wall-clock for perf span
                 total = 0
                 buf   = b''
                 t0    = None  # wall-clock start of playback
@@ -293,6 +295,21 @@ class _TTSNode(Node):
                     msg.data   = list(buf)
                     self._pub.publish(msg)
                 log.info(f"[tts] spoke {len(text)} chars → {total} bytes ({frames_sent} frames) in {_time.monotonic() - t_start:.2f}s")
+                # 上报 TTS perf span
+                try:
+                    import json as _json
+                    perf_msg = String()
+                    perf_msg.data = _json.dumps({
+                        "type": "perf_span",
+                        "span": "tts_synthesis",
+                        "component": "perception",
+                        "start_ts": t_start_wall,
+                        "end_ts": _time.time(),
+                        "meta": {"chars": len(text), "frames": frames_sent}
+                    })
+                    self._perf_pub.publish(perf_msg)
+                except Exception:
+                    pass
             except Exception as e:
                 log.error(f"[tts] synthesis error: {e}", exc_info=True)
 

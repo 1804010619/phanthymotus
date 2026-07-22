@@ -366,7 +366,7 @@ class Event:
         _collector_receive = trigger_event.get('ts')
         _trigger_emit = trigger_event.get('_perf_trigger_emit_ts')
         if _collector_receive and _trigger_emit:
-            _spans.append({'span': 'collector_wait', 'component': 'core',
+            _spans.append({'span': 'event_queue', 'component': 'core',
                            'start_ts': _collector_receive, 'end_ts': _trigger_emit})
 
         # Log incoming event
@@ -526,7 +526,9 @@ class Event:
 
                 # 性能追踪：记录工具完成
                 _t_after = time.time()
-                _spans.append({'span': f'tool:{name}', 'component': 'core',
+                # 工具 span 名称：mcp__mcp-123__tool_name → tool_name
+                _span_name = name.split('__')[-1] if name.startswith('mcp__') else name
+                _spans.append({'span': _span_name, 'component': 'core',
                                'start_ts': _t_before, 'end_ts': _t_after})
 
                 await push_event({

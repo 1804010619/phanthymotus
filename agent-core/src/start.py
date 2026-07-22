@@ -278,6 +278,10 @@ async def lifespan(app):
     topics = config.main.get('event', {}).get('subscribe_topics', [])
     topic_subscriber.start(topics, asyncio.get_event_loop())
 
+    # 订阅 perf_spans topic（用于接收 perception TTS 等异步上报的性能 span）
+    from api.inspection import register_topic_internal
+    await register_topic_internal('/perception/perf_spans', 'data/json', '__perf__')
+
     # 启动 collector（信息整理器）
     collector.start()
 
