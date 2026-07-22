@@ -472,11 +472,11 @@ function _mpCardHTML(item) {
 
   return `
     <div class="mp-card" data-driver-id="${driverId}" data-name="${_escAttr(fullName)}" data-desc="${_escAttr(desc)}" data-provider="${_escAttr(provider)}">
-      <div class="mp-card-body">
-        <div class="mp-card-name">${label}</div>
-        ${provider ? `<div class="mp-card-provider">${provider}</div>` : ''}
-        ${desc ? `<div class="mp-card-desc">${_escHTML(desc)}</div>` : ''}
+      <div class="mp-card-header">
+        <span class="mp-card-name">${label}</span>
+        ${provider ? `<span class="mp-card-provider">${provider}</span>` : ''}
       </div>
+      ${desc ? `<div class="mp-card-desc">${_escHTML(desc)}</div>` : ''}
       <div class="mp-card-action">${installBtn}</div>
       <div class="mp-versions hidden">${versionOpts}</div>
     </div>`;
