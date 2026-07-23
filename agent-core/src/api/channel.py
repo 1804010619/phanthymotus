@@ -93,6 +93,19 @@ async def restart_channel(channel_id: str):
     return {'status': 'ok'}
 
 
+@router.post('/{channel_id}/stop')
+async def stop_channel(channel_id: str):
+    ch = get_channel_config(channel_id)
+    if ch is None:
+        raise fastapi.HTTPException(404, f'Channel not found: {channel_id}')
+    if channel_id in manager._adapters:
+        await manager._adapters[channel_id].stop()
+        del manager._adapters[channel_id]
+    from channel.manager import _update_status
+    _update_status(channel_id, 'stopped')
+    return {'status': 'stopped'}
+
+
 # ── User Management ──────────────────────────────────────────────────────────
 
 @router.get('/users')

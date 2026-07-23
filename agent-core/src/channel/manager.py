@@ -96,8 +96,18 @@ class ChannelManager:
         self._adapters: dict[str, ChannelAdapter] = {}  # channel_id → adapter
         self._active_input_channels: set[str] = set()
         self._active_output_channels: set[str] = set()
-        # Last conversation context per channel (auto-updated on inbound)
-        self._last_context: dict[str, dict] = {}  # channel_id → {chat_id, user_id}
+
+    # ── Persistent conversation context ──────────────────────────────────────
+
+    def _get_last_context(self) -> dict:
+        """Get all channel contexts from persistent storage."""
+        return config.main.get('channel_last_context', {})
+
+    def _set_last_context(self, channel_id: str, chat_id: str, user_id: str):
+        """Persist conversation context for a channel."""
+        ctx = config.main.get('channel_last_context', {})
+        ctx[channel_id] = {'chat_id': chat_id, 'user_id': user_id}
+        config.main['channel_last_context'] = ctx
 
     def sync_from_canvas(self):
         """从 canvas layout 读取 channel_msg_input/output 卡片的 instance config，
@@ -242,11 +252,8 @@ class ChannelManager:
         if user['role'] == 'blocked':
             return  # 静默丢弃
 
-        # 4. Store last conversation context for reply routing
-        self._last_context[msg.channel_id] = {
-            'chat_id': msg.chat_id,
-            'user_id': msg.user_id,
-        }
+        # 4. Store last conversation context for reply routing (persisted)
+        self._set_last_context(msg.channel_id, msg.chat_id, msg.user_id)
 
         # 5. Publish to topic for dashboard and canvas data flow
         from api.inspection import publish_to_topic
@@ -305,7 +312,7 @@ class ChannelManager:
     async def send_to_channel(self, channel_id: str, text: str) -> str:
         """Send a message to a channel using the last known chat context.
         Called by channel_reply tool dispatch."""
-        ctx = self._last_context.get(channel_id)
+        ctx = self._get_last_context().get(channel_id)
         if not ctx:
             return (
                 f'Error: No conversation context for channel "{channel_id}". '
@@ -340,10 +347,11 @@ class ChannelManager:
 
     async def send_to_channel_any(self, text: str) -> str:
         """Send to the most recent channel with conversation context."""
-        if not self._last_context:
+        all_ctx = self._get_last_context()
+        if not all_ctx:
             return 'No active conversation. A user must send a message first.'
         # Use the most recently updated channel
-        channel_id = list(self._last_context.keys())[-1]
+        channel_id = list(all_ctx.keys())[-1]
         return await self.send_to_channel(channel_id, text)
 
     # ── Status ───────────────────────────────────────────────────────────────

@@ -58,6 +58,7 @@ function _renderChannels(channels) {
         <span class="channel-item-status ${ch.status === 'connected' ? 'online' : 'offline'}">${_esc(ch.status)}</span>
       </div>
       <div class="channel-item-actions">
+        <button class="btn-ghost btn-sm" onclick="window._channelStop('${_esc(ch.id)}')">Stop</button>
         <button class="btn-ghost btn-sm" onclick="window._channelRestart('${_esc(ch.id)}')">Restart</button>
         <button class="btn-ghost btn-sm btn-danger" onclick="window._channelDelete('${_esc(ch.id)}')">Delete</button>
       </div>
@@ -190,19 +191,48 @@ async function _submitAdd(formEl) {
 
 // ── Actions ───────────────────────────────────────────────────────────────────
 
-window._channelRestart = async function(id) {
+window._channelStop = async function(id) {
+  const btn = event.target;
+  btn.disabled = true;
+  btn.textContent = 'Stopping…';
   try {
-    await fetch(`/api/channel/${id}/restart`, { method: 'POST' });
-    setTimeout(_loadChannels, 500);
+    const res = await fetch(`/api/channel/${id}/stop`, { method: 'POST' });
+    if (!res.ok) {
+      const j = await res.json().catch(() => ({}));
+      alert(j.detail || `Stop failed (${res.status})`);
+    }
+  } catch (e) {
+    alert('Stop failed: ' + e.message);
+  } finally {
+    setTimeout(_loadChannels, 300);
+  }
+};
+
+window._channelRestart = async function(id) {
+  const btn = event.target;
+  btn.disabled = true;
+  btn.textContent = 'Restarting…';
+  try {
+    const res = await fetch(`/api/channel/${id}/restart`, { method: 'POST' });
+    if (!res.ok) {
+      const j = await res.json().catch(() => ({}));
+      alert(j.detail || `Restart failed (${res.status})`);
+    }
   } catch (e) {
     alert('Restart failed: ' + e.message);
+  } finally {
+    setTimeout(_loadChannels, 500);
   }
 };
 
 window._channelDelete = async function(id) {
   if (!confirm(`Delete channel "${id}"?`)) return;
   try {
-    await fetch(`/api/channel/${id}`, { method: 'DELETE' });
+    const res = await fetch(`/api/channel/${id}`, { method: 'DELETE' });
+    if (!res.ok) {
+      const j = await res.json().catch(() => ({}));
+      alert(j.detail || `Delete failed (${res.status})`);
+    }
     _loadChannels();
   } catch (e) {
     alert('Delete failed: ' + e.message);

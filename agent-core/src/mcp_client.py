@@ -434,7 +434,7 @@ async def _dispatch_internal(mcp_id: str, tool_name: str, args: dict) -> str:
             if not text:
                 return 'Error: "text" field is required.'
             from channel.manager import manager as channel_mgr
-            channels_with_context = list(channel_mgr._last_context.keys())
+            channels_with_context = list(channel_mgr._get_last_context().keys())
             if not channels_with_context:
                 return (
                     'Error: No active conversation context. '
