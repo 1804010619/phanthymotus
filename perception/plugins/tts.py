@@ -195,10 +195,10 @@ class _TTSNode(Node):
         self.state = "idle"
         return {"state": "idle"}
 
-    def enqueue(self, text: str):
+    def enqueue(self, text: str, trace_id: str = ''):
         if self.state != "running":
             raise RuntimeError("TTS not running; call start first")
-        self._text_queue.put(text)
+        self._text_queue.put((text, trace_id))
 
     def _text_cb(self, msg: String):
         if self.state != "running": return
@@ -208,7 +208,7 @@ class _TTSNode(Node):
             text = msg.data.strip()
         if text:
             log.info(f"[tts] received text from topic: {text[:50]}...")
-            self._text_queue.put(text)
+            self._text_queue.put((text, ''))
 
     def _worker(self):
         from audio_msgs.msg import AudioChunk
@@ -220,9 +220,14 @@ class _TTSNode(Node):
 
         while not self._stop_event.is_set():
             try:
-                text = self._text_queue.get(timeout=1)
+                item = self._text_queue.get(timeout=1)
             except queue.Empty:
                 continue
+            # Unpack queue item: (text, trace_id) or plain text for backward compat
+            if isinstance(item, tuple):
+                text, _trace_id = item
+            else:
+                text, _trace_id = item, ''
             try:
                 import time as _time
                 t_start = _time.monotonic()
@@ -302,16 +307,19 @@ class _TTSNode(Node):
                     import json as _json
                     t_end_wall = _time.time()
                     spans = []
+                    _span_base = {"type": "perf_span", "component": "perception"}
+                    if _trace_id:
+                        _span_base["trace_id"] = _trace_id
                     if t0_wall:
-                        spans.append({"type": "perf_span", "span": "tts_generate", "component": "perception",
+                        spans.append({**_span_base, "span": "tts_generate",
                                       "start_ts": t_start_wall, "end_ts": t0_wall,
                                       "meta": {"chars": len(text)}})
-                        spans.append({"type": "perf_span", "span": "tts_playback", "component": "perception",
+                        spans.append({**_span_base, "span": "tts_playback",
                                       "start_ts": t0_wall, "end_ts": t_end_wall,
                                       "meta": {"frames": frames_sent}})
                     else:
                         # 没有 prebuf（极短文本），合并为一个 span
-                        spans.append({"type": "perf_span", "span": "tts_generate", "component": "perception",
+                        spans.append({**_span_base, "span": "tts_generate",
                                       "start_ts": t_start_wall, "end_ts": t_end_wall,
                                       "meta": {"chars": len(text), "frames": frames_sent}})
                     for sp in spans:
@@ -489,7 +497,7 @@ class TTSPlugin:
                     node = self._nodes[node_key]
                 if node.state != "running":
                     node.start()
-            node.enqueue(text)
+            node.enqueue(text, trace_id=args.get('_trace_id', ''))
             return {"status": "queued", "text": text}
 
         elif action == "config":

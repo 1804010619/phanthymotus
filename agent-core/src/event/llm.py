@@ -521,6 +521,7 @@ class Event:
                 if name in self._sys_tools:
                     result = await self._sys_tools[name]['object'](**args)
                 elif name.startswith('mcp__'):
+                    args['_trace_id'] = _trace_id
                     result = await mcp_client.call_tool(name, args)
                 else:
                     result = f'未知工具: {name}'
