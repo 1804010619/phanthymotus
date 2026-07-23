@@ -132,6 +132,9 @@ function _showAddForm() {
 }
 
 async function _submitAdd(formEl) {
+  const submitBtn = document.getElementById('channel-form-submit');
+  if (submitBtn.disabled) return;  // 防止重复提交
+
   const platform = document.getElementById('channel-form-platform').value;
   const id = document.getElementById('channel-form-id').value.trim();
   const token = document.getElementById('channel-form-token').value.trim();
@@ -157,6 +160,12 @@ async function _submitAdd(formEl) {
     config.app_secret = appSecret;
   }
 
+  // 进入 loading 状态
+  submitBtn.disabled = true;
+  submitBtn.classList.add('btn-loading');
+  const originalText = submitBtn.textContent;
+  submitBtn.textContent = '验证中…';
+
   try {
     const res = await fetch('/api/channel/add', {
       method: 'POST',
@@ -172,6 +181,10 @@ async function _submitAdd(formEl) {
     _loadChannels();
   } catch (e) {
     alert('Error: ' + e.message);
+  } finally {
+    submitBtn.disabled = false;
+    submitBtn.classList.remove('btn-loading');
+    submitBtn.textContent = originalText;
   }
 }
 

@@ -2706,6 +2706,21 @@ html, body {
 }
 .btn-primary:hover { opacity: .88; box-shadow: 0 4px 14px var(--accent-glow); }
 .btn-primary:disabled { opacity: .4; cursor: default; box-shadow: none; }
+.btn-loading::before {
+  content: '';
+  display: inline-block;
+  width: 12px;
+  height: 12px;
+  margin-right: 6px;
+  border: 2px solid rgba(255,255,255,0.3);
+  border-top-color: #fff;
+  border-radius: 50%;
+  animation: btnSpin 0.6s linear infinite;
+  vertical-align: middle;
+}
+@keyframes btnSpin {
+  to { transform: rotate(360deg); }
+}
 
 .btn-secondary {
   background: var(--accent-dim);

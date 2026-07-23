@@ -6,6 +6,7 @@ collector.py — 信息整理器。
   - 超过 max_window 的事件 FIFO 丢弃
   - 间隔到达时，将积累的事件批量格式化为 XML 并输出
   - agent loop 通过 next_trigger() 获取下一批格式化事件
+  - priority > 0 的事件立即触发 emit（不等 interval）
 """
 
 import asyncio
@@ -19,6 +20,7 @@ import event_bus
 
 
 _buffer: deque = deque()
+_priority_buffer: deque = deque()  # 高优先级事件（busy 时暂存）
 _output: asyncio.Queue = asyncio.Queue(maxsize=64)
 _task: asyncio.Task | None = None
 # Per-source throttle: source → timestamp of last accepted event
@@ -26,6 +28,28 @@ _last_accepted: dict[str, float] = {}
 _THROTTLE_INTERVAL = 1.0  # 每个 source 最多 1 条/秒
 # Agent loop busy flag — 忙时不发射 trigger，让事件继续积累
 _busy: bool = False
+
+# 根据 source 自动赋 priority 的规则（包含匹配）
+_PRIORITY_SOURCES = {'asr', 'message', 'channel'}
+
+
+def _extract_priority(ev: dict) -> int:
+    """从事件中解析 priority。JSON text 中的 priority 字段优先，否则按 source 匹配。"""
+    text = ev.get('text', '')
+    if text and text.startswith('{'):
+        try:
+            data = _json.loads(text)
+            p = data.get('priority')
+            if p is not None:
+                return int(p)
+        except (ValueError, TypeError):
+            pass
+    # 按 source 名匹配
+    source = ev.get('source', '').lower()
+    for key in _PRIORITY_SOURCES:
+        if key in source:
+            return 1
+    return 0
 
 
 def _extract_perf_timestamps(ev: dict):
@@ -64,6 +88,41 @@ def set_busy(busy: bool):
     """由 agent loop 调用：标记当前是否正在执行 turn。"""
     global _busy
     _busy = busy
+    # turn 结束时，如果有积压的高优先级事件，立即 emit
+    if not busy and _priority_buffer:
+        asyncio.ensure_future(_emit_priority())
+
+
+async def _emit_priority():
+    """立即 emit 优先级 buffer 中的事件。"""
+    if not _priority_buffer:
+        return
+    batch = list(_priority_buffer)
+    _priority_buffer.clear()
+    # 也把普通 buffer 一起带上
+    if _buffer:
+        batch = list(_buffer) + batch
+        _buffer.clear()
+    await _emit_batch(batch)
+
+
+async def _emit_batch(batch: list[dict], urgent: bool = False):
+    """将一批事件格式化并放入 output。"""
+    formatted = _format_batch(batch)
+    trigger = {
+        'source': 'collector',
+        'text': formatted,
+        'payload': {'event_count': len(batch), 'sources': [e['source'] for e in batch]},
+        'ts': batch[-1]['ts'],
+        '_perf_trigger_emit_ts': time.time(),
+        '_urgent': urgent,
+    }
+    # 传递 perception spans
+    for ev in reversed(batch):
+        if '_perf_spans' in ev:
+            trigger['_perf_spans'] = ev['_perf_spans']
+            break
+    await _output.put(trigger)
 
 
 def _get_interval_ms() -> int:
@@ -86,15 +145,18 @@ def _format_batch(events: list[dict]) -> str:
 
 
 async def _drain_loop():
-    """后台任务：持续从 event_bus 消费事件存入 buffer，per-source 限流（1条/秒，保留最新）。"""
+    """后台任务：持续从 event_bus 消费事件存入 buffer，per-source 限流。"""
     max_window = _get_max_window()
     while True:
         ev = await event_bus.dequeue()
         source = ev.get('source', 'unknown')
         now = ev.get('ts', time.time())
 
-        # 尝试从 ASR JSON 事件中提取性能时间戳
+        # 提取性能数据
         _extract_perf_timestamps(ev)
+
+        # 解析优先级
+        priority = _extract_priority(ev)
 
         last_ts = _last_accepted.get(source, 0)
         if now - last_ts < _THROTTLE_INTERVAL:
@@ -104,7 +166,6 @@ async def _drain_loop():
                     _buffer[i] = ev
                     break
             else:
-                # 未找到（极端情况），直接 append
                 _buffer.append(ev)
         else:
             _last_accepted[source] = now
@@ -113,6 +174,17 @@ async def _drain_loop():
         # FIFO 丢弃超过窗口的旧事件
         while len(_buffer) > max_window:
             _buffer.popleft()
+
+        # 高优先级：立即 emit
+        if priority > 0:
+            if not _busy:
+                # 立即 emit 整个 buffer
+                batch = list(_buffer)
+                _buffer.clear()
+                await _emit_batch(batch, urgent=True)
+            else:
+                # busy 时暂存到优先级 buffer（set_busy(False) 时会 emit）
+                _priority_buffer.append(ev)
 
 
 async def _trigger_loop():
@@ -124,29 +196,14 @@ async def _trigger_loop():
         if not _buffer:
             continue
 
-        # 防堆积：agent loop 忙时不发射，让事件继续在 buffer 中积累
+        # 防堆积：agent loop 忙时不发射
         if _busy:
             continue
 
         # 取出当前所有积累的事件
         batch = list(_buffer)
         _buffer.clear()
-
-        formatted = _format_batch(batch)
-        # 构造一个合成的 trigger 对象供 agent loop 使用
-        trigger = {
-            'source': 'collector',
-            'text': formatted,
-            'payload': {'event_count': len(batch), 'sources': [e['source'] for e in batch]},
-            'ts': batch[-1]['ts'],  # 使用最后一个事件的时间戳
-            '_perf_trigger_emit_ts': time.time(),
-        }
-        # 传递 perception spans（取 batch 中最后一个含 spans 的事件）
-        for ev in reversed(batch):
-            if '_perf_spans' in ev:
-                trigger['_perf_spans'] = ev['_perf_spans']
-                break
-        await _output.put(trigger)
+        await _emit_batch(batch)
 
 
 def start():
@@ -161,3 +218,4 @@ def start():
 async def next_trigger() -> dict:
     """阻塞等待下一批格式化事件。返回合成的 trigger event dict。"""
     return await _output.get()
+

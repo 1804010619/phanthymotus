@@ -978,6 +978,7 @@ class _ASRNode(Node):
                           "audio_end_ts": end_ts, "asr_complete_ts": time.time(),
                           "audio_duration_ms": int(len(utterance) / 32),
                           "text_length": len(text),
+                          "priority": 1,
                           "spans": _spans}
                 msg = String(); msg.data = json.dumps(result, ensure_ascii=False)
                 self._pub.publish(msg)
