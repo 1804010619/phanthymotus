@@ -918,13 +918,30 @@ class _ASRNode(Node):
                 continue
             try:
                 wav   = _pcm16_to_wav(utterance)
+
+                # 性能 span 记录
+                _spans = []
+                _t0 = time.time()
                 text  = self._adapter.transcribe(wav, self._language)
+                _spans.append({"span": "asr_transcribe", "component": "perception",
+                               "start_ts": _t0, "end_ts": time.time(),
+                               "meta": {"audio_ms": int(len(utterance) / 32)}})
                 if not text.strip(): continue
 
                 # ASR-based keyword spotting
                 if trigger_mode == 'asr_kws' and keyword_ipa:
+                    _t1 = time.time()
                     text_ipa = _text_to_ipa(text)
+                    _spans.append({"span": "kws_phonemize", "component": "perception",
+                                   "start_ts": _t1, "end_ts": time.time(),
+                                   "meta": {"text": text[:20]}})
+
+                    _t2 = time.time()
                     matched, end_pos = _find_keyword_in_ipa(text_ipa, keyword_ipa, asr_kws_threshold)
+                    _spans.append({"span": "kws_match", "component": "perception",
+                                   "start_ts": _t2, "end_ts": time.time(),
+                                   "meta": {"matched": matched}})
+
                     log.info(f"[asr] asr_kws: text='{text}' ipa={text_ipa} dist_matched={matched} end={end_pos}")
                     if not matched:
                         continue
@@ -937,8 +954,9 @@ class _ASRNode(Node):
 
                 result = {"text": text, "audio_start_ts": start_ts,
                           "audio_end_ts": end_ts, "asr_complete_ts": time.time(),
-                          "audio_duration_ms": int(len(utterance) / 32),  # 16kHz 16bit = 32 bytes/ms
-                          "text_length": len(text)}
+                          "audio_duration_ms": int(len(utterance) / 32),
+                          "text_length": len(text),
+                          "spans": _spans}
                 msg = String(); msg.data = json.dumps(result, ensure_ascii=False)
                 self._pub.publish(msg)
                 log.info(f"[asr] {text!r}")
