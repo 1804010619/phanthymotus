@@ -44,6 +44,11 @@ export function initPerformance() {
     _load();
   });
   document.getElementById('perf-refresh')?.addEventListener('click', _load);
+  document.getElementById('perf-clear')?.addEventListener('click', async () => {
+    if (!confirm('确定清空所有性能数据？')) return;
+    await fetch('/api/performance/clear', { method: 'DELETE' });
+    _load();
+  });
   document.getElementById('btn-performance')?.addEventListener('click', _open);
 }
 
