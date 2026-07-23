@@ -154,8 +154,9 @@ def aggregate(start: float = 0, end: float = 0) -> dict:
         cnt = row[1]
         avg_ms = int(row[2]) if row[2] else 0
 
-        # P95
-        p95_offset = max(0, int(cnt * 0.95) - 1)
+        # P95: index of the 95th percentile value in ascending order
+        import math
+        p95_offset = min(cnt - 1, math.ceil(cnt * 0.95) - 1)
         p95_row = conn.execute(
             f'SELECT duration_ms FROM perf_spans {where} AND span=? ORDER BY duration_ms ASC LIMIT 1 OFFSET ?',
             params + [span_name, p95_offset],

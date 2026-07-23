@@ -85,16 +85,27 @@ class FeishuAdapter(ChannelAdapter):
         print(f'[feishu] adapter started (WebSocket mode): {self.channel_id}')
 
     async def _run(self):
-        """Run the lark WebSocket client in a dedicated thread with its own event loop."""
+        """Run the lark WebSocket client in a dedicated thread.
+
+        The SDK's client.start() uses loop.run_until_complete() which has issues
+        in a sub-thread — tasks created during _connect() may not be properly
+        scheduled. Instead, we use asyncio.run() and manually call the internal
+        methods to ensure the event loop stays running continuously.
+        """
         import threading
+        import lark_oapi.ws.client as ws_mod
+
+        async def _run_ws():
+            ws_mod.loop = asyncio.get_event_loop()
+            await self._client._connect()
+            asyncio.create_task(self._client._ping_loop())
+            # Keep event loop alive (mirrors SDK's _select())
+            while self._running:
+                await asyncio.sleep(1)
 
         def _thread_target():
-            new_loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(new_loop)
             try:
-                import lark_oapi.ws.client as ws_mod
-                ws_mod.loop = new_loop
-                self._client.start()
+                asyncio.run(_run_ws())
             except Exception as e:
                 err_msg = str(e)
                 if 'invalid' in err_msg.lower() and ('app_id' in err_msg.lower() or 'secret' in err_msg.lower()):
@@ -103,10 +114,8 @@ class FeishuAdapter(ChannelAdapter):
                 else:
                     print(f'[feishu] WebSocket connection error: {e}')
                 self._running = False
-            finally:
-                new_loop.close()
 
-        self._thread = threading.Thread(target=_thread_target, daemon=True)
+        self._thread = threading.Thread(target=_thread_target, daemon=True, name='feishu-ws')
         self._thread.start()
 
     async def stop(self) -> None:
