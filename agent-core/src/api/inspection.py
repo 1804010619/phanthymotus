@@ -77,16 +77,23 @@ def _push_factory(topic: str):
                 text = data.decode('utf-8') if isinstance(data, bytes) else data
                 span_data = json.loads(text)
                 if span_data.get('type') == 'perf_span':
-                    # 找到 tool:tts span start_ts 最接近此 span start_ts 的 turn
-                    span_start = span_data.get('start_ts', 0)
-                    conn = config._get_conn()
-                    row = conn.execute(
-                        '''SELECT trace_id FROM perf_spans
-                           WHERE span LIKE 'tool:tts%' AND start_ts <= ?
-                           ORDER BY start_ts DESC LIMIT 1''',
-                        (span_start,)
-                    ).fetchone()
-                    conn.close()
+                    trace_id = span_data.pop('trace_id', None)
+                    if trace_id:
+                        # 直接归属（trace_id 由 agent-core 透传）
+                        perf_log.commit_spans(trace_id, [span_data], source='perception')
+                    else:
+                        # 兼容旧版本 perception: fallback 到时间窗口匹配
+                        span_start = span_data.get('start_ts', 0)
+                        conn = config._get_conn()
+                        row = conn.execute(
+                            '''SELECT trace_id FROM perf_spans
+                               WHERE span LIKE 'tool:tts%' AND start_ts <= ? AND start_ts >= ? - 30
+                               ORDER BY start_ts DESC LIMIT 1''',
+                            (span_start, span_start)
+                        ).fetchone()
+                        conn.close()
+                        if row:
+                            perf_log.commit_spans(row[0], [span_data], source='perception')
                     if row:
                         perf_log.commit_spans(row[0], [span_data], source='perception')
             except Exception:
