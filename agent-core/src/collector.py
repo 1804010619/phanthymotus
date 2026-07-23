@@ -106,7 +106,7 @@ async def _emit_priority():
     await _emit_batch(batch)
 
 
-async def _emit_batch(batch: list[dict]):
+async def _emit_batch(batch: list[dict], urgent: bool = False):
     """将一批事件格式化并放入 output。"""
     formatted = _format_batch(batch)
     trigger = {
@@ -115,6 +115,7 @@ async def _emit_batch(batch: list[dict]):
         'payload': {'event_count': len(batch), 'sources': [e['source'] for e in batch]},
         'ts': batch[-1]['ts'],
         '_perf_trigger_emit_ts': time.time(),
+        '_urgent': urgent,
     }
     # 传递 perception spans
     for ev in reversed(batch):
@@ -180,7 +181,7 @@ async def _drain_loop():
                 # 立即 emit 整个 buffer
                 batch = list(_buffer)
                 _buffer.clear()
-                await _emit_batch(batch)
+                await _emit_batch(batch, urgent=True)
             else:
                 # busy 时暂存到优先级 buffer（set_busy(False) 时会 emit）
                 _priority_buffer.append(ev)

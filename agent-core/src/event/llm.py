@@ -370,7 +370,8 @@ class Event:
                            'start_ts': _collector_receive, 'end_ts': _trigger_emit})
 
         # Log incoming event
-        print(f'[decision] received event: source={trigger_event.get("source", "?")} text={trigger_event.get("text", "")[:100]}')
+        _urgent_tag = ' [URGENT]' if trigger_event.get('_urgent') else ''
+        print(f'[decision] received{_urgent_tag} event: source={trigger_event.get("source", "?")} text={trigger_event.get("text", "")[:100]}')
 
         # 广播触发事件到前端
         await push_event({
