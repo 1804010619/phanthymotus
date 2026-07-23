@@ -40,13 +40,40 @@ _LOW_LAT_QOS = QoSProfile(
 
 # ── IPA phoneme matching for asr_kws mode ────────────────────────────────────
 
+import re as _re
+
+# ── Persistent EspeakBackend instances (avoid 70ms+ re-init per call) ─────────
+_ESPEAK_BACKENDS = {}  # lang -> EspeakBackend instance
+_ESPEAK_SEP = None
+
+
+def _get_espeak_backend(lang):
+    global _ESPEAK_SEP
+    if _ESPEAK_SEP is None:
+        from phonemizer.separator import Separator
+        _ESPEAK_SEP = Separator(phone=' ', word='  ', syllable='')
+    if lang not in _ESPEAK_BACKENDS:
+        from phonemizer.backend import EspeakBackend
+        _ESPEAK_BACKENDS[lang] = EspeakBackend(lang, with_stress=False)
+    return _ESPEAK_BACKENDS[lang]
+
+
+def _phonemize_safe(text: str, lang: str) -> str:
+    """Phonemize with persistent backend; auto-rebuild on failure."""
+    backend = _get_espeak_backend(lang)
+    try:
+        return backend.phonemize([text], separator=_ESPEAK_SEP, strip=True)[0]
+    except Exception:
+        # espeak-ng may have crashed — rebuild backend and retry once
+        _ESPEAK_BACKENDS.pop(lang, None)
+        backend = _get_espeak_backend(lang)
+        return backend.phonemize([text], separator=_ESPEAK_SEP, strip=True)[0]
+
+
 def _text_to_ipa(text: str) -> list:
-    """Convert text to IPA phoneme sequence using phonemizer (espeak-ng backend).
+    """Convert text to IPA phoneme sequence using persistent espeak-ng backend.
     Returns a list of IPA phoneme strings (one per word/character).
     """
-    from phonemizer import phonemize
-    from phonemizer.separator import Separator
-
     # Separate Chinese and non-Chinese segments
     segments = []
     current = ''
@@ -65,17 +92,12 @@ def _text_to_ipa(text: str) -> list:
         segments.append((current.strip(), current_is_cjk))
 
     ipa_seq = []
-    sep = Separator(phone=' ', word='  ', syllable='')
     for seg_text, is_cjk in segments:
         lang = 'cmn' if is_cjk else 'en-us'
         try:
-            ipa = phonemize(seg_text, language=lang, backend='espeak',
-                           separator=sep, strip=True,
-                           with_stress=False, tie=False,
-                           language_switch='remove-flags')
+            ipa = _phonemize_safe(seg_text, lang)
             # Remove tone numbers and diacritics for fuzzy matching
-            import re
-            ipa = re.sub(r'[0-9˥˦˧˨˩¹²³⁴⁵]', '', ipa)
+            ipa = _re.sub(r'[0-9˥˦˧˨˩¹²³⁴⁵]', '', ipa)
             phones = [p for p in ipa.split() if p]
             ipa_seq.extend(phones)
         except Exception:
