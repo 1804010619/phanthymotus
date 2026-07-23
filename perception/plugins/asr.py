@@ -40,13 +40,40 @@ _LOW_LAT_QOS = QoSProfile(
 
 # ── IPA phoneme matching for asr_kws mode ────────────────────────────────────
 
+import re as _re
+
+# ── Persistent EspeakBackend instances (avoid 70ms+ re-init per call) ─────────
+_ESPEAK_BACKENDS = {}  # lang -> EspeakBackend instance
+_ESPEAK_SEP = None
+
+
+def _get_espeak_backend(lang):
+    global _ESPEAK_SEP
+    if _ESPEAK_SEP is None:
+        from phonemizer.separator import Separator
+        _ESPEAK_SEP = Separator(phone=' ', word='  ', syllable='')
+    if lang not in _ESPEAK_BACKENDS:
+        from phonemizer.backend import EspeakBackend
+        _ESPEAK_BACKENDS[lang] = EspeakBackend(lang, with_stress=False)
+    return _ESPEAK_BACKENDS[lang]
+
+
+def _phonemize_safe(text: str, lang: str) -> str:
+    """Phonemize with persistent backend; auto-rebuild on failure."""
+    backend = _get_espeak_backend(lang)
+    try:
+        return backend.phonemize([text], separator=_ESPEAK_SEP, strip=True)[0]
+    except Exception:
+        # espeak-ng may have crashed — rebuild backend and retry once
+        _ESPEAK_BACKENDS.pop(lang, None)
+        backend = _get_espeak_backend(lang)
+        return backend.phonemize([text], separator=_ESPEAK_SEP, strip=True)[0]
+
+
 def _text_to_ipa(text: str) -> list:
-    """Convert text to IPA phoneme sequence using phonemizer (espeak-ng backend).
+    """Convert text to IPA phoneme sequence using persistent espeak-ng backend.
     Returns a list of IPA phoneme strings (one per word/character).
     """
-    from phonemizer import phonemize
-    from phonemizer.separator import Separator
-
     # Separate Chinese and non-Chinese segments
     segments = []
     current = ''
@@ -65,17 +92,12 @@ def _text_to_ipa(text: str) -> list:
         segments.append((current.strip(), current_is_cjk))
 
     ipa_seq = []
-    sep = Separator(phone=' ', word='  ', syllable='')
     for seg_text, is_cjk in segments:
         lang = 'cmn' if is_cjk else 'en-us'
         try:
-            ipa = phonemize(seg_text, language=lang, backend='espeak',
-                           separator=sep, strip=True,
-                           with_stress=False, tie=False,
-                           language_switch='remove-flags')
+            ipa = _phonemize_safe(seg_text, lang)
             # Remove tone numbers and diacritics for fuzzy matching
-            import re
-            ipa = re.sub(r'[0-9˥˦˧˨˩¹²³⁴⁵]', '', ipa)
+            ipa = _re.sub(r'[0-9˥˦˧˨˩¹²³⁴⁵]', '', ipa)
             phones = [p for p in ipa.split() if p]
             ipa_seq.extend(phones)
         except Exception:
@@ -918,13 +940,30 @@ class _ASRNode(Node):
                 continue
             try:
                 wav   = _pcm16_to_wav(utterance)
+
+                # 性能 span 记录
+                _spans = []
+                _t0 = time.time()
                 text  = self._adapter.transcribe(wav, self._language)
+                _spans.append({"span": "asr_transcribe", "component": "perception",
+                               "start_ts": _t0, "end_ts": time.time(),
+                               "meta": {"audio_ms": int(len(utterance) / 32)}})
                 if not text.strip(): continue
 
                 # ASR-based keyword spotting
                 if trigger_mode == 'asr_kws' and keyword_ipa:
+                    _t1 = time.time()
                     text_ipa = _text_to_ipa(text)
+                    _spans.append({"span": "kws_phonemize", "component": "perception",
+                                   "start_ts": _t1, "end_ts": time.time(),
+                                   "meta": {"text": text[:20]}})
+
+                    _t2 = time.time()
                     matched, end_pos = _find_keyword_in_ipa(text_ipa, keyword_ipa, asr_kws_threshold)
+                    _spans.append({"span": "kws_match", "component": "perception",
+                                   "start_ts": _t2, "end_ts": time.time(),
+                                   "meta": {"matched": matched}})
+
                     log.info(f"[asr] asr_kws: text='{text}' ipa={text_ipa} dist_matched={matched} end={end_pos}")
                     if not matched:
                         continue
@@ -937,8 +976,9 @@ class _ASRNode(Node):
 
                 result = {"text": text, "audio_start_ts": start_ts,
                           "audio_end_ts": end_ts, "asr_complete_ts": time.time(),
-                          "audio_duration_ms": int(len(utterance) / 32),  # 16kHz 16bit = 32 bytes/ms
-                          "text_length": len(text)}
+                          "audio_duration_ms": int(len(utterance) / 32),
+                          "text_length": len(text),
+                          "spans": _spans}
                 msg = String(); msg.data = json.dumps(result, ensure_ascii=False)
                 self._pub.publish(msg)
                 log.info(f"[asr] {text!r}")

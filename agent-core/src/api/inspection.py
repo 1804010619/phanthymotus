@@ -73,15 +73,18 @@ def _push_factory(topic: str):
         # 处理 perf_span 类型消息（来自 perception TTS 等组件）
         if topic == '/perception/perf_spans':
             try:
-                import json, perf_log
+                import json, perf_log, config
                 text = data.decode('utf-8') if isinstance(data, bytes) else data
                 span_data = json.loads(text)
                 if span_data.get('type') == 'perf_span':
-                    # 关联到最近的 turn
-                    import config
+                    # 找到 tool:tts span start_ts 最接近此 span start_ts 的 turn
+                    span_start = span_data.get('start_ts', 0)
                     conn = config._get_conn()
                     row = conn.execute(
-                        'SELECT turn_id FROM perf_turns ORDER BY created_at DESC LIMIT 1'
+                        '''SELECT trace_id FROM perf_spans
+                           WHERE span LIKE 'tool:tts%' AND start_ts <= ?
+                           ORDER BY start_ts DESC LIMIT 1''',
+                        (span_start,)
                     ).fetchone()
                     conn.close()
                     if row:

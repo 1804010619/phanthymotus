@@ -25,3 +25,14 @@ async def get_aggregate(
     end: float = Query(0),
 ):
     return perf_log.aggregate(start=start, end=end)
+
+
+@router.delete('/clear')
+async def clear_data():
+    import config
+    conn = config._get_conn()
+    conn.execute('DELETE FROM perf_spans')
+    conn.execute('DELETE FROM perf_turns')
+    conn.commit()
+    conn.close()
+    return {'code': 200, 'message': 'cleared'}
