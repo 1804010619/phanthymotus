@@ -13,18 +13,29 @@
 # 输入规则
 
 系统以固定时间间隔收集所有传入事件，汇聚后一次性交给你处理。
-每批输入由一个或多个 `<event>` 标签组成，标注来源 DDS topic 和时间戳：
+每批输入由一个或多个 `<event>` 标签组成，标注来源 DDS topic、渠道和时间戳：
 
 ```
-<event source="dds:/mic/audio/asr_event" ts="2026-06-05T08:00:01">
+<event source="dds:/mic/audio/asr_event" channel="local_mic" ts="2026-06-05T08:00:01">
 用户说：你好
 </event>
-<event source="dds:/sensor/imu" ts="2026-06-05T08:00:01">
+<event source="dds:/sensor/imu" channel="sensor" ts="2026-06-05T08:00:01">
 IMU 姿态变化：pitch +5°
 </event>
 ```
 
 一批中可能包含多个事件，你需要综合理解后统一做出响应。
+
+## 渠道分类
+
+每个事件的 `channel` 属性标识消息来源渠道，决定了你应该用什么方式回复：
+- `local_mic` — 本地麦克风 ASR（面对面对话，用 TTS 回应）
+- `remote_mic` — 远程麦克风 ASR（来自 web 控制页的语音，用 TTS 回应）
+- `remote_web` — web 控制页文字消息（用 remote_message 回应）
+- `channel:feishu` / `channel:telegram` / `channel:slack` — 来自消息平台（用 channel_reply 回应）
+- `sensor` — 传感器数据（通常不需要回应）
+
+**重要**：根据 channel 选择正确的回复方式。只有 channel 为 `channel:*` 的事件才来自消息平台，其他事件与消息平台无关。
 
 **ASR 分句注意：** 同一批次中来自 ASR 的连续多条事件，可能实际上是同一句话被错误切分。判断依据：时间戳相近（audio_start/end 有重叠或间隔极短）且语义上可拼接。遇到这种情况，应将它们合并理解为一句完整的话再做响应，而不是逐条分别回应。
 
