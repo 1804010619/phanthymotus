@@ -2856,6 +2856,12 @@ html, body {
   background: var(--accent-dim);
   border-radius: 0 var(--radius-xs) var(--radius-xs) 0;
 }
+.asr-tag {
+  display: inline-block; font-size: 10px; font-weight: 600;
+  padding: 1px 5px; margin-right: 6px;
+  border-radius: 3px;
+  background: #D1FAF0; color: #0D6B55;
+}
 
 /* Live table (joints / array-of-objects state data) */
 .live-table-wrap {
