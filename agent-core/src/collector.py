@@ -133,14 +133,42 @@ def _get_max_window() -> int:
     return config.main.get('event', {}).get('llm', {}).get('collector_max_window', 20)
 
 
+def _infer_channel(ev: dict) -> str:
+    """从事件 source 推断渠道标签。"""
+    source = ev.get('source', '')
+    # 来自 channel 系统的消息（/channel/request/xxx 或 channel:platform:user）
+    if '/channel/' in source or source.startswith('channel:'):
+        text = ev.get('text', '')
+        if text and text.startswith('{'):
+            try:
+                data = _json.loads(text)
+                platform = data.get('platform', '')
+                if platform:
+                    return f'channel:{platform}'
+            except (ValueError, TypeError):
+                pass
+        return 'channel'
+    # 远程控制页面文字消息
+    if '/remote_control/message' in source:
+        return 'remote_web'
+    # ASR 事件或麦克风相关 — 根据 source 中是否含 remote 判断
+    if 'asr' in source.lower() or '/mic' in source:
+        if 'remote' in source:
+            return 'remote_mic'
+        return 'local_mic'
+    # 其他（传感器等）
+    return 'sensor'
+
+
 def _format_batch(events: list[dict]) -> str:
     """将事件列表格式化为堆叠的 <event> XML。"""
     lines = []
     for ev in events:
         ts = datetime.datetime.fromtimestamp(ev['ts']).strftime('%Y-%m-%dT%H:%M:%S')
         source = ev.get('source', 'unknown')
+        channel = _infer_channel(ev)
         text = ev.get('text', '')
-        lines.append(f'<event source="{source}" ts="{ts}">\n{text}\n</event>')
+        lines.append(f'<event source="{source}" channel="{channel}" ts="{ts}">\n{text}\n</event>')
     return '\n'.join(lines)
 
 
