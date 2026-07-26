@@ -106,6 +106,7 @@ class Client():
     async def __call__(self,
         message_list: list[dict],
         tool_list: list[dict],
+        cancel_event: 'asyncio.Event | None' = None,
     ) -> dict:
 
         async def _go(client, model) -> dict:
@@ -165,9 +166,23 @@ class Client():
                 for _, c, cfg in alive
             ]
 
-            done, pending = await asyncio.wait(task_list, return_when=asyncio.FIRST_COMPLETED)
+            # 如果有 cancel_event，加入哨兵 task 实现用户消息抢占
+            cancel_task = None
+            wait_tasks = list(task_list)
+            if cancel_event:
+                cancel_task = asyncio.create_task(cancel_event.wait())
+                wait_tasks.append(cancel_task)
+
+            done, pending = await asyncio.wait(wait_tasks, return_when=asyncio.FIRST_COMPLETED)
             for t in pending:
                 t.cancel()
+
+            # 如果 cancel 先完成 → 中断当前 turn
+            if cancel_task and cancel_task in done:
+                for t in task_list:
+                    t.cancel()
+                from event.llm import TurnCancelled
+                raise TurnCancelled("Interrupted by user message during LLM call")
 
             # 检查是否有成功的
             for t in done:
