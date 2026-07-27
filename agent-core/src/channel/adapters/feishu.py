@@ -19,6 +19,7 @@ Event subscription:
 
 import asyncio
 import json
+import threading
 
 from channel.adapter import ChannelAdapter, InboundMessage, OutboundMessage, OnMessageCallback
 
@@ -26,8 +27,8 @@ from channel.adapter import ChannelAdapter, InboundMessage, OutboundMessage, OnM
 _FEISHU_ERROR_HINTS = {
     10003: 'Invalid app_id. Check your Feishu app credentials in Channel settings.',
     10014: 'Invalid app_secret. Check your Feishu app credentials in Channel settings.',
-    99991663: 'Tenant token invalid. Try restarting the channel adapter.',
-    99991668: 'Tenant token expired. The adapter will auto-refresh, try again.',
+    99991663: 'Tenant token invalid. The adapter will attempt to reconnect automatically. If this persists, restart the channel.',
+    99991668: 'Tenant token expired. The SDK auto-refreshes tokens; if this persists, check app_id/app_secret in Channel settings.',
     99991672: 'Permission denied. Grant the required permission in Feishu Developer Console: https://open.feishu.cn/app/{app_id}/auth',
     230001: 'Bot not in this chat. Add the bot to the chat first, or the user needs to message the bot directly.',
     230002: 'Bot has been removed from chat. Re-add the bot.',
@@ -45,6 +46,7 @@ class FeishuAdapter(ChannelAdapter):
         self._client = None
         self._task: asyncio.Task | None = None
         self._api_client = None
+        self._thread: threading.Thread | None = None
 
     async def start(self) -> None:
         app_id = self.config.get('app_id', '')
@@ -77,56 +79,60 @@ class FeishuAdapter(ChannelAdapter):
             app_secret=app_secret,
             event_handler=event_handler,
             log_level=lark.LogLevel.INFO,
+            auto_reconnect=True,
         )
 
-        # Start in background thread (SDK blocks)
-        self._task = asyncio.create_task(self._run())
+        # Hook into SDK reconnect lifecycle for status tracking
+        self._client.on_reconnecting = self._on_reconnecting
+        self._client.on_reconnected = self._on_reconnected
+
+        # Start in background thread — SDK's start() blocks (contains _select())
         self._running = True
+        self._thread = threading.Thread(target=self._thread_target, daemon=True, name='feishu-ws')
+        self._thread.start()
         print(f'[feishu] adapter started (WebSocket mode): {self.channel_id}')
 
-    async def _run(self):
-        """Run the lark WebSocket client in a dedicated thread.
+    def _thread_target(self):
+        """Run lark SDK client.start() in a dedicated thread.
 
-        The SDK's client.start() uses loop.run_until_complete() which has issues
-        in a sub-thread — tasks created during _connect() may not be properly
-        scheduled. Instead, we use asyncio.run() and manually call the internal
-        methods to ensure the event loop stays running continuously.
+        SDK's start() does:
+        1. _connect() — establishes WS, starts _receive_message_loop task
+        2. _ping_loop() — periodic keepalive pings
+        3. _select() — keeps event loop alive forever
+
+        _receive_message_loop has built-in auto_reconnect on disconnect.
         """
-        import threading
-        import lark_oapi.ws.client as ws_mod
+        try:
+            self._client.start()
+        except Exception as e:
+            err_msg = str(e)
+            if 'invalid' in err_msg.lower() and ('app_id' in err_msg.lower() or 'secret' in err_msg.lower()):
+                print(f'[feishu] Connection failed: invalid app credentials. '
+                      f'Check app_id and app_secret in Channel settings.')
+            else:
+                print(f'[feishu] WebSocket connection error: {e}')
+            self._running = False
 
-        async def _run_ws():
-            ws_mod.loop = asyncio.get_event_loop()
-            await self._client._connect()
-            asyncio.create_task(self._client._ping_loop())
-            # Keep event loop alive (mirrors SDK's _select())
-            while self._running:
-                await asyncio.sleep(1)
+    def _on_reconnecting(self):
+        print(f'[feishu] connection lost, reconnecting... ({self.channel_id})')
 
-        def _thread_target():
-            try:
-                asyncio.run(_run_ws())
-            except Exception as e:
-                err_msg = str(e)
-                if 'invalid' in err_msg.lower() and ('app_id' in err_msg.lower() or 'secret' in err_msg.lower()):
-                    print(f'[feishu] Connection failed: invalid app credentials. '
-                          f'Check app_id and app_secret in Channel settings.')
-                else:
-                    print(f'[feishu] WebSocket connection error: {e}')
-                self._running = False
-
-        self._thread = threading.Thread(target=_thread_target, daemon=True, name='feishu-ws')
-        self._thread.start()
+    def _on_reconnected(self):
+        print(f'[feishu] reconnected successfully ({self.channel_id})')
 
     async def stop(self) -> None:
         self._running = False
-        if self._task:
-            self._task.cancel()
-            try:
-                await self._task
-            except asyncio.CancelledError:
-                pass
+
+        # Stop the SDK's event loop to break out of _select()
+        import lark_oapi.ws.client as ws_mod
+        if ws_mod.loop and ws_mod.loop.is_running():
+            ws_mod.loop.call_soon_threadsafe(ws_mod.loop.stop)
+
+        # Wait for thread to exit
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=5)
+
         self._client = None
+        self._thread = None
         print(f'[feishu] adapter stopped: {self.channel_id}')
 
     async def send_message(self, msg: OutboundMessage) -> None:
@@ -134,7 +140,8 @@ class FeishuAdapter(ChannelAdapter):
         if not self._api_client:
             raise RuntimeError(
                 '[feishu] Cannot send: adapter not initialized. '
-                'Check app_id/app_secret in Channel settings.'
+                'Cause: The adapter failed to start or has been stopped. '
+                'Solution: Check app_id/app_secret in Channel settings and restart the channel.'
             )
 
         import lark_oapi as lark
@@ -169,10 +176,17 @@ class FeishuAdapter(ChannelAdapter):
         except RuntimeError:
             raise
         except Exception as e:
+            error_str = str(e)
+            if 'timeout' in error_str.lower() or 'connect' in error_str.lower():
+                raise RuntimeError(
+                    f'[feishu] send_message network error: {e}\n'
+                    f'  → Cause: Network unreachable or Feishu API rate-limited.\n'
+                    f'  → Solution: Check network connectivity. Retry in a few seconds.'
+                )
             raise RuntimeError(f'[feishu] send_message exception: {e}')
 
     def _handle_message_event(self, data):
-        """Handle im.message.receive_v1 event from SDK callback (runs in thread)."""
+        """Handle im.message.receive_v1 event from SDK callback (runs in SDK thread)."""
         try:
             event = data.event
             message = event.message

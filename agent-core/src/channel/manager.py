@@ -169,8 +169,8 @@ class ChannelManager:
         self._adapters.clear()
         print('[channel] manager stopped')
 
-    async def _start_adapter(self, ch_cfg: dict):
-        """为单个 channel 配置启动 adapter。"""
+    async def _start_adapter(self, ch_cfg: dict, retries: int = 3, delay: float = 5.0):
+        """为单个 channel 配置启动 adapter，带重试。"""
         channel_id = ch_cfg['id']
         platform = ch_cfg['platform']
 
@@ -187,15 +187,23 @@ class ChannelManager:
             config=ch_cfg.get('config', {}),
             on_message=self._on_inbound_message,
         )
-        try:
-            await adapter.start()
-            self._adapters[channel_id] = adapter
-            _update_status(channel_id, 'connected')
-        except Exception as e:
-            error_msg = f'[channel] Failed to start {channel_id} ({platform}): {e}'
-            print(error_msg)
-            await self._push_error(error_msg)
-            _update_status(channel_id, f'error')
+
+        for attempt in range(retries):
+            try:
+                await adapter.start()
+                self._adapters[channel_id] = adapter
+                _update_status(channel_id, 'connected')
+                return
+            except Exception as e:
+                if attempt < retries - 1:
+                    print(f'[channel] {channel_id} start failed (attempt {attempt + 1}/{retries}), '
+                          f'retrying in {delay}s: {e}')
+                    await asyncio.sleep(delay)
+                else:
+                    error_msg = f'[channel] Failed to start {channel_id} ({platform}) after {retries} attempts: {e}'
+                    print(error_msg)
+                    await self._push_error(error_msg)
+                    _update_status(channel_id, 'error')
 
     async def _push_error(self, message: str):
         """Push error to frontend activity stream."""
@@ -315,16 +323,18 @@ class ChannelManager:
         ctx = self._get_last_context().get(channel_id)
         if not ctx:
             return (
-                f'Error: No conversation context for channel "{channel_id}". '
-                f'A user must send a message to the bot first. '
-                f'The bot can only reply to conversations that have been initiated by a user.'
+                f'Error: No conversation context for channel "{channel_id}".\n'
+                f'Cause: The bot has not received any message from a user yet in this channel.\n'
+                f'Solution: Ask a user to send a message to the bot in Feishu (private chat or @bot in group), '
+                f'then the bot can reply to that conversation.'
             )
 
         adapter = self._adapters.get(channel_id)
         if not adapter:
             return (
-                f'Error: Channel "{channel_id}" is not running. '
-                f'Check Settings → Channels to ensure it is enabled and connected.'
+                f'Error: Channel "{channel_id}" is not running.\n'
+                f'Cause: The channel adapter failed to start, was stopped, or the connection dropped.\n'
+                f'Solution: Go to Settings → Channels and click Restart for this channel.'
             )
 
         chat_id = ctx['chat_id']
@@ -333,12 +343,18 @@ class ChannelManager:
             return f'Reply sent ({len(text)} chars)'
         except Exception as e:
             error_msg = str(e)
-            # Extract actionable hint from the error
             if '99991672' in error_msg or 'Permission denied' in error_msg or 'Access denied' in error_msg:
                 result = (
-                    f'Error: Permission denied when sending message. '
-                    f'Grant "im:message:send_as_bot" permission in Feishu Developer Console, '
-                    f'then publish the app version.'
+                    f'Error: Permission denied when sending message.\n'
+                    f'Cause: The bot lacks "im:message:send_as_bot" permission.\n'
+                    f'Solution: Grant the permission in Feishu Developer Console, '
+                    f'then publish a new app version.'
+                )
+            elif 'not initialized' in error_msg or 'not running' in error_msg:
+                result = (
+                    f'Error: Channel adapter is not connected.\n'
+                    f'Cause: The WebSocket connection may have dropped silently.\n'
+                    f'Solution: Go to Settings → Channels and click Restart.'
                 )
             else:
                 result = f'Error sending reply: {error_msg}'
