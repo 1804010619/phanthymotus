@@ -5947,7 +5947,7 @@ html, body {
 .settings-dropdown-item--danger:hover { background: rgba(229, 77, 66, .08); }
 
 .btn-danger {
-  background: #e54d42;
+  background: #c0392b;
   color: #fff;
   border: none;
   border-radius: var(--radius-sm);
@@ -5955,24 +5955,69 @@ html, body {
   font-size: 13px;
   font-weight: 600;
   cursor: pointer;
-  transition: opacity .15s;
+  transition: background .15s;
   font-family: var(--font-ui);
 }
-.btn-danger:hover { opacity: .85; }
+.btn-danger:hover { background: #a93226; }
 .btn-danger:disabled { opacity: .4; cursor: default; }
 
-.reset-modal { max-width: 400px; width: 90%; }
-.reset-hint { color: var(--text-secondary); font-size: 12px; margin: 0 0 16px; }
+.reset-modal { max-width: 360px; width: 90%; }
+.reset-modal .modal-body { padding: 16px 20px 8px; }
+.reset-hint {
+  color: var(--text-secondary);
+  font-size: 12px;
+  margin: 0 0 12px;
+  line-height: 1.4;
+}
 .reset-item {
   display: flex;
-  align-items: flex-start;
-  gap: 10px;
-  padding: 10px 0;
-  border-bottom: 1px solid var(--border);
+  align-items: center;
+  gap: 12px;
+  padding: 10px 12px;
+  margin: 0 -12px;
+  border-radius: var(--radius-sm);
   cursor: pointer;
+  transition: background .12s;
 }
-.reset-item:last-child { border-bottom: none; }
-.reset-item input[type=checkbox] { margin-top: 2px; flex-shrink: 0; }
-.reset-item span { font-size: 13px; font-weight: 500; display: block; }
-.reset-item small { font-size: 11px; color: var(--text-secondary); display: block; margin-top: 2px; }
+.reset-item:hover { background: var(--bg-hover, rgba(0,0,0,.03)); }
+.reset-item input[type=checkbox] {
+  appearance: none;
+  -webkit-appearance: none;
+  width: 18px;
+  height: 18px;
+  border: 2px solid var(--border);
+  border-radius: 4px;
+  flex-shrink: 0;
+  cursor: pointer;
+  position: relative;
+  transition: border-color .12s, background .12s;
+}
+.reset-item input[type=checkbox]:checked {
+  background: #c0392b;
+  border-color: #c0392b;
+}
+.reset-item input[type=checkbox]:checked::after {
+  content: '';
+  position: absolute;
+  left: 5px;
+  top: 2px;
+  width: 4px;
+  height: 8px;
+  border: solid #fff;
+  border-width: 0 2px 2px 0;
+  transform: rotate(45deg);
+}
+.reset-item-text { flex: 1; min-width: 0; }
+.reset-item-text span {
+  font-size: 13px;
+  font-weight: 500;
+  display: block;
+  color: var(--text-primary);
+}
+.reset-item-text small {
+  font-size: 11px;
+  color: var(--text-secondary);
+  display: block;
+  margin-top: 2px;
+}
 

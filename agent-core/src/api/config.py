@@ -556,7 +556,7 @@ async def reset_config(req: ResetRequest):
     import pathlib
     reset_items = []
 
-    defaults_dir = pathlib.Path('./resource/memory/defaults')
+    defaults_dir = pathlib.Path('/opt/defaults/memory')
     memory_dir = pathlib.Path('./resource/memory')
 
     if req.chat_history:
