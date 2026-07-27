@@ -217,6 +217,47 @@ html, body {
 }
 .settings-dropdown-item:hover { background: var(--bg-hover); }
 
+/* Think mode toggle in settings dropdown */
+.settings-dropdown-toggle {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 9px 16px;
+  border-bottom: 1px solid var(--border);
+}
+.settings-dropdown-toggle-label {
+  font-size: 13px;
+  color: var(--text);
+}
+.toggle-switch {
+  position: relative;
+  width: 36px;
+  height: 20px;
+  display: inline-block;
+}
+.toggle-switch input { opacity: 0; width: 0; height: 0; }
+.toggle-slider {
+  position: absolute;
+  inset: 0;
+  background: var(--bg-hover);
+  border-radius: 10px;
+  cursor: pointer;
+  transition: background 0.2s;
+}
+.toggle-slider::before {
+  content: '';
+  position: absolute;
+  width: 16px;
+  height: 16px;
+  left: 2px;
+  top: 2px;
+  background: white;
+  border-radius: 50%;
+  transition: transform 0.2s;
+}
+.toggle-switch input:checked + .toggle-slider { background: var(--green, #059669); }
+.toggle-switch input:checked + .toggle-slider::before { transform: translateX(16px); }
+
 /* Mode toggle icons */
 .mode-toggle-btn { display: flex; align-items: center; gap: 4px; }
 .mode-toggle-btn svg { opacity: 0.7; flex-shrink: 0; }

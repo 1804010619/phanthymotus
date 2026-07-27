@@ -344,6 +344,45 @@ function _initSettingsDropdown() {
       dropdown.classList.add('hidden');
     });
   });
+
+  // Think mode toggle
+  _initThinkModeToggle();
+}
+
+function _initThinkModeToggle() {
+  const checkbox = document.getElementById('think-mode-checkbox');
+  if (!checkbox) return;
+
+  // Load current state
+  fetch('/api/config')
+    .then(r => r.json())
+    .then(res => {
+      const thinkMode = res.data?.services?.llm?.think_mode ?? false;
+      checkbox.checked = thinkMode;
+    })
+    .catch(() => {});
+
+  // Save on change
+  checkbox.addEventListener('change', async () => {
+    const checked = checkbox.checked;
+    try {
+      // Read current config, update think_mode, save back
+      const res = await fetch('/api/config');
+      const json = await res.json();
+      const services = json.data?.services || {};
+      const llm = services.llm || {};
+      llm.think_mode = checked;
+
+      await fetch('/api/config', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ services: { ...services, llm } }),
+      });
+    } catch (e) {
+      console.error('[think-mode] save failed:', e);
+      checkbox.checked = !checked; // revert on error
+    }
+  });
 }
 
 function _showLoginScreen() {
