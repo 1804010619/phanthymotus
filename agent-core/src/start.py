@@ -300,7 +300,10 @@ async def lifespan(app):
             for t in tasks:
                 t.cancel()
             await channel_manager.stop()
-            await loop.run_in_executor(None, ros2_bridge.stop)
+            try:
+                await loop.run_in_executor(None, ros2_bridge.stop)
+            except (asyncio.CancelledError, RuntimeError):
+                ros2_bridge.stop()
 
 
 # ========== 网络服务 ==========

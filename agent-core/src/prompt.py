@@ -186,7 +186,7 @@ def _env_dynamic() -> str:
         counts = Counter(e['source'] for e in recents)
         recent_str = ', '.join(f'{src} ×{n}' for src, n in counts.most_common())
     else:
-        recent_str = '暂无历史事件'
+        recent_str = 'no recent events'
 
     # 活跃任务
     import task_store
@@ -208,7 +208,7 @@ def _env_dynamic() -> str:
 
     return (
         f'<status time="{now}">\n'
-        f'  <recent_sources>最近 {len(recents)} 条事件来自: {recent_str}</recent_sources>\n'
+        f'  <recent_sources>last {len(recents)} events from: {recent_str}</recent_sources>\n'
         f'{tasks_section}'
         f'</status>'
     )
