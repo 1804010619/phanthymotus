@@ -126,7 +126,7 @@ def _estimate_chars(turns: list[list[dict]]) -> int:
             elif isinstance(content, list):
                 total += 200  # multimodal 粗估
             # tool_calls 的 arguments 也计入
-            for tc in msg.get('tool_calls', []):
+            for tc in (msg.get('tool_calls') or []):
                 total += len(tc.get('function', {}).get('arguments', ''))
     return total
 
