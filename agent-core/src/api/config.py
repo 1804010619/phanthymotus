@@ -540,3 +540,65 @@ async def config_test_vad_audio(
         return {'code': 200, 'data': {'ok': False, 'info': str(e)}}
 
 
+# ── 重置 ─────────────────────────────────────────────────────────────────────────
+
+class ResetRequest(BaseModel):
+    chat_history: bool = False
+    system_prompt: bool = False
+    identity: bool = False
+    memory: bool = False
+    skills: bool = False
+
+
+@router.post('/reset')
+async def reset_config(req: ResetRequest):
+    import shutil
+    import pathlib
+    reset_items = []
+
+    defaults_dir = pathlib.Path('./resource/memory/defaults')
+    memory_dir = pathlib.Path('./resource/memory')
+
+    if req.chat_history:
+        import chat_history
+        chat_history.clear_all()
+        import event
+        event.llm._turns = []
+        event.llm._summary = None
+        event.llm._session_id = None
+        event.llm._current_turn = []
+        reset_items.append('chat_history')
+
+    if req.system_prompt:
+        src = defaults_dir / 'prompt_system.md'
+        dst = memory_dir / 'prompt_system.md'
+        if src.exists():
+            shutil.copy2(src, dst)
+        reset_items.append('system_prompt')
+
+    if req.identity:
+        src = defaults_dir / 'identity.md'
+        dst = memory_dir / 'identity.md'
+        if src.exists():
+            shutil.copy2(src, dst)
+        reset_items.append('identity')
+
+    if req.memory:
+        src = defaults_dir / 'prompt_memory_init.md'
+        dst = memory_dir / 'prompt_memory.md'
+        if src.exists():
+            shutil.copy2(src, dst)
+        reset_items.append('memory')
+
+    if req.skills:
+        skills_cfg = config.main.get('skills', {'installed': []})
+        for skill in skills_cfg.get('installed', []):
+            skill['active'] = False
+        config.main['skills'] = skills_cfg
+        import event.skills
+        event.skills._runtime_activated.clear()
+        reset_items.append('skills')
+
+    return {'ok': True, 'reset': reset_items}
+
+

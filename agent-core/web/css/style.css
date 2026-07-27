@@ -5937,3 +5937,42 @@ html, body {
   }
 }
 
+/* ── Reset Modal ────────────────────────────────────────────────────────────── */
+.settings-dropdown-divider {
+  height: 1px;
+  background: var(--border);
+  margin: 4px 0;
+}
+.settings-dropdown-item--danger { color: #e54d42; }
+.settings-dropdown-item--danger:hover { background: rgba(229, 77, 66, .08); }
+
+.btn-danger {
+  background: #e54d42;
+  color: #fff;
+  border: none;
+  border-radius: var(--radius-sm);
+  padding: 9px 22px;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: opacity .15s;
+  font-family: var(--font-ui);
+}
+.btn-danger:hover { opacity: .85; }
+.btn-danger:disabled { opacity: .4; cursor: default; }
+
+.reset-modal { max-width: 400px; width: 90%; }
+.reset-hint { color: var(--text-secondary); font-size: 12px; margin: 0 0 16px; }
+.reset-item {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 10px 0;
+  border-bottom: 1px solid var(--border);
+  cursor: pointer;
+}
+.reset-item:last-child { border-bottom: none; }
+.reset-item input[type=checkbox] { margin-top: 2px; flex-shrink: 0; }
+.reset-item span { font-size: 13px; font-weight: 500; display: block; }
+.reset-item small { font-size: 11px; color: var(--text-secondary); display: block; margin-top: 2px; }
+

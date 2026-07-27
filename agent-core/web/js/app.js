@@ -344,6 +344,56 @@ function _initSettingsDropdown() {
       dropdown.classList.add('hidden');
     });
   });
+
+  // Reset modal
+  _initResetModal();
+}
+
+function _initResetModal() {
+  const overlay = document.getElementById('reset-overlay');
+  const btnOpen = document.getElementById('btn-reset');
+  const btnClose = document.getElementById('reset-close');
+  const btnCancel = document.getElementById('reset-cancel');
+  const btnConfirm = document.getElementById('reset-confirm');
+  if (!overlay || !btnOpen) return;
+
+  const close = () => overlay.classList.add('hidden');
+
+  btnOpen.addEventListener('click', () => overlay.classList.remove('hidden'));
+  btnClose?.addEventListener('click', close);
+  btnCancel?.addEventListener('click', close);
+  overlay.addEventListener('click', (e) => { if (e.target === overlay) close(); });
+
+  btnConfirm?.addEventListener('click', async () => {
+    const body = {
+      chat_history: document.getElementById('reset-chat-history')?.checked || false,
+      system_prompt: document.getElementById('reset-system-prompt')?.checked || false,
+      identity: document.getElementById('reset-identity')?.checked || false,
+      memory: document.getElementById('reset-memory')?.checked || false,
+      skills: document.getElementById('reset-skills')?.checked || false,
+    };
+    if (!Object.values(body).some(v => v)) return;
+
+    btnConfirm.disabled = true;
+    btnConfirm.textContent = '重置中...';
+    try {
+      const res = await fetch('/api/config/reset', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      if (res.ok) {
+        btnConfirm.textContent = '已重置';
+        setTimeout(() => { close(); btnConfirm.textContent = '确认重置'; btnConfirm.disabled = false; }, 1000);
+        // Uncheck all
+        overlay.querySelectorAll('input[type=checkbox]').forEach(cb => cb.checked = false);
+      }
+    } catch (e) {
+      console.error('[reset] failed:', e);
+      btnConfirm.textContent = '失败';
+      setTimeout(() => { btnConfirm.textContent = '确认重置'; btnConfirm.disabled = false; }, 2000);
+    }
+  });
 }
 
 function _showLoginScreen() {

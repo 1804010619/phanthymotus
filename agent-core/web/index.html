@@ -56,6 +56,8 @@
           <button class="settings-dropdown-item" data-target="btn-channels">渠道</button>
           <button class="settings-dropdown-item" data-target="btn-deploy">部署</button>
           <button class="settings-dropdown-item" data-target="btn-performance">性能</button>
+          <div class="settings-dropdown-divider"></div>
+          <button class="settings-dropdown-item settings-dropdown-item--danger" data-target="btn-reset">重置</button>
         </div>
       </div>
       <!-- Hidden buttons for existing JS handlers -->
@@ -64,6 +66,7 @@
       <button class="btn-ghost topbar-btn hidden" id="btn-agent-def">智能体定义</button>
       <button class="btn-ghost topbar-btn hidden" id="btn-skills">技能</button>
       <button class="btn-ghost topbar-btn hidden" id="btn-channels">渠道</button>
+      <button class="btn-ghost topbar-btn hidden" id="btn-reset">重置</button>
       <button class="btn-ghost topbar-btn hidden" id="btn-deploy">部署 ▾</button>
       <button class="btn-ghost topbar-btn hidden" id="btn-performance">性能</button>
     </div>
@@ -265,6 +268,28 @@
     <div class="modal-footer">
       <button class="btn-secondary" id="agent-def-cancel">取消</button>
       <button class="btn-primary" id="agent-def-save">保存</button>
+    </div>
+  </div>
+</div>
+
+<!-- ── Reset Modal ────────────────────────────────────────────────────── -->
+<div class="modal-overlay hidden" id="reset-overlay">
+  <div class="modal reset-modal">
+    <div class="modal-header">
+      <span class="modal-title">重置</span>
+      <button class="btn-icon" id="reset-close">✕</button>
+    </div>
+    <div class="modal-body">
+      <p class="reset-hint">选择要重置的项目，重置后不可恢复。</p>
+      <label class="reset-item"><input type="checkbox" id="reset-chat-history"><span>历史对话</span><small>清空所有聊天记录</small></label>
+      <label class="reset-item"><input type="checkbox" id="reset-system-prompt"><span>系统提示词</span><small>恢复默认 prompt_system.md</small></label>
+      <label class="reset-item"><input type="checkbox" id="reset-identity"><span>身份设定</span><small>恢复默认 identity.md</small></label>
+      <label class="reset-item"><input type="checkbox" id="reset-memory"><span>长期记忆</span><small>恢复默认 prompt_memory.md</small></label>
+      <label class="reset-item"><input type="checkbox" id="reset-skills"><span>技能</span><small>停用所有已启用技能</small></label>
+    </div>
+    <div class="modal-footer">
+      <button class="btn-secondary" id="reset-cancel">取消</button>
+      <button class="btn-danger" id="reset-confirm">确认重置</button>
     </div>
   </div>
 </div>
