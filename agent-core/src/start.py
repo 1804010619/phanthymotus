@@ -110,6 +110,7 @@ def _register_core_mcp(silent=False):
                         'llm_key':   {'type': 'string', 'description': 'LLM API Key', 'format': 'password'},
                         'llm_model': {'type': 'string', 'description': 'LLM 模型名称'},
                         'trigger_interval_ms': {'type': 'integer', 'description': '采集触发间隔（毫秒）', 'default': 1000},
+                        'think_mode': {'type': 'boolean', 'description': 'Think mode (enables deep reasoning, disable for faster response)', 'default': False},
                     },
                     'required': ['llm_url', 'llm_key']
                 },

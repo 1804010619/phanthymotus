@@ -4,9 +4,11 @@ collector.py — 信息整理器。
 职责：
   - 从 event_bus 持续消费事件，在触发间隔内积累
   - 超过 max_window 的事件 FIFO 丢弃
-  - 间隔到达时，将积累的事件批量格式化为 XML 并输出
+  - 间隔到达时，按 source 分组摘要并输出（而非原始全量 XML）
   - agent loop 通过 next_trigger() 获取下一批格式化事件
   - priority > 0 的事件立即触发 emit（不等 interval）
+  - per-source ring buffer 保留原始事件，供 detailed_info tool 按需查询
+  - 支持 cancel_event 信号，允许用户消息中断正在进行的 turn
 """
 
 import asyncio
@@ -28,6 +30,12 @@ _last_accepted: dict[str, float] = {}
 _THROTTLE_INTERVAL = 1.0  # 每个 source 最多 1 条/秒
 # Agent loop busy flag — 忙时不发射 trigger，让事件继续积累
 _busy: bool = False
+
+# ── Per-source ring buffer（保留原始事件供 detailed_info tool 查询）────────────
+_source_ring: dict[str, deque] = {}
+
+# ── Turn 取消信号（Phase 2：用户消息抢占）────────────────────────────────────────
+_cancel_event: asyncio.Event | None = None
 
 # 根据 source 自动赋 priority 的规则（包含匹配）
 _PRIORITY_SOURCES = {'asr', 'message', 'channel'}
@@ -91,6 +99,12 @@ def set_busy(busy: bool):
     # turn 结束时，如果有积压的高优先级事件，立即 emit
     if not busy and _priority_buffer:
         asyncio.ensure_future(_emit_priority())
+
+
+def set_cancel_event(ev: asyncio.Event | None):
+    """由 agent loop 调用：注册/清除当前 turn 的取消信号。"""
+    global _cancel_event
+    _cancel_event = ev
 
 
 async def _emit_priority():
@@ -161,20 +175,54 @@ def _infer_channel(ev: dict) -> str:
 
 
 def _format_batch(events: list[dict]) -> str:
-    """将事件列表格式化为堆叠的 <event> XML。"""
-    lines = []
+    """将事件列表按 source 分组摘要。
+
+    每个 source 组调用对应 MCP 设备的 output_summary tool（如果存在），
+    否则 fallback 到取该 source 最后一条事件的 text。
+    高优先级事件（用户消息）始终保留原文。
+    """
+    # 按 source 分组，保持出现顺序
+    groups: dict[str, list[dict]] = {}
     for ev in events:
-        ts = datetime.datetime.fromtimestamp(ev['ts']).strftime('%Y-%m-%dT%H:%M:%S')
         source = ev.get('source', 'unknown')
-        channel = _infer_channel(ev)
-        text = ev.get('text', '')
-        lines.append(f'<event source="{source}" channel="{channel}" ts="{ts}">\n{text}\n</event>')
-    return '\n'.join(lines)
+        groups.setdefault(source, []).append(ev)
+
+    parts = []
+    for source, evs in groups.items():
+        # 高优先级事件保留原始 XML（用户消息不摘要）
+        priority = max(_extract_priority(e) for e in evs)
+        if priority > 0:
+            for ev in evs:
+                ts = datetime.datetime.fromtimestamp(ev['ts']).strftime('%Y-%m-%dT%H:%M:%S')
+                channel = _infer_channel(ev)
+                text = ev.get('text', '')
+                parts.append(f'<event source="{source}" channel="{channel}" ts="{ts}">\n{text}\n</event>')
+        else:
+            # Sensor/低优先级：摘要模式
+            summary = _get_source_summary_sync(source, evs)
+            ts = datetime.datetime.fromtimestamp(evs[-1]['ts']).strftime('%Y-%m-%dT%H:%M:%S')
+            parts.append(f'<source name="{source}" count="{len(evs)}" ts="{ts}">\n{summary}\n</source>')
+    return '\n'.join(parts)
+
+
+def _get_source_summary_sync(source: str, events: list[dict]) -> str:
+    """同步获取 source 的摘要。Fallback：取最后一条事件的 text。
+
+    注意：output_summary 的 MCP 调用是异步的，将在 _emit_batch_async 中处理。
+    这里先用 fallback 逻辑（最后一条事件），异步版本在 _build_summary_batch 中。
+    """
+    # 取最后一条事件的 text 作为摘要
+    last_text = events[-1].get('text', '')
+    if len(events) == 1:
+        return last_text
+    # 多条时，补充统计信息
+    return f'{last_text}\n(共 {len(events)} 条事件，显示最新)'
 
 
 async def _drain_loop():
     """后台任务：持续从 event_bus 消费事件存入 buffer，per-source 限流。"""
     max_window = _get_max_window()
+    ring_size = config.main.get('event', {}).get('llm', {}).get('source_ring_size', 50)
     while True:
         ev = await event_bus.dequeue()
         source = ev.get('source', 'unknown')
@@ -185,6 +233,11 @@ async def _drain_loop():
 
         # 解析优先级
         priority = _extract_priority(ev)
+
+        # ── 存入 per-source ring buffer（保留原始事件供 detailed_info 查询）
+        if source not in _source_ring:
+            _source_ring[source] = deque(maxlen=ring_size)
+        _source_ring[source].append(ev)
 
         last_ts = _last_accepted.get(source, 0)
         if now - last_ts < _THROTTLE_INTERVAL:
@@ -211,8 +264,10 @@ async def _drain_loop():
                 _buffer.clear()
                 await _emit_batch(batch, urgent=True)
             else:
-                # busy 时暂存到优先级 buffer（set_busy(False) 时会 emit）
+                # busy 时暂存到优先级 buffer，并触发取消信号
                 _priority_buffer.append(ev)
+                if _cancel_event:
+                    _cancel_event.set()
 
 
 async def _trigger_loop():
@@ -232,6 +287,20 @@ async def _trigger_loop():
         batch = list(_buffer)
         _buffer.clear()
         await _emit_batch(batch)
+
+
+def get_source_detail(source: str, limit: int = 20) -> list[dict]:
+    """获取指定 source 的原始事件详情（从 ring buffer）。供 detailed_info tool 调用。"""
+    ring = _source_ring.get(source)
+    if not ring:
+        return []
+    events = list(ring)[-limit:]
+    return events
+
+
+def get_available_sources() -> list[str]:
+    """返回当前有数据的所有 source 名称列表。"""
+    return list(_source_ring.keys())
 
 
 def start():

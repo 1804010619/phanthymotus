@@ -691,9 +691,10 @@ async def _handle_agentcore_call(req: MCPCallRequest):
         llm_url = req.arguments.get('llm_url', '')
         llm_key = req.arguments.get('llm_key', '')
         llm_model = req.arguments.get('llm_model', '')
+        think_mode = req.arguments.get('think_mode', False)
         if llm_url and llm_key:
             client_cfg = config.main.get('client', {})
-            client_cfg['llm'] = [{'url': llm_url, 'key': llm_key, 'model': llm_model}]
+            client_cfg['llm'] = [{'url': llm_url, 'key': llm_key, 'model': llm_model, 'think_mode': think_mode}]
             config.main['client'] = client_cfg
             # Reinitialize the LLM client with new config
             import client as client_mod

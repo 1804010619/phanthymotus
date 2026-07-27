@@ -31,6 +31,13 @@ import prompt as prompt_mod
 from api.motus_stream import push_event
 
 
+# ── Turn 取消异常 ────────────────────────────────────────────────────────────────
+
+class TurnCancelled(Exception):
+    """用户消息抢占时抛出，中断正在进行的 sensor turn。"""
+    pass
+
+
 # ── 系统工具注册（静态，仅 finish / memory）──────────────────────────────────
 
 def _build_system_tools(named_functions: list[tuple[str, callable]]) -> dict:
@@ -183,6 +190,28 @@ async def _compress_turns(turns: list[list[dict]]) -> str:
         return f'[历史摘要] 之前有 {len(turns)} 轮对话，因压缩失败仅保留最近内容。'
 
 
+# ── detailed_info 系统工具实现 ────────────────────────────────────────────────────
+
+import datetime as _dt
+
+async def _raw_input_info(
+    source: typing.Annotated[str, "要查看详情的信息源名称（可通过摘要中的 source name 获得）"],
+    limit: typing.Annotated[int, "返回最近 N 条原始事件，默认 20"] = 20,
+) -> str:
+    """获取指定信息源的原始输入数据。当摘要信息不足以做决策时使用此工具深入查看原始事件。"""
+    events = collector.get_source_detail(source, limit=limit)
+    if not events:
+        available = collector.get_available_sources()
+        return f'未找到 source={source} 的数据。当前可用 sources: {", ".join(available) if available else "(无)"}'
+    # 格式化为详细 XML
+    lines = []
+    for ev in events:
+        ts = _dt.datetime.fromtimestamp(ev['ts']).strftime('%Y-%m-%dT%H:%M:%S')
+        text = ev.get('text', '')
+        lines.append(f'<event ts="{ts}">\n{text}\n</event>')
+    return '\n'.join(lines)
+
+
 class Event:
     def __init__(self):
         self._turns: list[list[dict]] = []  # 每轮对话的消息列表
@@ -192,7 +221,7 @@ class Event:
         self._current_turn: list[dict] = []   # 当前轮消息（供 run_forever 保存）
 
     async def __aenter__(self):
-        # 注册系统工具（finish / memory / task）
+        # 注册系统工具（finish / memory / task / detailed_info）
         self._sys_tools = _build_system_tools([
             ('finish', event.finish.__call__),
             ('update_memory', event.memory.update),
@@ -203,6 +232,7 @@ class Event:
             ('task_done', event.task.task_done),
             ('task_fail', event.task.task_fail),
             ('task_list', event.task.task_list),
+            ('raw_input_info', _raw_input_info),
         ])
         # 连接并注册所有 MCP 工具
         await mcp_client.init_all()
@@ -265,9 +295,19 @@ class Event:
         while True:
             ev = await collector.next_trigger()
             self._current_turn = []  # 本轮消息，无论成功失败都会保存
+            # 注册取消信号（用户消息可通过此信号中断 sensor turn）
+            cancel_ev = asyncio.Event()
+            collector.set_cancel_event(cancel_ev)
             collector.set_busy(True)
             try:
-                await self._one_turn(ev)
+                await self._one_turn(ev, cancel_event=cancel_ev)
+            except TurnCancelled:
+                print(f'[decision] turn cancelled by user message')
+                self._current_turn.append({
+                    'role': 'assistant',
+                    'content': '[turn interrupted by user message]',
+                })
+                await push_event({'type': 'turn_cancelled', 'payload': {}})
             except asyncio.CancelledError:
                 raise
             except Exception as e:
@@ -279,6 +319,7 @@ class Event:
                 })
                 await push_event({'type': 'error', 'payload': {'message': str(e)}})
             finally:
+                collector.set_cancel_event(None)
                 collector.set_busy(False)
                 # 无论成功失败，只要有消息就持久化
                 if self._current_turn:
@@ -345,7 +386,7 @@ class Event:
         self._turns = recent_turns
         print(f'[decision] compressed: kept {len(recent_turns)} recent turns, summary={len(summary)} chars')
 
-    async def _one_turn(self, trigger_event: dict):
+    async def _one_turn(self, trigger_event: dict, cancel_event: asyncio.Event | None = None):
         import time as _time
         from uuid import uuid4
         _turn_t0 = _time.perf_counter()
@@ -440,14 +481,21 @@ class Event:
             last_user = next((m.get('content', '')[:80] for m in reversed(messages) if m.get('role') == 'user'), '')
             print(f'[decision] llm request: round={round_idx} messages={msg_count} tools={tool_count} ~chars={prompt_chars} last_user={last_user}')
 
-            # ── 调用 LLM（含上下文溢出恢复）───────────────────────────────
+            # ── 调用 LLM（含上下文溢出恢复 + 取消检查）──────────────────────
+            # 取消检查点：在耗时的 LLM 调用前检查是否被用户消息中断
+            if cancel_event and cancel_event.is_set():
+                raise TurnCancelled("Interrupted before LLM call")
+
             _round_t0 = _time.perf_counter()
             _round_start_ts = time.time()
             try:
                 response = await client.llm(
                     message_list = messages,
                     tool_list    = all_tool_list,
+                    cancel_event = cancel_event,
                 )
+            except TurnCancelled:
+                raise
             except Exception as e:
                 from client.llm import LLMErrorKind, _classify_error
                 kind, _ = _classify_error(e)
@@ -592,6 +640,10 @@ class Event:
             # ── finish 检测 ───────────────────────────────────────────────
             if finish_tool in [c['function']['name'] for c in tool_calls]:
                 break
+
+            # ── 取消检查点：工具执行完毕后，下一轮 LLM 调用前 ────────────────
+            if cancel_event and cancel_event.is_set():
+                raise TurnCancelled("Interrupted after tool dispatch")
 
         # 检查是否需要压缩（保存由 run_forever 的 finally 统一处理）
         await self._maybe_compress()

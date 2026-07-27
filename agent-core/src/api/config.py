@@ -18,6 +18,7 @@ class LLMConfig(BaseModel):
     url:   str = ''
     key:   str = ''
     model: str = ''
+    think_mode: bool = False
 
 
 class TTSConfig(BaseModel):
@@ -140,6 +141,7 @@ async def config_get():
     llm = dict(services.get('llm', {}))
     if llm.get('key'):
         llm['key'] = '****'
+    llm.setdefault('think_mode', False)
 
     mcp_list = [
         {
@@ -205,7 +207,21 @@ async def config_save(req: ConfigSaveRequest):
         'url':   _normalize_llm_url(req.services.llm.url),
         'key':   new_key,
         'model': req.services.llm.model,
+        'think_mode': req.services.llm.think_mode,
     }
+
+    # Sync to client.llm (operational LLM config)
+    client_cfg = config.main.get('client', {})
+    client_cfg['llm'] = [{
+        'url':   services['llm']['url'],
+        'key':   services['llm']['key'],
+        'model': services['llm']['model'],
+        'think_mode': services['llm']['think_mode'],
+    }]
+    config.main['client'] = client_cfg
+    # Reinitialize the LLM client with new config
+    import client as client_mod
+    client_mod.llm = client_mod.llm.__class__()
 
     # TTS / VAD / ASR
     existing_tts_key = services.get('tts', {}).get('api_key', '')

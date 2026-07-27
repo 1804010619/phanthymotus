@@ -106,19 +106,26 @@ class Client():
     async def __call__(self,
         message_list: list[dict],
         tool_list: list[dict],
+        cancel_event: 'asyncio.Event | None' = None,
     ) -> dict:
 
-        async def _go(client, model) -> dict:
+        async def _go(client, model, think_mode: bool) -> dict:
             url = str(client.base_url)
             t0 = time.perf_counter()
             try:
+                extra = {}
+                if not think_mode:
+                    extra["extra_body"] = {
+                        "chat_template_kwargs": {"enable_thinking": False},
+                    }
+
                 response = await client.chat.completions.create(
                     model=model,
                     messages=message_list,
                     tools=tool_list,
                     max_tokens=10240,
                     stream=False,
-                    extra_body={"thinking": {"type": "disabled"}, "enable_thinking": False},
+                    **extra,
                 )
                 elapsed = time.perf_counter() - t0
                 # Performance log: latency + token usage
@@ -161,13 +168,27 @@ class Client():
 
             # 竞速调用所有存活 endpoint
             task_list = [
-                asyncio.create_task(_go(c, cfg['model']))
+                asyncio.create_task(_go(c, cfg['model'], cfg.get('think_mode', False)))
                 for _, c, cfg in alive
             ]
 
-            done, pending = await asyncio.wait(task_list, return_when=asyncio.FIRST_COMPLETED)
+            # 如果有 cancel_event，加入哨兵 task 实现用户消息抢占
+            cancel_task = None
+            wait_tasks = list(task_list)
+            if cancel_event:
+                cancel_task = asyncio.create_task(cancel_event.wait())
+                wait_tasks.append(cancel_task)
+
+            done, pending = await asyncio.wait(wait_tasks, return_when=asyncio.FIRST_COMPLETED)
             for t in pending:
                 t.cancel()
+
+            # 如果 cancel 先完成 → 中断当前 turn
+            if cancel_task and cancel_task in done:
+                for t in task_list:
+                    t.cancel()
+                from event.llm import TurnCancelled
+                raise TurnCancelled("Interrupted by user message during LLM call")
 
             # 检查是否有成功的
             for t in done:
