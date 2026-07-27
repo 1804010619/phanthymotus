@@ -99,6 +99,7 @@ class Client():
                 ),
             )
             for config_it in config.main['client']['llm']
+            if config_it.get('key')  # 跳过未配置 credentials 的条目
         ]
         # 跟踪每个 endpoint 的健康状态
         self._endpoint_dead: list[bool] = [False] * len(self.client_list)
