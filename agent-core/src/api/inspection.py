@@ -266,7 +266,7 @@ async def bus_ws(websocket: fastapi.WebSocket, topic: str):
                     await websocket.send_text(json.dumps({'type': 'ping', 'ts': time.time()}))
                 except Exception:
                     break
-    except (fastapi.WebSocketDisconnect, Exception):
+    except (fastapi.WebSocketDisconnect, asyncio.CancelledError, Exception):
         pass
     finally:
         queues = _topic_queues.get(topic, [])

@@ -71,7 +71,7 @@ async def motus_ws(websocket: fastapi.WebSocket):
                     await websocket.send_text(json.dumps({'type': 'ping', 'ts': time.time()}))
                 except Exception:
                     break
-    except (fastapi.WebSocketDisconnect, Exception):
+    except (fastapi.WebSocketDisconnect, asyncio.CancelledError, Exception):
         pass
     finally:
         _clients.discard(queue)
