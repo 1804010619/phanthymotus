@@ -1465,6 +1465,35 @@ async function _startProject() {
   // Save canvas layout first (so backend reads latest topology)
   await _saveLayout();
 
+  // Import motus for event subscription
+  const { onMotusEvent, offMotusEvent } = await import('./motus-stream.js');
+
+  // Subscribe to startup progress events
+  let modal = null;
+  let itemIndex = {};  // tool_name -> index in modal
+
+  function _onEvent(event) {
+    const p = event.payload || {};
+    if (event.type === 'project_start_begin') {
+      const cards = p.cards || [];
+      const items = cards.map(c => ({ card: { toolName: c.tool, mcpId: c.mcp_id } }));
+      modal = _showStartupModal(items);
+      cards.forEach((c, i) => { itemIndex[c.tool] = i; });
+    } else if (event.type === 'project_start_item' && modal) {
+      const idx = itemIndex[p.tool];
+      if (idx !== undefined) {
+        modal.updateItem(idx, p.status, p.message || '');
+      }
+    } else if (event.type === 'project_start_done') {
+      if (modal && !p.has_error) {
+        setTimeout(() => { modal.close(); }, 1500);
+      }
+      offMotusEvent(_onEvent);
+    }
+  }
+
+  onMotusEvent(null, _onEvent);
+
   // Call unified backend start-project
   try {
     const res = await fetch('/api/config/start-project', { method: 'POST' });
@@ -1476,9 +1505,13 @@ async function _startProject() {
     } else {
       const data = await res.json().catch(() => ({}));
       _logActivity('error', `启动失败: ${data.detail || res.status}`);
+      offMotusEvent(_onEvent);
+      if (modal) modal.close();
     }
   } catch (e) {
     _logActivity('error', `启动失败: ${e.message}`);
+    offMotusEvent(_onEvent);
+    if (modal) modal.close();
   }
 }
 
