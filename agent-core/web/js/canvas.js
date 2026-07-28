@@ -1519,6 +1519,16 @@ function _initAutoStartToggle() {
     .catch(() => {});
 
   checkbox.addEventListener('change', async () => {
+    // 开启时警告 token 消耗
+    if (checkbox.checked) {
+      const confirmed = confirm(
+        '开启后，设备启动时将自动开始智能控制，持续消耗 LLM Token。\n\n确认开启开机自启动？'
+      );
+      if (!confirmed) {
+        checkbox.checked = false;
+        return;
+      }
+    }
     try {
       await fetch('/api/config/auto-start', {
         method: 'PUT',
