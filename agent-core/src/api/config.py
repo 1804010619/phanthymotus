@@ -184,6 +184,18 @@ async def _do_start_project():
     core = config.main.get('core', {})
     core['project_running'] = True
     config.main['core'] = core
+
+    # 确保 channel adapters 已连接（restart 断开的 adapter）
+    from channel.manager import manager as channel_mgr, _get_channel_configs
+    channel_mgr.sync_from_canvas()
+    for ch_cfg in _get_channel_configs():
+        ch_id = ch_cfg.get('id', '')
+        if ch_cfg.get('enabled') and ch_id not in channel_mgr._adapters:
+            try:
+                await channel_mgr.restart_adapter(ch_id)
+            except Exception as e:
+                print(f'[start-project] channel {ch_id} restart failed: {e}')
+
     print(f'[start-project] done ({len(cards)} cards)')
 
 
