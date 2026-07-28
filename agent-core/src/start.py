@@ -244,13 +244,10 @@ async def _heartbeat_core_mcp():
 
 
 async def _auto_start_project():
-    """开机自动启动：复用前端 _startProject 的逻辑。
-    读取 canvas layout，按拓扑顺序对每个 card 发送 start action。
-    使用内部 HTTP API（与前端相同路径），避免 registry 时序依赖。"""
+    """开机自动启动：等待设备就绪后调用统一的 start-project 函数。"""
     import time as _time
-    import aiohttp
 
-    # 等待 MCP 设备可达（最多 30s）
+    # 等待 MCP 设备 online（最多 30s）
     print('[auto-start] waiting for devices...')
     deadline = _time.time() + 30
     while _time.time() < deadline:
@@ -262,75 +259,10 @@ async def _auto_start_project():
             break
         await asyncio.sleep(2)
 
-    # 读取 canvas layout
-    layout = config.main.get('canvas_layout', {})
-    cards = layout.get('cards', [])
-    connections = layout.get('connections', [])
-
-    if not cards:
-        print('[auto-start] no cards in canvas, skipping')
-        return
-
-    # 分类：sources (无入连接) 和 processors (有入连接)
-    cards_with_inbound = set()
-    for conn in connections:
-        cards_with_inbound.add(conn.get('toCardId'))
-
-    sources = [c for c in cards if c['id'] not in cards_with_inbound]
-    processors = [c for c in cards if c['id'] in cards_with_inbound]
-
-    async def _start_card(card, session):
-        mcp_id = card.get('mcpId', '')
-        tool_name = card.get('toolName', '')
-        card_id = card.get('id', '')
-        if not mcp_id or not tool_name:
-            return
-        # Skip agentcore cards that aren't decision_core (e.g. remote_message is input-only)
-        if mcp_id == 'agentcore' and tool_name != 'decision_core':
-            return
-
-        # 构建 input_topic 参数
-        in_conns = [c for c in connections if c.get('toCardId') == card_id]
-        topics = list(set(c.get('fromTopic', '') for c in in_conns if c.get('fromTopic')))
-
-        args = {'action': 'start', 'instance_id': card_id}
-        if len(topics) > 1:
-            args['input_topics'] = topics
-        elif len(topics) == 1:
-            args['input_topic'] = topics[0]
-
-        # 调用内部 API（与前端 _triggerAction 相同）
-        url = f'https://localhost:15678/api/mcp/{mcp_id}/call'
-        headers = {}
-        token = auth.get_token()
-        if token:
-            headers['Authorization'] = f'Bearer {token}'
-        payload = {'tool': tool_name, 'arguments': args}
-        try:
-            async with session.post(url, json=payload, ssl=False, headers=headers) as resp:
-                if resp.status == 200:
-                    print(f'[auto-start] started {tool_name} ({mcp_id})')
-                else:
-                    text = await resp.text()
-                    print(f'[auto-start] {tool_name} returned {resp.status}: {text[:100]}')
-        except Exception as e:
-            print(f'[auto-start] failed {tool_name}: {e}')
-
-    timeout = aiohttp.ClientTimeout(total=15)
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        # Phase 1: start sources
-        for card in sources:
-            await _start_card(card, session)
-
-        # Phase 2: start processors
-        for card in processors:
-            await _start_card(card, session)
-
-    # 标记 project_running
-    core = config.main.get('core', {})
-    core['project_running'] = True
-    config.main['core'] = core
-    print(f'[auto-start] project started ({len(cards)} cards)')
+    # 调用统一的启动函数
+    from api.config import _do_start_project
+    await _do_start_project()
+    print('[auto-start] done')
 
 
 @contextlib.asynccontextmanager
