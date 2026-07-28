@@ -6021,3 +6021,43 @@ html, body {
   margin-top: 2px;
 }
 
+/* ── Auto-Start Toggle ──────────────────────────────────────────────────────── */
+.auto-start-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  margin-left: 10px;
+  cursor: pointer;
+  user-select: none;
+}
+.auto-start-toggle input[type=checkbox] {
+  appearance: none;
+  -webkit-appearance: none;
+  width: 14px;
+  height: 14px;
+  border: 1.5px solid var(--border);
+  border-radius: 3px;
+  cursor: pointer;
+  position: relative;
+  transition: border-color .12s, background .12s;
+}
+.auto-start-toggle input[type=checkbox]:checked {
+  background: var(--accent);
+  border-color: var(--accent);
+}
+.auto-start-toggle input[type=checkbox]:checked::after {
+  content: '';
+  position: absolute;
+  left: 3.5px;
+  top: 1px;
+  width: 3.5px;
+  height: 7px;
+  border: solid #fff;
+  border-width: 0 1.5px 1.5px 0;
+  transform: rotate(45deg);
+}
+.auto-start-label {
+  font-size: 11px;
+  color: var(--text-secondary);
+}
+

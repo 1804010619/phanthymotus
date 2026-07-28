@@ -242,6 +242,50 @@ async def _heartbeat_core_mcp():
             print(f'[heartbeat] core re-register failed: {e}')
 
 
+async def _auto_start_project():
+    """开机自动启动：等待设备就绪后启动所有 canvas cards。"""
+    import time as _time
+
+    # 等待 MCP 设备 online（最多 30s）
+    print('[auto-start] waiting for devices...')
+    deadline = _time.time() + 30
+    while _time.time() < deadline:
+        external = [
+            info for mcp_id, info in mcp_client.registry.items()
+            if mcp_id not in ('agentcore', 'channel', '__perf__')
+        ]
+        if external and all(info.get('online') for info in external):
+            break
+        await asyncio.sleep(2)
+
+    # 启动所有 canvas cards
+    layout = config.main.get('canvas_layout', {})
+    cards = layout.get('cards', [])
+    started = []
+    for card in cards:
+        mcp_id = card.get('mcpId')
+        if not mcp_id or mcp_id == 'agentcore':
+            continue
+        info = mcp_client.registry.get(mcp_id)
+        if not info or not info.get('online'):
+            continue
+        # 找到 start 工具
+        start_tool = f'mcp__{mcp_id}__start'
+        if start_tool not in info.get('schemas', {}):
+            continue
+        try:
+            await mcp_client.call_tool(start_tool, {})
+            started.append(mcp_id)
+        except Exception as e:
+            print(f'[auto-start] failed to start {mcp_id}: {e}')
+
+    # 标记 project_running
+    core = config.main.get('core', {})
+    core['project_running'] = True
+    config.main['core'] = core
+    print(f'[auto-start] project started ({len(started)} devices: {", ".join(started)})')
+
+
 @contextlib.asynccontextmanager
 async def lifespan(app):
     # 初始化 access token 认证
@@ -290,6 +334,10 @@ async def lifespan(app):
     await channel_manager.start()
 
     async with event.llm:
+        # Auto-start project if configured
+        if config.main.get('core', {}).get('auto_start', False):
+            asyncio.create_task(_auto_start_project())
+
         tasks = [
             asyncio.create_task(event.llm.run_forever()),
             asyncio.create_task(scheduler.run()),

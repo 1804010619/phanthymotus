@@ -127,6 +127,24 @@ async def set_project_running(req: ProjectRunningRequest):
     return {'ok': True}
 
 
+@router.get('/auto-start')
+async def get_auto_start():
+    core = config.main.get('core', {})
+    return {'auto_start': bool(core.get('auto_start', False))}
+
+
+class AutoStartRequest(BaseModel):
+    auto_start: bool
+
+
+@router.put('/auto-start')
+async def set_auto_start(req: AutoStartRequest):
+    core = config.main.get('core', {})
+    core['auto_start'] = req.auto_start
+    config.main['core'] = core
+    return {'ok': True}
+
+
 @router.get('/services')
 async def config_services():
     """Return just the services section (used by browser to resolve inspector host)."""

@@ -377,6 +377,9 @@ function _setupControlButtons() {
     _projectRunning ? _stopProject() : _startProject();
   });
   _syncProjectBtn();
+
+  // Auto-start toggle
+  _initAutoStartToggle();
 }
 
 // ── Drop zone ─────────────────────────────────────────────────────────────────
@@ -1672,6 +1675,29 @@ function _syncProjectBtn() {
   btn.textContent = _projectRunning ? '停止智能控制' : '开启智能控制';
   btn.title = _projectRunning ? '停止智能控制' : '开启智能控制';
   btn.classList.toggle('running', _projectRunning);
+}
+
+function _initAutoStartToggle() {
+  const checkbox = document.getElementById('auto-start-checkbox');
+  if (!checkbox) return;
+
+  fetch('/api/config/auto-start')
+    .then(r => r.json())
+    .then(res => { checkbox.checked = res.auto_start ?? false; })
+    .catch(() => {});
+
+  checkbox.addEventListener('change', async () => {
+    try {
+      await fetch('/api/config/auto-start', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ auto_start: checkbox.checked }),
+      });
+    } catch (e) {
+      console.error('[auto-start] save failed:', e);
+      checkbox.checked = !checkbox.checked;
+    }
+  });
 }
 
 async function _triggerAction(mcpId, toolName, action, extraArgs = {}) {
