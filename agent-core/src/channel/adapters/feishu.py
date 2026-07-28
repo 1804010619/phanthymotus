@@ -102,6 +102,13 @@ class FeishuAdapter(ChannelAdapter):
 
         _receive_message_loop has built-in auto_reconnect on disconnect.
         """
+        # Lark SDK stores the event loop in a module-level variable (lark_oapi.ws.client.loop)
+        # which captures the main uvloop at import time. Replace it with a fresh loop
+        # so SDK operations run independently of the main event loop.
+        import lark_oapi.ws.client as ws_mod
+        new_loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(new_loop)
+        ws_mod.loop = new_loop
         try:
             self._client.start()
         except Exception as e:

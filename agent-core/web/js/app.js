@@ -345,44 +345,113 @@ function _initSettingsDropdown() {
     });
   });
 
-  // Think mode toggle
-  _initThinkModeToggle();
+  // Reset modal
+  _initResetModal();
 }
 
-function _initThinkModeToggle() {
-  const checkbox = document.getElementById('think-mode-checkbox');
-  if (!checkbox) return;
+function _initResetModal() {
+  const overlay = document.getElementById('reset-overlay');
+  const btnOpen = document.getElementById('btn-reset');
+  const btnClose = document.getElementById('reset-close');
+  const btnCancel = document.getElementById('reset-cancel');
+  const btnConfirm = document.getElementById('reset-confirm');
+  if (!overlay || !btnOpen) return;
 
-  // Load current state
-  fetch('/api/config')
-    .then(r => r.json())
-    .then(res => {
-      const thinkMode = res.data?.services?.llm?.think_mode ?? false;
-      checkbox.checked = thinkMode;
-    })
-    .catch(() => {});
+  const close = () => overlay.classList.add('hidden');
 
-  // Save on change
-  checkbox.addEventListener('change', async () => {
-    const checked = checkbox.checked;
+  btnOpen.addEventListener('click', () => overlay.classList.remove('hidden'));
+  btnClose?.addEventListener('click', close);
+  btnCancel?.addEventListener('click', close);
+  overlay.addEventListener('click', (e) => { if (e.target === overlay) close(); });
+
+  btnConfirm?.addEventListener('click', async () => {
+    const restartServices = document.getElementById('reset-restart-services')?.checked || false;
+    const body = {
+      restart_services: restartServices,
+      chat_history: document.getElementById('reset-chat-history')?.checked || false,
+      system_prompt: document.getElementById('reset-system-prompt')?.checked || false,
+      identity: document.getElementById('reset-identity')?.checked || false,
+      memory: document.getElementById('reset-memory')?.checked || false,
+      skills: document.getElementById('reset-skills')?.checked || false,
+    };
+    if (!Object.values(body).some(v => v)) return;
+
+    btnConfirm.disabled = true;
+    btnConfirm.textContent = '执行中...';
     try {
-      // Read current config, update think_mode, save back
-      const res = await fetch('/api/config');
-      const json = await res.json();
-      const services = json.data?.services || {};
-      const llm = services.llm || {};
-      llm.think_mode = checked;
-
-      await fetch('/api/config', {
+      const res = await fetch('/api/config/reset', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ services: { ...services, llm } }),
+        body: JSON.stringify(body),
       });
+      if (res.ok) {
+        overlay.querySelectorAll('input[type=checkbox]').forEach(cb => cb.checked = false);
+        if (restartServices) {
+          // Show restart waiting overlay
+          close();
+          _showRestartWaiting();
+        } else {
+          btnConfirm.textContent = '已完成';
+          setTimeout(() => { close(); btnConfirm.textContent = '确认执行'; btnConfirm.disabled = false; }, 1000);
+        }
+      }
     } catch (e) {
-      console.error('[think-mode] save failed:', e);
-      checkbox.checked = !checked; // revert on error
+      console.error('[reset] failed:', e);
+      btnConfirm.textContent = '失败';
+      setTimeout(() => { btnConfirm.textContent = '确认执行'; btnConfirm.disabled = false; }, 2000);
     }
   });
+}
+
+function _showRestartWaiting() {
+  let el = document.getElementById('restart-waiting-overlay');
+  if (!el) {
+    el = document.createElement('div');
+    el.id = 'restart-waiting-overlay';
+    el.className = 'modal-overlay';
+    el.innerHTML = `
+      <div class="restart-waiting">
+        <div class="restart-waiting-spinner"></div>
+        <p class="restart-waiting-text">服务重启中，请稍候...</p>
+        <p class="restart-waiting-sub" id="restart-waiting-status">等待服务关闭...</p>
+      </div>
+    `;
+    document.body.appendChild(el);
+  }
+  el.classList.remove('hidden');
+
+  // Phase 1: Wait for agent-core to go down (up to 10s)
+  // Phase 2: Then poll until it's back up
+  let attempts = 0;
+  let wentDown = false;
+  const poll = setInterval(async () => {
+    attempts++;
+    const statusEl = document.getElementById('restart-waiting-status');
+    try {
+      const r = await fetch('/api/config', { signal: AbortSignal.timeout(2000) });
+      if (r.ok && wentDown) {
+        // Phase 2 complete: service is back
+        clearInterval(poll);
+        if (statusEl) statusEl.textContent = '服务已恢复，正在刷新...';
+        setTimeout(() => location.reload(), 500);
+        return;
+      }
+      // Still up, waiting to go down
+      if (!wentDown && statusEl) statusEl.textContent = '等待服务关闭...';
+    } catch (_) {
+      // Service is down
+      if (!wentDown) {
+        wentDown = true;
+        if (statusEl) statusEl.textContent = '服务已关闭，等待恢复...';
+      } else {
+        if (statusEl) statusEl.textContent = `等待恢复中... (${attempts * 2}s)`;
+      }
+    }
+    if (attempts > 45) { // 90s timeout
+      clearInterval(poll);
+      if (statusEl) statusEl.textContent = '超时，请手动刷新页面';
+    }
+  }, 2000);
 }
 
 function _showLoginScreen() {

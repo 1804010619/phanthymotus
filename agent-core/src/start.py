@@ -10,6 +10,7 @@ import event
 import collector
 import scheduler
 import topic_subscriber
+import mcp_client
 from channel.manager import manager as channel_manager
 
 
@@ -242,6 +243,28 @@ async def _heartbeat_core_mcp():
             print(f'[heartbeat] core re-register failed: {e}')
 
 
+async def _auto_start_project():
+    """开机自动启动：等待设备就绪后调用统一的 start-project 函数。"""
+    import time as _time
+
+    # 等待 MCP 设备 online（最多 30s）
+    print('[auto-start] waiting for devices...')
+    deadline = _time.time() + 30
+    while _time.time() < deadline:
+        external = [
+            info for mcp_id, info in mcp_client.registry.items()
+            if mcp_id not in ('agentcore', 'channel', '__perf__')
+        ]
+        if external and all(info.get('online') for info in external):
+            break
+        await asyncio.sleep(2)
+
+    # 调用统一的启动函数
+    from api.config import _do_start_project
+    await _do_start_project()
+    print('[auto-start] done')
+
+
 @contextlib.asynccontextmanager
 async def lifespan(app):
     # 初始化 access token 认证
@@ -290,6 +313,23 @@ async def lifespan(app):
     await channel_manager.start()
 
     async with event.llm:
+        # Auto-start project if configured, otherwise reset running state
+        if config.main.get('core', {}).get('auto_start', False):
+            async def _safe_auto_start():
+                try:
+                    await _auto_start_project()
+                except Exception as e:
+                    print(f'[auto-start] ERROR: {e}')
+                    import traceback
+                    traceback.print_exc()
+            asyncio.create_task(_safe_auto_start())
+        else:
+            # Not auto-starting: clear stale project_running flag from last session
+            core = config.main.get('core', {})
+            if core.get('project_running'):
+                core['project_running'] = False
+                config.main['core'] = core
+
         tasks = [
             asyncio.create_task(event.llm.run_forever()),
             asyncio.create_task(scheduler.run()),
@@ -300,7 +340,10 @@ async def lifespan(app):
             for t in tasks:
                 t.cancel()
             await channel_manager.stop()
-            await loop.run_in_executor(None, ros2_bridge.stop)
+            try:
+                await loop.run_in_executor(None, ros2_bridge.stop)
+            except (asyncio.CancelledError, RuntimeError):
+                ros2_bridge.stop()
 
 
 # ========== 网络服务 ==========

@@ -99,6 +99,7 @@ class Client():
                 ),
             )
             for config_it in config.main['client']['llm']
+            if config_it.get('key')  # 跳过未配置 credentials 的条目
         ]
         # 跟踪每个 endpoint 的健康状态
         self._endpoint_dead: list[bool] = [False] * len(self.client_list)
@@ -141,6 +142,9 @@ class Client():
                 else:
                     print(f'[llm] {model} ok {elapsed:.2f}s | usage=N/A')
                 msg = response.choices[0].message.to_dict()
+                # OpenAI SDK 可能生成 tool_calls: None，清理以避免下游迭代报错
+                if msg.get('tool_calls') is None:
+                    del msg['tool_calls']
                 # 清理模型泄漏的 think 标签残留
                 if msg.get('content'):
                     msg['content'] = re.sub(r'</?think>', '', msg['content']).strip()

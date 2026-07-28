@@ -126,7 +126,7 @@ def _estimate_chars(turns: list[list[dict]]) -> int:
             elif isinstance(content, list):
                 total += 200  # multimodal 粗估
             # tool_calls 的 arguments 也计入
-            for tc in msg.get('tool_calls', []):
+            for tc in (msg.get('tool_calls') or []):
                 total += len(tc.get('function', {}).get('arguments', ''))
     return total
 
@@ -194,6 +194,23 @@ async def _compress_turns(turns: list[list[dict]]) -> str:
 
 import datetime as _dt
 
+
+async def _search_history(
+    query: typing.Annotated[str, "搜索关键词（支持中文）"],
+    limit: typing.Annotated[int, "返回最多 N 条结果，默认 5"] = 5,
+) -> str:
+    """搜索历史对话记录。当需要回忆过去的对话内容、查找之前讨论过的话题时使用。"""
+    import chat_history
+    results = chat_history.search(query, limit=limit)
+    if not results:
+        return '未找到相关历史记录。'
+    lines = []
+    for r in results:
+        ts = _dt.datetime.fromtimestamp(r['ts']).strftime('%m-%d %H:%M')
+        lines.append(f'[{ts}] {r["preview"]}')
+    return '\n---\n'.join(lines)
+
+
 async def _raw_input_info(
     source: typing.Annotated[str, "要查看详情的信息源名称（可通过摘要中的 source name 获得）"],
     limit: typing.Annotated[int, "返回最近 N 条原始事件，默认 20"] = 20,
@@ -233,6 +250,7 @@ class Event:
             ('task_fail', event.task.task_fail),
             ('task_list', event.task.task_list),
             ('raw_input_info', _raw_input_info),
+            ('search_history', _search_history),
         ])
         # 连接并注册所有 MCP 工具
         await mcp_client.init_all()
@@ -242,8 +260,15 @@ class Event:
         task_store.load_all()
         for task in task_store.active_tasks():
             _register_check(task)
-        # 聊天历史会话 — 延迟到第一次 save_turn 时创建
-        self._session_id = None
+        # 重启续跑：加载上一个 session 的最近 turns
+        import chat_history
+        last = chat_history.get_last_session_turns(limit=10)
+        if last:
+            self._turns = last['turns']
+            self._session_id = last['session_id']
+            print(f'[startup] resumed session {last["session_id"][:8]}... ({len(last["turns"])} turns)')
+        else:
+            self._session_id = None
         return self
 
     async def __aexit__(self, *args):

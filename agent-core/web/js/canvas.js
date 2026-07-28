@@ -377,6 +377,9 @@ function _setupControlButtons() {
     _projectRunning ? _stopProject() : _startProject();
   });
   _syncProjectBtn();
+
+  // Auto-start toggle
+  _initAutoStartToggle();
 }
 
 // ── Drop zone ─────────────────────────────────────────────────────────────────
@@ -1459,196 +1462,32 @@ function _autoStopOnDisconnect(cardId, portIdx, topic) {
 }
 
 async function _startProject() {
-  // 先对 agentcore 发 stop，清理上一轮残留的 topic 订阅（必须 await 否则后续 start 会被 stop 覆盖）
-  await _triggerAction('agentcore', 'decision_core', 'stop', {});
+  // Save canvas layout first (so backend reads latest topology)
+  await _saveLayout();
 
-  // Check all cards on canvas that need config are configured (via sidebar per-tool config)
-  const unconfigured = _cards.filter(c => {
-    const mcp = _allMcps.find(m => m.id === c.mcpId);
-    const tools = mcp?.tools || [];
-    const toolObj = tools.find(t => (typeof t === 'string' ? t : t.name) === c.toolName);
-    const configSchema = typeof toolObj === 'object' ? toolObj.configSchema : null;
-    return hasSharedRequired(configSchema) && !isToolConfigured(c.mcpId, c.toolName);
-  });
-  if (unconfigured.length) {
-    const names = unconfigured.map(c => c.toolName).join(', ');
-    const msg = `无法启动：以下工具未配置: ${names}（请在侧边栏中配置）`;
-    _logActivity('error', msg);
-    _flashStartError(msg);
-    return;
-  }
-
-  // Resolve all topics before validation (ensures correctness after page reload)
-  _resolveAllTopics();
-
-  // For processor cards with empty output topics, fetch from driver using input topic
-  for (const card of _cards) {
-    const outPorts = [...card.el.querySelectorAll('.canvas-port.out')];
-    const hasEmptyOut = outPorts.some(p => !p.dataset.topic);
-    if (!hasEmptyOut) continue;
-    // Only for cards that have outgoing connections (otherwise irrelevant)
-    const hasOutConn = _connections.some(c => c.fromCardId === card.id);
-    if (!hasOutConn) continue;
-    // Get input topic from inbound connection
-    const inConn = _connections.find(c => c.toCardId === card.id);
-    const inputTopic = inConn?.fromTopic || '';
-    await _fetchTopicsFromDriver(card, inputTopic);
-  }
-  _resolveAllTopics();
-
-  // Validate topic connections: every connection must have a fromTopic
-  for (const conn of _connections) {
-    if (!conn.fromTopic) {
-      const fromCard = _cards.find(c => c.id === conn.fromCardId);
-      const toCard = _cards.find(c => c.id === conn.toCardId);
-      const msg = `连线缺少 topic: ${fromCard?.toolName || '?'} → ${toCard?.toolName || '?'}，请删除并重新连接`;
-      _logActivity('error', msg);
-      _flashStartError(msg);
-      return;
-    }
-  }
-
-  _projectRunning = true;
-  _syncProjectBtn();
-  // Enable execute buttons
-  document.querySelectorAll('.canvas-exec-btn').forEach(btn => btn.classList.remove('locked'));
-
-  // Collect start args for all cards
-  const startItems = _cards.map(card => {
-    const inConns = _connections.filter(c => c.toCardId === card.id);
-    const topics = [...new Set(inConns.map(conn => conn.fromTopic || '').filter(Boolean))];
-    let args;
-    if (topics.length > 1) {
-      args = { input_topics: topics };
-    } else if (topics.length === 1) {
-      args = { input_topic: topics[0] };
+  // Call unified backend start-project
+  try {
+    const res = await fetch('/api/config/start-project', { method: 'POST' });
+    if (res.ok) {
+      _projectRunning = true;
+      _syncProjectBtn();
+      document.querySelectorAll('.canvas-exec-btn').forEach(btn => btn.classList.remove('locked'));
+      _logActivity('project', '智能控制已开启');
     } else {
-      args = {};
+      const data = await res.json().catch(() => ({}));
+      _logActivity('error', `启动失败: ${data.detail || res.status}`);
     }
-    args.instance_id = card.id;
-    return { card, args };
-  });
-
-  // Show startup modal
-  const { modal, updateItem, close } = _showStartupModal(startItems);
-  let aborted = false;
-
-  modal.onCancel = () => {
-    aborted = true;
-    close();
-    _stopProject();
-  };
-
-  // Split into sources (no inbound connections) and processors (have inbound connections)
-  const sourceIndices = [];
-  const processorIndices = [];
-  startItems.forEach(({ card }, i) => {
-    const hasInbound = _connections.some(c => c.toCardId === card.id);
-    (hasInbound ? processorIndices : sourceIndices).push(i);
-  });
-
-  // Helper to start a batch of items by index
-  async function _startBatch(indices) {
-    const batch = indices.map(i => (async () => {
-      const { card, args } = startItems[i];
-      updateItem(i, 'starting');
-      try {
-        const startResult = await _triggerAction(card.mcpId, card.toolName, 'start', args);
-        if (aborted) return;
-        if (startResult && startResult.code !== 200) {
-          updateItem(i, 'error', startResult.message || '启动失败');
-          _logActivity('error', `${card.toolName} 启动失败: ${startResult.message || '未知错误'}`);
-          if (!aborted) { aborted = true; _stopProject(); _showStartupError(modal, close); }
-          return;
-        }
-        // Auto-start mic stream for remote_mic card
-        if (card.toolName === 'remote_mic' && !isMicActive()) {
-          const wsProto = location.protocol === 'https:' ? 'wss' : 'ws';
-          const wsUrl = `${wsProto}://${location.host}/ws/mic`;
-          try {
-            await toggleMicStream(wsUrl, (active) => {
-              const micBtn = card.el?.querySelector('.canvas-mic-btn');
-              if (micBtn) {
-                micBtn.textContent = active ? '\u23F9 停止录音' : '\uD83C\uDF99 开始录音';
-                micBtn.classList.toggle('recording', active);
-              }
-            });
-          } catch (err) {
-            _logActivity('error', '麦克风启动失败: ' + err.message);
-          }
-        }
-        // Update card.topicOut from start response
-        const parsed = _parseMcpCallResult(startResult);
-        if (parsed?.topic_out?.some(t => t.topic)) {
-          card.topicOut = parsed.topic_out;
-          const outPorts = [...card.el.querySelectorAll('.canvas-port.out')];
-          parsed.topic_out.forEach((t, idx) => { if (outPorts[idx] && t.topic) outPorts[idx].dataset.topic = t.topic; });
-        }
-        updateItem(i, 'ready');
-      } catch (e) {
-        if (!aborted) {
-          updateItem(i, 'error', e.message || '异常');
-          aborted = true;
-          _stopProject();
-          _showStartupError(modal, close);
-        }
-      }
-    })());
-    await Promise.allSettled(batch);
-  }
-
-  // Phase 1: start sources (data producers) first
-  await _startBatch(sourceIndices);
-  if (aborted) return;
-
-  // Re-resolve topics so processors can find source output topics
-  _resolveAllTopics();
-
-  // Phase 2: start processors (data consumers)
-  await _startBatch(processorIndices);
-  if (!aborted) {
-    // Re-resolve topics after all starts complete
-    _resolveAllTopics();
-    _redrawConnections();
-    // Ensure button shows running state
-    _syncProjectBtn();
-    document.querySelectorAll('.canvas-exec-btn').forEach(btn => btn.classList.remove('locked'));
-    // Update cancel button to close button
-    const cancelBtn = modal.querySelector('.startup-cancel-btn');
-    cancelBtn.textContent = '关闭';
-    cancelBtn.onclick = close;
-    modal.onCancel = null;
-    // Persist layout and running state
-    await _saveLayout();
-    fetch('/api/config/project-running', {
-      method: 'PUT', headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({running: true}),
-    });
-    _logActivity('project', '智能控制已开启');
+  } catch (e) {
+    _logActivity('error', `启动失败: ${e.message}`);
   }
 }
 
 function _stopProject() {
   _projectRunning = false;
   _syncProjectBtn();
-  // Disable execute buttons
   document.querySelectorAll('.canvas-exec-btn').forEach(btn => btn.classList.add('locked'));
-  // Stop all cards on canvas, resolving input_topic from connections
+  // Auto-stop mic stream
   for (const card of _cards) {
-    const inConns = _connections.filter(c => c.toCardId === card.id);
-    const topics = inConns.map(conn => conn.fromTopic || '').filter(Boolean);
-
-    let args;
-    if (topics.length > 1) {
-      args = { input_topics: topics };
-    } else if (topics.length === 1) {
-      args = { input_topic: topics[0] };
-    } else {
-      args = {};
-    }
-    args.instance_id = card.id;
-    _triggerAction(card.mcpId, card.toolName, 'stop', args);
-    // Auto-stop mic stream when remote_mic card stops
     if (card.toolName === 'remote_mic' && isMicActive()) {
       toggleMicStream('', () => {}).catch(() => {});
       const micBtn = card.el?.querySelector('.canvas-mic-btn');
@@ -1658,11 +1497,7 @@ function _stopProject() {
       }
     }
   }
-  // 持久化运行状态
-  fetch('/api/config/project-running', {
-    method: 'PUT', headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({running: false}),
-  });
+  fetch('/api/config/stop-project', { method: 'POST' }).catch(() => {});
   _logActivity('project', '智能控制已停止');
 }
 
@@ -1672,6 +1507,39 @@ function _syncProjectBtn() {
   btn.textContent = _projectRunning ? '停止智能控制' : '开启智能控制';
   btn.title = _projectRunning ? '停止智能控制' : '开启智能控制';
   btn.classList.toggle('running', _projectRunning);
+}
+
+function _initAutoStartToggle() {
+  const checkbox = document.getElementById('auto-start-checkbox');
+  if (!checkbox) return;
+
+  fetch('/api/config/auto-start')
+    .then(r => r.json())
+    .then(res => { checkbox.checked = res.auto_start ?? false; })
+    .catch(() => {});
+
+  checkbox.addEventListener('change', async () => {
+    // 开启时警告 token 消耗
+    if (checkbox.checked) {
+      const confirmed = confirm(
+        '开启后，设备启动时将自动开始智能控制，持续消耗 LLM Token。\n\n确认开启开机自启动？'
+      );
+      if (!confirmed) {
+        checkbox.checked = false;
+        return;
+      }
+    }
+    try {
+      await fetch('/api/config/auto-start', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ auto_start: checkbox.checked }),
+      });
+    } catch (e) {
+      console.error('[auto-start] save failed:', e);
+      checkbox.checked = !checkbox.checked;
+    }
+  });
 }
 
 async function _triggerAction(mcpId, toolName, action, extraArgs = {}) {

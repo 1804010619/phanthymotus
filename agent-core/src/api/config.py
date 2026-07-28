@@ -115,6 +115,118 @@ async def get_project_running():
     return {'running': bool(core.get('project_running', False))}
 
 
+# ── Start / Stop Project (统一入口) ─────────────────────────────────────────────
+
+async def _do_start_project():
+    """启动所有 canvas cards — 前端按钮和 auto-start 共用此函数。"""
+    from api.mcp_manage import mcp_call_tool, MCPCallRequest
+
+    layout = config.main.get('canvas_layout', {})
+    cards = layout.get('cards', [])
+    connections = layout.get('connections', [])
+
+    if not cards:
+        return
+
+    # 分类：sources (无入连接) 和 processors (有入连接)
+    cards_with_inbound = set()
+    for conn in connections:
+        cards_with_inbound.add(conn.get('toCardId'))
+
+    sources = [c for c in cards if c['id'] not in cards_with_inbound]
+    processors = [c for c in cards if c['id'] in cards_with_inbound]
+
+    async def _start_card(card):
+        mcp_id = card.get('mcpId', '')
+        tool_name = card.get('toolName', '')
+        card_id = card.get('id', '')
+        if not mcp_id or not tool_name:
+            return
+
+        # 构建 input_topic 参数
+        in_conns = [c for c in connections if c.get('toCardId') == card_id]
+        topics = list(set(c.get('fromTopic', '') for c in in_conns if c.get('fromTopic')))
+
+        args = {'action': 'start', 'instance_id': card_id}
+        if len(topics) > 1:
+            args['input_topics'] = topics
+        elif len(topics) == 1:
+            args['input_topic'] = topics[0]
+
+        try:
+            req = MCPCallRequest(tool=tool_name, arguments=args)
+            result = await mcp_call_tool(mcp_id, req)
+            if result.get('code') == 200:
+                print(f'[start-project] started {tool_name} ({mcp_id})')
+            else:
+                print(f'[start-project] {tool_name} error: {result}')
+        except Exception as e:
+            print(f'[start-project] failed {tool_name}: {e}')
+
+    # Phase 1: sources
+    for card in sources:
+        await _start_card(card)
+    # Phase 2: processors
+    for card in processors:
+        await _start_card(card)
+
+    # 标记 project_running
+    core = config.main.get('core', {})
+    core['project_running'] = True
+    config.main['core'] = core
+
+    # 确保 channel adapters 已连接（restart 断开的 adapter）
+    from channel.manager import manager as channel_mgr, _get_channel_configs
+    channel_mgr.sync_from_canvas()
+    for ch_cfg in _get_channel_configs():
+        ch_id = ch_cfg.get('id', '')
+        if ch_cfg.get('enabled') and ch_id not in channel_mgr._adapters:
+            try:
+                await channel_mgr.restart_adapter(ch_id)
+            except Exception as e:
+                print(f'[start-project] channel {ch_id} restart failed: {e}')
+
+    print(f'[start-project] done ({len(cards)} cards)')
+
+
+async def _do_stop_project():
+    """停止所有 canvas cards。"""
+    from api.mcp_manage import mcp_call_tool, MCPCallRequest
+
+    layout = config.main.get('canvas_layout', {})
+    cards = layout.get('cards', [])
+
+    for card in cards:
+        mcp_id = card.get('mcpId', '')
+        tool_name = card.get('toolName', '')
+        card_id = card.get('id', '')
+        if not mcp_id or not tool_name:
+            continue
+        try:
+            req = MCPCallRequest(tool=tool_name, arguments={'action': 'stop', 'instance_id': card_id})
+            await mcp_call_tool(mcp_id, req)
+        except Exception:
+            pass
+
+    core = config.main.get('core', {})
+    core['project_running'] = False
+    config.main['core'] = core
+    print('[stop-project] done')
+
+
+@router.post('/start-project')
+async def api_start_project():
+    await _do_start_project()
+    return {'ok': True}
+
+
+@router.post('/stop-project')
+async def api_stop_project():
+    await _do_stop_project()
+    return {'ok': True}
+
+
+
 class ProjectRunningRequest(BaseModel):
     running: bool
 
@@ -123,6 +235,24 @@ class ProjectRunningRequest(BaseModel):
 async def set_project_running(req: ProjectRunningRequest):
     core = config.main.get('core', {})
     core['project_running'] = req.running
+    config.main['core'] = core
+    return {'ok': True}
+
+
+@router.get('/auto-start')
+async def get_auto_start():
+    core = config.main.get('core', {})
+    return {'auto_start': bool(core.get('auto_start', False))}
+
+
+class AutoStartRequest(BaseModel):
+    auto_start: bool
+
+
+@router.put('/auto-start')
+async def set_auto_start(req: AutoStartRequest):
+    core = config.main.get('core', {})
+    core['auto_start'] = req.auto_start
     config.main['core'] = core
     return {'ok': True}
 
@@ -538,5 +668,117 @@ async def config_test_vad_audio(
         return {'code': 200, 'data': result}
     except Exception as e:
         return {'code': 200, 'data': {'ok': False, 'info': str(e)}}
+
+
+# ── 重置 ─────────────────────────────────────────────────────────────────────────
+
+class ResetRequest(BaseModel):
+    restart_services: bool = False
+    chat_history: bool = False
+    system_prompt: bool = False
+    identity: bool = False
+    memory: bool = False
+    skills: bool = False
+
+
+@router.post('/reset')
+async def reset_config(req: ResetRequest):
+    import shutil
+    import pathlib
+    reset_items = []
+
+    defaults_dir = pathlib.Path('/opt/defaults/memory')
+    memory_dir = pathlib.Path('./resource/memory')
+
+    if req.chat_history:
+        import chat_history
+        chat_history.clear_all()
+        import event
+        event.llm._turns = []
+        event.llm._summary = None
+        event.llm._session_id = None
+        event.llm._current_turn = []
+        reset_items.append('chat_history')
+
+    if req.system_prompt:
+        src = defaults_dir / 'prompt_system.md'
+        dst = memory_dir / 'prompt_system.md'
+        if src.exists():
+            shutil.copy2(src, dst)
+        reset_items.append('system_prompt')
+
+    if req.identity:
+        src = defaults_dir / 'identity.md'
+        dst = memory_dir / 'identity.md'
+        if src.exists():
+            shutil.copy2(src, dst)
+        reset_items.append('identity')
+
+    if req.memory:
+        src = defaults_dir / 'prompt_memory_init.md'
+        dst = memory_dir / 'prompt_memory.md'
+        if src.exists():
+            shutil.copy2(src, dst)
+        reset_items.append('memory')
+
+    if req.skills:
+        skills_cfg = config.main.get('skills', {'installed': []})
+        for skill in skills_cfg.get('installed', []):
+            skill['active'] = False
+        config.main['skills'] = skills_cfg
+        import event.skills
+        event.skills._runtime_activated.clear()
+        reset_items.append('skills')
+
+    if req.restart_services:
+        reset_items.append('restart_services')
+        # Restart all deployed services by matching running containers to deployed images
+        import subprocess
+        import os
+
+        # Get all running containers with their images
+        result = subprocess.run(
+            ['docker', 'ps', '--format', '{{.Names}}\t{{.Image}}'],
+            capture_output=True, text=True
+        )
+
+        # Collect deployed images from config
+        deployed_images = set()
+        drivers = config.main.get('drivers', [])
+        for d in drivers:
+            img = d.get('image', '')
+            if img:
+                # Match by repo (without tag) for robustness
+                deployed_images.add(img.rsplit(':', 1)[0])
+
+        # Find containers whose image matches a deployed service
+        self_name = os.environ.get('CONTAINER_NAME', 'phanthy-motus-agent-core-1')
+        others = []
+        restart_self = False
+
+        for line in result.stdout.strip().split('\n'):
+            if not line or '\t' not in line:
+                continue
+            name, image = line.split('\t', 1)
+            image_repo = image.rsplit(':', 1)[0]
+            if image_repo in deployed_images:
+                if name == self_name:
+                    restart_self = True
+                else:
+                    others.append(name)
+
+        # Restart others first, then self last
+        if others:
+            subprocess.Popen(
+                ['docker', 'restart'] + others,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+        if restart_self:
+            subprocess.Popen(
+                ['sh', '-c', f'sleep 3 && docker restart {self_name}'],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+
+    return {'ok': True, 'reset': reset_items}
 
 
