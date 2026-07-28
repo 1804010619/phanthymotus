@@ -68,6 +68,16 @@ _DB_DEFAULTS = {
         'auto_approve': True,
         'require_actuator_confirm': True,
     },
+    'subagent': {
+        'max_concurrent': 2,
+        'max_total': 10,
+        'default_max_rounds': 10,
+        'default_timeout_s': 300,
+        'preemption_enabled': True,
+        'checkpoint_interval': 5,
+        'compress_threshold_chars': 20000,
+        'cleanup_age_hours': 24,
+    },
 }
 
 

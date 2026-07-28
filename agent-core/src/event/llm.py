@@ -236,9 +236,18 @@ class Event:
         self._summary: str | None     = None  # 压缩后的历史摘要
         self._session_id: str | None  = None  # chat history session
         self._current_turn: list[dict] = []   # 当前轮消息（供 run_forever 保存）
+        self._subagent_mgr = None             # SubagentManager instance
 
     async def __aenter__(self):
-        # 注册系统工具（finish / memory / task / detailed_info）
+        # 初始化子代理管理器
+        from subagent.manager import SubagentManager
+        from subagent.tools import SubagentTools
+        from subagent import _set_manager
+        self._subagent_mgr = SubagentManager(llm_client=client.llm)
+        _set_manager(self._subagent_mgr)
+        _sa_tools = SubagentTools(self._subagent_mgr)
+
+        # 注册系统工具（finish / memory / task / detailed_info / subagent）
         self._sys_tools = _build_system_tools([
             ('finish', event.finish.__call__),
             ('update_memory', event.memory.update),
@@ -251,6 +260,12 @@ class Event:
             ('task_list', event.task.task_list),
             ('raw_input_info', _raw_input_info),
             ('search_history', _search_history),
+            ('subagent_spawn', _sa_tools.subagent_spawn),
+            ('subagent_spawn_sync', _sa_tools.subagent_spawn_sync),
+            ('subagent_status', _sa_tools.subagent_status),
+            ('subagent_cancel', _sa_tools.subagent_cancel),
+            ('subagent_message', _sa_tools.subagent_message),
+            ('subagent_result', _sa_tools.subagent_result),
         ])
         # 连接并注册所有 MCP 工具
         await mcp_client.init_all()
@@ -260,6 +275,8 @@ class Event:
         task_store.load_all()
         for task in task_store.active_tasks():
             _register_check(task)
+        # 启动子代理调度器（restore + scheduler loop）
+        await self._subagent_mgr.start()
         # 重启续跑：加载上一个 session 的最近 turns
         import chat_history
         last = chat_history.get_last_session_turns(limit=10)
@@ -272,6 +289,9 @@ class Event:
         return self
 
     async def __aexit__(self, *args):
+        # 关闭子代理管理器（checkpoint all running）
+        if self._subagent_mgr:
+            await self._subagent_mgr.shutdown()
         return False
 
     def _get_bound_tool_schemas(self) -> list[dict]:
