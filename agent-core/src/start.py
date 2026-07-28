@@ -285,7 +285,8 @@ async def _auto_start_project():
         card_id = card.get('id', '')
         if not mcp_id or not tool_name:
             return
-        if mcp_id == 'agentcore':
+        # Skip agentcore cards that aren't decision_core (e.g. remote_message is input-only)
+        if mcp_id == 'agentcore' and tool_name != 'decision_core':
             return
 
         # 构建 input_topic 参数
