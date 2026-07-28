@@ -6025,39 +6025,47 @@ html, body {
 .auto-start-toggle {
   display: inline-flex;
   align-items: center;
-  gap: 5px;
-  margin-left: 10px;
+  gap: 6px;
+  margin-left: 12px;
   cursor: pointer;
   user-select: none;
 }
 .auto-start-toggle input[type=checkbox] {
-  appearance: none;
-  -webkit-appearance: none;
-  width: 14px;
-  height: 14px;
-  border: 1.5px solid var(--border);
-  border-radius: 3px;
-  cursor: pointer;
+  position: absolute;
+  opacity: 0;
+  width: 0;
+  height: 0;
+}
+.auto-start-switch {
   position: relative;
-  transition: border-color .12s, background .12s;
+  width: 28px;
+  height: 16px;
+  background: var(--border);
+  border-radius: 8px;
+  transition: background .2s;
+  flex-shrink: 0;
 }
-.auto-start-toggle input[type=checkbox]:checked {
-  background: var(--accent);
-  border-color: var(--accent);
-}
-.auto-start-toggle input[type=checkbox]:checked::after {
+.auto-start-switch::after {
   content: '';
   position: absolute;
-  left: 3.5px;
-  top: 1px;
-  width: 3.5px;
-  height: 7px;
-  border: solid #fff;
-  border-width: 0 1.5px 1.5px 0;
-  transform: rotate(45deg);
+  top: 2px;
+  left: 2px;
+  width: 12px;
+  height: 12px;
+  background: #fff;
+  border-radius: 50%;
+  transition: transform .2s;
+  box-shadow: 0 1px 2px rgba(0,0,0,.15);
+}
+.auto-start-toggle input:checked + .auto-start-switch {
+  background: var(--accent);
+}
+.auto-start-toggle input:checked + .auto-start-switch::after {
+  transform: translateX(12px);
 }
 .auto-start-label {
   font-size: 11px;
   color: var(--text-secondary);
+  white-space: nowrap;
 }
 
