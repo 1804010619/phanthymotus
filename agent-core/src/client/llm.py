@@ -149,6 +149,14 @@ class Client():
                 # 清理模型泄漏的 think 标签残留
                 if msg.get('content'):
                     msg['content'] = re.sub(r'</?think>', '', msg['content']).strip()
+                # 附加 token 用量信息（内部字段，下划线前缀）
+                if usage:
+                    msg['_usage'] = {
+                        'prompt_tokens': usage.prompt_tokens,
+                        'completion_tokens': usage.completion_tokens,
+                        'total_tokens': usage.total_tokens,
+                        'cached_tokens': cached_tokens,
+                    }
                 return msg
             except Exception as e:
                 elapsed = time.perf_counter() - t0

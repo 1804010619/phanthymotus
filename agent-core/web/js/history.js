@@ -140,9 +140,42 @@ function _renderChat(turns) {
     _chat.innerHTML = '<div class="history-placeholder">此会话无消息</div>';
     return;
   }
-  const html = turns.map(turn => turn.map(msg => _renderMessage(msg)).join('')).join('');
-  _chat.innerHTML = `<div class="history-messages">${html}</div>`;
+  const summaryHtml = _renderUsageSummary(turns);
+  const html = turns.map(turn => {
+    const msgs = turn.map(msg => _renderMessage(msg)).join('');
+    const usage = _extractTurnUsage(turn);
+    const usageHtml = usage
+      ? `<div class="history-turn-divider">
+           <span class="history-usage">输入 ${usage.prompt_tokens} · 输出 ${usage.completion_tokens} · 缓存 ${usage.cached_tokens} tokens</span>
+         </div>`
+      : '<div class="history-turn-divider"></div>';
+    return msgs + usageHtml;
+  }).join('');
+  _chat.innerHTML = `<div class="history-messages">${summaryHtml}${html}</div>`;
   _chat.scrollTop = _chat.scrollHeight;
+}
+
+function _extractTurnUsage(turn) {
+  for (const msg of turn) {
+    if (msg._usage) return msg._usage;
+  }
+  return null;
+}
+
+function _renderUsageSummary(turns) {
+  let totalPrompt = 0, totalCompletion = 0, totalCached = 0;
+  for (const turn of turns) {
+    const u = _extractTurnUsage(turn);
+    if (u) {
+      totalPrompt += u.prompt_tokens || 0;
+      totalCompletion += u.completion_tokens || 0;
+      totalCached += u.cached_tokens || 0;
+    }
+  }
+  if (!totalPrompt && !totalCompletion) return '';
+  return `<div class="history-usage-summary">
+    会话用量: 输入 ${totalPrompt.toLocaleString()} · 输出 ${totalCompletion.toLocaleString()} · 缓存 ${totalCached.toLocaleString()} tokens
+  </div>`;
 }
 
 function _renderMessage(msg) {

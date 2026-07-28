@@ -457,7 +457,13 @@ class Event:
 
         # Log incoming event
         _urgent_tag = ' [URGENT]' if trigger_event.get('_urgent') else ''
-        print(f'[decision] received{_urgent_tag} event: source={trigger_event.get("source", "?")} text={trigger_event.get("text", "")[:100]}')
+        print(f'[decision] received{_urgent_tag} event: source={trigger_event.get("source", "?")} text={trigger_event.get("text", "")[:300]}')
+        # Subagent status in log
+        if self._subagent_mgr:
+            _sa_active = self._subagent_mgr.list_active()
+            if _sa_active:
+                _sa_summary = ', '.join(f'{s.id}(P{s.priority}/{s.status})' for s in _sa_active[:5])
+                print(f'[decision] subagents: {_sa_summary}')
 
         # 广播触发事件到前端
         await push_event({
@@ -483,6 +489,7 @@ class Event:
         response    = None
         decisions   = []
         turn_messages = self._current_turn  # alias for brevity
+        _turn_usage = {'prompt_tokens': 0, 'completion_tokens': 0, 'total_tokens': 0, 'cached_tokens': 0}
 
         for round_idx in range(max_rounds):
             # ── 构建分层 prompt ────────────────────────────────────────────
@@ -523,7 +530,7 @@ class Event:
             tool_count = len(all_tool_list)
             # Estimate prompt size (rough: 1 token ≈ 3 chars for CJK)
             prompt_chars = sum(len(m.get('content') or '') for m in messages)
-            last_user = next((m.get('content', '')[:80] for m in reversed(messages) if m.get('role') == 'user'), '')
+            last_user = next((m.get('content', '')[:200] for m in reversed(messages) if m.get('role') == 'user'), '')
             print(f'[decision] llm request: round={round_idx} messages={msg_count} tools={tool_count} ~chars={prompt_chars} last_user={last_user}')
 
             # ── 调用 LLM（含上下文溢出恢复 + 取消检查）──────────────────────
@@ -578,11 +585,11 @@ class Event:
             _round_end_ts = time.time()
             _spans.append({'span': f'llm_round_{round_idx}', 'component': 'core',
                            'start_ts': _round_start_ts, 'end_ts': _round_end_ts})
-            resp_text = (response.get('content') or '')[:200]
+            resp_text = (response.get('content') or '')[:300]
             resp_tools = []
             for c in (response.get('tool_calls') or []):
                 name = c['function']['name']
-                args_str = c['function'].get('arguments', '')[:150]
+                args_str = c['function'].get('arguments', '')[:300]
                 resp_tools.append(f'{name}({args_str})')
             print(f'[decision] llm response: round_time={_round_elapsed:.2f}s text={resp_text!r}')
             if resp_tools:
@@ -593,6 +600,15 @@ class Event:
             text = response.get('content') or ''
             if text:
                 await push_event({'type': 'agent_thought', 'payload': {'text': text}})
+
+            # ── 用量广播 ──────────────────────────────────────────────────
+            _usage = response.get('_usage')
+            if _usage:
+                _turn_usage['prompt_tokens'] += _usage.get('prompt_tokens', 0)
+                _turn_usage['completion_tokens'] += _usage.get('completion_tokens', 0)
+                _turn_usage['total_tokens'] += _usage.get('total_tokens', 0)
+                _turn_usage['cached_tokens'] += _usage.get('cached_tokens', 0)
+                await push_event({'type': 'llm_usage', 'payload': _usage})
 
             # ── 工具调用 ──────────────────────────────────────────────────
             tool_calls = response.get('tool_calls') or []
@@ -703,7 +719,11 @@ class Event:
         }
         ros2_bridge.publish('/decision_core', json.dumps(decision, ensure_ascii=False))
 
-        await push_event({'type': 'turn_end', 'payload': {}})
+        await push_event({'type': 'turn_end', 'payload': {
+            'rounds': round_idx + 1,
+            'duration_s': round(_time.perf_counter() - _turn_t0, 2),
+            'usage': _turn_usage,
+        }})
         _turn_elapsed = _time.perf_counter() - _turn_t0
         print(f'[decision] turn complete: {_turn_elapsed:.2f}s total, {round_idx + 1} rounds')
 
@@ -716,7 +736,7 @@ class Event:
                 trace_id=_trace_id,
                 spans=_spans,
                 source=trigger_event.get('source', ''),
-                trigger_text=trigger_event.get('text', '')[:100],
+                trigger_text=trigger_event.get('text', '')[:300],
             )
         except Exception as _pe:
             print(f'[perf_log] commit error: {_pe}')

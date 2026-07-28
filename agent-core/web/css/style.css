@@ -4550,6 +4550,28 @@ html, body {
   color: var(--text-dim);
   font-style: italic;
 }
+.history-turn-divider {
+  border-top: 1px solid var(--border);
+  margin: 12px 0;
+  padding-top: 4px;
+  display: flex;
+  justify-content: flex-end;
+}
+.history-usage {
+  font-size: 0.7rem;
+  color: var(--text-dim);
+  font-family: 'JetBrains Mono', monospace;
+}
+.history-usage-summary {
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 8px 12px;
+  margin-bottom: 12px;
+  font-size: 0.75rem;
+  color: var(--text-dim);
+  font-family: 'JetBrains Mono', monospace;
+}
 
 .btn-sm {
   font-size: 0.78rem;
