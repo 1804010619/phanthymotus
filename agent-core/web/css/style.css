@@ -895,6 +895,8 @@ html, body {
   left: 50%;
   transform: translateX(-50%);
   z-index: 50;
+  display: flex;
+  align-items: center;
 }
 
 .canvas-main-btn {
@@ -6019,6 +6021,44 @@ html, body {
   color: var(--text-secondary);
   display: block;
   margin-top: 2px;
+}
+.reset-section-label {
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: .5px;
+  color: var(--text-secondary);
+  margin: 14px 0 6px;
+  padding: 0 12px;
+}
+.reset-section-label:first-child { margin-top: 0; }
+.settings-item--danger .settings-item-label { color: #c0392b; }
+
+/* ── Restart Waiting Overlay ────────────────────────────────────────────────── */
+.restart-waiting {
+  text-align: center;
+  padding: 40px;
+}
+.restart-waiting-spinner {
+  width: 32px;
+  height: 32px;
+  border: 3px solid var(--border);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  margin: 0 auto 16px;
+  animation: spin .8s linear infinite;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+.restart-waiting-text {
+  font-size: 14px;
+  font-weight: 500;
+  color: var(--text-primary);
+  margin: 0 0 6px;
+}
+.restart-waiting-sub {
+  font-size: 12px;
+  color: var(--text-secondary);
+  margin: 0;
 }
 
 /* ── Auto-Start Toggle ──────────────────────────────────────────────────────── */

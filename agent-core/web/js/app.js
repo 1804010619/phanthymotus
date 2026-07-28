@@ -365,7 +365,9 @@ function _initResetModal() {
   overlay.addEventListener('click', (e) => { if (e.target === overlay) close(); });
 
   btnConfirm?.addEventListener('click', async () => {
+    const restartServices = document.getElementById('reset-restart-services')?.checked || false;
     const body = {
+      restart_services: restartServices,
       chat_history: document.getElementById('reset-chat-history')?.checked || false,
       system_prompt: document.getElementById('reset-system-prompt')?.checked || false,
       identity: document.getElementById('reset-identity')?.checked || false,
@@ -375,7 +377,7 @@ function _initResetModal() {
     if (!Object.values(body).some(v => v)) return;
 
     btnConfirm.disabled = true;
-    btnConfirm.textContent = '重置中...';
+    btnConfirm.textContent = '执行中...';
     try {
       const res = await fetch('/api/config/reset', {
         method: 'POST',
@@ -383,17 +385,60 @@ function _initResetModal() {
         body: JSON.stringify(body),
       });
       if (res.ok) {
-        btnConfirm.textContent = '已重置';
-        setTimeout(() => { close(); btnConfirm.textContent = '确认重置'; btnConfirm.disabled = false; }, 1000);
-        // Uncheck all
         overlay.querySelectorAll('input[type=checkbox]').forEach(cb => cb.checked = false);
+        if (restartServices) {
+          // Show restart waiting overlay
+          close();
+          _showRestartWaiting();
+        } else {
+          btnConfirm.textContent = '已完成';
+          setTimeout(() => { close(); btnConfirm.textContent = '确认执行'; btnConfirm.disabled = false; }, 1000);
+        }
       }
     } catch (e) {
       console.error('[reset] failed:', e);
       btnConfirm.textContent = '失败';
-      setTimeout(() => { btnConfirm.textContent = '确认重置'; btnConfirm.disabled = false; }, 2000);
+      setTimeout(() => { btnConfirm.textContent = '确认执行'; btnConfirm.disabled = false; }, 2000);
     }
   });
+}
+
+function _showRestartWaiting() {
+  let el = document.getElementById('restart-waiting-overlay');
+  if (!el) {
+    el = document.createElement('div');
+    el.id = 'restart-waiting-overlay';
+    el.className = 'modal-overlay';
+    el.innerHTML = `
+      <div class="restart-waiting">
+        <div class="restart-waiting-spinner"></div>
+        <p class="restart-waiting-text">服务重启中，请稍候...</p>
+        <p class="restart-waiting-sub" id="restart-waiting-status">等待服务恢复</p>
+      </div>
+    `;
+    document.body.appendChild(el);
+  }
+  el.classList.remove('hidden');
+
+  // Poll until agent-core is back
+  let attempts = 0;
+  const poll = setInterval(async () => {
+    attempts++;
+    const statusEl = document.getElementById('restart-waiting-status');
+    if (statusEl) statusEl.textContent = `已等待 ${attempts * 3} 秒...`;
+    try {
+      const r = await fetch('/api/config', { signal: AbortSignal.timeout(2000) });
+      if (r.ok) {
+        clearInterval(poll);
+        if (statusEl) statusEl.textContent = '服务已恢复，正在刷新...';
+        setTimeout(() => location.reload(), 500);
+      }
+    } catch (_) { /* still down */ }
+    if (attempts > 20) { // 60s timeout
+      clearInterval(poll);
+      if (statusEl) statusEl.textContent = '超时，请手动刷新页面';
+    }
+  }, 3000);
 }
 
 function _showLoginScreen() {

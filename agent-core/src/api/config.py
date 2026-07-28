@@ -561,6 +561,7 @@ async def config_test_vad_audio(
 # ── 重置 ─────────────────────────────────────────────────────────────────────────
 
 class ResetRequest(BaseModel):
+    restart_services: bool = False
     chat_history: bool = False
     system_prompt: bool = False
     identity: bool = False
@@ -616,6 +617,17 @@ async def reset_config(req: ResetRequest):
         import event.skills
         event.skills._runtime_activated.clear()
         reset_items.append('skills')
+
+    if req.restart_services:
+        reset_items.append('restart_services')
+        # Run docker compose restart in background (non-blocking, this process will be killed)
+        import subprocess
+        import os
+        compose_dir = os.environ.get('COMPOSE_DIR', '/opt/phanthy-motus')
+        subprocess.Popen(
+            ['docker', 'compose', '-f', f'{compose_dir}/docker-compose.yml', 'restart'],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
 
     return {'ok': True, 'reset': reset_items}
 
