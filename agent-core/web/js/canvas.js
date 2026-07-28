@@ -139,6 +139,36 @@ export async function initCanvas(initialMcps) {
     }
   } catch { /* ignore */ }
 
+  // Cross-tab sync: listen for project_state events via WebSocket
+  const { onMotusEvent } = await import('./motus-stream.js');
+  onMotusEvent(null, (event) => {
+    if (event.type === 'project_state') {
+      const running = event.payload?.running;
+      if (running !== _projectRunning) {
+        _projectRunning = running;
+        _syncProjectBtn();
+        document.querySelectorAll('.canvas-exec-btn').forEach(btn => {
+          btn.classList.toggle('locked', !_projectRunning);
+        });
+      }
+    }
+  });
+
+  // Re-sync state when tab becomes visible (fallback for WS disconnect)
+  document.addEventListener('visibilitychange', () => {
+    if (!document.hidden) {
+      fetch('/api/config/project-running').then(r => r.json()).then(d => {
+        if (d.running !== _projectRunning) {
+          _projectRunning = d.running;
+          _syncProjectBtn();
+          document.querySelectorAll('.canvas-exec-btn').forEach(btn => {
+            btn.classList.toggle('locked', !_projectRunning);
+          });
+        }
+      }).catch(() => {});
+    }
+  });
+
   _syncEmptyState();
 }
 
@@ -1486,7 +1516,8 @@ async function _startProject() {
       }
     } else if (event.type === 'project_start_done') {
       if (modal && !p.has_error) {
-        setTimeout(() => { modal.close(); }, 1500);
+        // Show countdown close button, auto-close after 15s
+        modal.startCountdown(15);
       }
       offMotusEvent(_onEvent);
     }
@@ -1637,11 +1668,33 @@ function _showStartupModal(items) {
     statuses[i].textContent = msg || STATUS_TEXT[state] || '';
   }
   function close() {
+    if (_countdownTimer) clearInterval(_countdownTimer);
     overlay.remove();
   }
+
+  let _countdownTimer = null;
+  function startCountdown(seconds) {
+    const footer = modal.querySelector('.startup-modal-footer');
+    const title = modal.querySelector('.modal-title');
+    if (title) title.textContent = '启动完成';
+    let remaining = seconds;
+    footer.innerHTML = `<button class="startup-close-btn">关闭 <span class="startup-countdown">${remaining}s</span></button>`;
+    const btn = footer.querySelector('.startup-close-btn');
+    const span = footer.querySelector('.startup-countdown');
+    btn.addEventListener('click', close);
+    _countdownTimer = setInterval(() => {
+      remaining--;
+      if (remaining <= 0) {
+        close();
+      } else {
+        span.textContent = `${remaining}s`;
+      }
+    }, 1000);
+  }
+
   const cancelBtn = modal.querySelector('.startup-cancel-btn');
-  cancelBtn.addEventListener('click', () => { if (modal.onCancel) modal.onCancel(); });
-  return { modal, updateItem, close };
+  cancelBtn.addEventListener('click', () => { if (modal.onCancel) modal.onCancel(); close(); });
+  return { modal, updateItem, close, startCountdown };
 }
 
 /**

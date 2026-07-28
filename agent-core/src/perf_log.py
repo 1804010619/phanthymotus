@@ -193,7 +193,7 @@ def aggregate(start: float = 0, end: float = 0) -> dict:
     return {'count': turn_count, 'by_span': by_span}
 
 
-def prune(days: int = 7):
+def prune(days: int = 90):
     """清理过期记录。"""
     cutoff = time.time() - days * 86400
     conn = _get_conn()
@@ -281,6 +281,40 @@ def query_usage_daily(start: float = 0, end: float = 0) -> list:
     return [
         {
             'date': row[0],
+            'prompt_tokens': row[1] or 0,
+            'completion_tokens': row[2] or 0,
+            'cached_tokens': row[3] or 0,
+            'total_tokens': row[4] or 0,
+            'call_count': row[5],
+        }
+        for row in rows
+    ]
+
+
+def query_usage_hourly(start: float = 0, end: float = 0) -> list:
+    """Aggregate usage grouped by hour (UTC+8)."""
+    conn = _get_conn()
+    where = 'WHERE 1=1'
+    params = []
+    if start:
+        where += ' AND created_at >= ?'
+        params.append(start)
+    if end:
+        where += ' AND created_at <= ?'
+        params.append(end)
+
+    rows = conn.execute(
+        f'''SELECT strftime('%Y-%m-%d %H', created_at + 28800, 'unixepoch') as hour,
+                   SUM(prompt_tokens), SUM(completion_tokens),
+                   SUM(cached_tokens), SUM(total_tokens), COUNT(*)
+            FROM token_usage {where}
+            GROUP BY hour ORDER BY hour DESC''',
+        params,
+    ).fetchall()
+    conn.close()
+    return [
+        {
+            'date': row[0],  # "2026-07-29 14"
             'prompt_tokens': row[1] or 0,
             'completion_tokens': row[2] or 0,
             'cached_tokens': row[3] or 0,

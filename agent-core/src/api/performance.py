@@ -30,19 +30,33 @@ async def get_aggregate(
 
 @router.get('/usage')
 async def get_usage(range: str = Query('7d')):
-    """Token usage summary + daily breakdown."""
+    """Token usage summary + daily/hourly breakdown."""
+    import datetime
     now = time.time()
-    range_map = {
-        'today': 86400,
-        '7d': 7 * 86400,
-        '30d': 30 * 86400,
-    }
-    seconds = range_map.get(range, 7 * 86400)
-    start = now - seconds
+
+    # Calculate start time (UTC+8 day boundary for 'today')
+    tz = datetime.timezone(datetime.timedelta(hours=8))
+    now_dt = datetime.datetime.now(tz)
+
+    if range == 'today':
+        # Start of today in UTC+8
+        start_of_day = now_dt.replace(hour=0, minute=0, second=0, microsecond=0)
+        start = start_of_day.timestamp()
+    else:
+        range_map = {'7d': 7, '30d': 30, '90d': 90}
+        days = range_map.get(range, 7)
+        start_of_day = (now_dt - datetime.timedelta(days=days)).replace(hour=0, minute=0, second=0, microsecond=0)
+        start = start_of_day.timestamp()
 
     summary = perf_log.query_usage_summary(start=start)
-    daily = perf_log.query_usage_daily(start=start)
-    return {'summary': summary, 'daily': daily}
+
+    # today/7d → hourly, 30d/90d → daily
+    if range in ('today', '7d'):
+        breakdown = perf_log.query_usage_hourly(start=start)
+    else:
+        breakdown = perf_log.query_usage_daily(start=start)
+
+    return {'summary': summary, 'breakdown': breakdown, 'granularity': 'hourly' if range in ('today', '7d') else 'daily'}
 
 
 @router.delete('/clear')

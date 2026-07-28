@@ -214,12 +214,14 @@ async def _do_start_project():
 
     # 广播启动完成
     await push_event({'type': 'project_start_done', 'payload': {'has_error': len(errors) > 0}})
+    await push_event({'type': 'project_state', 'payload': {'running': True}})
     print(f'[start-project] done ({len(cards)} cards, {len(errors)} errors)')
 
 
 async def _do_stop_project():
     """停止所有 canvas cards。"""
     from api.mcp_manage import mcp_call_tool, MCPCallRequest
+    from api.motus_stream import push_event
 
     layout = config.main.get('canvas_layout', {})
     cards = layout.get('cards', [])
@@ -239,6 +241,7 @@ async def _do_stop_project():
     core = config.main.get('core', {})
     core['project_running'] = False
     config.main['core'] = core
+    await push_event({'type': 'project_state', 'payload': {'running': False}})
     print('[stop-project] done')
 
 

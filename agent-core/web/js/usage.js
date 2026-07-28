@@ -1,6 +1,5 @@
 /**
  * usage.js — Token 用量统计 Modal
- * 展示 LLM 调用的 token 用量汇总、每日趋势柱状图和明细表。
  */
 
 let _overlay, _rangeSelect;
@@ -16,7 +15,6 @@ export function initUsage() {
   _overlay.addEventListener('click', e => { if (e.target === _overlay) _close(); });
   _rangeSelect?.addEventListener('change', () => _load());
 
-  // Mobile settings action
   document.querySelector('[data-action="usage"]')?.addEventListener('click', () => {
     document.getElementById('btn-usage')?.click();
   });
@@ -37,7 +35,7 @@ async function _load() {
   const chart = document.getElementById('usage-daily-chart');
   const table = document.getElementById('usage-daily-table');
 
-  cards.innerHTML = '<div style="text-align:center;color:var(--text-dim)">加载中…</div>';
+  cards.innerHTML = '<div class="usage-loading">加载中…</div>';
   chart.innerHTML = '';
   table.innerHTML = '';
 
@@ -45,97 +43,151 @@ async function _load() {
     const res = await fetch(`/api/performance/usage?range=${range}`);
     const data = await res.json();
     _renderCards(cards, data.summary);
-    _renderChart(chart, data.daily);
-    _renderTable(table, data.daily);
+    _renderChart(chart, data.breakdown, data.granularity);
+    _renderTable(table, data.breakdown, data.granularity);
   } catch (e) {
-    cards.innerHTML = '<div style="text-align:center;color:var(--red)">加载失败</div>';
+    cards.innerHTML = '<div class="usage-loading" style="color:var(--red)">加载失败</div>';
   }
 }
 
 function _renderCards(el, summary) {
+  const hasData = summary.total_tokens > 0;
   const items = [
-    { label: '输入 Tokens', value: summary.prompt_tokens, color: 'var(--accent)' },
-    { label: '输出 Tokens', value: summary.completion_tokens, color: '#4ade80' },
-    { label: '缓存 Tokens', value: summary.cached_tokens, color: '#a78bfa' },
+    { label: '输入', value: summary.prompt_tokens, color: '#3b82f6' },
+    { label: '输出', value: summary.completion_tokens, color: '#10b981' },
+    { label: '缓存', value: summary.cached_tokens, color: '#8b5cf6' },
   ];
+
   el.innerHTML = `
-    <div class="usage-summary-cards">
+    <div class="usage-cards-grid">
       ${items.map(it => `
         <div class="usage-card">
-          <div class="usage-card-value" style="color:${it.color}">${_formatTokens(it.value)}</div>
-          <div class="usage-card-label">${it.label}</div>
+          <div class="usage-card-indicator" style="background:${it.color}"></div>
+          <div class="usage-card-content">
+            <div class="usage-card-value">${_fmt(it.value)}</div>
+            <div class="usage-card-label">${it.label}</div>
+          </div>
         </div>
       `).join('')}
     </div>
-    <div class="usage-total-row">
-      合计 ${_formatTokens(summary.total_tokens)} tokens · ${summary.call_count} 次调用
+    <div class="usage-total">
+      <span class="usage-total-value">${_fmt(summary.total_tokens)}</span>
+      <span class="usage-total-label">总 tokens · ${summary.call_count} 次调用</span>
     </div>
   `;
 }
 
-function _renderChart(el, daily) {
-  if (!daily || !daily.length) {
-    el.innerHTML = '<div style="text-align:center;color:var(--text-dim);padding:20px 0">暂无数据</div>';
+function _renderChart(el, breakdown, granularity) {
+  if (!breakdown || !breakdown.length) {
+    el.innerHTML = `
+      <div class="usage-empty">
+        <div class="usage-empty-icon">📊</div>
+        <div class="usage-empty-text">当前周期内暂无用量数据</div>
+        <div class="usage-empty-hint">发送消息后将自动记录 token 消耗</div>
+      </div>`;
     return;
   }
 
-  // Reverse to chronological order (API returns DESC)
-  const days = [...daily].reverse();
-  const maxTotal = Math.max(...days.map(d => d.prompt_tokens + d.completion_tokens));
-  if (!maxTotal) {
-    el.innerHTML = '<div style="text-align:center;color:var(--text-dim);padding:20px 0">暂无数据</div>';
-    return;
-  }
+  const days = [...breakdown].reverse();
+  const maxVal = Math.max(...days.map(d => d.prompt_tokens + d.completion_tokens), 1);
 
   const bars = days.map(d => {
-    const promptH = (d.prompt_tokens / maxTotal) * 100;
-    const completionH = (d.completion_tokens / maxTotal) * 100;
-    const dateLabel = d.date.slice(5); // MM-DD
+    const total = d.prompt_tokens + d.completion_tokens;
+    const h = Math.max((total / maxVal) * 100, 3);
+    const uncached = Math.max(d.prompt_tokens - (d.cached_tokens || 0), 0);
+    const cached = d.cached_tokens || 0;
+    const comp = d.completion_tokens || 0;
+    // Format label based on granularity
+    let dateLabel;
+    if (granularity === 'hourly') {
+      // d.date is "2026-07-29 14" → show "14:00" or "07-29 14h"
+      const parts = d.date.split(' ');
+      dateLabel = parts.length > 1 ? parts[1] + ':00' : d.date;
+    } else {
+      dateLabel = d.date.slice(5); // MM-DD
+    }
     return `
-      <div class="usage-bar" title="${d.date}: in=${_formatTokens(d.prompt_tokens)} out=${_formatTokens(d.completion_tokens)}">
-        <div class="usage-bar-stack">
-          <div class="usage-bar-fill completion" style="height:${completionH}%"></div>
-          <div class="usage-bar-fill prompt" style="height:${promptH}%"></div>
+      <div class="usage-bar" title="${d.date}\n非缓存输入: ${_fmt(uncached)}\n缓存输入: ${_fmt(cached)}\n输出: ${_fmt(comp)}">
+        <div class="usage-bar-track">
+          <div class="usage-bar-fill" style="height:${h}%">
+            ${comp ? `<div class="usage-bar-segment completion" style="flex-grow:${comp}"></div>` : ''}
+            ${cached ? `<div class="usage-bar-segment cached" style="flex-grow:${cached}"></div>` : ''}
+            ${uncached ? `<div class="usage-bar-segment prompt" style="flex-grow:${uncached}"></div>` : ''}
+          </div>
         </div>
-        <div class="usage-bar-label">${dateLabel}</div>
-      </div>
-    `;
+        <span class="usage-bar-date">${dateLabel}</span>
+      </div>`;
   }).join('');
 
+  const titleText = granularity === 'hourly' ? '每小时用量' : '每日用量';
   el.innerHTML = `
-    <div class="usage-chart-legend">
-      <span><span class="usage-dot" style="background:var(--accent)"></span>输入</span>
-      <span><span class="usage-dot" style="background:#4ade80"></span>输出</span>
+    <div class="usage-chart-header">
+      <span class="usage-chart-title">${titleText}</span>
+      <div class="usage-chart-legend">
+        <span class="usage-legend-item"><i style="background:#3b82f6"></i>非缓存输入</span>
+        <span class="usage-legend-item"><i style="background:#93c5fd"></i>缓存输入</span>
+        <span class="usage-legend-item"><i style="background:#10b981"></i>输出</span>
+      </div>
     </div>
-    <div class="usage-chart">${bars}</div>
-  `;
+    <div class="usage-chart">${bars}</div>`;
 }
 
-function _renderTable(el, daily) {
-  if (!daily || !daily.length) {
-    el.innerHTML = '';
-    return;
+function _renderTable(el, breakdown, granularity) {
+  if (!breakdown || !breakdown.length) { el.innerHTML = ''; return; }
+
+  const PAGE_SIZE = 20;
+  let page = 0;
+  const totalPages = Math.ceil(breakdown.length / PAGE_SIZE);
+
+  function render() {
+    const start = page * PAGE_SIZE;
+    const slice = breakdown.slice(start, start + PAGE_SIZE);
+
+    const rows = slice.map(d => {
+      let label;
+      if (granularity === 'hourly') {
+        const parts = d.date.split(' ');
+        label = parts.length > 1 ? `${parts[0].slice(5)} ${parts[1]}:00` : d.date;
+      } else {
+        label = d.date;
+      }
+      return `
+      <div class="usage-row">
+        <span class="usage-row-date">${label}</span>
+        <div class="usage-row-bars">
+          <span class="usage-row-tag prompt">${_fmt(d.prompt_tokens)}</span>
+          <span class="usage-row-tag completion">${_fmt(d.completion_tokens)}</span>
+          <span class="usage-row-tag cached">${_fmt(d.cached_tokens)}</span>
+        </div>
+      </div>`;
+    }).join('');
+
+    let paginationHtml = '';
+    if (totalPages > 1) {
+      paginationHtml = `
+        <div class="usage-pagination">
+          <button class="usage-page-btn" data-dir="prev" ${page === 0 ? 'disabled' : ''}>‹</button>
+          <span class="usage-page-info">${page + 1} / ${totalPages}</span>
+          <button class="usage-page-btn" data-dir="next" ${page >= totalPages - 1 ? 'disabled' : ''}>›</button>
+        </div>`;
+    }
+
+    el.innerHTML = `<div class="usage-table">${rows}</div>${paginationHtml}`;
+
+    // Bind pagination buttons
+    el.querySelectorAll('.usage-page-btn').forEach(btn => {
+      btn.addEventListener('click', () => {
+        if (btn.dataset.dir === 'prev' && page > 0) { page--; render(); }
+        if (btn.dataset.dir === 'next' && page < totalPages - 1) { page++; render(); }
+      });
+    });
   }
 
-  const rows = daily.map(d => `
-    <div class="usage-daily-row">
-      <span class="usage-daily-date">${d.date}</span>
-      <span class="usage-daily-values">
-        <span style="color:var(--accent)">↑${_formatTokens(d.prompt_tokens)}</span>
-        <span style="color:#4ade80">↓${_formatTokens(d.completion_tokens)}</span>
-        <span style="color:#a78bfa">⟳${_formatTokens(d.cached_tokens)}</span>
-      </span>
-    </div>
-  `).join('');
-
-  el.innerHTML = `<div class="usage-daily-header">每日明细</div>${rows}`;
+  render();
 }
 
-/**
- * Format token count with auto K/M/G units.
- */
-function _formatTokens(n) {
-  if (n == null) return '0';
+function _fmt(n) {
+  if (n == null || n === 0) return '0';
   if (n >= 1_000_000_000) return (n / 1_000_000_000).toFixed(1) + 'G';
   if (n >= 1_000_000) return (n / 1_000_000).toFixed(1) + 'M';
   if (n >= 10_000) return (n / 1_000).toFixed(1) + 'K';
