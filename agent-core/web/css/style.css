@@ -5116,7 +5116,9 @@ html, body {
     left: 60px;
     right: 60px;
     transform: none;
-    text-align: center;
+    justify-content: center;
+    flex-wrap: wrap;
+    gap: 6px;
     pointer-events: none;
     z-index: 57;
   }
@@ -6069,6 +6071,7 @@ html, body {
   margin-left: 12px;
   cursor: pointer;
   user-select: none;
+  pointer-events: auto;
 }
 .auto-start-toggle input[type=checkbox] {
   position: absolute;
