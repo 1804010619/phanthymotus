@@ -413,32 +413,45 @@ function _showRestartWaiting() {
       <div class="restart-waiting">
         <div class="restart-waiting-spinner"></div>
         <p class="restart-waiting-text">服务重启中，请稍候...</p>
-        <p class="restart-waiting-sub" id="restart-waiting-status">等待服务恢复</p>
+        <p class="restart-waiting-sub" id="restart-waiting-status">等待服务关闭...</p>
       </div>
     `;
     document.body.appendChild(el);
   }
   el.classList.remove('hidden');
 
-  // Poll until agent-core is back
+  // Phase 1: Wait for agent-core to go down (up to 10s)
+  // Phase 2: Then poll until it's back up
   let attempts = 0;
+  let wentDown = false;
   const poll = setInterval(async () => {
     attempts++;
     const statusEl = document.getElementById('restart-waiting-status');
-    if (statusEl) statusEl.textContent = `已等待 ${attempts * 3} 秒...`;
     try {
       const r = await fetch('/api/config', { signal: AbortSignal.timeout(2000) });
-      if (r.ok) {
+      if (r.ok && wentDown) {
+        // Phase 2 complete: service is back
         clearInterval(poll);
         if (statusEl) statusEl.textContent = '服务已恢复，正在刷新...';
         setTimeout(() => location.reload(), 500);
+        return;
       }
-    } catch (_) { /* still down */ }
-    if (attempts > 20) { // 60s timeout
+      // Still up, waiting to go down
+      if (!wentDown && statusEl) statusEl.textContent = '等待服务关闭...';
+    } catch (_) {
+      // Service is down
+      if (!wentDown) {
+        wentDown = true;
+        if (statusEl) statusEl.textContent = '服务已关闭，等待恢复...';
+      } else {
+        if (statusEl) statusEl.textContent = `等待恢复中... (${attempts * 2}s)`;
+      }
+    }
+    if (attempts > 45) { // 90s timeout
       clearInterval(poll);
       if (statusEl) statusEl.textContent = '超时，请手动刷新页面';
     }
-  }, 3000);
+  }, 2000);
 }
 
 function _showLoginScreen() {
