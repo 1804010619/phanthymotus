@@ -620,21 +620,50 @@ async def reset_config(req: ResetRequest):
 
     if req.restart_services:
         reset_items.append('restart_services')
-        # Restart all related containers (agent-core, perception, drivers, etc.)
+        # Restart all deployed services by matching running containers to deployed images
         import subprocess
         import os
-        # Find all running containers matching our naming patterns
+
+        # Get all running containers with their images
         result = subprocess.run(
-            ['docker', 'ps', '--format', '{{.Names}}'],
+            ['docker', 'ps', '--format', '{{.Names}}\t{{.Image}}'],
             capture_output=True, text=True
         )
-        containers = [
-            name for name in result.stdout.strip().split('\n')
-            if name and any(p in name for p in ('phanthy', 'embodied', 'motus'))
-        ]
-        if containers:
+
+        # Collect deployed images from config
+        deployed_images = set()
+        drivers = config.main.get('drivers', [])
+        for d in drivers:
+            img = d.get('image', '')
+            if img:
+                # Match by repo (without tag) for robustness
+                deployed_images.add(img.rsplit(':', 1)[0])
+
+        # Find containers whose image matches a deployed service
+        self_name = os.environ.get('CONTAINER_NAME', 'phanthy-motus-agent-core-1')
+        others = []
+        restart_self = False
+
+        for line in result.stdout.strip().split('\n'):
+            if not line or '\t' not in line:
+                continue
+            name, image = line.split('\t', 1)
+            image_repo = image.rsplit(':', 1)[0]
+            if image_repo in deployed_images:
+                if name == self_name:
+                    restart_self = True
+                else:
+                    others.append(name)
+
+        # Restart others first, then self last
+        if others:
             subprocess.Popen(
-                ['docker', 'restart'] + containers,
+                ['docker', 'restart'] + others,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+        if restart_self:
+            subprocess.Popen(
+                ['sh', '-c', f'sleep 3 && docker restart {self_name}'],
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             )
 
