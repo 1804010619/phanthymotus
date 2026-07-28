@@ -609,6 +609,7 @@ class Event:
                 _turn_usage['total_tokens'] += _usage.get('total_tokens', 0)
                 _turn_usage['cached_tokens'] += _usage.get('cached_tokens', 0)
                 await push_event({'type': 'llm_usage', 'payload': _usage})
+                perf_log.record_usage(_trace_id, _usage)
 
             # ── 工具调用 ──────────────────────────────────────────────────
             tool_calls = response.get('tool_calls') or []

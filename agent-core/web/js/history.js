@@ -146,7 +146,7 @@ function _renderChat(turns) {
     const usage = _extractTurnUsage(turn);
     const usageHtml = usage
       ? `<div class="history-turn-divider">
-           <span class="history-usage">输入 ${usage.prompt_tokens} · 输出 ${usage.completion_tokens} · 缓存 ${usage.cached_tokens} tokens</span>
+           <span class="history-usage">输入 ${_fmtTokens(usage.prompt_tokens)} · 输出 ${_fmtTokens(usage.completion_tokens)} · 缓存 ${_fmtTokens(usage.cached_tokens)}</span>
          </div>`
       : '<div class="history-turn-divider"></div>';
     return msgs + usageHtml;
@@ -174,8 +174,16 @@ function _renderUsageSummary(turns) {
   }
   if (!totalPrompt && !totalCompletion) return '';
   return `<div class="history-usage-summary">
-    会话用量: 输入 ${totalPrompt.toLocaleString()} · 输出 ${totalCompletion.toLocaleString()} · 缓存 ${totalCached.toLocaleString()} tokens
+    会话用量: 输入 ${_fmtTokens(totalPrompt)} · 输出 ${_fmtTokens(totalCompletion)} · 缓存 ${_fmtTokens(totalCached)} tokens
   </div>`;
+}
+
+function _fmtTokens(n) {
+  if (n >= 1_000_000_000) return (n / 1_000_000_000).toFixed(1) + 'G';
+  if (n >= 1_000_000) return (n / 1_000_000).toFixed(1) + 'M';
+  if (n >= 10_000) return (n / 1_000).toFixed(1) + 'K';
+  if (n >= 1_000) return (n / 1_000).toFixed(2) + 'K';
+  return String(n);
 }
 
 function _renderMessage(msg) {
