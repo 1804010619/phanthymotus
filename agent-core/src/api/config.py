@@ -620,14 +620,23 @@ async def reset_config(req: ResetRequest):
 
     if req.restart_services:
         reset_items.append('restart_services')
-        # Run docker compose restart in background (non-blocking, this process will be killed)
+        # Restart all related containers (agent-core, perception, drivers, etc.)
         import subprocess
         import os
-        compose_dir = os.environ.get('COMPOSE_DIR', '/opt/phanthy-motus')
-        subprocess.Popen(
-            ['docker', 'compose', '-f', f'{compose_dir}/docker-compose.yml', 'restart'],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        # Find all running containers matching our naming patterns
+        result = subprocess.run(
+            ['docker', 'ps', '--format', '{{.Names}}'],
+            capture_output=True, text=True
         )
+        containers = [
+            name for name in result.stdout.strip().split('\n')
+            if name and any(p in name for p in ('phanthy', 'embodied', 'motus'))
+        ]
+        if containers:
+            subprocess.Popen(
+                ['docker', 'restart'] + containers,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
 
     return {'ok': True, 'reset': reset_items}
 
