@@ -119,8 +119,7 @@ async def get_project_running():
 
 async def _do_start_project():
     """启动所有 canvas cards — 前端按钮和 auto-start 共用此函数。"""
-    import aiohttp
-    import auth
+    from api.mcp_manage import mcp_call_tool, MCPCallRequest
 
     layout = config.main.get('canvas_layout', {})
     cards = layout.get('cards', [])
@@ -137,48 +136,39 @@ async def _do_start_project():
     sources = [c for c in cards if c['id'] not in cards_with_inbound]
     processors = [c for c in cards if c['id'] in cards_with_inbound]
 
-    headers = {}
-    token = auth.get_token()
-    if token:
-        headers['Authorization'] = f'Bearer {token}'
+    async def _start_card(card):
+        mcp_id = card.get('mcpId', '')
+        tool_name = card.get('toolName', '')
+        card_id = card.get('id', '')
+        if not mcp_id or not tool_name:
+            return
 
-    timeout = aiohttp.ClientTimeout(total=15)
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        async def _start_card(card):
-            mcp_id = card.get('mcpId', '')
-            tool_name = card.get('toolName', '')
-            card_id = card.get('id', '')
-            if not mcp_id or not tool_name:
-                return
+        # 构建 input_topic 参数
+        in_conns = [c for c in connections if c.get('toCardId') == card_id]
+        topics = list(set(c.get('fromTopic', '') for c in in_conns if c.get('fromTopic')))
 
-            # 构建 input_topic 参数
-            in_conns = [c for c in connections if c.get('toCardId') == card_id]
-            topics = list(set(c.get('fromTopic', '') for c in in_conns if c.get('fromTopic')))
+        args = {'action': 'start', 'instance_id': card_id}
+        if len(topics) > 1:
+            args['input_topics'] = topics
+        elif len(topics) == 1:
+            args['input_topic'] = topics[0]
 
-            args = {'action': 'start', 'instance_id': card_id}
-            if len(topics) > 1:
-                args['input_topics'] = topics
-            elif len(topics) == 1:
-                args['input_topic'] = topics[0]
+        try:
+            req = MCPCallRequest(tool=tool_name, arguments=args)
+            result = await mcp_call_tool(mcp_id, req)
+            if result.get('code') == 200:
+                print(f'[start-project] started {tool_name} ({mcp_id})')
+            else:
+                print(f'[start-project] {tool_name} error: {result}')
+        except Exception as e:
+            print(f'[start-project] failed {tool_name}: {e}')
 
-            url = f'https://localhost:15678/api/mcp/{mcp_id}/call'
-            payload = {'tool': tool_name, 'arguments': args}
-            try:
-                async with session.post(url, json=payload, ssl=False, headers=headers) as resp:
-                    if resp.status == 200:
-                        print(f'[start-project] started {tool_name} ({mcp_id})')
-                    else:
-                        text = await resp.text()
-                        print(f'[start-project] {tool_name} returned {resp.status}: {text[:100]}')
-            except Exception as e:
-                print(f'[start-project] failed {tool_name}: {e}')
-
-        # Phase 1: sources
-        for card in sources:
-            await _start_card(card)
-        # Phase 2: processors
-        for card in processors:
-            await _start_card(card)
+    # Phase 1: sources
+    for card in sources:
+        await _start_card(card)
+    # Phase 2: processors
+    for card in processors:
+        await _start_card(card)
 
     # 标记 project_running
     core = config.main.get('core', {})
@@ -201,33 +191,22 @@ async def _do_start_project():
 
 async def _do_stop_project():
     """停止所有 canvas cards。"""
-    import aiohttp
-    import auth
+    from api.mcp_manage import mcp_call_tool, MCPCallRequest
 
     layout = config.main.get('canvas_layout', {})
     cards = layout.get('cards', [])
 
-    headers = {}
-    token = auth.get_token()
-    if token:
-        headers['Authorization'] = f'Bearer {token}'
-
-    timeout = aiohttp.ClientTimeout(total=15)
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        for card in cards:
-            mcp_id = card.get('mcpId', '')
-            tool_name = card.get('toolName', '')
-            card_id = card.get('id', '')
-            if not mcp_id or not tool_name:
-                continue
-
-            url = f'https://localhost:15678/api/mcp/{mcp_id}/call'
-            payload = {'tool': tool_name, 'arguments': {'action': 'stop', 'instance_id': card_id}}
-            try:
-                async with session.post(url, json=payload, ssl=False, headers=headers) as resp:
-                    pass
-            except Exception:
-                pass
+    for card in cards:
+        mcp_id = card.get('mcpId', '')
+        tool_name = card.get('toolName', '')
+        card_id = card.get('id', '')
+        if not mcp_id or not tool_name:
+            continue
+        try:
+            req = MCPCallRequest(tool=tool_name, arguments={'action': 'stop', 'instance_id': card_id})
+            await mcp_call_tool(mcp_id, req)
+        except Exception:
+            pass
 
     core = config.main.get('core', {})
     core['project_running'] = False

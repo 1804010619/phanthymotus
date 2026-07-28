@@ -313,7 +313,7 @@ async def lifespan(app):
     await channel_manager.start()
 
     async with event.llm:
-        # Auto-start project if configured
+        # Auto-start project if configured, otherwise reset running state
         if config.main.get('core', {}).get('auto_start', False):
             async def _safe_auto_start():
                 try:
@@ -323,6 +323,12 @@ async def lifespan(app):
                     import traceback
                     traceback.print_exc()
             asyncio.create_task(_safe_auto_start())
+        else:
+            # Not auto-starting: clear stale project_running flag from last session
+            core = config.main.get('core', {})
+            if core.get('project_running'):
+                core['project_running'] = False
+                config.main['core'] = core
 
         tasks = [
             asyncio.create_task(event.llm.run_forever()),
