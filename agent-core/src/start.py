@@ -10,6 +10,7 @@ import event
 import collector
 import scheduler
 import topic_subscriber
+import mcp_client
 from channel.manager import manager as channel_manager
 
 
@@ -299,9 +300,13 @@ async def _auto_start_project():
 
         # 调用内部 API（与前端 _triggerAction 相同）
         url = f'https://localhost:15678/api/mcp/{mcp_id}/call'
+        headers = {}
+        token = auth.get_token()
+        if token:
+            headers['Authorization'] = f'Bearer {token}'
         payload = {'tool': tool_name, 'arguments': args}
         try:
-            async with session.post(url, json=payload, ssl=False) as resp:
+            async with session.post(url, json=payload, ssl=False, headers=headers) as resp:
                 if resp.status == 200:
                     print(f'[auto-start] started {tool_name} ({mcp_id})')
                 else:
