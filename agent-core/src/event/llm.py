@@ -258,6 +258,7 @@ class Event:
             ('task_done', event.task.task_done),
             ('task_fail', event.task.task_fail),
             ('task_list', event.task.task_list),
+            ('task_force_clear', event.task.task_force_clear),
             ('raw_input_info', _raw_input_info),
             ('search_history', _search_history),
             ('subagent_spawn', _sa_tools.subagent_spawn),
