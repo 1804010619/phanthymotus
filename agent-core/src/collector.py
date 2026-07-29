@@ -34,7 +34,7 @@ _current_turn_priority: int = 0
 _source_ring: dict[str, deque] = {}  # per-source ring buffer（所有事件）
 
 # 优先级判定规则
-_PRIORITY_SOURCES = {'asr', 'message', 'channel'}
+_PRIORITY_SOURCES = {'asr', 'message', 'channel', 'subagent'}
 
 
 def _extract_priority(ev: dict) -> int:
