@@ -369,6 +369,8 @@ class _ObstacleNode(Node):
         return {"state": "idle", "input": self._input_topic}
 
     def _image_cb(self, msg: CompressedImage):
+        log.info(
+            f"[obstacle] received image frame: size={len(msg.data)} bytes, format={msg.format}, topic={self._input_topic}")
         # Drop old frame if queue full (no backpressure)
         try:
             self._frame_queue.put_nowait(msg.data)
