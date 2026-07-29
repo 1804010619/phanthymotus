@@ -394,16 +394,38 @@
   <div class="modal skill-modal">
     <div class="modal-header">
       <span class="modal-title">技能管理</span>
+      <div class="skill-rc-login-status" id="skill-rc-login-status"></div>
       <button class="btn-icon" id="skill-close">✕</button>
     </div>
     <div class="skill-tabs">
       <button class="skill-tab active" data-tab="installed">已安装</button>
+      <button class="skill-tab" data-tab="mine">我的技能</button>
       <button class="skill-tab" data-tab="browse">技能广场</button>
     </div>
     <div class="modal-body skill-modal-body">
       <div class="skill-panel active" data-panel="installed" id="skill-installed-panel">
         <div class="skill-empty" id="skill-installed-empty">暂无已安装技能</div>
         <div class="skill-list" id="skill-installed-list"></div>
+      </div>
+      <div class="skill-panel" data-panel="mine" id="skill-mine-panel">
+        <!-- Login form (shown when not logged in) -->
+        <div id="skill-rc-login-form" class="skill-rc-login">
+          <p class="skill-rc-login-hint">登录 Resource Center 以管理您的技能</p>
+          <form id="skill-rc-login-form-el">
+            <input type="email" id="skill-rc-email" placeholder="邮箱" required autocomplete="email">
+            <input type="password" id="skill-rc-password" placeholder="密码" required autocomplete="current-password">
+            <button type="submit" class="skill-btn skill-btn-primary">登录</button>
+          </form>
+          <p class="skill-rc-login-error hidden" id="skill-rc-login-error"></p>
+        </div>
+        <!-- My skills list (shown when logged in) -->
+        <div id="skill-mine-content" class="hidden">
+          <div class="skill-mine-toolbar">
+            <button class="skill-btn skill-btn-primary" id="skill-mine-create-btn">+ 创建技能</button>
+          </div>
+          <div class="skill-list" id="skill-mine-list"></div>
+          <div class="skill-empty hidden" id="skill-mine-empty">暂无技能，点击上方创建</div>
+        </div>
       </div>
       <div class="skill-panel" data-panel="browse" id="skill-browse-panel">
         <div class="skill-search-bar">
@@ -412,6 +434,75 @@
         <div class="skill-list" id="skill-browse-list"></div>
         <div class="skill-empty hidden" id="skill-browse-empty">未找到技能</div>
       </div>
+    </div>
+  </div>
+</div>
+
+<!-- Skill Create/Edit Form Modal -->
+<div class="modal-overlay hidden" id="skill-form-overlay">
+  <div class="modal skill-form-modal">
+    <div class="modal-header">
+      <span class="modal-title" id="skill-form-title">创建技能</span>
+      <button class="btn-icon" id="skill-form-close">✕</button>
+    </div>
+    <div class="modal-body skill-form-body">
+      <form id="skill-form-el">
+        <div class="skill-form-row">
+          <div class="skill-form-field">
+            <label>名称 <span class="required">*</span></label>
+            <input type="text" id="sf-name" required>
+          </div>
+          <div class="skill-form-field">
+            <label>Slug <span class="required">*</span></label>
+            <input type="text" id="sf-slug" required pattern="[a-z0-9-]+">
+          </div>
+        </div>
+        <div class="skill-form-row">
+          <div class="skill-form-field">
+            <label>分类</label>
+            <select id="sf-category">
+              <option value="navigation">navigation</option>
+              <option value="perception">perception</option>
+              <option value="manipulation">manipulation</option>
+              <option value="social">social</option>
+              <option value="utility" selected>utility</option>
+            </select>
+          </div>
+          <div class="skill-form-field skill-form-field-sm">
+            <label>图标</label>
+            <input type="text" id="sf-icon" placeholder="🤖">
+          </div>
+          <div class="skill-form-field">
+            <label>版本 <span class="required">*</span></label>
+            <input type="text" id="sf-version" required value="1.0.0">
+          </div>
+        </div>
+        <div class="skill-form-field">
+          <label>一句话描述 <span class="required">*</span></label>
+          <input type="text" id="sf-oneliner" required maxlength="80">
+        </div>
+        <div class="skill-form-field">
+          <label>详细描述 <span class="required">*</span></label>
+          <textarea id="sf-description" rows="2" required></textarea>
+        </div>
+        <div class="skill-form-field">
+          <label>指令 <span class="required">*</span></label>
+          <textarea id="sf-instruction" rows="8" required class="mono"></textarea>
+        </div>
+        <div class="skill-form-field">
+          <label>依赖工具（逗号分隔）</label>
+          <input type="text" id="sf-tools" placeholder="mic_start, speaker_play">
+        </div>
+        <div class="skill-form-field">
+          <label>配置模式 (JSON Schema)</label>
+          <textarea id="sf-configschema" rows="3" class="mono" placeholder='{"type":"object","properties":{}}'></textarea>
+        </div>
+        <p class="skill-form-error hidden" id="skill-form-error"></p>
+        <div class="skill-form-footer">
+          <button type="button" class="skill-btn" id="skill-form-cancel">取消</button>
+          <button type="submit" class="skill-btn skill-btn-primary" id="skill-form-submit-btn">保存</button>
+        </div>
+      </form>
     </div>
   </div>
 </div>
