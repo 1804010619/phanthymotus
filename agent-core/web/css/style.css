@@ -4824,8 +4824,8 @@ html, body {
 }
 
 /* ── Usage Modal ──────────────────────────────────────────────────────────── */
-.usage-modal { max-width: 520px; }
-.usage-body { padding: 20px; }
+.usage-modal { max-width: 520px; max-height: 88vh; display: flex; flex-direction: column; }
+.usage-body { padding: 20px; overflow-y: auto; flex: 1; min-height: 0; scrollbar-width: thin; }
 .usage-loading { text-align: center; color: var(--text-dim); padding: 40px 0; }
 
 /* Summary cards */
@@ -4922,9 +4922,36 @@ html, body {
   gap: 3px;
   height: 110px;
   padding: 0;
+  padding-bottom: 20px;
+  position: relative;
+}
+.usage-chart-wrap {
+  position: relative;
   margin-bottom: 24px;
   border-bottom: 1px solid var(--border);
-  padding-bottom: 20px;
+}
+.usage-y-lines {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 20px; /* match chart padding-bottom */
+  pointer-events: none;
+}
+.usage-y-line {
+  position: absolute;
+  left: 0;
+  right: 0;
+  border-top: 1px dashed rgba(0,0,0,0.08);
+}
+.usage-y-label {
+  position: absolute;
+  right: 0;
+  top: -14px;
+  font-size: 0.55rem;
+  color: var(--text-dim);
+  opacity: 0.7;
+  font-family: 'JetBrains Mono', monospace;
 }
 .usage-bar {
   flex: 1;
