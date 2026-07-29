@@ -1,14 +1,11 @@
 """
-collector.py — 信息整理器。
+collector.py — 双队列事件收集器。
 
-职责：
-  - 从 event_bus 持续消费事件，在触发间隔内积累
-  - 超过 max_window 的事件 FIFO 丢弃
-  - 间隔到达时，按 source 分组摘要并输出（而非原始全量 XML）
-  - agent loop 通过 next_trigger() 获取下一批格式化事件
-  - priority > 0 的事件立即触发 emit（不等 interval）
-  - per-source ring buffer 保留原始事件，供 detailed_info tool 按需查询
-  - 支持 cancel_event 信号，允许用户消息中断正在进行的 turn
+架构：
+  - P>0 事件（ASR/message/channel）→ 立即送 main agent，或 busy 时暂存等 turn 结束
+  - P=0 事件（sensor/scheduler 等）→ 独立节奏送 bg subagent，main agent 永远不看到
+  - Ring buffer 保留所有事件（供 raw_input_info 按需查询）
+  - 支持 cancel_event 信号（仅 P>P_current 时 cancel）
 """
 
 import asyncio
@@ -21,24 +18,22 @@ import config
 import event_bus
 
 
-_buffer: deque = deque()
-_priority_buffer: deque = deque()  # 高优先级事件（busy 时暂存）
-_output: asyncio.Queue = asyncio.Queue(maxsize=64)
-_task: asyncio.Task | None = None
-# Per-source throttle: source → timestamp of last accepted event
-_last_accepted: dict[str, float] = {}
-_THROTTLE_INTERVAL = 1.0  # 每个 source 最多 1 条/秒
-# Agent loop busy flag — 忙时不发射 trigger，让事件继续积累
+# ── P>0 管道 ─────────────────────────────────────────────────────────────────
+_priority_pending: deque = deque()   # P>0 事件（busy 时暂存）
+_output: asyncio.Queue = asyncio.Queue(maxsize=64)  # main agent 消费端
+
+# ── P=0 管道 ─────────────────────────────────────────────────────────────────
+_bg_buffer: deque = deque()          # P=0 事件（按节奏送 bg subagent）
+_bg_last_accepted: dict[str, float] = {}  # per-source throttle for bg
+_BG_THROTTLE_INTERVAL = 1.0
+
+# ── 共享状态 ──────────────────────────────────────────────────────────────────
 _busy: bool = False
-
-# ── Per-source ring buffer（保留原始事件供 detailed_info tool 查询）────────────
-_source_ring: dict[str, deque] = {}
-
-# ── Turn 取消信号（Phase 2：用户消息抢占）────────────────────────────────────────
 _cancel_event: asyncio.Event | None = None
-_current_turn_priority: int = 0  # 当前正在执行的 turn 的 priority
+_current_turn_priority: int = 0
+_source_ring: dict[str, deque] = {}  # per-source ring buffer（所有事件）
 
-# 根据 source 自动赋 priority 的规则（包含匹配）
+# 优先级判定规则
 _PRIORITY_SOURCES = {'asr', 'message', 'channel'}
 
 
@@ -53,7 +48,6 @@ def _extract_priority(ev: dict) -> int:
                 return int(p)
         except (ValueError, TypeError):
             pass
-    # 按 source 名匹配
     source = ev.get('source', '').lower()
     for key in _PRIORITY_SOURCES:
         if key in source:
@@ -70,35 +64,30 @@ def _extract_perf_timestamps(ev: dict):
         data = _json.loads(text)
     except (ValueError, TypeError):
         return
-
-    # 新格式：perception 直接上报 spans 数组
     if 'spans' in data:
         ev['_perf_spans'] = data['spans']
         return
-
-    # 旧格式兼容：从 audio_start_ts 等字段构造 spans
     spans = []
     audio_start = data.get('audio_start_ts')
     audio_end = data.get('audio_end_ts')
     asr_complete = data.get('asr_complete_ts')
-
     if audio_start and audio_start > 1e9 and audio_end and audio_end > 1e9:
         spans.append({'span': 'vad_collect', 'start_ts': audio_start, 'end_ts': audio_end,
                       'meta': {'audio_ms': data.get('audio_duration_ms')}})
     if audio_end and audio_end > 1e9 and asr_complete and asr_complete > 1e9:
         spans.append({'span': 'asr_inference', 'start_ts': audio_end, 'end_ts': asr_complete,
                       'meta': {'text_length': data.get('text_length')}})
-
     if spans:
         ev['_perf_spans'] = spans
 
+
+# ── 公开接口 ──────────────────────────────────────────────────────────────────
 
 def set_busy(busy: bool):
     """由 agent loop 调用：标记当前是否正在执行 turn。"""
     global _busy
     _busy = busy
-    # turn 结束时，如果有积压的高优先级事件，立即 emit
-    if not busy and _priority_buffer:
+    if not busy and _priority_pending:
         asyncio.ensure_future(_emit_priority())
 
 
@@ -109,27 +98,43 @@ def set_cancel_event(ev: asyncio.Event | None):
 
 
 def set_turn_priority(priority: int):
-    """由 agent loop 调用：设置当前 turn 的 priority（用于 cancel 判断）。"""
+    """由 agent loop 调用：设置当前 turn 的 priority。"""
     global _current_turn_priority
     _current_turn_priority = priority
 
 
+async def next_trigger() -> dict:
+    """阻塞等待下一批 P>0 事件（main agent 消费端）。"""
+    return await _output.get()
+
+
+def get_source_detail(source: str, limit: int = 20) -> list[dict]:
+    """获取指定 source 的原始事件详情（从 ring buffer）。"""
+    ring = _source_ring.get(source)
+    if not ring:
+        return []
+    return list(ring)[-limit:]
+
+
+def get_available_sources() -> list[str]:
+    """返回当前有数据的所有 source 名称列表。"""
+    return list(_source_ring.keys())
+
+
+# ── 内部：P>0 管道 ────────────────────────────────────────────────────────────
+
 async def _emit_priority():
-    """立即 emit 优先级 buffer 中的事件。"""
-    if not _priority_buffer:
+    """busy 结束后，立即 emit 暂存的 P>0 事件。"""
+    if not _priority_pending:
         return
-    batch = list(_priority_buffer)
-    _priority_buffer.clear()
-    # 也把普通 buffer 一起带上
-    if _buffer:
-        batch = list(_buffer) + batch
-        _buffer.clear()
-    await _emit_batch(batch)
+    batch = list(_priority_pending)
+    _priority_pending.clear()
+    await _emit_batch(batch, urgent=True)
 
 
 async def _emit_batch(batch: list[dict], urgent: bool = False):
-    """将一批事件格式化并放入 output。"""
-    formatted = _format_batch(batch)
+    """将 P>0 事件格式化并放入 output。"""
+    formatted = _format_priority_batch(batch)
     trigger = {
         'source': 'collector',
         'text': formatted,
@@ -138,7 +143,6 @@ async def _emit_batch(batch: list[dict], urgent: bool = False):
         '_perf_trigger_emit_ts': time.time(),
         '_urgent': urgent,
     }
-    # 传递 perception spans
     for ev in reversed(batch):
         if '_perf_spans' in ev:
             trigger['_perf_spans'] = ev['_perf_spans']
@@ -146,18 +150,114 @@ async def _emit_batch(batch: list[dict], urgent: bool = False):
     await _output.put(trigger)
 
 
-def _get_interval_ms() -> int:
-    return config.main.get('event', {}).get('llm', {}).get('trigger_interval_ms', 1000)
+def _format_priority_batch(events: list[dict]) -> str:
+    """格式化 P>0 事件为 XML（保留原文）。"""
+    parts = []
+    for ev in events:
+        ts = datetime.datetime.fromtimestamp(ev['ts']).strftime('%Y-%m-%dT%H:%M:%S')
+        channel = _infer_channel(ev)
+        source = ev.get('source', '')
+        text = ev.get('text', '')
+        parts.append(f'<event source="{source}" channel="{channel}" ts="{ts}">\n{text}\n</event>')
+    return '\n'.join(parts)
 
 
-def _get_max_window() -> int:
-    return config.main.get('event', {}).get('llm', {}).get('collector_max_window', 20)
+# ── 内部：P=0 管道 ────────────────────────────────────────────────────────────
 
+def _bg_buffer_add(ev: dict):
+    """将 P=0 事件加入 bg buffer（per-source throttle）。"""
+    source = ev.get('source', 'unknown')
+    now = ev.get('ts', time.time())
+    last_ts = _bg_last_accepted.get(source, 0)
+
+    if now - last_ts < _BG_THROTTLE_INTERVAL:
+        # 替换同 source 最后一条
+        for i in range(len(_bg_buffer) - 1, -1, -1):
+            if _bg_buffer[i].get('source') == source:
+                _bg_buffer[i] = ev
+                return
+    _bg_last_accepted[source] = now
+    _bg_buffer.append(ev)
+
+    # FIFO 限制
+    max_window = config.main.get('event', {}).get('llm', {}).get('collector_max_window', 20)
+    while len(_bg_buffer) > max_window:
+        _bg_buffer.popleft()
+
+
+def _format_bg_batch(events: list[dict]) -> str:
+    """格式化 P=0 事件为摘要（按 source 分组）。"""
+    groups: dict[str, list[dict]] = {}
+    for ev in events:
+        source = ev.get('source', 'unknown')
+        groups.setdefault(source, []).append(ev)
+
+    parts = []
+    for source, evs in groups.items():
+        ts = datetime.datetime.fromtimestamp(evs[-1]['ts']).strftime('%Y-%m-%dT%H:%M:%S')
+        last_text = evs[-1].get('text', '')
+        if len(evs) == 1:
+            parts.append(f'<source name="{source}" ts="{ts}">\n{last_text}\n</source>')
+        else:
+            parts.append(f'<source name="{source}" count="{len(evs)}" ts="{ts}">\n{last_text}\n(共 {len(evs)} 条，显示最新)\n</source>')
+    return '\n'.join(parts)
+
+
+async def _route_to_bg_subagent(batch: list[dict]) -> bool:
+    """将 P=0 事件批次路由到 bg subagent。"""
+    try:
+        from subagent import _manager_instance
+    except ImportError:
+        return False
+
+    if not _manager_instance:
+        return False
+
+    bg_config = config.main.get('subagent', {})
+    if not bg_config.get('bg_route_enabled', True):
+        return False
+
+    summary = _format_bg_batch(batch)
+
+    # 同步 main agent 最近对话上下文
+    try:
+        from event.llm import get_recent_context
+        recent_context = get_recent_context(max_turns=5)
+    except (ImportError, AttributeError):
+        recent_context = ''
+
+    if recent_context:
+        message = f'[主代理最近对话]\n{recent_context}\n\n[新数据]\n{summary}'
+    else:
+        message = summary
+
+    # 检查是否有活跃的 bg subagent
+    active = _manager_instance.list_active()
+    bg_agents = [a for a in active if a.goal.startswith('[bg]')]
+
+    if bg_agents:
+        _manager_instance.send_message(bg_agents[0].id, message)
+    else:
+        from subagent.protocol import SubagentSpec, P_LOW
+        spec = SubagentSpec(
+            goal='[bg] 后台监控：分析传入的信息。如果发现值得注意的变化或异常，调用 subagent_report 上报。无重要变化时直接调用 subagent_finish。不要主动调用任何工具去查询数据，只分析传入的内容。',
+            priority=P_LOW,
+            model=bg_config.get('bg_model'),
+            tool_deny=['mcp__*'],
+            max_rounds=50,
+            timeout_s=3600,
+            context_seed=message,
+        )
+        await _manager_instance.spawn(spec)
+
+    return True
+
+
+# ── Channel 推断 ──────────────────────────────────────────────────────────────
 
 def _infer_channel(ev: dict) -> str:
     """从事件 source 推断渠道标签。"""
     source = ev.get('source', '')
-    # 来自 channel 系统的消息（/channel/request/xxx 或 channel:platform:user）
     if '/channel/' in source or source.startswith('channel:'):
         text = ev.get('text', '')
         if text and text.startswith('{'):
@@ -169,205 +269,60 @@ def _infer_channel(ev: dict) -> str:
             except (ValueError, TypeError):
                 pass
         return 'channel'
-    # 远程控制页面文字消息
     if '/remote_control/message' in source:
         return 'remote_web'
-    # ASR 事件或麦克风相关 — 根据 source 中是否含 remote 判断
     if 'asr' in source.lower() or '/mic' in source:
         if 'remote' in source:
             return 'remote_mic'
         return 'local_mic'
-    # 其他（传感器等）
     return 'sensor'
 
 
-def _format_batch(events: list[dict]) -> str:
-    """将事件列表按 source 分组摘要。
-
-    每个 source 组调用对应 MCP 设备的 output_summary tool（如果存在），
-    否则 fallback 到取该 source 最后一条事件的 text。
-    高优先级事件（用户消息）始终保留原文。
-    """
-    # 按 source 分组，保持出现顺序
-    groups: dict[str, list[dict]] = {}
-    for ev in events:
-        source = ev.get('source', 'unknown')
-        groups.setdefault(source, []).append(ev)
-
-    parts = []
-    for source, evs in groups.items():
-        # 高优先级事件保留原始 XML（用户消息不摘要）
-        priority = max(_extract_priority(e) for e in evs)
-        if priority > 0:
-            for ev in evs:
-                ts = datetime.datetime.fromtimestamp(ev['ts']).strftime('%Y-%m-%dT%H:%M:%S')
-                channel = _infer_channel(ev)
-                text = ev.get('text', '')
-                parts.append(f'<event source="{source}" channel="{channel}" ts="{ts}">\n{text}\n</event>')
-        else:
-            # Sensor/低优先级：摘要模式
-            summary = _get_source_summary_sync(source, evs)
-            ts = datetime.datetime.fromtimestamp(evs[-1]['ts']).strftime('%Y-%m-%dT%H:%M:%S')
-            parts.append(f'<source name="{source}" count="{len(evs)}" ts="{ts}">\n{summary}\n</source>')
-    return '\n'.join(parts)
-
-
-def _get_source_summary_sync(source: str, events: list[dict]) -> str:
-    """同步获取 source 的摘要。Fallback：取最后一条事件的 text。
-
-    注意：output_summary 的 MCP 调用是异步的，将在 _emit_batch_async 中处理。
-    这里先用 fallback 逻辑（最后一条事件），异步版本在 _build_summary_batch 中。
-    """
-    # 取最后一条事件的 text 作为摘要
-    last_text = events[-1].get('text', '')
-    if len(events) == 1:
-        return last_text
-    # 多条时，补充统计信息
-    return f'{last_text}\n(共 {len(events)} 条事件，显示最新)'
-
+# ── 主循环 ────────────────────────────────────────────────────────────────────
 
 async def _drain_loop():
-    """后台任务：持续从 event_bus 消费事件存入 buffer，per-source 限流。"""
-    max_window = _get_max_window()
+    """持续从 event_bus 消费事件，按 priority 分流到两个管道。"""
     ring_size = config.main.get('event', {}).get('llm', {}).get('source_ring_size', 50)
     while True:
         ev = await event_bus.dequeue()
         source = ev.get('source', 'unknown')
-        now = ev.get('ts', time.time())
 
-        # 提取性能数据
         _extract_perf_timestamps(ev)
-
-        # 解析优先级
         priority = _extract_priority(ev)
 
-        # ── 存入 per-source ring buffer（保留原始事件供 detailed_info 查询）
+        # Ring buffer 始终存储（所有事件，供 raw_input_info 查询）
         if source not in _source_ring:
             _source_ring[source] = deque(maxlen=ring_size)
         _source_ring[source].append(ev)
 
-        last_ts = _last_accepted.get(source, 0)
-        if now - last_ts < _THROTTLE_INTERVAL:
-            # 同 source 在 1s 内：替换 buffer 中该 source 的最后一条（保留最新）
-            for i in range(len(_buffer) - 1, -1, -1):
-                if _buffer[i].get('source') == source:
-                    _buffer[i] = ev
-                    break
-            else:
-                _buffer.append(ev)
-        else:
-            _last_accepted[source] = now
-            _buffer.append(ev)
-
-        # FIFO 丢弃超过窗口的旧事件
-        while len(_buffer) > max_window:
-            _buffer.popleft()
-
-        # 高优先级：立即 emit
         if priority > 0:
+            # ── P>0: 送 main agent ──
             if not _busy:
-                # 立即 emit 整个 buffer
-                batch = list(_buffer)
-                _buffer.clear()
-                await _emit_batch(batch, urgent=True)
+                await _emit_batch([ev], urgent=True)
             else:
-                # busy 时暂存到优先级 buffer
-                _priority_buffer.append(ev)
-                # 仅当新事件优先级 > 当前 turn 优先级时才 cancel
+                _priority_pending.append(ev)
                 if priority > _current_turn_priority and _cancel_event:
                     _cancel_event.set()
+        else:
+            # ── P=0: 送 bg buffer ──
+            _bg_buffer_add(ev)
 
 
-async def _trigger_loop():
-    """后台任务：每隔 trigger_interval 检查 buffer，有内容则格式化并放入 output。"""
+async def _bg_trigger_loop():
+    """独立节奏：每 interval 把 bg_buffer 送给 bg subagent。"""
     while True:
-        interval = _get_interval_ms() / 1000.0
+        interval = config.main.get('event', {}).get('llm', {}).get('trigger_interval_ms', 1000) / 1000.0
         await asyncio.sleep(interval)
-
-        if not _buffer:
+        if not _bg_buffer:
             continue
-
-        # 防堆积：agent loop 忙时不发射
-        if _busy:
-            continue
-
-        # 取出当前所有积累的事件
-        batch = list(_buffer)
-        _buffer.clear()
-
-        # P=0 事件自动路由到 bg subagent（如果已启用）
-        has_priority = any(_extract_priority(ev) > 0 for ev in batch)
-        if not has_priority:
-            routed = await _route_to_bg_subagent(batch)
-            if routed:
-                continue
-
-        await _emit_batch(batch)
-
-
-async def _route_to_bg_subagent(batch: list[dict]) -> bool:
-    """尝试将 P=0 事件批次路由到 bg subagent。返回 True 表示已处理。"""
-    try:
-        from subagent import _manager_instance
-    except ImportError:
-        return False
-
-    if not _manager_instance:
-        return False
-
-    # 检查 config 是否启用 bg subagent 路由
-    bg_config = config.main.get('subagent', {})
-    if not bg_config.get('bg_route_enabled', True):
-        return False
-
-    summary = _format_batch(batch)
-
-    # 检查是否有活跃的 bg subagent
-    active = _manager_instance.list_active()
-    bg_agents = [a for a in active if a.goal.startswith('[bg]')]
-
-    if bg_agents:
-        _manager_instance.send_message(bg_agents[0].id, summary)
-    else:
-        from subagent.protocol import SubagentSpec, P_LOW
-        spec = SubagentSpec(
-            goal='[bg] 后台监控：分析传入的 sensor 数据。如果发现值得注意的变化或异常，调用 subagent_report 上报。无重要变化时直接调用 subagent_finish。不要主动调用任何工具去查询数据，只分析传入的内容。',
-            priority=P_LOW,
-            model=bg_config.get('bg_model'),
-            tool_deny=['mcp__*'],
-            max_rounds=50,
-            timeout_s=3600,
-            context_seed=summary,
-        )
-        await _manager_instance.spawn(spec)
-
-    return True
-
-
-def get_source_detail(source: str, limit: int = 20) -> list[dict]:
-    """获取指定 source 的原始事件详情（从 ring buffer）。供 detailed_info tool 调用。"""
-    ring = _source_ring.get(source)
-    if not ring:
-        return []
-    events = list(ring)[-limit:]
-    return events
-
-
-def get_available_sources() -> list[str]:
-    """返回当前有数据的所有 source 名称列表。"""
-    return list(_source_ring.keys())
+        batch = list(_bg_buffer)
+        _bg_buffer.clear()
+        await _route_to_bg_subagent(batch)
 
 
 def start():
-    """启动 collector 后台任务（在 lifespan 中调用）。"""
-    global _task
-    loop = asyncio.get_event_loop()
+    """启动 collector 后台任务。"""
     asyncio.ensure_future(_drain_loop())
-    asyncio.ensure_future(_trigger_loop())
-    print(f'[collector] started: interval={_get_interval_ms()}ms, max_window={_get_max_window()}')
-
-
-async def next_trigger() -> dict:
-    """阻塞等待下一批格式化事件。返回合成的 trigger event dict。"""
-    return await _output.get()
-
+    asyncio.ensure_future(_bg_trigger_loop())
+    interval = config.main.get('event', {}).get('llm', {}).get('trigger_interval_ms', 1000)
+    print(f'[collector] started: dual-queue mode, bg_interval={interval}ms')

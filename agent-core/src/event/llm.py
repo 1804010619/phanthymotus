@@ -229,6 +229,30 @@ async def _raw_input_info(
     return '\n'.join(lines)
 
 
+# ── Module-level reference for bg subagent context sync ───────────────────────
+
+_event_instance: 'Event | None' = None
+
+
+def get_recent_context(max_turns: int = 5) -> str:
+    """返回最近 N 轮 main agent 的 assistant 输出摘要，供 bg subagent 同步上下文。"""
+    if not _event_instance or not _event_instance._turns:
+        return ''
+    recent = _event_instance._turns[-max_turns:]
+    lines = []
+    for turn in recent:
+        for msg in turn:
+            if msg.get('role') == 'assistant':
+                content = msg.get('content', '')
+                if content:
+                    lines.append(content[:200])
+            elif msg.get('role') == 'user':
+                content = msg.get('content', '')
+                if content and not content.startswith('<status'):
+                    lines.append(f'[用户] {content[:100]}')
+    return '\n'.join(lines[-10:])  # 最多 10 行
+
+
 class Event:
     def __init__(self):
         self._turns: list[list[dict]] = []  # 每轮对话的消息列表
@@ -239,6 +263,8 @@ class Event:
         self._subagent_mgr = None             # SubagentManager instance
 
     async def __aenter__(self):
+        global _event_instance
+        _event_instance = self
         # 初始化子代理管理器
         from subagent.manager import SubagentManager
         from subagent.tools import SubagentTools
