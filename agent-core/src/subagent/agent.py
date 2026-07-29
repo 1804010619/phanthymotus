@@ -176,11 +176,11 @@ class Subagent:
 
     # ── LLM Loop ───────────────────────────────────────────────────────────────
 
-    async def run(self, llm_client) -> SubagentResult:
+    async def run(self, llm_client=None) -> SubagentResult:
         """Execute the subagent's LLM loop until completion, failure, or interruption.
 
         Args:
-            llm_client: The shared LLM client instance (client.llm)
+            llm_client: Deprecated, kept for backward compat. Uses client.call() directly.
 
         Returns:
             SubagentResult with final status and output
@@ -229,11 +229,13 @@ class Subagent:
                 print(f'[subagent:{self.id}] round {round_idx} | msgs={len(messages)} tools={len(tool_list)}')
 
                 try:
-                    response = await llm_client(
+                    import client as _client
+                    response = await _client.call(
                         message_list=messages,
                         tool_list=tool_list,
                         cancel_event=self._cancel_event,
                         model_override=self.spec.model,
+                        trace_id=f'subagent:{self.id}',
                     )
                 except Exception as e:
                     from client.llm import LLMErrorKind, _classify_error

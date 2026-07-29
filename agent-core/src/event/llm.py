@@ -176,7 +176,7 @@ async def _compress_turns(turns: list[list[dict]]) -> str:
         text = text[:30000] + '\n...(已截断)'
 
     try:
-        summary_response = await client.llm(
+        summary_response = await client.call(
             message_list=[
                 {'role': 'system', 'content': '你是一个高效的对话摘要助手。'},
                 {'role': 'user', 'content': _COMPRESS_PROMPT + text},
@@ -569,10 +569,11 @@ class Event:
             _round_t0 = _time.perf_counter()
             _round_start_ts = time.time()
             try:
-                response = await client.llm(
+                response = await client.call(
                     message_list = messages,
                     tool_list    = all_tool_list,
                     cancel_event = cancel_event,
+                    trace_id     = _trace_id,
                 )
             except TurnCancelled:
                 raise
@@ -598,9 +599,10 @@ class Event:
                         trigger_user_msg = messages[-1]
                         turn_messages.clear()
                         turn_messages.append(trigger_user_msg)
-                        response = await client.llm(
+                        response = await client.call(
                             message_list = messages,
                             tool_list    = all_tool_list,
+                            trace_id     = _trace_id,
                         )
                     else:
                         raise
@@ -637,7 +639,6 @@ class Event:
                 _turn_usage['total_tokens'] += _usage.get('total_tokens', 0)
                 _turn_usage['cached_tokens'] += _usage.get('cached_tokens', 0)
                 await push_event({'type': 'llm_usage', 'payload': _usage})
-                perf_log.record_usage(_trace_id, _usage)
 
             # ── 工具调用 ──────────────────────────────────────────────────
             tool_calls = response.get('tool_calls') or []

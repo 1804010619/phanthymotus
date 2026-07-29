@@ -124,7 +124,7 @@ class SubagentContext:
         )
         return total > self._compress_threshold
 
-    async def compress(self, llm_client, model_override: str | None = None) -> None:
+    async def compress(self, llm_client=None, model_override: str | None = None) -> None:
         """Compress old turns into a summary, keeping recent 2 turns."""
         if len(self._turns) <= 2:
             return
@@ -155,7 +155,8 @@ class SubagentContext:
         ]
 
         try:
-            result = await llm_client(compress_messages, [], model_override=model_override)
+            import client as _client
+            result = await _client.call(compress_messages, [], model_override=model_override, trace_id='subagent:compress')
             new_summary = result.get('content', '')
             if self._summary:
                 self._summary = f'{self._summary}\n\n{new_summary}'
