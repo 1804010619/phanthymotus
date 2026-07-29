@@ -326,7 +326,7 @@ class SubagentManager:
     # ── Lifecycle Helpers ─────────────────────────────────────────────────────
 
     def _finalize(self, agent: Subagent):
-        """Handle terminal state: store result, notify, cleanup."""
+        """Handle terminal state: store result, notify, cleanup, save history."""
         result = agent.result
         if result:
             # Store in completed ring (keep last 50)
@@ -338,11 +338,25 @@ class SubagentManager:
             # Persist terminal state
             self._store.save_result(agent.id, result)
 
+            # Save subagent conversation to chat history
+            self._save_subagent_history(agent, result)
+
             # Notify via event_bus
             asyncio.create_task(self._notify_completion(agent, result))
 
         # Remove from active
         self._agents.pop(agent.id, None)
+
+    def _save_subagent_history(self, agent: Subagent, result: SubagentResult):
+        """Save subagent turns to chat_history for visibility in history modal."""
+        try:
+            import chat_history
+            session_id = chat_history.create_session()
+            chat_history.update_summary(session_id, f'[subagent:{agent.id}] {agent.spec.goal[:80]}')
+            for i, turn in enumerate(agent.context.turns):
+                chat_history.save_turn(session_id, i, turn)
+        except Exception as e:
+            print(f'[subagent:{agent.id}] save history failed: {e}')
 
     async def _notify_completion(self, agent: Subagent, result: SubagentResult):
         """Push completion event to event_bus and motus stream."""

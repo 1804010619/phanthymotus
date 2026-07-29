@@ -188,10 +188,12 @@ class Subagent:
         self.status = STATUS_RUNNING
         self.updated_at = time.time()
         t0 = time.time()
+        _trace_id = f'subagent:{self.id}'
 
         tool_list = self._get_allowed_tools()
         finish_output: str | None = None
         fail_reason: str | None = None
+        _spans = []
 
         try:
             for round_idx in range(self.spec.max_rounds):
@@ -227,6 +229,7 @@ class Subagent:
 
                 # Call LLM
                 print(f'[subagent:{self.id}] round {round_idx} | msgs={len(messages)} tools={len(tool_list)}')
+                _round_start = time.time()
 
                 try:
                     import client as _client
@@ -235,14 +238,16 @@ class Subagent:
                         tool_list=tool_list,
                         cancel_event=self._cancel_event,
                         model_override=self.spec.model,
-                        trace_id=f'subagent:{self.id}',
+                        trace_id=_trace_id,
                     )
+                    _spans.append({'span': f'llm_round_{round_idx}', 'component': 'subagent',
+                                   'start_ts': _round_start, 'end_ts': time.time()})
                 except Exception as e:
                     from client.llm import LLMErrorKind, _classify_error
                     kind, _ = _classify_error(e)
                     if kind == LLMErrorKind.CONTEXT_OVERFLOW:
                         # Try compression
-                        await self._context.compress(llm_client, self.spec.model)
+                        await self._context.compress(None, self.spec.model)
                         continue
                     raise
 
@@ -381,6 +386,22 @@ class Subagent:
             )
             self.status = STATUS_FAILED
             return self.result
+
+        finally:
+            # Commit perf spans for this subagent run
+            if _spans:
+                _spans.append({'span': 'subagent_total', 'component': 'subagent',
+                               'start_ts': t0, 'end_ts': time.time()})
+                try:
+                    import perf_log
+                    perf_log.commit_spans(
+                        trace_id=_trace_id,
+                        spans=_spans,
+                        source=f'subagent:{self.id}',
+                        trigger_text=self.spec.goal[:200],
+                    )
+                except Exception:
+                    pass
 
     async def _dispatch_tool(self, name: str, args: dict) -> str:
         """Dispatch a tool call and return result text."""
