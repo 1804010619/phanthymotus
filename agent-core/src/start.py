@@ -1,5 +1,6 @@
 import contextlib
 import asyncio
+import logging
 import pathlib
 import shutil
 import subprocess
@@ -612,6 +613,15 @@ def _ensure_ssl_certs(cert_dir: str = "./resource/certs") -> tuple[str, str]:
 
 # ========== 启动服务 ==========
 if __name__ == '__main__':
+    # Suppress noisy "SSL connection is closed" from uvicorn/asyncio
+    class _SSLCloseFilter(logging.Filter):
+        def filter(self, record):
+            return 'SSL connection is closed' not in record.getMessage()
+
+    logging.getLogger('uvicorn.error').addFilter(_SSLCloseFilter())
+    logging.getLogger('asyncio').addFilter(_SSLCloseFilter())
+
     cert_file, key_file = _ensure_ssl_certs()
     uvicorn.run(app, host='0.0.0.0', port=15678, ws_ping_interval=None,
-                ssl_certfile=cert_file, ssl_keyfile=key_file)
+                ssl_certfile=cert_file, ssl_keyfile=key_file,
+                timeout_keep_alive=65)
