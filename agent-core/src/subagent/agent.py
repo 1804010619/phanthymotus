@@ -391,6 +391,12 @@ class Subagent:
             progress = args.get('progress', '')
             self._progress_reports.append(progress)
             print(f'[subagent:{self.id}] progress: {progress[:100]}')
+            # Inject report into event_bus so main agent can see it
+            import event_bus
+            await event_bus.enqueue(
+                source=f'subagent:{self.id}/report',
+                text=progress,
+            )
             return 'ok'
 
         # MCP tool call

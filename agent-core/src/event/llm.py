@@ -344,6 +344,7 @@ class Event:
             # 注册取消信号（用户消息可通过此信号中断 sensor turn）
             cancel_ev = asyncio.Event()
             collector.set_cancel_event(cancel_ev)
+            collector.set_turn_priority(1 if ev.get('_urgent') else 0)
             collector.set_busy(True)
             try:
                 await self._one_turn(ev, cancel_event=cancel_ev)

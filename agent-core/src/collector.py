@@ -36,6 +36,7 @@ _source_ring: dict[str, deque] = {}
 
 # ── Turn 取消信号（Phase 2：用户消息抢占）────────────────────────────────────────
 _cancel_event: asyncio.Event | None = None
+_current_turn_priority: int = 0  # 当前正在执行的 turn 的 priority
 
 # 根据 source 自动赋 priority 的规则（包含匹配）
 _PRIORITY_SOURCES = {'asr', 'message', 'channel'}
@@ -105,6 +106,12 @@ def set_cancel_event(ev: asyncio.Event | None):
     """由 agent loop 调用：注册/清除当前 turn 的取消信号。"""
     global _cancel_event
     _cancel_event = ev
+
+
+def set_turn_priority(priority: int):
+    """由 agent loop 调用：设置当前 turn 的 priority（用于 cancel 判断）。"""
+    global _current_turn_priority
+    _current_turn_priority = priority
 
 
 async def _emit_priority():
@@ -264,9 +271,10 @@ async def _drain_loop():
                 _buffer.clear()
                 await _emit_batch(batch, urgent=True)
             else:
-                # busy 时暂存到优先级 buffer，并触发取消信号
+                # busy 时暂存到优先级 buffer
                 _priority_buffer.append(ev)
-                if _cancel_event:
+                # 仅当新事件优先级 > 当前 turn 优先级时才 cancel
+                if priority > _current_turn_priority and _cancel_event:
                     _cancel_event.set()
 
 
@@ -286,7 +294,53 @@ async def _trigger_loop():
         # 取出当前所有积累的事件
         batch = list(_buffer)
         _buffer.clear()
+
+        # P=0 事件自动路由到 bg subagent（如果已启用）
+        has_priority = any(_extract_priority(ev) > 0 for ev in batch)
+        if not has_priority:
+            routed = await _route_to_bg_subagent(batch)
+            if routed:
+                continue
+
         await _emit_batch(batch)
+
+
+async def _route_to_bg_subagent(batch: list[dict]) -> bool:
+    """尝试将 P=0 事件批次路由到 bg subagent。返回 True 表示已处理。"""
+    try:
+        from subagent import _manager_instance
+    except ImportError:
+        return False
+
+    if not _manager_instance:
+        return False
+
+    # 检查 config 是否启用 bg subagent 路由
+    bg_config = config.main.get('subagent', {})
+    if not bg_config.get('bg_route_enabled', True):
+        return False
+
+    summary = _format_batch(batch)
+
+    # 检查是否有活跃的 bg subagent
+    active = _manager_instance.list_active()
+    bg_agents = [a for a in active if a.goal.startswith('[bg]')]
+
+    if bg_agents:
+        _manager_instance.send_message(bg_agents[0].id, summary)
+    else:
+        from subagent.protocol import SubagentSpec, P_LOW
+        spec = SubagentSpec(
+            goal='[bg] 后台监控：分析 sensor 数据，仅在发现异常（如电池低、温度过高、关节异常等）时通过 subagent_report 上报主代理。正常数据不需要报告，直接 finish 即可。',
+            priority=P_LOW,
+            model=bg_config.get('bg_model'),  # 可配置轻量模型
+            max_rounds=50,
+            timeout_s=3600,
+            context_seed=summary,
+        )
+        await _manager_instance.spawn(spec)
+
+    return True
 
 
 def get_source_detail(source: str, limit: int = 20) -> list[dict]:

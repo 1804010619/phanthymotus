@@ -77,6 +77,8 @@ _DB_DEFAULTS = {
         'checkpoint_interval': 5,
         'compress_threshold_chars': 20000,
         'cleanup_age_hours': 24,
+        'bg_route_enabled': True,
+        'bg_model': None,  # None = use main model; or specify e.g. 'qwen-turbo'
     },
 }
 
