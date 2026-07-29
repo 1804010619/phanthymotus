@@ -91,6 +91,9 @@ function _renderChart(el, breakdown, granularity) {
   const days = [...breakdown].reverse();
   const maxVal = Math.max(...days.map(d => d.prompt_tokens + d.completion_tokens), 1);
 
+  // Generate Y-axis reference lines (3-4 lines)
+  const yLines = _calcYLines(maxVal);
+
   const bars = days.map(d => {
     const total = d.prompt_tokens + d.completion_tokens;
     const h = Math.max((total / maxVal) * 100, 3);
@@ -119,6 +122,11 @@ function _renderChart(el, breakdown, granularity) {
       </div>`;
   }).join('');
 
+  const yLinesHtml = yLines.map(line => `
+    <div class="usage-y-line" style="bottom:${(line.value / maxVal) * 100}%">
+      <span class="usage-y-label">${line.label}</span>
+    </div>`).join('');
+
   const titleText = granularity === 'hourly' ? '每小时用量' : '每日用量';
   el.innerHTML = `
     <div class="usage-chart-header">
@@ -129,7 +137,29 @@ function _renderChart(el, breakdown, granularity) {
         <span class="usage-legend-item"><i style="background:#10b981"></i>输出</span>
       </div>
     </div>
-    <div class="usage-chart">${bars}</div>`;
+    <div class="usage-chart-wrap">
+      <div class="usage-y-lines">${yLinesHtml}</div>
+      <div class="usage-chart">${bars}</div>
+    </div>`;
+}
+
+/** Calculate nice Y-axis reference values. */
+function _calcYLines(maxVal) {
+  if (maxVal <= 0) return [];
+  // Find a nice step (1, 2, 5 × 10^n)
+  const rough = maxVal / 4;
+  const mag = Math.pow(10, Math.floor(Math.log10(rough)));
+  let step;
+  if (rough / mag < 1.5) step = mag;
+  else if (rough / mag < 3.5) step = mag * 2;
+  else if (rough / mag < 7.5) step = mag * 5;
+  else step = mag * 10;
+
+  const lines = [];
+  for (let v = step; v < maxVal; v += step) {
+    lines.push({ value: v, label: _fmt(v) });
+  }
+  return lines;
 }
 
 function _renderTable(el, breakdown, granularity) {

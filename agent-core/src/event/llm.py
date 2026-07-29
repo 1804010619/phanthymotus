@@ -253,6 +253,46 @@ def get_recent_context(max_turns: int = 5) -> str:
     return '\n'.join(lines[-10:])  # 最多 10 行
 
 
+def get_recent_context_rich(max_turns: int = 20, max_chars: int = 6000) -> str:
+    """返回 main agent 最近对话的原始片段，供 subagent 理解完整上下文。
+
+    策略：20 轮内，纯字符串提取，不额外调 LLM。包含用户消息、
+    assistant 决策文本、tool 结果（含 subagent_result 返回值）。
+    """
+    if not _event_instance or not _event_instance._turns:
+        return ''
+    recent = _event_instance._turns[-max_turns:]
+    parts = []
+    total = 0
+    truncated = False
+    for turn in recent:
+        if truncated:
+            break
+        for msg in turn:
+            role = msg.get('role', '')
+            content = msg.get('content', '')
+            if not content:
+                continue
+            # 跳过 <status 开头的环境快照（噪音大）
+            if role == 'user' and content.startswith('<status'):
+                continue
+            if role == 'user':
+                line = f'[用户] {content[:500]}'
+            elif role == 'assistant':
+                line = f'[助手] {content[:500]}'
+            elif role == 'tool':
+                line = f'[工具结果] {content[:800]}'
+            else:
+                continue
+            if total + len(line) > max_chars:
+                parts.append('...(更早历史已截断)')
+                truncated = True
+                break
+            parts.append(line)
+            total += len(line)
+    return '\n'.join(parts)
+
+
 class Event:
     def __init__(self):
         self._turns: list[list[dict]] = []  # 每轮对话的消息列表

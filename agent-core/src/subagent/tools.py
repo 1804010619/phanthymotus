@@ -20,6 +20,44 @@ class SubagentTools:
     def __init__(self, manager: SubagentManager):
         self._mgr = manager
 
+    def _build_context_with_history(self, explicit_context: str, goal: str) -> str:
+        """自动注入 main agent 对话历史 + 已完成 subagent 结果，减少重复劳动。
+
+        无论 LLM 是否传了 context，都会注入系统提取的历史信息。
+        纯字符串提取，零额外 LLM 调用。
+        """
+        sections = []
+
+        # 1. Main agent 近期对话（20轮内）
+        try:
+            from event.llm import get_recent_context_rich
+            recent = get_recent_context_rich(max_turns=20, max_chars=6000)
+            if recent:
+                sections.append(f'[主代理近期对话]\n{recent}')
+        except (ImportError, AttributeError):
+            pass
+
+        # 2. 已完成的 subagent 结果（非 bg，最近3个）
+        recent_results = []
+        for agent_id, result in self._mgr._completed.items():
+            if result.status != 'completed' or not result.output:
+                continue
+            # Skip background monitoring results
+            if result.output.startswith('电池') or result.output.startswith('后台监控'):
+                continue
+            output_summary = result.output[:1500]
+            if len(result.output) > 1500:
+                output_summary += '...'
+            recent_results.append(f'[子代理 {agent_id[:8]} 结果] {output_summary}')
+        if recent_results:
+            sections.append('\n\n'.join(recent_results[-3:]))
+
+        # 3. LLM 显式传入的 context（合并，不丢弃）
+        if explicit_context:
+            sections.append(f'[额外上下文]\n{explicit_context}')
+
+        return '\n\n'.join(sections) if sections else ''
+
     async def subagent_spawn(
         self,
         goal: Annotated[str, "子代理的任务目标描述"],
@@ -30,6 +68,7 @@ class SubagentTools:
         context: Annotated[str, "传递给子代理的初始上下文信息"] = '',
     ) -> str:
         """创建子代理异步执行任务。返回 agent_id 用于后续查询。适合不需要立即结果的后台任务。"""
+        context_seed = self._build_context_with_history(context, goal)
         tool_filter = None if tools == '*' else [t.strip() for t in tools.split(',')]
         spec = SubagentSpec(
             goal=goal,
@@ -37,7 +76,7 @@ class SubagentTools:
             model=model or None,
             tool_filter=tool_filter,
             max_rounds=max_rounds,
-            context_seed=context,
+            context_seed=context_seed,
         )
         agent_id = await self._mgr.spawn(spec)
         return f'子代理已创建: id={agent_id}, priority={spec.priority}, 任务: {goal[:80]}'
@@ -53,6 +92,7 @@ class SubagentTools:
         timeout: Annotated[int, "等待超时秒数"] = 120,
     ) -> str:
         """创建子代理并等待结果返回。适合需要立即获得结果的查询类任务。会阻塞当前轮直到完成。"""
+        context_seed = self._build_context_with_history(context, goal)
         tool_filter = None if tools == '*' else [t.strip() for t in tools.split(',')]
         spec = SubagentSpec(
             goal=goal,
@@ -60,7 +100,7 @@ class SubagentTools:
             model=model or None,
             tool_filter=tool_filter,
             max_rounds=max_rounds,
-            context_seed=context,
+            context_seed=context_seed,
         )
         result = await self._mgr.spawn_and_wait(spec, timeout=float(timeout))
         if result.status == 'completed':
