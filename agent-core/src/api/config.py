@@ -825,14 +825,29 @@ async def reset_config(req: ResetRequest):
                     others.append(name)
 
         # Restart others first, then self last
-        if others:
-            subprocess.Popen(
-                ['docker', 'restart'] + others,
+        # Spawn a detached sidecar container to do the restart — child processes
+        # inside this container get killed when it restarts, so we need an external actor.
+        targets = others + ([self_name] if restart_self else [])
+        if targets:
+            restart_script = 'sleep 2; ' + '; '.join(f'docker restart {name}' for name in targets)
+            # Reuse our own image (guaranteed available locally) as the restart helper
+            own_image_result = subprocess.run(
+                ['docker', 'inspect', self_name, '--format', '{{.Config.Image}}'],
+                capture_output=True, text=True
+            )
+            helper_image = own_image_result.stdout.strip() or 'alpine'
+            # Remove stale helper if exists
+            subprocess.run(
+                ['docker', 'rm', '-f', 'phanthy-restart-helper'],
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             )
-        if restart_self:
             subprocess.Popen(
-                ['sh', '-c', f'sleep 3 && docker restart {self_name}'],
+                ['docker', 'run', '--rm', '-d',
+                 '--name', 'phanthy-restart-helper',
+                 '--entrypoint', 'sh',
+                 '-v', '/var/run/docker.sock:/var/run/docker.sock',
+                 helper_image,
+                 '-c', restart_script],
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             )
 
