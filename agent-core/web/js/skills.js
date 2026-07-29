@@ -54,6 +54,7 @@ export function initSkills() {
       const target = tab.dataset.tab;
       _tabs.forEach(t => t.classList.toggle('active', t === tab));
       _panels.forEach(p => p.classList.toggle('active', p.dataset.panel === target));
+      if (target === 'installed') _loadInstalled();
       if (target === 'browse') _loadBrowse();
       if (target === 'mine') _loadMine();
     });
@@ -218,6 +219,16 @@ function _renderInstalled(skills) {
 
 // ── My Skills tab ─────────────────────────────────────────────────────────
 
+let _installedSlugs = new Set();
+
+async function _fetchInstalledSlugs() {
+  try {
+    const res = await fetch('/api/skills');
+    const json = await res.json();
+    _installedSlugs = new Set((json.data || []).map(s => s.slug));
+  } catch { _installedSlugs = new Set(); }
+}
+
 async function _loadMine() {
   if (!_isRcLoggedIn()) {
     _loginForm.classList.remove('hidden');
@@ -228,6 +239,7 @@ async function _loadMine() {
   _mineContent.classList.remove('hidden');
 
   try {
+    await _fetchInstalledSlugs();
     const res = await fetch('/api/skills/rc/mine', { headers: _rcHeaders() });
     const json = await res.json();
     if (json.code === 401) {
@@ -257,6 +269,7 @@ function _renderMine(skills) {
   _mineList.innerHTML = skills.map(s => {
     const st = STATUS_LABELS[s.status] || STATUS_LABELS.draft;
     const canSubmit = ['draft', 'rejected'].includes(s.status);
+    const isInstalled = _installedSlugs.has(s.slug);
     return `
     <div class="skill-card" data-id="${_esc(s.id)}">
       <div class="skill-card-header">
@@ -271,6 +284,10 @@ function _renderMine(skills) {
       </div>
       <p class="skill-card-desc">${_esc(s.oneLiner)}</p>
       <div class="skill-mine-actions">
+        ${isInstalled
+          ? `<button class="skill-btn skill-btn-sm" data-action="uninstall" data-slug="${_esc(s.slug)}">卸载</button>`
+          : `<button class="skill-btn skill-btn-sm skill-btn-primary" data-action="install" data-slug="${_esc(s.slug)}">安装</button>`
+        }
         <button class="skill-btn skill-btn-sm" data-action="edit" data-id="${_esc(s.id)}">编辑</button>
         ${canSubmit ? `<button class="skill-btn skill-btn-sm skill-btn-warn" data-action="submit" data-id="${_esc(s.id)}">提交审核</button>` : ''}
         <button class="skill-btn skill-btn-sm skill-btn-danger" data-action="delete" data-id="${_esc(s.id)}">删除</button>
@@ -279,6 +296,12 @@ function _renderMine(skills) {
   }).join('');
 
   // Bind actions
+  _mineList.querySelectorAll('[data-action="install"]').forEach(btn => {
+    btn.addEventListener('click', () => _installMineSkill(btn.dataset.slug));
+  });
+  _mineList.querySelectorAll('[data-action="uninstall"]').forEach(btn => {
+    btn.addEventListener('click', () => _uninstallMineSkill(btn.dataset.slug));
+  });
   _mineList.querySelectorAll('[data-action="edit"]').forEach(btn => {
     btn.addEventListener('click', () => {
       const skill = skills.find(s => s.id === btn.dataset.id);
@@ -317,6 +340,38 @@ async function _deleteMineSkill(id) {
     if (data.code === 200) _loadMine();
     else alert(data.error || '删除失败');
   } catch (e) { alert('删除失败: ' + e.message); }
+}
+
+async function _installMineSkill(slug) {
+  try {
+    const res = await fetch('/api/skills/install', {
+      method: 'POST',
+      headers: _rcHeaders(),
+      body: JSON.stringify({ slug }),
+    });
+    const data = await res.json();
+    if (data.code === 200) {
+      _loadMine(); // refresh to show "卸载" button
+    } else {
+      alert(data.error || '安装失败');
+    }
+  } catch (e) { alert('安装失败: ' + e.message); }
+}
+
+async function _uninstallMineSkill(slug) {
+  try {
+    const res = await fetch('/api/skills/uninstall', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ slug }),
+    });
+    const data = await res.json();
+    if (data.code === 200) {
+      _loadMine(); // refresh to show "安装" button
+    } else {
+      alert(data.error || '卸载失败');
+    }
+  } catch (e) { alert('卸载失败: ' + e.message); }
 }
 
 // ── Skill Create/Edit Form ───────────────────────────────────────────────────

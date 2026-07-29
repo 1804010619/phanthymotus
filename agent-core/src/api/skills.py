@@ -48,7 +48,7 @@ async def list_skills():
 
 
 @router.post('/install')
-async def install_skill(body: dict = fastapi.Body(...), request: fastapi.Request = None):
+async def install_skill(request: fastapi.Request, body: dict = fastapi.Body(...)):
     """从 Resource Center 安装技能。"""
     slug = body.get('slug', '').strip()
     if not slug:
@@ -63,7 +63,7 @@ async def install_skill(body: dict = fastapi.Body(...), request: fastapi.Request
     rc_url = _get_rc_url()
     headers = {}
     # 传递 RC token 以允许作者安装自己的未发布技能
-    rc_token = request.headers.get('x-rc-token') if request else None
+    rc_token = request.headers.get('x-rc-token')
     if rc_token:
         headers['Authorization'] = f'Bearer {rc_token}'
     try:
@@ -76,10 +76,12 @@ async def install_skill(body: dict = fastapi.Body(...), request: fastapi.Request
             if not data.get('ok'):
                 return {'code': 404, 'error': data.get('error', '获取失败')}
     except ImportError:
-        # httpx 未安装时 fallback 到 aiohttp 或 urllib
+        # httpx 未安装时 fallback 到 urllib
         import urllib.request, json as _json
         try:
             req = urllib.request.Request(f'{rc_url}/api/skills/{slug}')
+            for k, v in headers.items():
+                req.add_header(k, v)
             with urllib.request.urlopen(req, timeout=10) as resp:
                 data = _json.loads(resp.read())
                 if not data.get('ok'):
