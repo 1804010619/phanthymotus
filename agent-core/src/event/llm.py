@@ -176,7 +176,7 @@ async def _compress_turns(turns: list[list[dict]]) -> str:
         text = text[:30000] + '\n...(已截断)'
 
     try:
-        summary_response = await client.llm(
+        summary_response = await client.call(
             message_list=[
                 {'role': 'system', 'content': '你是一个高效的对话摘要助手。'},
                 {'role': 'user', 'content': _COMPRESS_PROMPT + text},
@@ -229,6 +229,30 @@ async def _raw_input_info(
     return '\n'.join(lines)
 
 
+# ── Module-level reference for bg subagent context sync ───────────────────────
+
+_event_instance: 'Event | None' = None
+
+
+def get_recent_context(max_turns: int = 5) -> str:
+    """返回最近 N 轮 main agent 的 assistant 输出摘要，供 bg subagent 同步上下文。"""
+    if not _event_instance or not _event_instance._turns:
+        return ''
+    recent = _event_instance._turns[-max_turns:]
+    lines = []
+    for turn in recent:
+        for msg in turn:
+            if msg.get('role') == 'assistant':
+                content = msg.get('content', '')
+                if content:
+                    lines.append(content[:200])
+            elif msg.get('role') == 'user':
+                content = msg.get('content', '')
+                if content and not content.startswith('<status'):
+                    lines.append(f'[用户] {content[:100]}')
+    return '\n'.join(lines[-10:])  # 最多 10 行
+
+
 class Event:
     def __init__(self):
         self._turns: list[list[dict]] = []  # 每轮对话的消息列表
@@ -236,9 +260,20 @@ class Event:
         self._summary: str | None     = None  # 压缩后的历史摘要
         self._session_id: str | None  = None  # chat history session
         self._current_turn: list[dict] = []   # 当前轮消息（供 run_forever 保存）
+        self._subagent_mgr = None             # SubagentManager instance
 
     async def __aenter__(self):
-        # 注册系统工具（finish / memory / task / detailed_info）
+        global _event_instance
+        _event_instance = self
+        # 初始化子代理管理器
+        from subagent.manager import SubagentManager
+        from subagent.tools import SubagentTools
+        from subagent import _set_manager
+        self._subagent_mgr = SubagentManager(llm_client=client.llm)
+        _set_manager(self._subagent_mgr)
+        _sa_tools = SubagentTools(self._subagent_mgr)
+
+        # 注册系统工具（finish / memory / task / detailed_info / subagent）
         self._sys_tools = _build_system_tools([
             ('finish', event.finish.__call__),
             ('update_memory', event.memory.update),
@@ -249,8 +284,15 @@ class Event:
             ('task_done', event.task.task_done),
             ('task_fail', event.task.task_fail),
             ('task_list', event.task.task_list),
+            ('task_force_clear', event.task.task_force_clear),
             ('raw_input_info', _raw_input_info),
             ('search_history', _search_history),
+            ('subagent_spawn', _sa_tools.subagent_spawn),
+            ('subagent_spawn_sync', _sa_tools.subagent_spawn_sync),
+            ('subagent_status', _sa_tools.subagent_status),
+            ('subagent_cancel', _sa_tools.subagent_cancel),
+            ('subagent_message', _sa_tools.subagent_message),
+            ('subagent_result', _sa_tools.subagent_result),
         ])
         # 连接并注册所有 MCP 工具
         await mcp_client.init_all()
@@ -260,6 +302,8 @@ class Event:
         task_store.load_all()
         for task in task_store.active_tasks():
             _register_check(task)
+        # 启动子代理调度器（restore + scheduler loop）
+        await self._subagent_mgr.start()
         # 重启续跑：加载上一个 session 的最近 turns
         import chat_history
         last = chat_history.get_last_session_turns(limit=10)
@@ -272,6 +316,9 @@ class Event:
         return self
 
     async def __aexit__(self, *args):
+        # 关闭子代理管理器（checkpoint all running）
+        if self._subagent_mgr:
+            await self._subagent_mgr.shutdown()
         return False
 
     def _get_bound_tool_schemas(self) -> list[dict]:
@@ -323,6 +370,7 @@ class Event:
             # 注册取消信号（用户消息可通过此信号中断 sensor turn）
             cancel_ev = asyncio.Event()
             collector.set_cancel_event(cancel_ev)
+            collector.set_turn_priority(1 if ev.get('_urgent') else 0)
             collector.set_busy(True)
             try:
                 await self._one_turn(ev, cancel_event=cancel_ev)
@@ -437,7 +485,13 @@ class Event:
 
         # Log incoming event
         _urgent_tag = ' [URGENT]' if trigger_event.get('_urgent') else ''
-        print(f'[decision] received{_urgent_tag} event: source={trigger_event.get("source", "?")} text={trigger_event.get("text", "")[:100]}')
+        print(f'[decision] received{_urgent_tag} event: source={trigger_event.get("source", "?")} text={trigger_event.get("text", "")[:300]}')
+        # Subagent status in log
+        if self._subagent_mgr:
+            _sa_active = self._subagent_mgr.list_active()
+            if _sa_active:
+                _sa_summary = ', '.join(f'{s.id}(P{s.priority}/{s.status})' for s in _sa_active[:5])
+                print(f'[decision] subagents: {_sa_summary}')
 
         # 广播触发事件到前端
         await push_event({
@@ -463,6 +517,7 @@ class Event:
         response    = None
         decisions   = []
         turn_messages = self._current_turn  # alias for brevity
+        _turn_usage = {'prompt_tokens': 0, 'completion_tokens': 0, 'total_tokens': 0, 'cached_tokens': 0}
 
         for round_idx in range(max_rounds):
             # ── 构建分层 prompt ────────────────────────────────────────────
@@ -503,7 +558,7 @@ class Event:
             tool_count = len(all_tool_list)
             # Estimate prompt size (rough: 1 token ≈ 3 chars for CJK)
             prompt_chars = sum(len(m.get('content') or '') for m in messages)
-            last_user = next((m.get('content', '')[:80] for m in reversed(messages) if m.get('role') == 'user'), '')
+            last_user = next((m.get('content', '')[:200] for m in reversed(messages) if m.get('role') == 'user'), '')
             print(f'[decision] llm request: round={round_idx} messages={msg_count} tools={tool_count} ~chars={prompt_chars} last_user={last_user}')
 
             # ── 调用 LLM（含上下文溢出恢复 + 取消检查）──────────────────────
@@ -514,10 +569,11 @@ class Event:
             _round_t0 = _time.perf_counter()
             _round_start_ts = time.time()
             try:
-                response = await client.llm(
+                response = await client.call(
                     message_list = messages,
                     tool_list    = all_tool_list,
                     cancel_event = cancel_event,
+                    trace_id     = _trace_id,
                 )
             except TurnCancelled:
                 raise
@@ -543,9 +599,10 @@ class Event:
                         trigger_user_msg = messages[-1]
                         turn_messages.clear()
                         turn_messages.append(trigger_user_msg)
-                        response = await client.llm(
+                        response = await client.call(
                             message_list = messages,
                             tool_list    = all_tool_list,
+                            trace_id     = _trace_id,
                         )
                     else:
                         raise
@@ -558,11 +615,11 @@ class Event:
             _round_end_ts = time.time()
             _spans.append({'span': f'llm_round_{round_idx}', 'component': 'core',
                            'start_ts': _round_start_ts, 'end_ts': _round_end_ts})
-            resp_text = (response.get('content') or '')[:200]
+            resp_text = (response.get('content') or '')[:300]
             resp_tools = []
             for c in (response.get('tool_calls') or []):
                 name = c['function']['name']
-                args_str = c['function'].get('arguments', '')[:150]
+                args_str = c['function'].get('arguments', '')[:300]
                 resp_tools.append(f'{name}({args_str})')
             print(f'[decision] llm response: round_time={_round_elapsed:.2f}s text={resp_text!r}')
             if resp_tools:
@@ -573,6 +630,15 @@ class Event:
             text = response.get('content') or ''
             if text:
                 await push_event({'type': 'agent_thought', 'payload': {'text': text}})
+
+            # ── 用量广播 ──────────────────────────────────────────────────
+            _usage = response.get('_usage')
+            if _usage:
+                _turn_usage['prompt_tokens'] += _usage.get('prompt_tokens', 0)
+                _turn_usage['completion_tokens'] += _usage.get('completion_tokens', 0)
+                _turn_usage['total_tokens'] += _usage.get('total_tokens', 0)
+                _turn_usage['cached_tokens'] += _usage.get('cached_tokens', 0)
+                await push_event({'type': 'llm_usage', 'payload': _usage})
 
             # ── 工具调用 ──────────────────────────────────────────────────
             tool_calls = response.get('tool_calls') or []
@@ -683,7 +749,11 @@ class Event:
         }
         ros2_bridge.publish('/decision_core', json.dumps(decision, ensure_ascii=False))
 
-        await push_event({'type': 'turn_end', 'payload': {}})
+        await push_event({'type': 'turn_end', 'payload': {
+            'rounds': round_idx + 1,
+            'duration_s': round(_time.perf_counter() - _turn_t0, 2),
+            'usage': _turn_usage,
+        }})
         _turn_elapsed = _time.perf_counter() - _turn_t0
         print(f'[decision] turn complete: {_turn_elapsed:.2f}s total, {round_idx + 1} rounds')
 
@@ -696,7 +766,7 @@ class Event:
                 trace_id=_trace_id,
                 spans=_spans,
                 source=trigger_event.get('source', ''),
-                trigger_text=trigger_event.get('text', '')[:100],
+                trigger_text=trigger_event.get('text', '')[:300],
             )
         except Exception as _pe:
             print(f'[perf_log] commit error: {_pe}')

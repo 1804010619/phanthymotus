@@ -19,7 +19,21 @@ import config
 
 
 def _get_conn():
-    return config._get_conn()
+    conn = config._get_conn()
+    # Ensure token_usage table exists
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS token_usage (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            trace_id TEXT NOT NULL,
+            prompt_tokens INTEGER DEFAULT 0,
+            completion_tokens INTEGER DEFAULT 0,
+            cached_tokens INTEGER DEFAULT 0,
+            total_tokens INTEGER DEFAULT 0,
+            created_at REAL NOT NULL
+        )
+    ''')
+    conn.execute('CREATE INDEX IF NOT EXISTS idx_token_usage_created ON token_usage(created_at)')
+    return conn
 
 
 def commit_spans(trace_id: str, spans: list[dict], source: str = '', trigger_text: str = ''):
@@ -179,14 +193,136 @@ def aggregate(start: float = 0, end: float = 0) -> dict:
     return {'count': turn_count, 'by_span': by_span}
 
 
-def prune(days: int = 7):
+def prune(days: int = 90):
     """清理过期记录。"""
     cutoff = time.time() - days * 86400
     conn = _get_conn()
     conn.execute('DELETE FROM perf_spans WHERE created_at < ?', (cutoff,))
     conn.execute('DELETE FROM perf_turns WHERE created_at < ?', (cutoff,))
+    conn.execute('DELETE FROM token_usage WHERE created_at < ?', (cutoff,))
     conn.commit()
     conn.close()
+
+
+# ── Token Usage ───────────────────────────────────────────────────────────────
+
+def record_usage(trace_id: str, usage: dict):
+    """Record token usage for a single LLM call."""
+    if not usage:
+        return
+    conn = _get_conn()
+    conn.execute(
+        '''INSERT INTO token_usage (trace_id, prompt_tokens, completion_tokens, cached_tokens, total_tokens, created_at)
+           VALUES (?, ?, ?, ?, ?, ?)''',
+        (
+            trace_id,
+            usage.get('prompt_tokens', 0),
+            usage.get('completion_tokens', 0),
+            usage.get('cached_tokens', 0),
+            usage.get('total_tokens', 0),
+            time.time(),
+        ),
+    )
+    conn.commit()
+    conn.close()
+
+
+def query_usage_summary(start: float = 0, end: float = 0) -> dict:
+    """Aggregate total usage within time range."""
+    conn = _get_conn()
+    where = 'WHERE 1=1'
+    params = []
+    if start:
+        where += ' AND created_at >= ?'
+        params.append(start)
+    if end:
+        where += ' AND created_at <= ?'
+        params.append(end)
+
+    row = conn.execute(
+        f'''SELECT COALESCE(SUM(prompt_tokens),0), COALESCE(SUM(completion_tokens),0),
+                   COALESCE(SUM(cached_tokens),0), COALESCE(SUM(total_tokens),0),
+                   COUNT(*)
+            FROM token_usage {where}''',
+        params,
+    ).fetchone()
+    conn.close()
+    return {
+        'prompt_tokens': row[0],
+        'completion_tokens': row[1],
+        'cached_tokens': row[2],
+        'total_tokens': row[3],
+        'call_count': row[4],
+    }
+
+
+def query_usage_daily(start: float = 0, end: float = 0) -> list:
+    """Aggregate usage grouped by day (UTC+8)."""
+    conn = _get_conn()
+    where = 'WHERE 1=1'
+    params = []
+    if start:
+        where += ' AND created_at >= ?'
+        params.append(start)
+    if end:
+        where += ' AND created_at <= ?'
+        params.append(end)
+
+    # Group by date (UTC+8: +28800 seconds offset)
+    rows = conn.execute(
+        f'''SELECT date(created_at + 28800, 'unixepoch') as day,
+                   SUM(prompt_tokens), SUM(completion_tokens),
+                   SUM(cached_tokens), SUM(total_tokens), COUNT(*)
+            FROM token_usage {where}
+            GROUP BY day ORDER BY day DESC''',
+        params,
+    ).fetchall()
+    conn.close()
+    return [
+        {
+            'date': row[0],
+            'prompt_tokens': row[1] or 0,
+            'completion_tokens': row[2] or 0,
+            'cached_tokens': row[3] or 0,
+            'total_tokens': row[4] or 0,
+            'call_count': row[5],
+        }
+        for row in rows
+    ]
+
+
+def query_usage_hourly(start: float = 0, end: float = 0) -> list:
+    """Aggregate usage grouped by hour (UTC+8)."""
+    conn = _get_conn()
+    where = 'WHERE 1=1'
+    params = []
+    if start:
+        where += ' AND created_at >= ?'
+        params.append(start)
+    if end:
+        where += ' AND created_at <= ?'
+        params.append(end)
+
+    rows = conn.execute(
+        f'''SELECT strftime('%Y-%m-%d %H', created_at + 28800, 'unixepoch') as hour,
+                   SUM(prompt_tokens), SUM(completion_tokens),
+                   SUM(cached_tokens), SUM(total_tokens), COUNT(*)
+            FROM token_usage {where}
+            GROUP BY hour ORDER BY hour DESC''',
+        params,
+    ).fetchall()
+    conn.close()
+    return [
+        {
+            'date': row[0],  # "2026-07-29 14"
+            'prompt_tokens': row[1] or 0,
+            'completion_tokens': row[2] or 0,
+            'cached_tokens': row[3] or 0,
+            'total_tokens': row[4] or 0,
+            'call_count': row[5],
+        }
+        for row in rows
+    ]
 
 
 # 模块加载时自动清理

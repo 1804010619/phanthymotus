@@ -108,6 +108,7 @@ class Client():
         message_list: list[dict],
         tool_list: list[dict],
         cancel_event: 'asyncio.Event | None' = None,
+        model_override: 'str | None' = None,
     ) -> dict:
 
         async def _go(client, model, think_mode: bool) -> dict:
@@ -148,6 +149,14 @@ class Client():
                 # 清理模型泄漏的 think 标签残留
                 if msg.get('content'):
                     msg['content'] = re.sub(r'</?think>', '', msg['content']).strip()
+                # 附加 token 用量信息（内部字段，下划线前缀）
+                if usage:
+                    msg['_usage'] = {
+                        'prompt_tokens': usage.prompt_tokens,
+                        'completion_tokens': usage.completion_tokens,
+                        'total_tokens': usage.total_tokens,
+                        'cached_tokens': cached_tokens,
+                    }
                 return msg
             except Exception as e:
                 elapsed = time.perf_counter() - t0
@@ -158,21 +167,39 @@ class Client():
         last_error = None
         max_retries = 2  # 重试上限
 
+        # model_override: select matching endpoints or override model on first endpoint
+        _override_model = None
+        if model_override:
+            matched_indices = [i for i, c in enumerate(configs) if c.get('model') == model_override]
+            if matched_indices:
+                # Use only matching endpoints
+                configs = [configs[i] for i in matched_indices]
+                client_list = [self.client_list[i] for i in matched_indices]
+                endpoint_dead = [self._endpoint_dead[i] for i in matched_indices]
+            else:
+                # Override model name, use all endpoints
+                _override_model = model_override
+                client_list = self.client_list
+                endpoint_dead = self._endpoint_dead
+        else:
+            client_list = self.client_list
+            endpoint_dead = self._endpoint_dead
+
         for attempt in range(max_retries + 1):
             # 筛选存活的 endpoint
             alive = [
-                (i, self.client_list[i], configs[i])
-                for i in range(len(self.client_list))
-                if not self._endpoint_dead[i]
+                (i, client_list[i], configs[i])
+                for i in range(len(client_list))
+                if not endpoint_dead[i]
             ]
             if not alive:
                 # 全部标记为 dead，重置后再试
-                self._endpoint_dead = [False] * len(self.client_list)
-                alive = [(i, self.client_list[i], configs[i]) for i in range(len(self.client_list))]
+                endpoint_dead = [False] * len(client_list)
+                alive = [(i, client_list[i], configs[i]) for i in range(len(client_list))]
 
             # 竞速调用所有存活 endpoint
             task_list = [
-                asyncio.create_task(_go(c, cfg['model'], cfg.get('think_mode', False)))
+                asyncio.create_task(_go(c, _override_model or cfg['model'], cfg.get('think_mode', False)))
                 for _, c, cfg in alive
             ]
 
@@ -209,14 +236,14 @@ class Client():
             if kind == LLMErrorKind.BILLING:
                 # 标记触发 402 的 endpoint 为 dead，切换到下一个
                 for idx, _, cfg in alive:
-                    self._endpoint_dead[idx] = True
+                    endpoint_dead[idx] = True
                 print(f'[llm] billing error — marked endpoint(s) dead, trying others')
                 continue  # 立即重试剩余 endpoint
 
             if kind == LLMErrorKind.AUTH:
                 # 认证错误不可恢复
                 for idx, _, cfg in alive:
-                    self._endpoint_dead[idx] = True
+                    endpoint_dead[idx] = True
                 print(f'[llm] auth error — marked endpoint(s) dead')
                 continue
 

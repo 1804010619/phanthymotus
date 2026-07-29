@@ -56,6 +56,7 @@
           <button class="settings-dropdown-item" data-target="btn-channels">渠道</button>
           <button class="settings-dropdown-item" data-target="btn-deploy">部署</button>
           <button class="settings-dropdown-item" data-target="btn-performance">性能</button>
+          <button class="settings-dropdown-item" data-target="btn-usage">用量</button>
           <div class="settings-dropdown-divider"></div>
           <button class="settings-dropdown-item settings-dropdown-item--danger" data-target="btn-reset">重启与重置</button>
         </div>
@@ -69,6 +70,7 @@
       <button class="btn-ghost topbar-btn hidden" id="btn-reset">重置</button>
       <button class="btn-ghost topbar-btn hidden" id="btn-deploy">部署 ▾</button>
       <button class="btn-ghost topbar-btn hidden" id="btn-performance">性能</button>
+      <button class="btn-ghost topbar-btn hidden" id="btn-usage">用量</button>
     </div>
     <button class="mobile-hamburger" id="mobile-hamburger" aria-label="菜单">⋮</button>
   </header>
@@ -208,6 +210,10 @@
         </button>
         <button class="settings-item" data-action="performance">
           <span class="settings-item-label">性能</span>
+          <span class="settings-item-arrow">›</span>
+        </button>
+        <button class="settings-item" data-action="usage">
+          <span class="settings-item-label">用量</span>
           <span class="settings-item-arrow">›</span>
         </button>
         <button class="settings-item settings-item--danger" data-action="reset">
@@ -414,7 +420,10 @@
 <div class="modal-overlay hidden" id="history-overlay">
   <div class="modal history-modal">
     <div class="modal-header">
-      <span class="modal-title">历史日志</span>
+      <div class="history-tabs">
+        <button class="history-tab active" data-tab="sessions">会话记录</button>
+        <button class="history-tab" data-tab="tasks">任务</button>
+      </div>
       <div class="history-header-actions">
         <button class="btn-ghost btn-sm" id="history-refresh">刷新</button>
         <button class="btn-ghost btn-sm" id="history-clear-all">清空全部</button>
@@ -423,12 +432,15 @@
       </div>
     </div>
     <div class="modal-body history-body">
-      <div class="history-list" id="history-list">
-        <div class="history-empty">暂无对话记录</div>
+      <div class="history-sessions-pane">
+        <div class="history-list" id="history-list">
+          <div class="history-empty">暂无对话记录</div>
+        </div>
+        <div class="history-chat" id="history-chat">
+          <div class="history-placeholder">选择一个会话查看对话记录</div>
+        </div>
       </div>
-      <div class="history-chat" id="history-chat">
-        <div class="history-placeholder">选择一个会话查看对话记录</div>
-      </div>
+      <div class="history-tasks-pane hidden" id="history-tasks"></div>
     </div>
   </div>
 </div>
@@ -453,6 +465,29 @@
     <div class="modal-body performance-body">
       <div id="perf-summary-cards"></div>
       <div id="perf-waterfall"></div>
+    </div>
+  </div>
+</div>
+
+<!-- Usage Modal -->
+<div class="modal-overlay hidden" id="usage-overlay">
+  <div class="modal usage-modal">
+    <div class="modal-header">
+      <span class="modal-title">用量统计</span>
+      <div style="display:flex;gap:6px;align-items:center">
+        <select id="usage-range" class="perf-select">
+          <option value="today">今天</option>
+          <option value="7d" selected>最近7天</option>
+          <option value="30d">最近30天</option>
+          <option value="90d">最近90天</option>
+        </select>
+        <button class="btn-icon" id="usage-close">✕</button>
+      </div>
+    </div>
+    <div class="modal-body usage-body">
+      <div id="usage-summary-cards"></div>
+      <div id="usage-daily-chart"></div>
+      <div id="usage-daily-table"></div>
     </div>
   </div>
 </div>

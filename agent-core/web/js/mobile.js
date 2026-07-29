@@ -169,6 +169,7 @@ function _triggerSettingsAction(action) {
     'channels': 'btn-channels',
     'deploy': 'btn-deploy',
     'performance': 'btn-performance',
+    'usage': 'btn-usage',
     'reset': 'btn-reset',
   };
   const btnId = btnMap[action];

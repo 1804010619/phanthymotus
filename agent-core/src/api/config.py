@@ -120,6 +120,7 @@ async def get_project_running():
 async def _do_start_project():
     """启动所有 canvas cards — 前端按钮和 auto-start 共用此函数。"""
     from api.mcp_manage import mcp_call_tool, MCPCallRequest
+    from api.motus_stream import push_event
 
     layout = config.main.get('canvas_layout', {})
     cards = layout.get('cards', [])
@@ -135,6 +136,14 @@ async def _do_start_project():
 
     sources = [c for c in cards if c['id'] not in cards_with_inbound]
     processors = [c for c in cards if c['id'] in cards_with_inbound]
+    all_ordered = sources + processors
+
+    # 广播启动开始
+    await push_event({'type': 'project_start_begin', 'payload': {
+        'cards': [{'tool': c.get('toolName', ''), 'mcp_id': c.get('mcpId', '')} for c in all_ordered],
+    }})
+
+    errors = []
 
     async def _start_card(card):
         mcp_id = card.get('mcpId', '')
@@ -142,6 +151,11 @@ async def _do_start_project():
         card_id = card.get('id', '')
         if not mcp_id or not tool_name:
             return
+
+        # 广播：启动中
+        await push_event({'type': 'project_start_item', 'payload': {
+            'tool': tool_name, 'mcp_id': mcp_id, 'status': 'starting',
+        }})
 
         # 构建 input_topic 参数
         in_conns = [c for c in connections if c.get('toCardId') == card_id]
@@ -158,10 +172,22 @@ async def _do_start_project():
             result = await mcp_call_tool(mcp_id, req)
             if result.get('code') == 200:
                 print(f'[start-project] started {tool_name} ({mcp_id})')
+                await push_event({'type': 'project_start_item', 'payload': {
+                    'tool': tool_name, 'mcp_id': mcp_id, 'status': 'ready',
+                }})
             else:
+                msg = str(result.get('detail', result.get('data', '')))[:100]
                 print(f'[start-project] {tool_name} error: {result}')
+                await push_event({'type': 'project_start_item', 'payload': {
+                    'tool': tool_name, 'mcp_id': mcp_id, 'status': 'error', 'message': msg,
+                }})
+                errors.append(tool_name)
         except Exception as e:
             print(f'[start-project] failed {tool_name}: {e}')
+            await push_event({'type': 'project_start_item', 'payload': {
+                'tool': tool_name, 'mcp_id': mcp_id, 'status': 'error', 'message': str(e)[:100],
+            }})
+            errors.append(tool_name)
 
     # Phase 1: sources
     for card in sources:
@@ -186,12 +212,16 @@ async def _do_start_project():
             except Exception as e:
                 print(f'[start-project] channel {ch_id} restart failed: {e}')
 
-    print(f'[start-project] done ({len(cards)} cards)')
+    # 广播启动完成
+    await push_event({'type': 'project_start_done', 'payload': {'has_error': len(errors) > 0}})
+    await push_event({'type': 'project_state', 'payload': {'running': True}})
+    print(f'[start-project] done ({len(cards)} cards, {len(errors)} errors)')
 
 
 async def _do_stop_project():
     """停止所有 canvas cards。"""
     from api.mcp_manage import mcp_call_tool, MCPCallRequest
+    from api.motus_stream import push_event
 
     layout = config.main.get('canvas_layout', {})
     cards = layout.get('cards', [])
@@ -211,6 +241,7 @@ async def _do_stop_project():
     core = config.main.get('core', {})
     core['project_running'] = False
     config.main['core'] = core
+    await push_event({'type': 'project_state', 'payload': {'running': False}})
     print('[stop-project] done')
 
 

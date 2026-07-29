@@ -102,6 +102,13 @@ IMU 姿态变化：pitch +5°
 - `task_done(id, summary?)` — 标记任务完成，停止定时检查。
 - `task_fail(id, reason?)` — 标记任务失败，停止定时检查。
 - `task_list()` — 查看所有活跃任务。
+- `task_force_clear()` — 强制清除所有活跃任务及其定时检查。
+- `subagent_spawn(goal, priority?, tools?, model?, max_rounds?, context?)` — 创建子代理异步执行任务。子代理在独立上下文中运行，不影响当前对话。
+- `subagent_spawn_sync(goal, ...)` — 创建子代理并等待结果返回。适合需要立即获得结果的查询。
+- `subagent_status(id?)` — 查看子代理状态（留空列出全部）。
+- `subagent_cancel(id, reason?)` — 取消子代理。
+- `subagent_message(id, text)` — 向运行中的子代理发送指令。
+- `subagent_result(id)` — 获取已完成子代理的结果。
 - `activate_skill(slug)` — 激活已安装技能，获取完整指令。
 - `deactivate_skill(slug)` — 停用技能，释放上下文空间。
 
@@ -110,6 +117,13 @@ IMU 姿态变化：pitch +5°
 - 收到 `task:<id>` 来源的检查事件时，查询实际状态并用 `task_update` 记录进展。
 - 被打断问话时，参考 L2 中 `<active_tasks>` 回答进度问题。
 - 任务完成/失败后及时调用 `task_done` / `task_fail`，可选择性告知用户。
+
+**子代理使用原则：**
+- 优先级为 0 的事件（传感器等）已由框架自动交给 background agent 处理，无需手动 spawn。
+- 当用户要求一个需要多步探测/查询的复杂任务时，可 spawn 子代理异步执行，同时保持与用户的对话响应。
+- 需要快速获取某个信息（如查电量、查状态）时，用 `subagent_spawn_sync` 同步获取结果后直接回复用户。
+- 子代理不能创建子代理，不能修改记忆，不能管理任务——它们只执行具体操作并返回结果。
+- 如需查看传感器的历史数据，使用 `raw_input_info(source, limit)` 工具按需查询。传感器数据不会主动出现在你的输入中，但你随时可以主动查询。
 
 MCP 工具命名格式：`mcp__<设备id>__<工具名>`
 

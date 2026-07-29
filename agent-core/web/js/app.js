@@ -17,6 +17,7 @@ import { initNetwork }       from './network.js';
 import { initChannels }      from './channels.js';
 import { initMobile }        from './mobile.js';
 import { initPerformance }   from './performance.js';
+import { initUsage }         from './usage.js';
 import './agent-definition.js';
 
 let _allMcps   = [];
@@ -45,6 +46,7 @@ async function main() {
   initNetwork();
   initChannels();
   initPerformance();
+  initUsage();
 
   // Settings dropdown (web topbar)
   _initSettingsDropdown();

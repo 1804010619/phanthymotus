@@ -139,6 +139,36 @@ export async function initCanvas(initialMcps) {
     }
   } catch { /* ignore */ }
 
+  // Cross-tab sync: listen for project_state events via WebSocket
+  const { onMotusEvent } = await import('./motus-stream.js');
+  onMotusEvent(null, (event) => {
+    if (event.type === 'project_state') {
+      const running = event.payload?.running;
+      if (running !== _projectRunning) {
+        _projectRunning = running;
+        _syncProjectBtn();
+        document.querySelectorAll('.canvas-exec-btn').forEach(btn => {
+          btn.classList.toggle('locked', !_projectRunning);
+        });
+      }
+    }
+  });
+
+  // Re-sync state when tab becomes visible (fallback for WS disconnect)
+  document.addEventListener('visibilitychange', () => {
+    if (!document.hidden) {
+      fetch('/api/config/project-running').then(r => r.json()).then(d => {
+        if (d.running !== _projectRunning) {
+          _projectRunning = d.running;
+          _syncProjectBtn();
+          document.querySelectorAll('.canvas-exec-btn').forEach(btn => {
+            btn.classList.toggle('locked', !_projectRunning);
+          });
+        }
+      }).catch(() => {});
+    }
+  });
+
   _syncEmptyState();
 }
 
@@ -1465,6 +1495,36 @@ async function _startProject() {
   // Save canvas layout first (so backend reads latest topology)
   await _saveLayout();
 
+  // Import motus for event subscription
+  const { onMotusEvent, offMotusEvent } = await import('./motus-stream.js');
+
+  // Subscribe to startup progress events
+  let modal = null;
+  let itemIndex = {};  // tool_name -> index in modal
+
+  function _onEvent(event) {
+    const p = event.payload || {};
+    if (event.type === 'project_start_begin') {
+      const cards = p.cards || [];
+      const items = cards.map(c => ({ card: { toolName: c.tool, mcpId: c.mcp_id } }));
+      modal = _showStartupModal(items);
+      cards.forEach((c, i) => { itemIndex[c.tool] = i; });
+    } else if (event.type === 'project_start_item' && modal) {
+      const idx = itemIndex[p.tool];
+      if (idx !== undefined) {
+        modal.updateItem(idx, p.status, p.message || '');
+      }
+    } else if (event.type === 'project_start_done') {
+      if (modal && !p.has_error) {
+        // Show countdown close button, auto-close after 15s
+        modal.startCountdown(15);
+      }
+      offMotusEvent(_onEvent);
+    }
+  }
+
+  onMotusEvent(null, _onEvent);
+
   // Call unified backend start-project
   try {
     const res = await fetch('/api/config/start-project', { method: 'POST' });
@@ -1476,9 +1536,13 @@ async function _startProject() {
     } else {
       const data = await res.json().catch(() => ({}));
       _logActivity('error', `启动失败: ${data.detail || res.status}`);
+      offMotusEvent(_onEvent);
+      if (modal) modal.close();
     }
   } catch (e) {
     _logActivity('error', `启动失败: ${e.message}`);
+    offMotusEvent(_onEvent);
+    if (modal) modal.close();
   }
 }
 
@@ -1604,11 +1668,33 @@ function _showStartupModal(items) {
     statuses[i].textContent = msg || STATUS_TEXT[state] || '';
   }
   function close() {
+    if (_countdownTimer) clearInterval(_countdownTimer);
     overlay.remove();
   }
+
+  let _countdownTimer = null;
+  function startCountdown(seconds) {
+    const footer = modal.querySelector('.startup-modal-footer');
+    const title = modal.querySelector('.modal-title');
+    if (title) title.textContent = '启动完成';
+    let remaining = seconds;
+    footer.innerHTML = `<button class="startup-close-btn">关闭 <span class="startup-countdown">${remaining}s</span></button>`;
+    const btn = footer.querySelector('.startup-close-btn');
+    const span = footer.querySelector('.startup-countdown');
+    btn.addEventListener('click', close);
+    _countdownTimer = setInterval(() => {
+      remaining--;
+      if (remaining <= 0) {
+        close();
+      } else {
+        span.textContent = `${remaining}s`;
+      }
+    }, 1000);
+  }
+
   const cancelBtn = modal.querySelector('.startup-cancel-btn');
-  cancelBtn.addEventListener('click', () => { if (modal.onCancel) modal.onCancel(); });
-  return { modal, updateItem, close };
+  cancelBtn.addEventListener('click', () => { if (modal.onCancel) modal.onCancel(); close(); });
+  return { modal, updateItem, close, startCountdown };
 }
 
 /**
