@@ -46,12 +46,19 @@ class InspectorConfig(BaseModel):
     url: str = ''
 
 
+class SearchConfig(BaseModel):
+    type:     str = 'none'   # 'none' | 'baidu_search'
+    base_url: str = ''
+    api_key:  str = ''
+
+
 class ServicesConfig(BaseModel):
     llm:       LLMConfig       = LLMConfig()
     tts:       TTSConfig       = TTSConfig()
     vad:       VADConfig       = VADConfig()
     asr:       ASRConfig       = ASRConfig()
     inspector: InspectorConfig = InspectorConfig()
+    search:    SearchConfig    = SearchConfig()
 
 
 class MCPEntry(BaseModel):
@@ -342,6 +349,12 @@ async def config_get():
     if tts.get('api_key'):
         tts['api_key'] = '****'
 
+    # Search config (from desktop_tools)
+    dt = config.main.get('desktop_tools', {})
+    search = dict(dt.get('search', {}))
+    if search.get('api_key'):
+        search['api_key'] = '****'
+
     return {
         'code': 200,
         'data': {
@@ -351,6 +364,7 @@ async def config_get():
                 'vad':       dict(services.get('vad', {})),
                 'asr':       asr,
                 'inspector': inspector,
+                'search':    search,
             },
             'mcp_list': mcp_list,
         }
@@ -433,6 +447,18 @@ async def config_save(req: ConfigSaveRequest):
         services['inspector'] = {'url': req.services.inspector.url}
 
     config.main['services'] = services
+
+    # Search config → desktop_tools section
+    dt = config.main.get('desktop_tools', {})
+    existing_search = dt.get('search', {})
+    existing_search_key = existing_search.get('api_key', '')
+    new_search_key = req.services.search.api_key if (req.services.search.api_key and req.services.search.api_key != '****') else existing_search_key
+    dt['search'] = {
+        'type':     req.services.search.type,
+        'base_url': req.services.search.base_url,
+        'api_key':  new_search_key,
+    }
+    config.main['desktop_tools'] = dt
 
     # Mark configured
     core = config.main.get('core', {})

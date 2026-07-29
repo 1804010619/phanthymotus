@@ -707,6 +707,20 @@ async def _handle_agentcore_call(req: MCPCallRequest):
             llm_cfg['trigger_interval_ms'] = int(trigger_interval)
             event_cfg['llm'] = llm_cfg
             config.main['event'] = event_cfg
+        # Save search config to desktop_tools.search
+        search_type = req.arguments.get('search_type')
+        if search_type is not None:
+            dt = config.main.get('desktop_tools', {})
+            search_cfg = dt.get('search', {})
+            search_cfg['type'] = search_type
+            search_base = req.arguments.get('search_base_url', '')
+            search_key = req.arguments.get('search_api_key', '')
+            if search_base and search_base != '****':
+                search_cfg['base_url'] = search_base
+            if search_key and search_key != '****':
+                search_cfg['api_key'] = search_key
+            dt['search'] = search_cfg
+            config.main['desktop_tools'] = dt
         return {'code': 200, 'data': 'config saved'}
 
     return {'code': 200, 'data': None}

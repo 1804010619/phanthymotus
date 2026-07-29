@@ -97,6 +97,9 @@ class Subagent:
         # Get all bound tools from canvas (same as main agent sees)
         all_schemas = self._get_all_mcp_schemas()
 
+        # Also include desktop tools (system tools available to subagents)
+        all_schemas.extend(self._get_desktop_tool_schemas())
+
         # Apply whitelist filter
         if self.spec.tool_filter is not None:
             filtered = []
@@ -135,6 +138,18 @@ class Subagent:
             for name, schema in info.get('schemas', {}).items():
                 schemas.append(schema)
         return schemas
+
+    def _get_desktop_tool_schemas(self) -> list[dict]:
+        """Get desktop tool schemas from the main event loop's sys_tools."""
+        from event.llm import _event_instance
+        if not _event_instance:
+            return []
+        _DESKTOP_TOOLS = {'Bash', 'PythonExec', 'Read', 'Write', 'Edit', 'Glob', 'Grep', 'WebFetch', 'WebSearch'}
+        return [
+            info['schema']
+            for name, info in _event_instance._sys_tools.items()
+            if name in _DESKTOP_TOOLS and name not in _DENIED_TOOLS
+        ]
 
     def _build_subagent_sys_tools(self) -> list[dict]:
         """Build the 3 subagent-specific system tools."""
@@ -431,6 +446,16 @@ class Subagent:
                 if isinstance(result, dict):
                     return json.dumps(result, ensure_ascii=False)
                 return str(result)
+            except Exception as e:
+                return f'[tool error] {type(e).__name__}: {e}'
+
+        # Desktop tool call (system tools from main agent)
+        from event.llm import _event_instance
+        if _event_instance and name in _event_instance._sys_tools:
+            try:
+                fn = _event_instance._sys_tools[name]['object']
+                result = await fn(**args)
+                return str(result) if result else '(no output)'
             except Exception as e:
                 return f'[tool error] {type(e).__name__}: {e}'
 
