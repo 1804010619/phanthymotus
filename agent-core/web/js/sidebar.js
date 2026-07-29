@@ -655,6 +655,9 @@ function _openToolConfigModal(mcpId, toolName, configSchema) {
     bodyEl.querySelectorAll('[data-key]').forEach(input => {
       const v = input.value.trim();
       if (!v) return;
+      // Skip fields hidden by x-show-when (their parent .tool-config-field has display:none)
+      const fieldWrapper = input.closest('.tool-config-field');
+      if (fieldWrapper && fieldWrapper.style.display === 'none') return;
       const fieldDef = props[input.dataset.key];
       if (fieldDef?.type === 'integer') values[input.dataset.key] = parseInt(v, 10);
       else if (fieldDef?.type === 'number') values[input.dataset.key] = parseFloat(v);
@@ -937,6 +940,9 @@ export function openInstanceConfigModal(mcpId, toolName, instanceId, configSchem
     bodyEl.querySelectorAll('[data-key]').forEach(input => {
       const v = input.value.trim();
       if (!v) return;
+      // Skip fields hidden by x-show-when (their parent .tool-config-field has display:none)
+      const fieldWrapper = input.closest('.tool-config-field');
+      if (fieldWrapper && fieldWrapper.style.display === 'none') return;
       const fieldDef = props[input.dataset.key];
       if (fieldDef?.type === 'integer') values[input.dataset.key] = parseInt(v, 10);
       else if (fieldDef?.type === 'number') values[input.dataset.key] = parseFloat(v);

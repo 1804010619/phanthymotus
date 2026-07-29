@@ -273,7 +273,11 @@ class Event:
         _set_manager(self._subagent_mgr)
         _sa_tools = SubagentTools(self._subagent_mgr)
 
-        # 注册系统工具（finish / memory / task / detailed_info / subagent）
+        # 注册桌面工具（文件操作 / Shell / Python / 搜索 / Web）
+        from event.desktop import DesktopTools
+        self._desktop_tools = DesktopTools()
+
+        # 注册系统工具（finish / memory / task / detailed_info / subagent / desktop）
         self._sys_tools = _build_system_tools([
             ('finish', event.finish.__call__),
             ('update_memory', event.memory.update),
@@ -293,6 +297,16 @@ class Event:
             ('subagent_cancel', _sa_tools.subagent_cancel),
             ('subagent_message', _sa_tools.subagent_message),
             ('subagent_result', _sa_tools.subagent_result),
+            # Desktop tools (Claude Code 风格)
+            ('Bash', self._desktop_tools.Bash),
+            ('PythonExec', self._desktop_tools.PythonExec),
+            ('Read', self._desktop_tools.Read),
+            ('Write', self._desktop_tools.Write),
+            ('Edit', self._desktop_tools.Edit),
+            ('Glob', self._desktop_tools.Glob),
+            ('Grep', self._desktop_tools.Grep),
+            ('WebFetch', self._desktop_tools.WebFetch),
+            ('WebSearch', self._desktop_tools.WebSearch),
         ])
         # 连接并注册所有 MCP 工具
         await mcp_client.init_all()
@@ -463,6 +477,9 @@ class Event:
         import time as _time
         from uuid import uuid4
         _turn_t0 = _time.perf_counter()
+
+        # Reset Python sandbox namespace for this turn
+        self._desktop_tools.reset_python_namespace()
 
         # 性能追踪（开放 span 式）
         _trace_id = str(uuid4())

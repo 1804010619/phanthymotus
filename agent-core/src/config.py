@@ -80,6 +80,19 @@ _DB_DEFAULTS = {
         'bg_route_enabled': True,
         'bg_model': None,  # None = use main model; or specify e.g. 'qwen-turbo'
     },
+    'desktop_tools': {
+        'enabled': True,
+        'allowed_dirs': ['/work', '/tmp'],
+        'bash_blocked_patterns': ['rm -rf /', 'rm -rf /*', 'mkfs', 'reboot', 'shutdown', 'poweroff'],
+        'python_allowed_modules': ['math', 'json', 're', 'datetime', 'collections', 'itertools',
+                                   'struct', 'pathlib', 'numpy', 'hashlib', 'base64', 'urllib.parse'],
+        'max_output_bytes': 51200,
+        'search': {
+            'type': 'none',       # 'none' | 'baidu_search'
+            'base_url': '',
+            'api_key': '',
+        },
+    },
 }
 
 

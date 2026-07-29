@@ -112,6 +112,9 @@ def _register_core_mcp(silent=False):
                         'llm_model': {'type': 'string', 'description': 'LLM 模型名称'},
                         'trigger_interval_ms': {'type': 'integer', 'description': '采集触发间隔（毫秒）', 'default': 1000},
                         'think_mode': {'type': 'boolean', 'description': 'Think mode (enables deep reasoning, disable for faster response)', 'default': False},
+                        'search_type': {'type': 'string', 'description': '搜索引擎', 'enum': ['none', 'baidu_search'], 'default': 'none'},
+                        'search_base_url': {'type': 'string', 'description': '搜索服务 URL (带 /v1)', 'x-show-when': {'search_type': 'baidu_search'}},
+                        'search_api_key': {'type': 'string', 'description': '搜索服务 API Key', 'format': 'password', 'x-show-when': {'search_type': 'baidu_search'}},
                     },
                     'required': ['llm_url', 'llm_key']
                 },
@@ -202,7 +205,7 @@ def _register_core_mcp(silent=False):
             {
                 'name': 'channel_reply',
                 'type': 'actuator',
-                'description': 'Send a reply message to a messaging channel (Feishu/Telegram/Slack)',
+                'description': 'Reply to a message from a messaging platform (Feishu/Telegram/Slack). ONLY use this tool when the triggering event has channel="channel:*". Never use for local_mic/remote_mic/remote_web events — those should be answered via TTS/speaker on the robot body.',
                 'inputSchema': {
                     'type': 'object',
                     'properties': {
