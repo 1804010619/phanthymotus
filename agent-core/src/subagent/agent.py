@@ -389,6 +389,8 @@ class Subagent:
             return args.get('reason', 'failed')
         if name == 'subagent_report':
             progress = args.get('progress', '')
+            if not progress.strip():
+                return 'ok'
             self._progress_reports.append(progress)
             print(f'[subagent:{self.id}] progress: {progress[:100]}')
             # Inject report into event_bus so main agent can see it

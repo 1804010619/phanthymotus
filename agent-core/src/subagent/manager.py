@@ -346,6 +346,16 @@ class SubagentManager:
 
     async def _notify_completion(self, agent: Subagent, result: SubagentResult):
         """Push completion event to event_bus and motus stream."""
+        # Bg subagent 正常完成且无实质输出 → 不通知 main agent（避免 context 污染）
+        is_bg = agent.spec.goal.startswith('[bg]')
+        if is_bg and result.status == 'completed' and not result.output.strip():
+            # Still push to motus for frontend visibility, but skip event_bus
+            await push_event({
+                'type': 'subagent_complete',
+                'payload': {'id': agent.id, 'status': 'completed', 'output': '', 'rounds': result.rounds_used},
+            })
+            return
+
         status_emoji = {'completed': '✓', 'failed': '✗', 'timeout': '⏱', 'cancelled': '⊘'}
         emoji = status_emoji.get(result.status, '?')
 

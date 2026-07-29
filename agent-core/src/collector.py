@@ -331,9 +331,10 @@ async def _route_to_bg_subagent(batch: list[dict]) -> bool:
     else:
         from subagent.protocol import SubagentSpec, P_LOW
         spec = SubagentSpec(
-            goal='[bg] 后台监控：分析 sensor 数据，仅在发现异常（如电池低、温度过高、关节异常等）时通过 subagent_report 上报主代理。正常数据不需要报告，直接 finish 即可。',
+            goal='[bg] 后台监控：分析传入的 sensor 数据。如果发现值得注意的变化或异常，调用 subagent_report 上报。无重要变化时直接调用 subagent_finish。不要主动调用任何工具去查询数据，只分析传入的内容。',
             priority=P_LOW,
-            model=bg_config.get('bg_model'),  # 可配置轻量模型
+            model=bg_config.get('bg_model'),
+            tool_deny=['mcp__*'],
             max_rounds=50,
             timeout_s=3600,
             context_seed=summary,
