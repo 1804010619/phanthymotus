@@ -4940,6 +4940,7 @@ html, body {
   padding: 0;
   padding-bottom: 20px;
   position: relative;
+  z-index: 2;
 }
 .usage-chart-wrap {
   position: relative;
@@ -4951,23 +4952,30 @@ html, body {
   top: 0;
   left: 0;
   right: 0;
-  bottom: 20px; /* match chart padding-bottom */
+  bottom: 20px;
   pointer-events: none;
+  z-index: 1;
 }
 .usage-y-line {
   position: absolute;
   left: 0;
   right: 0;
-  border-top: 1px dashed rgba(0,0,0,0.08);
+  border-top: 1px dashed rgba(0,0,0,0.06);
+  display: flex;
+  align-items: flex-end;
 }
 .usage-y-label {
   position: absolute;
-  right: 0;
-  top: -14px;
-  font-size: 0.55rem;
+  left: 0;
+  top: -12px;
+  font-size: 9px;
   color: var(--text-dim);
   opacity: 0.7;
   font-family: 'JetBrains Mono', monospace;
+  line-height: 1;
+  white-space: nowrap;
+  background: var(--bg);
+  padding-right: 4px;
 }
 .usage-bar {
   flex: 1;
