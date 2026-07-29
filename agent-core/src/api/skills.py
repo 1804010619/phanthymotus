@@ -48,7 +48,7 @@ async def list_skills():
 
 
 @router.post('/install')
-async def install_skill(body: dict = fastapi.Body(...)):
+async def install_skill(body: dict = fastapi.Body(...), request: fastapi.Request = None):
     """从 Resource Center 安装技能。"""
     slug = body.get('slug', '').strip()
     if not slug:
@@ -61,10 +61,15 @@ async def install_skill(body: dict = fastapi.Body(...)):
 
     # 从 Resource Center 获取技能定义
     rc_url = _get_rc_url()
+    headers = {}
+    # 传递 RC token 以允许作者安装自己的未发布技能
+    rc_token = request.headers.get('x-rc-token') if request else None
+    if rc_token:
+        headers['Authorization'] = f'Bearer {rc_token}'
     try:
         import httpx
         async with httpx.AsyncClient(timeout=10) as http:
-            resp = await http.get(f'{rc_url}/api/skills/{slug}')
+            resp = await http.get(f'{rc_url}/api/skills/{slug}', headers=headers)
             if resp.status_code != 200:
                 return {'code': 404, 'error': f'技能 "{slug}" 未在 Resource Center 找到 (HTTP {resp.status_code})'}
             data = resp.json()
