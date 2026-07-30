@@ -181,6 +181,17 @@ async def _do_start_project():
                         topics.append(topic_out[0]['topic'])
             topics = list(set(topics))
 
+        # Fallback: if still no input_topic but card has topicOut that implies an input
+        # (e.g. TTS output "/remote_control/message/tts" → input "/remote_control/message")
+        if not topics:
+            topic_out = card.get('topicOut') or []
+            if topic_out and topic_out[0].get('topic'):
+                out_topic = topic_out[0]['topic']
+                # Strip the tool name suffix to derive input topic
+                suffix = f'/{tool_name}'
+                if out_topic.endswith(suffix) and len(out_topic) > len(suffix):
+                    topics = [out_topic[:-len(suffix)]]
+
         args = {'action': 'start', 'instance_id': card_id}
         if len(topics) > 1:
             args['input_topics'] = topics
