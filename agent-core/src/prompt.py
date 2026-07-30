@@ -84,10 +84,10 @@ def _registry_fingerprint(mcp_registry: dict, bound_tools: set | None) -> tuple:
             info.get('name', ''),
         ))
     # 包含 skills 状态（visible + runtime activated）
-    import event.skills as _sk
+    from event.skills import visible_skills as _visible_skills, _runtime_activated as _rt_act
     skills_fp = (
-        tuple(s['slug'] for s in _sk.visible_skills()),
-        frozenset(_sk._runtime_activated),
+        tuple(s['slug'] for s in _visible_skills()),
+        frozenset(_rt_act),
     )
     return (tuple(parts), frozenset(bound_tools) if bound_tools else None, skills_fp)
 
