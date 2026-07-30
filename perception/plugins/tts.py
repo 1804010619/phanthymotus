@@ -216,7 +216,7 @@ class _TTSNode(Node):
 
         # Real-time pacing: publish frames at playback rate to avoid bursts/gaps
         FRAME_DURATION = CHUNK_BYTES / (SAMPLE_RATE * 2)  # 0.1s per 3200-byte frame
-        PREBUF_FRAMES  = 3  # buffer 3 frames (~300ms) before starting real-time pacing
+        PREBUF_FRAMES  = 0  # no pre-buffer — publish immediately for lowest latency
 
         while not self._stop_event.is_set():
             try:
