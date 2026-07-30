@@ -29,14 +29,14 @@ from std_msgs.msg import String
 log = logging.getLogger(__name__)
 
 _LOW_LAT_QOS = QoSProfile(
-    reliability=ReliabilityPolicy.BEST_EFFORT,
+    reliability=ReliabilityPolicy.RELIABLE,
     history=HistoryPolicy.KEEP_LAST,
     depth=50,
     durability=DurabilityPolicy.VOLATILE,
 )
 
 _PUB_QOS = QoSProfile(
-    reliability=ReliabilityPolicy.BEST_EFFORT,
+    reliability=ReliabilityPolicy.RELIABLE,
     history=HistoryPolicy.KEEP_LAST,
     depth=10,
     durability=DurabilityPolicy.VOLATILE,
