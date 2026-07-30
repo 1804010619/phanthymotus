@@ -277,6 +277,8 @@ class Subagent:
                     assistant_msg['content'] = content
                 if tool_calls:
                     assistant_msg['tool_calls'] = tool_calls
+                if response.get('_usage'):
+                    assistant_msg['_usage'] = response['_usage']
                 round_messages.append(assistant_msg)
 
                 # Dispatch tool calls
