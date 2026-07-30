@@ -31,7 +31,7 @@ log = logging.getLogger(__name__)
 _LOW_LAT_QOS = QoSProfile(
     reliability=ReliabilityPolicy.BEST_EFFORT,
     history=HistoryPolicy.KEEP_LAST,
-    depth=2,
+    depth=50,
     durability=DurabilityPolicy.VOLATILE,
 )
 
@@ -335,7 +335,7 @@ class _ObstacleNode(Node):
 
         self._pub = self.create_publisher(String, self._output_topic, _PUB_QOS)
         self._sub: Optional[object] = None
-        self._frame_queue: queue.Queue = queue.Queue(maxsize=1)
+        self._frame_queue: queue.Queue = queue.Queue(maxsize=10)
         self._stop_event = threading.Event()
         self._worker: Optional[threading.Thread] = None
         self._detect_count = 0
