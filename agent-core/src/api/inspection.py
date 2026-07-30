@@ -101,19 +101,29 @@ def _push_factory(topic: str):
     return _push
 
 
+# per-topic last-recreate timestamp to prevent thrashing
+_last_recreate: dict[str, float] = {}
+
+
 def _ensure_primary_sub(topic: str, fmt: str, loop: asyncio.AbstractEventLoop):
     """Start primary ROS2 subscription only if not already active. Recreate if stale."""
     key = f'__primary__#{topic}'
 
     if topic in _active_primary_subs:
-        # Health check: if subscription hasn't received data for >10s
+        # Health check: if subscription hasn't received data for >30s
         # but topic is still advertised in DDS, the sub is likely stale
         # (common after driver container restart with fastrtps VOLATILE QoS)
+        # Only recreate at most once per 60s to avoid thrashing on idle topics (e.g. TTS)
         last = ros2_bridge.get_last_seen(topic)
-        if last > 0 and (time.time() - last) > 10 and topic in ros2_bridge.get_dds_topics():
+        now = time.time()
+        if (last > 0
+                and (now - last) > 30
+                and topic in ros2_bridge.get_dds_topics()
+                and (now - _last_recreate.get(topic, 0)) > 60):
             print(f'[inspection] primary sub stale, recreating: {topic}')
             ros2_bridge.unsubscribe(key)
             _active_primary_subs.discard(topic)
+            _last_recreate[topic] = now
         else:
             return  # healthy or never received yet
 
