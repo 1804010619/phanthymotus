@@ -102,12 +102,22 @@ def _push_factory(topic: str):
 
 
 def _ensure_primary_sub(topic: str, fmt: str, loop: asyncio.AbstractEventLoop):
-    """Start primary ROS2 subscription only if not already active. Once started, stays forever."""
-    if topic in _active_primary_subs:
-        return  # already subscribed, no DDS discovery delay
-    _active_primary_subs.add(topic)  # mark immediately to prevent race
-
+    """Start primary ROS2 subscription only if not already active. Recreate if stale."""
     key = f'__primary__#{topic}'
+
+    if topic in _active_primary_subs:
+        # Health check: if subscription hasn't received data for >10s
+        # but topic is still advertised in DDS, the sub is likely stale
+        # (common after driver container restart with fastrtps VOLATILE QoS)
+        last = ros2_bridge.get_last_seen(topic)
+        if last > 0 and (time.time() - last) > 10 and topic in ros2_bridge.get_dds_topics():
+            print(f'[inspection] primary sub stale, recreating: {topic}')
+            ros2_bridge.unsubscribe(key)
+            _active_primary_subs.discard(topic)
+        else:
+            return  # healthy or never received yet
+
+    _active_primary_subs.add(topic)  # mark immediately to prevent race
     ros2_bridge.subscribe(key, topic, fmt, loop, _push_factory(topic))
     print(f'[inspection] started primary sub: {topic}')
 
@@ -115,19 +125,18 @@ def _ensure_primary_sub(topic: str, fmt: str, loop: asyncio.AbstractEventLoop):
 # ── Internal API (called by mcp_manage directly) ───────────────────────────────
 
 async def register_topic_internal(topic: str, fmt: str, mcp_id: str) -> None:
-    """Register a topic in the registry; if consumers exist, start primary sub immediately."""
+    """Register a topic in the registry; always check primary sub health."""
     if not topic:
         return
     existing = _topic_registry.get(topic)
-    if existing and existing.get('format') == fmt and existing.get('mcp_id') == mcp_id:
-        return  # already registered with same params, skip
-    _topic_registry[topic] = {
-        'format':        fmt,
-        'mcp_id':        mcp_id,
-        'registered_at': time.time(),
-    }
-    print(f'[inspection] registered topic={topic} format={fmt} mcp_id={mcp_id}')
-    # Start primary sub immediately on registration (stays forever)
+    if not (existing and existing.get('format') == fmt and existing.get('mcp_id') == mcp_id):
+        _topic_registry[topic] = {
+            'format':        fmt,
+            'mcp_id':        mcp_id,
+            'registered_at': time.time(),
+        }
+        print(f'[inspection] registered topic={topic} format={fmt} mcp_id={mcp_id}')
+    # Always check health of primary sub (even on duplicate registration)
     loop = asyncio.get_event_loop()
     _ensure_primary_sub(topic, fmt, loop)
 
