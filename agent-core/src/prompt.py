@@ -73,7 +73,7 @@ _l2_static_cache: dict = {'fingerprint': None, 'content': ''}
 
 
 def _registry_fingerprint(mcp_registry: dict, bound_tools: set | None) -> tuple:
-    """计算 registry + bound_tools 的指纹，用于判断是否需要重建。"""
+    """计算 registry + bound_tools + skills 状态的指纹，用于判断是否需要重建。"""
     # 使用 registry 的 key 集合 + 每个设备的 online/tools 状态 + bound_tools
     parts = []
     for mcp_id, info in sorted(mcp_registry.items()):
@@ -83,7 +83,13 @@ def _registry_fingerprint(mcp_registry: dict, bound_tools: set | None) -> tuple:
             tuple(sorted(info.get('tools', []))),
             info.get('name', ''),
         ))
-    return (tuple(parts), frozenset(bound_tools) if bound_tools else None)
+    # 包含 skills 状态（visible + runtime activated）
+    import event.skills as _sk
+    skills_fp = (
+        tuple(s['slug'] for s in _sk.visible_skills()),
+        frozenset(_sk._runtime_activated),
+    )
+    return (tuple(parts), frozenset(bound_tools) if bound_tools else None, skills_fp)
 
 
 def _env_static(mcp_registry: dict, bound_tools: set | None = None) -> str:
