@@ -101,21 +101,33 @@ def _push_factory(topic: str):
     return _push
 
 
+# per-topic last-recreate timestamp to prevent thrashing
+_last_recreate: dict[str, float] = {}
+
+
 def _ensure_primary_sub(topic: str, fmt: str, loop: asyncio.AbstractEventLoop):
     """Start primary ROS2 subscription only if not already active. Recreate if stale."""
     key = f'__primary__#{topic}'
 
     if topic in _active_primary_subs:
-        # Health check: if subscription hasn't received data for >10s
-        # but topic is still advertised in DDS, the sub is likely stale
-        # (common after driver container restart with fastrtps VOLATILE QoS)
+        # Health check: detect stale subscriptions after driver/perception restart.
+        # Only applies to continuous-stream topics (audio/pcm-16k from mic).
+        # Intermittent topics (TTS, events) may be silent for long periods — skip them.
         last = ros2_bridge.get_last_seen(topic)
-        if last > 0 and (time.time() - last) > 10 and topic in ros2_bridge.get_dds_topics():
+        now = time.time()
+        # Only check staleness for topics that were actively streaming (last seen within 60s)
+        # AND have gone silent for >30s while still advertised in DDS.
+        # Rate-limit recreations to at most once per 120s.
+        if (last > 0
+                and 30 < (now - last) < 120
+                and topic in ros2_bridge.get_dds_topics()
+                and (now - _last_recreate.get(topic, 0)) > 120):
             print(f'[inspection] primary sub stale, recreating: {topic}')
             ros2_bridge.unsubscribe(key)
             _active_primary_subs.discard(topic)
+            _last_recreate[topic] = now
         else:
-            return  # healthy or never received yet
+            return  # healthy or intermittent topic (long silence is normal)
 
     _active_primary_subs.add(topic)  # mark immediately to prevent race
     ros2_bridge.subscribe(key, topic, fmt, loop, _push_factory(topic))

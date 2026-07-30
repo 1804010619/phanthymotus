@@ -168,6 +168,19 @@ async def _do_start_project():
         in_conns = [c for c in connections if c.get('toCardId') == card_id]
         topics = list(set(c.get('fromTopic', '') for c in in_conns if c.get('fromTopic')))
 
+        # Fallback: if connection exists but fromTopic is empty, resolve from source card's topicOut
+        if not topics and in_conns:
+            for conn in in_conns:
+                from_card = next((c for c in cards if c.get('id') == conn.get('fromCardId')), None)
+                if from_card:
+                    topic_out = from_card.get('topicOut') or []
+                    port_idx = int(conn.get('fromPortIdx', 0))
+                    if port_idx < len(topic_out) and topic_out[port_idx].get('topic'):
+                        topics.append(topic_out[port_idx]['topic'])
+                    elif topic_out and topic_out[0].get('topic'):
+                        topics.append(topic_out[0]['topic'])
+            topics = list(set(topics))
+
         args = {'action': 'start', 'instance_id': card_id}
         if len(topics) > 1:
             args['input_topics'] = topics
