@@ -735,11 +735,26 @@ async def mcp_call_tool(mcp_id: str, req: MCPCallRequest):
         if req.tool == 'remote_mic':
             action = req.arguments.get('action', 'start')
             if action == 'start':
+                # Self-check: ensure _mic_pub publisher is created and DDS topic exists
+                from start import _ensure_mic_pub
+                pub = _ensure_mic_pub()
+                if pub is None:
+                    return {'code': 200, 'data': {'state': 'error', 'message': 'ROS2 mic publisher not available'}}
+                # Verify topic is advertised in DDS
+                import ros2_bridge
+                if '/remote_control/mic' not in ros2_bridge.get_dds_topics():
+                    # Topic may take a moment to appear; still report running but warn
+                    return {'code': 200, 'data': {'state': 'running', 'ws_path': '/ws/mic',
+                                                   'warning': 'topic not yet visible in DDS'}}
                 return {'code': 200, 'data': {'state': 'running', 'ws_path': '/ws/mic'}}
             elif action == 'stop':
                 return {'code': 200, 'data': {'state': 'idle'}}
             elif action == 'info':
-                return {'code': 200, 'data': {'state': 'running', 'ws_path': '/ws/mic', 'topic_out': [{'topic': '/remote_control/mic', 'format': 'audio/pcm-16k'}]}}
+                import ros2_bridge
+                topic_visible = '/remote_control/mic' in ros2_bridge.get_dds_topics()
+                return {'code': 200, 'data': {'state': 'running', 'ws_path': '/ws/mic',
+                                               'topic_out': [{'topic': '/remote_control/mic', 'format': 'audio/pcm-16k'}],
+                                               'topic_visible': topic_visible}}
             return {'code': 200, 'data': None}
         if req.tool == 'remote_message':
             action = req.arguments.get('action', 'start')
