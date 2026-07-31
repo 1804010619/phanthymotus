@@ -563,10 +563,16 @@ def _ensure_mic_pub():
     return _mic_pub
 
 
+_mic_chunk_count = 0
+_mic_ws_connected = False
+
+
 @app.websocket('/ws/mic')
 async def _ws_mic(ws: fastapi.WebSocket):
     """Receive PCM-16k audio from browser and publish to ROS2 topic."""
+    global _mic_chunk_count, _mic_ws_connected
     await ws.accept()
+    _mic_ws_connected = True
     try:
         _ensure_mic_pub()
         while True:
@@ -582,6 +588,7 @@ async def _ws_mic(ws: fastapi.WebSocket):
                     msg.format = "pcm_16k_16bit_mono"
                     msg.data = list(chunk)
                     _mic_pub.publish(msg)
+                    _mic_chunk_count += 1
     except Exception:
         pass
 

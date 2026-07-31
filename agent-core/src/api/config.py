@@ -184,10 +184,32 @@ async def _do_start_project():
             req = MCPCallRequest(tool=tool_name, arguments=args)
             result = await mcp_call_tool(mcp_id, req)
             if result.get('code') == 200:
-                print(f'[start-project] started {tool_name} ({mcp_id})')
-                await push_event({'type': 'project_start_item', 'payload': {
-                    'tool': tool_name, 'mcp_id': mcp_id, 'status': 'ready',
-                }})
+                # Check if tool reported an error state in its response
+                resp_data = result.get('data')
+                tool_state = None
+                tool_message = ''
+                if isinstance(resp_data, dict):
+                    tool_state = resp_data.get('state')
+                    tool_message = resp_data.get('message', '')
+                elif isinstance(resp_data, list) and resp_data:
+                    try:
+                        parsed = _json.loads(resp_data[0].get('text', '{}')) if isinstance(resp_data[0], dict) else {}
+                        tool_state = parsed.get('state')
+                        tool_message = parsed.get('message', '')
+                    except Exception:
+                        pass
+
+                if tool_state == 'error':
+                    print(f'[start-project] {tool_name} ({mcp_id}) self-check failed: {tool_message}')
+                    await push_event({'type': 'project_start_item', 'payload': {
+                        'tool': tool_name, 'mcp_id': mcp_id, 'status': 'error', 'message': tool_message,
+                    }})
+                    errors.append(tool_name)
+                else:
+                    print(f'[start-project] started {tool_name} ({mcp_id})')
+                    await push_event({'type': 'project_start_item', 'payload': {
+                        'tool': tool_name, 'mcp_id': mcp_id, 'status': 'ready',
+                    }})
                 # After successful start, query info() to get resolved topic_out
                 try:
                     info_req = MCPCallRequest(tool=tool_name, arguments={'action': 'info', 'instance_id': card_id})

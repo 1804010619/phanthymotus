@@ -735,11 +735,36 @@ async def mcp_call_tool(mcp_id: str, req: MCPCallRequest):
         if req.tool == 'remote_mic':
             action = req.arguments.get('action', 'start')
             if action == 'start':
-                return {'code': 200, 'data': {'state': 'running', 'ws_path': '/ws/mic'}}
+                # Self-check: ensure publisher exists + wait for real browser audio data
+                from start import _ensure_mic_pub
+                import start as _start_mod
+                pub = _ensure_mic_pub()
+                if pub is None:
+                    return {'code': 200, 'data': {'state': 'error', 'message': 'ROS2 mic publisher not available'}}
+                # Wait up to 10s for browser WebSocket to connect and send data
+                import asyncio
+                initial_count = _start_mod._mic_chunk_count
+                for _ in range(20):  # 20 × 0.5s = 10s
+                    if _start_mod._mic_chunk_count > initial_count:
+                        return {'code': 200, 'data': {'state': 'running', 'ws_path': '/ws/mic',
+                                                       'chunks_received': _start_mod._mic_chunk_count}}
+                    await asyncio.sleep(0.5)
+                # Timeout
+                if not _start_mod._mic_ws_connected:
+                    return {'code': 200, 'data': {'state': 'error', 'message': '等待浏览器麦克风连接超时（10s）— 请在 dashboard 开启麦克风'}}
+                else:
+                    return {'code': 200, 'data': {'state': 'error', 'message': '浏览器已连接但未收到音频数据 — 请检查麦克风权限'}}
             elif action == 'stop':
                 return {'code': 200, 'data': {'state': 'idle'}}
             elif action == 'info':
-                return {'code': 200, 'data': {'state': 'running', 'ws_path': '/ws/mic', 'topic_out': [{'topic': '/remote_control/mic', 'format': 'audio/pcm-16k'}]}}
+                import ros2_bridge, start as _start_mod
+                topic_visible = '/remote_control/mic' in ros2_bridge.get_dds_topics()
+                return {'code': 200, 'data': {'state': 'running' if _start_mod._mic_chunk_count > 0 else 'idle',
+                                               'ws_path': '/ws/mic',
+                                               'topic_out': [{'topic': '/remote_control/mic', 'format': 'audio/pcm-16k'}],
+                                               'topic_visible': topic_visible,
+                                               'ws_connected': _start_mod._mic_ws_connected,
+                                               'chunks_received': _start_mod._mic_chunk_count}}
             return {'code': 200, 'data': None}
         if req.tool == 'remote_message':
             action = req.arguments.get('action', 'start')
@@ -779,6 +804,21 @@ async def mcp_call_tool(mcp_id: str, req: MCPCallRequest):
         if req.tool == 'channel_request':
             action = req.arguments.get('action', 'start')
             if action == 'start':
+                # Self-check: verify channel adapter is connected
+                from channel.manager import manager as channel_mgr
+                instance_id = req.arguments.get('instance_id', '')
+                channel_id = ''
+                if instance_id:
+                    cfg = config.main.get(f'tool_config:channel:channel_request:{instance_id}', None)
+                    if cfg:
+                        channel_id = cfg.get('channel_id', '')
+                if channel_id and channel_id in channel_mgr._adapters:
+                    adapter = channel_mgr._adapters[channel_id]
+                    connected = getattr(adapter, 'connected', False)
+                    if connected:
+                        return {'code': 200, 'data': {'state': 'running', 'channel': channel_id}}
+                    else:
+                        return {'code': 200, 'data': {'state': 'error', 'message': f'channel {channel_id} adapter not connected'}}
                 return {'code': 200, 'data': {'state': 'running'}}
             elif action == 'stop':
                 return {'code': 200, 'data': {'state': 'idle'}}
@@ -797,7 +837,17 @@ async def mcp_call_tool(mcp_id: str, req: MCPCallRequest):
         if req.tool == 'channel_reply':
             action = req.arguments.get('action', 'send')
             if action == 'start':
-                return {'code': 200, 'data': {'state': 'running'}}
+                # Self-check: send a greeting to verify channel is working
+                from channel.manager import manager as channel_mgr
+                try:
+                    import asyncio
+                    result = await channel_mgr.send_to_channel_any("我上线啦！我可以通过飞书与您交流。")
+                    if result:
+                        return {'code': 200, 'data': {'state': 'running', 'self_check': 'greeting sent'}}
+                    else:
+                        return {'code': 200, 'data': {'state': 'error', 'message': 'failed to send greeting — channel not connected'}}
+                except Exception as e:
+                    return {'code': 200, 'data': {'state': 'error', 'message': f'channel send failed: {e}'}}
             elif action == 'stop':
                 return {'code': 200, 'data': {'state': 'idle'}}
             elif action == 'send':
