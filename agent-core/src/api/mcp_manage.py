@@ -794,6 +794,21 @@ async def mcp_call_tool(mcp_id: str, req: MCPCallRequest):
         if req.tool == 'channel_request':
             action = req.arguments.get('action', 'start')
             if action == 'start':
+                # Self-check: verify channel adapter is connected
+                from channel.manager import manager as channel_mgr
+                instance_id = req.arguments.get('instance_id', '')
+                channel_id = ''
+                if instance_id:
+                    cfg = config.main.get(f'tool_config:channel:channel_request:{instance_id}', None)
+                    if cfg:
+                        channel_id = cfg.get('channel_id', '')
+                if channel_id and channel_id in channel_mgr._adapters:
+                    adapter = channel_mgr._adapters[channel_id]
+                    connected = getattr(adapter, 'connected', False)
+                    if connected:
+                        return {'code': 200, 'data': {'state': 'running', 'channel': channel_id}}
+                    else:
+                        return {'code': 200, 'data': {'state': 'error', 'message': f'channel {channel_id} adapter not connected'}}
                 return {'code': 200, 'data': {'state': 'running'}}
             elif action == 'stop':
                 return {'code': 200, 'data': {'state': 'idle'}}
@@ -812,7 +827,17 @@ async def mcp_call_tool(mcp_id: str, req: MCPCallRequest):
         if req.tool == 'channel_reply':
             action = req.arguments.get('action', 'send')
             if action == 'start':
-                return {'code': 200, 'data': {'state': 'running'}}
+                # Self-check: send a greeting to verify channel is working
+                from channel.manager import manager as channel_mgr
+                try:
+                    import asyncio
+                    result = await channel_mgr.send_to_channel_any("我上线啦！我可以通过飞书与您交流。")
+                    if result:
+                        return {'code': 200, 'data': {'state': 'running', 'self_check': 'greeting sent'}}
+                    else:
+                        return {'code': 200, 'data': {'state': 'error', 'message': 'failed to send greeting — channel not connected'}}
+                except Exception as e:
+                    return {'code': 200, 'data': {'state': 'error', 'message': f'channel send failed: {e}'}}
             elif action == 'stop':
                 return {'code': 200, 'data': {'state': 'idle'}}
             elif action == 'send':
