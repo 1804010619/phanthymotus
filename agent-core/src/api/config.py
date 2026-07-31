@@ -284,32 +284,58 @@ async def _do_start_project():
     # Phase 1: start sources (no input_topic needed) and collect their topic_out
     for card in sources:
         await _start_and_resolve(card)
+        if errors:
+            break
 
     # Phase 2: start processors with resolved input_topic from sources
-    for card in processors:
-        input_topic, input_topics = _resolve_input_topic(card['id'])
-        await _start_and_resolve(card, input_topic=input_topic, input_topics=input_topics)
+    if not errors:
+        for card in processors:
+            input_topic, input_topics = _resolve_input_topic(card['id'])
+            await _start_and_resolve(card, input_topic=input_topic, input_topics=input_topics)
+            if errors:
+                break
 
-    # 标记 project_running
-    core = config.main.get('core', {})
-    core['project_running'] = True
-    config.main['core'] = core
+    # 标记 project_running（仅在无错误时）
+    if not errors:
+        core = config.main.get('core', {})
+        core['project_running'] = True
+        config.main['core'] = core
 
-    # 确保 channel adapters 已连接（restart 断开的 adapter）
-    from channel.manager import manager as channel_mgr, _get_channel_configs
-    channel_mgr.sync_from_canvas()
-    for ch_cfg in _get_channel_configs():
-        ch_id = ch_cfg.get('id', '')
-        if ch_cfg.get('enabled') and ch_id not in channel_mgr._adapters:
+        # 确保 channel adapters 已连接（restart 断开的 adapter）
+        from channel.manager import manager as channel_mgr, _get_channel_configs
+        channel_mgr.sync_from_canvas()
+        for ch_cfg in _get_channel_configs():
+            ch_id = ch_cfg.get('id', '')
+            if ch_cfg.get('enabled') and ch_id not in channel_mgr._adapters:
+                try:
+                    await channel_mgr.restart_adapter(ch_id)
+                except Exception as e:
+                    print(f'[start-project] channel {ch_id} restart failed: {e}')
+
+        # 广播启动完成
+        await push_event({'type': 'project_start_done', 'payload': {'has_error': False}})
+        await push_event({'type': 'project_state', 'payload': {'running': True}})
+        print(f'[start-project] done ({len(cards)} cards, 0 errors)')
+    else:
+        # 回滚：stop 已成功启动的 cards
+        started_tools = [c for c in all_ordered if c.get('toolName', '') not in errors]
+        for card in started_tools:
+            mcp_id = card.get('mcpId', '')
+            tool_name = card.get('toolName', '')
+            card_id = card.get('id', '')
+            if not mcp_id or not tool_name:
+                continue
             try:
-                await channel_mgr.restart_adapter(ch_id)
-            except Exception as e:
-                print(f'[start-project] channel {ch_id} restart failed: {e}')
+                req = MCPCallRequest(tool=tool_name, arguments={'action': 'stop', 'instance_id': card_id})
+                await mcp_call_tool(mcp_id, req)
+            except Exception:
+                pass
 
-    # 广播启动完成
-    await push_event({'type': 'project_start_done', 'payload': {'has_error': len(errors) > 0}})
-    await push_event({'type': 'project_state', 'payload': {'running': True}})
-    print(f'[start-project] done ({len(cards)} cards, {len(errors)} errors)')
+        await push_event({'type': 'project_start_done', 'payload': {'has_error': True}})
+        await push_event({'type': 'project_state', 'payload': {'running': False}})
+        print(f'[start-project] ABORTED ({len(cards)} cards, {len(errors)} errors: {errors})')
+
+    return errors
 
 
 async def _do_stop_project():
@@ -341,7 +367,10 @@ async def _do_stop_project():
 
 @router.post('/start-project')
 async def api_start_project():
-    await _do_start_project()
+    errors = await _do_start_project()
+    if errors:
+        from fastapi.responses import JSONResponse
+        return JSONResponse({'ok': False, 'errors': errors}, status_code=409)
     return {'ok': True}
 
 

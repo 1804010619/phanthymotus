@@ -814,7 +814,7 @@ async def mcp_call_tool(mcp_id: str, req: MCPCallRequest):
                         channel_id = cfg.get('channel_id', '')
                 if channel_id and channel_id in channel_mgr._adapters:
                     adapter = channel_mgr._adapters[channel_id]
-                    connected = getattr(adapter, 'connected', False)
+                    connected = getattr(adapter, 'is_running', False)
                     if connected:
                         return {'code': 200, 'data': {'state': 'running', 'channel': channel_id}}
                     else:
