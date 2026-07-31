@@ -957,36 +957,7 @@ function _buildCardEl({ id, mcpId, toolName, driverName, x, y, topicIn: savedTop
     }
 
     // remote_mic 特殊渲染：麦克风录音按钮
-    if (toolName === 'remote_mic') {
-      const footer = el.querySelector('.canvas-card-footer');
-      const micBtn = document.createElement('button');
-      micBtn.className = 'canvas-mic-btn';
-      micBtn.textContent = isMicActive() ? '\u23F9 停止录音' : '\uD83C\uDF99 开始录音';
-      if (isMicActive()) micBtn.classList.add('recording');
-      micBtn.addEventListener('click', async (e) => {
-        e.stopPropagation();
-        const liveMcp = _allMcps.find(m => m.id === mcpId);
-        if (!liveMcp) return;
-        // Connect mic WebSocket to agent-core's /ws/mic proxy (same host/port as page)
-        const wsProto = location.protocol === 'https:' ? 'wss' : 'ws';
-        const wsUrl = `${wsProto}://${location.host}/ws/mic`;
-        try {
-          // Ensure mic permission is granted before connecting
-          if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-            alert('麦克风不可用：需要 HTTPS 安全连接');
-            return;
-          }
-          await toggleMicStream(wsUrl, (active) => {
-            micBtn.textContent = active ? '\u23F9 停止录音' : '\uD83C\uDF99 开始录音';
-            micBtn.classList.toggle('recording', active);
-          });
-        } catch (err) {
-          console.error('[canvas] mic toggle failed:', err);
-          alert('麦克风启动失败: ' + err.message);
-        }
-      });
-      footer.prepend(micBtn);
-    }
+    // remote_mic: no manual button — mic auto-starts with project
 
     // Generic file upload buttons (format: 'file' in schema)
     el.querySelectorAll('.canvas-file-btn').forEach(btn => {
@@ -1533,6 +1504,23 @@ async function _startProject() {
       _syncProjectBtn();
       document.querySelectorAll('.canvas-exec-btn').forEach(btn => btn.classList.remove('locked'));
       _logActivity('project', '智能控制已开启');
+      // Auto-start browser mic for remote_mic cards
+      const remoteMicCard = _cards.find(c => c.toolName === 'remote_mic');
+      if (remoteMicCard && !isMicActive()) {
+        const wsProto = location.protocol === 'https:' ? 'wss' : 'ws';
+        const wsUrl = `${wsProto}://${location.host}/ws/mic`;
+        try {
+          await toggleMicStream(wsUrl, (active) => {
+            const micBtn = remoteMicCard.el?.querySelector('.canvas-mic-btn');
+            if (micBtn) {
+              micBtn.textContent = active ? '\u23F9 停止录音' : '\uD83C\uDF99 开始录音';
+              micBtn.classList.toggle('recording', active);
+            }
+          });
+        } catch (err) {
+          _logActivity('warn', `麦克风启动失败: ${err.message}`);
+        }
+      }
     } else {
       const data = await res.json().catch(() => ({}));
       _logActivity('error', `启动失败: ${data.detail || res.status}`);
