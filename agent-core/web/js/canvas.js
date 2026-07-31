@@ -1489,6 +1489,8 @@ async function _startProject() {
       if (modal && !p.has_error) {
         // Show countdown close button, auto-close after 15s
         modal.startCountdown(15);
+      } else if (modal && p.has_error) {
+        _showStartupError(modal.modal, modal.close);
       }
       offMotusEvent(_onEvent);
     }
@@ -1525,12 +1527,11 @@ async function _startProject() {
       const data = await res.json().catch(() => ({}));
       _logActivity('error', `启动失败: ${data.detail || res.status}`);
       offMotusEvent(_onEvent);
-      if (modal) modal.close();
     }
   } catch (e) {
     _logActivity('error', `启动失败: ${e.message}`);
     offMotusEvent(_onEvent);
-    if (modal) modal.close();
+    if (modal) _showStartupError(modal.modal, modal.close);
   }
 }
 
