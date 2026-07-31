@@ -125,9 +125,17 @@ async def get_project_running():
 # ── Start / Stop Project (统一入口) ─────────────────────────────────────────────
 
 async def _do_start_project():
-    """启动所有 canvas cards — 前端按钮和 auto-start 共用此函数。"""
+    """启动所有 canvas cards — 前端按钮和 auto-start 共用此函数。
+
+    Topic resolution strategy:
+      1. Start source cards first, then call info() to get their actual topic_out
+      2. Build a resolved_topics map: card_id → [topic_out entries]
+      3. When starting processor cards, look up source card's topic_out via connections
+      4. Fallback: use connection's persisted fromTopic if info() didn't return topic_out
+    """
     from api.mcp_manage import mcp_call_tool, MCPCallRequest
     from api.motus_stream import push_event
+    import json as _json
 
     layout = config.main.get('canvas_layout', {})
     cards = layout.get('cards', [])
@@ -151,52 +159,26 @@ async def _do_start_project():
     }})
 
     errors = []
+    # Resolved topic_out per card (populated after starting sources)
+    resolved_topics: dict[str, list] = {}
 
-    async def _start_card(card):
+    async def _start_and_resolve(card, input_topic: str = '', input_topics: list = None):
+        """Start a card, then call info() to get its resolved topic_out."""
         mcp_id = card.get('mcpId', '')
         tool_name = card.get('toolName', '')
         card_id = card.get('id', '')
         if not mcp_id or not tool_name:
             return
 
-        # 广播：启动中
         await push_event({'type': 'project_start_item', 'payload': {
             'tool': tool_name, 'mcp_id': mcp_id, 'status': 'starting',
         }})
 
-        # 构建 input_topic 参数
-        in_conns = [c for c in connections if c.get('toCardId') == card_id]
-        topics = list(set(c.get('fromTopic', '') for c in in_conns if c.get('fromTopic')))
-
-        # Fallback: if connection exists but fromTopic is empty, resolve from source card's topicOut
-        if not topics and in_conns:
-            for conn in in_conns:
-                from_card = next((c for c in cards if c.get('id') == conn.get('fromCardId')), None)
-                if from_card:
-                    topic_out = from_card.get('topicOut') or []
-                    port_idx = int(conn.get('fromPortIdx', 0))
-                    if port_idx < len(topic_out) and topic_out[port_idx].get('topic'):
-                        topics.append(topic_out[port_idx]['topic'])
-                    elif topic_out and topic_out[0].get('topic'):
-                        topics.append(topic_out[0]['topic'])
-            topics = list(set(topics))
-
-        # Fallback: if still no input_topic but card has topicOut that implies an input
-        # (e.g. TTS output "/remote_control/message/tts" → input "/remote_control/message")
-        if not topics:
-            topic_out = card.get('topicOut') or []
-            if topic_out and topic_out[0].get('topic'):
-                out_topic = topic_out[0]['topic']
-                # Strip the tool name suffix to derive input topic
-                suffix = f'/{tool_name}'
-                if out_topic.endswith(suffix) and len(out_topic) > len(suffix):
-                    topics = [out_topic[:-len(suffix)]]
-
         args = {'action': 'start', 'instance_id': card_id}
-        if len(topics) > 1:
-            args['input_topics'] = topics
-        elif len(topics) == 1:
-            args['input_topic'] = topics[0]
+        if input_topics and len(input_topics) > 1:
+            args['input_topics'] = input_topics
+        elif input_topic:
+            args['input_topic'] = input_topic
 
         try:
             req = MCPCallRequest(tool=tool_name, arguments=args)
@@ -206,6 +188,30 @@ async def _do_start_project():
                 await push_event({'type': 'project_start_item', 'payload': {
                     'tool': tool_name, 'mcp_id': mcp_id, 'status': 'ready',
                 }})
+                # After successful start, query info() to get resolved topic_out
+                try:
+                    info_req = MCPCallRequest(tool=tool_name, arguments={'action': 'info', 'instance_id': card_id})
+                    info_result = await mcp_call_tool(mcp_id, info_req)
+                    if info_result.get('code') == 200:
+                        data = info_result.get('data')
+                        # Parse MCP JSON-RPC content format: [{"type":"text","text":"..."}]
+                        if isinstance(data, list) and data:
+                            text = data[0].get('text', '{}') if isinstance(data[0], dict) else '{}'
+                            try:
+                                data = _json.loads(text)
+                            except Exception:
+                                data = {}
+                        elif isinstance(data, str):
+                            try:
+                                data = _json.loads(data)
+                            except Exception:
+                                data = {}
+                        if isinstance(data, dict):
+                            topic_out = data.get('topic_out', [])
+                            if topic_out:
+                                resolved_topics[card_id] = topic_out
+                except Exception:
+                    pass  # info() failure is non-fatal
             else:
                 msg = str(result.get('detail', result.get('data', '')))[:100]
                 print(f'[start-project] {tool_name} error: {result}')
@@ -220,12 +226,47 @@ async def _do_start_project():
             }})
             errors.append(tool_name)
 
-    # Phase 1: sources
+    def _resolve_input_topic(card_id: str) -> tuple[str, list]:
+        """Resolve input_topic(s) for a processor card from its inbound connections."""
+        in_conns = [c for c in connections if c.get('toCardId') == card_id]
+        topics = []
+        for conn in in_conns:
+            from_card_id = conn.get('fromCardId', '')
+            port_idx = int(conn.get('fromPortIdx', 0))
+            # Primary: use resolved topic_out from source card's info() response
+            if from_card_id in resolved_topics:
+                out_list = resolved_topics[from_card_id]
+                if port_idx < len(out_list) and out_list[port_idx].get('topic'):
+                    topics.append(out_list[port_idx]['topic'])
+                elif out_list and out_list[0].get('topic'):
+                    topics.append(out_list[0]['topic'])
+            # Fallback: use persisted fromTopic in connection data
+            elif conn.get('fromTopic'):
+                topics.append(conn['fromTopic'])
+            # Fallback 2: use source card's persisted topicOut
+            else:
+                from_card = next((c for c in cards if c.get('id') == from_card_id), None)
+                if from_card:
+                    card_topic_out = from_card.get('topicOut') or []
+                    if port_idx < len(card_topic_out) and card_topic_out[port_idx].get('topic'):
+                        topics.append(card_topic_out[port_idx]['topic'])
+                    elif card_topic_out and card_topic_out[0].get('topic'):
+                        topics.append(card_topic_out[0]['topic'])
+        topics = list(set(t for t in topics if t))
+        if len(topics) > 1:
+            return '', topics
+        elif len(topics) == 1:
+            return topics[0], []
+        return '', []
+
+    # Phase 1: start sources (no input_topic needed) and collect their topic_out
     for card in sources:
-        await _start_card(card)
-    # Phase 2: processors
+        await _start_and_resolve(card)
+
+    # Phase 2: start processors with resolved input_topic from sources
     for card in processors:
-        await _start_card(card)
+        input_topic, input_topics = _resolve_input_topic(card['id'])
+        await _start_and_resolve(card, input_topic=input_topic, input_topics=input_topics)
 
     # 标记 project_running
     core = config.main.get('core', {})
