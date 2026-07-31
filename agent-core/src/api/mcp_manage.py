@@ -735,26 +735,36 @@ async def mcp_call_tool(mcp_id: str, req: MCPCallRequest):
         if req.tool == 'remote_mic':
             action = req.arguments.get('action', 'start')
             if action == 'start':
-                # Self-check: ensure _mic_pub publisher is created and DDS topic exists
+                # Self-check: ensure publisher exists + wait for real browser audio data
                 from start import _ensure_mic_pub
+                import start as _start_mod
                 pub = _ensure_mic_pub()
                 if pub is None:
                     return {'code': 200, 'data': {'state': 'error', 'message': 'ROS2 mic publisher not available'}}
-                # Verify topic is advertised in DDS
-                import ros2_bridge
-                if '/remote_control/mic' not in ros2_bridge.get_dds_topics():
-                    # Topic may take a moment to appear; still report running but warn
-                    return {'code': 200, 'data': {'state': 'running', 'ws_path': '/ws/mic',
-                                                   'warning': 'topic not yet visible in DDS'}}
-                return {'code': 200, 'data': {'state': 'running', 'ws_path': '/ws/mic'}}
+                # Wait up to 10s for browser WebSocket to connect and send data
+                import asyncio
+                initial_count = _start_mod._mic_chunk_count
+                for _ in range(20):  # 20 × 0.5s = 10s
+                    if _start_mod._mic_chunk_count > initial_count:
+                        return {'code': 200, 'data': {'state': 'running', 'ws_path': '/ws/mic',
+                                                       'chunks_received': _start_mod._mic_chunk_count}}
+                    await asyncio.sleep(0.5)
+                # Timeout
+                if not _start_mod._mic_ws_connected:
+                    return {'code': 200, 'data': {'state': 'error', 'message': '等待浏览器麦克风连接超时（10s）— 请在 dashboard 开启麦克风'}}
+                else:
+                    return {'code': 200, 'data': {'state': 'error', 'message': '浏览器已连接但未收到音频数据 — 请检查麦克风权限'}}
             elif action == 'stop':
                 return {'code': 200, 'data': {'state': 'idle'}}
             elif action == 'info':
-                import ros2_bridge
+                import ros2_bridge, start as _start_mod
                 topic_visible = '/remote_control/mic' in ros2_bridge.get_dds_topics()
-                return {'code': 200, 'data': {'state': 'running', 'ws_path': '/ws/mic',
+                return {'code': 200, 'data': {'state': 'running' if _start_mod._mic_chunk_count > 0 else 'idle',
+                                               'ws_path': '/ws/mic',
                                                'topic_out': [{'topic': '/remote_control/mic', 'format': 'audio/pcm-16k'}],
-                                               'topic_visible': topic_visible}}
+                                               'topic_visible': topic_visible,
+                                               'ws_connected': _start_mod._mic_ws_connected,
+                                               'chunks_received': _start_mod._mic_chunk_count}}
             return {'code': 200, 'data': None}
         if req.tool == 'remote_message':
             action = req.arguments.get('action', 'start')
