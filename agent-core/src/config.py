@@ -165,6 +165,19 @@ def _get_conn() -> sqlite3.Connection:
     ''')
     conn.execute('CREATE INDEX IF NOT EXISTS idx_spans_trace ON perf_spans(trace_id)')
     conn.execute('CREATE INDEX IF NOT EXISTS idx_spans_created ON perf_spans(created_at)')
+    # ── subagent 结论存储（memory_recall 检索用）──────────────────────────────
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS subagent_conclusions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            agent_id TEXT NOT NULL,
+            goal TEXT DEFAULT '',
+            conclusion TEXT NOT NULL,
+            source_type TEXT DEFAULT 'bg_monitor',
+            created_at REAL NOT NULL
+        )
+    ''')
+    conn.execute('CREATE INDEX IF NOT EXISTS idx_conclusions_ts ON subagent_conclusions(created_at)')
+    conn.execute('CREATE INDEX IF NOT EXISTS idx_conclusions_type ON subagent_conclusions(source_type)')
     conn.commit()
     return conn
 

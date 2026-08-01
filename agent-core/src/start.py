@@ -10,6 +10,7 @@ import auth
 import event
 import collector
 import scheduler
+import daily_summary
 import topic_subscriber
 import mcp_client
 from channel.manager import manager as channel_manager
@@ -338,6 +339,7 @@ async def lifespan(app):
         tasks = [
             asyncio.create_task(event.llm.run_forever()),
             asyncio.create_task(scheduler.run()),
+            asyncio.create_task(daily_summary.run()),
         ]
         try:
             yield

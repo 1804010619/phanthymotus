@@ -359,30 +359,57 @@ class SubagentManager:
             print(f'[subagent:{agent.id}] save history failed: {e}')
 
     async def _notify_completion(self, agent: Subagent, result: SubagentResult):
-        """Push completion event to event_bus and motus stream."""
-        # Bg subagent 正常完成且无实质输出 → 不通知 main agent（避免 context 污染）
+        """Push completion event to event_bus and motus stream.
+
+        策略：
+        - BG subagent 正常完成 → 结论存 DB，不触发 main agent
+        - BG subagent fail/timeout → 仍触发 main agent
+        - 用户任务 subagent → 结论存 DB + 精简通知触发 main agent
+        """
         is_bg = agent.spec.goal.startswith('[bg]')
-        if is_bg and result.status == 'completed' and not result.output.strip():
-            # Still push to motus for frontend visibility, but skip event_bus
+
+        # 所有 subagent 完成时结论存 DB
+        if result.status == 'completed' and result.output.strip():
+            try:
+                import time as _time
+                from config import _get_conn
+                source_type = 'bg_monitor' if is_bg else 'user_task'
+                with _get_conn() as conn:
+                    conn.execute(
+                        'INSERT INTO subagent_conclusions (agent_id, goal, conclusion, source_type, created_at) '
+                        'VALUES (?, ?, ?, ?, ?)',
+                        (agent.id, agent.spec.goal[:200], result.output, source_type, _time.time())
+                    )
+                    conn.commit()
+            except Exception as e:
+                print(f'[subagent:{agent.id}] save conclusion to DB failed: {e}')
+
+        # BG subagent 正常完成 → 不触发 main agent
+        if is_bg and result.status == 'completed':
             await push_event({
                 'type': 'subagent_complete',
-                'payload': {'id': agent.id, 'status': 'completed', 'output': '', 'rounds': result.rounds_used},
+                'payload': {'id': agent.id, 'status': 'completed', 'output': result.output[:100], 'rounds': result.rounds_used},
             })
             return
 
+        # 非 bg 或 fail/timeout → 触发 main agent（精简通知）
         status_emoji = {'completed': '✓', 'failed': '✗', 'timeout': '⏱', 'cancelled': '⊘'}
         emoji = status_emoji.get(result.status, '?')
 
+        # 精简通知：goal 摘要 + output 前 100 字符
+        notify_text = f'子代理 [{agent.id}] {emoji} {result.status}: {agent.spec.goal[:40]}'
+        if result.output:
+            notify_text += f'\n摘要: {result.output[:100]}'
+        elif result.error:
+            notify_text += f'\n错误: {result.error[:100]}'
+
         await event_bus.enqueue(
             source=f'subagent:{agent.id}',
-            text=(
-                f'子代理 [{agent.id}] {emoji} {result.status}: {agent.spec.goal[:60]}\n'
-                f'结果: {result.output[:200] if result.output else result.error or "(无输出)"}'
-            ),
+            text=notify_text,
             payload={
                 'agent_id': agent.id,
                 'status': result.status,
-                'output': result.output[:500],
+                'output': result.output[:200] if result.output else '',
                 'error': result.error,
                 'rounds_used': result.rounds_used,
             },
