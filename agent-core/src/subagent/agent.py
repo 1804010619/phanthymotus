@@ -475,7 +475,12 @@ class Subagent:
             try:
                 fn = _event_instance._sys_tools[name]['object']
                 result = await fn(**args)
-                return str(result) if result else '(no output)'
+                result_str = str(result) if result else '(no output)'
+                # 截断大结果（WebSearch/WebFetch 等可能返回 6K+ chars）
+                _MAX_TOOL_RESULT = 2500
+                if len(result_str) > _MAX_TOOL_RESULT:
+                    result_str = result_str[:_MAX_TOOL_RESULT] + '\n...(结果已截断，如需更多请细化查询)'
+                return result_str
             except Exception as e:
                 return f'[tool error] {type(e).__name__}: {e}'
 

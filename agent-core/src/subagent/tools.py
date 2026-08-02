@@ -68,11 +68,19 @@ class SubagentTools:
         """创建子代理异步执行任务。返回 agent_id 用于后续查询。适合不需要立即结果的后台任务。"""
         context_seed = self._build_context_with_history(context, goal)
         tool_filter = None if tools == '*' else [t.strip() for t in tools.split(',')]
+
+        # 默认 deny MCP 工具（subagent 通常不需要 tts/asr/channel 等硬件工具）
+        # 除非 tools 参数显式包含 mcp 相关模式
+        tool_deny = None
+        if tools == '*' or (tool_filter and not any('mcp' in t for t in tool_filter)):
+            tool_deny = ['mcp__*']
+
         spec = SubagentSpec(
             goal=goal,
             priority=max(0, min(3, priority)),
             model=model or None,
             tool_filter=tool_filter,
+            tool_deny=tool_deny,
             max_rounds=max_rounds,
             context_seed=context_seed,
         )
@@ -92,11 +100,18 @@ class SubagentTools:
         """创建子代理并等待结果返回。适合需要立即获得结果的查询类任务。会阻塞当前轮直到完成。"""
         context_seed = self._build_context_with_history(context, goal)
         tool_filter = None if tools == '*' else [t.strip() for t in tools.split(',')]
+
+        # 默认 deny MCP 工具
+        tool_deny = None
+        if tools == '*' or (tool_filter and not any('mcp' in t for t in tool_filter)):
+            tool_deny = ['mcp__*']
+
         spec = SubagentSpec(
             goal=goal,
             priority=max(0, min(3, priority)),
             model=model or None,
             tool_filter=tool_filter,
+            tool_deny=tool_deny,
             max_rounds=max_rounds,
             context_seed=context_seed,
         )
