@@ -1525,7 +1525,9 @@ async function _startProject() {
       const data = await res.json().catch(() => ({}));
       _logActivity('error', `启动失败: ${data.detail || res.status}`);
       offMotusEvent(_onEvent);
-      if (modal) modal.close();
+      if (modal) {
+        _showStartupError(modal);
+      }
     }
   } catch (e) {
     _logActivity('error', `启动失败: ${e.message}`);

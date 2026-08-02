@@ -290,7 +290,14 @@ async def _do_start_project():
         input_topic, input_topics = _resolve_input_topic(card['id'])
         await _start_and_resolve(card, input_topic=input_topic, input_topics=input_topics)
 
-    # 标记 project_running
+    # 有 card 失败 → 全部回滚，不标记 running
+    if errors:
+        print(f'[start-project] {len(errors)} cards failed ({", ".join(errors)}), rolling back')
+        await push_event({'type': 'project_start_done', 'payload': {'has_error': True, 'errors': errors}})
+        await _do_stop_project()
+        return False
+
+    # 全部成功 → 标记 running
     core = config.main.get('core', {})
     core['project_running'] = True
     config.main['core'] = core
@@ -307,9 +314,10 @@ async def _do_start_project():
                 print(f'[start-project] channel {ch_id} restart failed: {e}')
 
     # 广播启动完成
-    await push_event({'type': 'project_start_done', 'payload': {'has_error': len(errors) > 0}})
+    await push_event({'type': 'project_start_done', 'payload': {'has_error': False}})
     await push_event({'type': 'project_state', 'payload': {'running': True}})
-    print(f'[start-project] done ({len(cards)} cards, {len(errors)} errors)')
+    print(f'[start-project] done ({len(cards)} cards, all succeeded)')
+    return True
 
 
 async def _do_stop_project():
@@ -341,7 +349,12 @@ async def _do_stop_project():
 
 @router.post('/start-project')
 async def api_start_project():
-    await _do_start_project()
+    success = await _do_start_project()
+    if success is False:
+        return fastapi.responses.JSONResponse(
+            status_code=500,
+            content={'ok': False, 'detail': '部分设备启动失败，已回滚'}
+        )
     return {'ok': True}
 
 
