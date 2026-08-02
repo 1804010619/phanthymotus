@@ -1681,7 +1681,11 @@ function _showStartupModal(items) {
   }
 
   const cancelBtn = modal.querySelector('.startup-cancel-btn');
-  cancelBtn.addEventListener('click', () => { if (modal.onCancel) modal.onCancel(); close(); });
+  cancelBtn.addEventListener('click', () => {
+    close();
+    // Actually stop the project when user cancels during startup
+    _stopProject();
+  });
   return { modal, updateItem, close, startCountdown };
 }
 
