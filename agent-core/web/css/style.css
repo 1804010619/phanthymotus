@@ -837,6 +837,60 @@ html, body {
 }
 
 /* ── Canvas Controls (zoom buttons) ───────────────────────────────────── */
+
+.canvas-editor-bar {
+  position: absolute;
+  top: 12px;
+  left: 16px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 5px 10px;
+  box-shadow: var(--shadow-sm);
+  z-index: 50;
+  user-select: none;
+  font-size: 12px;
+  color: var(--text-muted);
+  transition: opacity 0.2s;
+}
+.canvas-editor-bar svg {
+  flex-shrink: 0;
+}
+.canvas-editor-bar .editor-label {
+  font-weight: 500;
+  white-space: nowrap;
+}
+.canvas-editor-bar .editor-label--active {
+  color: var(--green);
+}
+.canvas-editor-bar .editor-label--locked {
+  color: var(--text-dim);
+}
+.canvas-editor-bar .editor-btn {
+  background: none;
+  border: 1px solid var(--border-med);
+  border-radius: var(--radius-xs);
+  padding: 2px 8px;
+  font-size: 11px;
+  cursor: pointer;
+  color: var(--text-muted);
+  transition: background 0.1s, color 0.1s;
+}
+.canvas-editor-bar .editor-btn:hover {
+  background: var(--bg-hover);
+  color: var(--text);
+}
+.canvas-editor-bar .editor-btn--claim {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+.canvas-editor-bar .editor-btn--claim:hover {
+  background: var(--accent-dim);
+}
+
 .canvas-controls {
   position: absolute;
   bottom: 14px;
