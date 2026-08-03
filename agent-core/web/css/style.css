@@ -6020,6 +6020,17 @@ html, body {
 
   .canvas-controls { bottom: 66px; right: 12px; }
   .canvas-top-control { top: 12px; }
+
+  .canvas-editor-bar {
+    position: fixed;
+    top: auto;
+    bottom: calc(56px + env(safe-area-inset-bottom, 0px) + 52px);
+    left: 12px;
+    right: auto;
+    padding: 4px 8px;
+    font-size: 11px;
+    gap: 5px;
+  }
 }
 
 /* ── Channel Settings Modal ─────────────────────────────────────────────────── */
