@@ -23,6 +23,24 @@ let _connSvg    = null;
 let _cards      = [];   // [{ id, mcpId, toolName, driverName, x, y, el }]
 let _allMcps    = [];
 
+// ── Editor Lock ──────────────────────────────────────────────────────────────
+let _sessionId = localStorage.getItem('canvas_session_id');
+if (!_sessionId) {
+  _sessionId = 'sess-' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+  localStorage.setItem('canvas_session_id', _sessionId);
+}
+let _isEditor = false;
+let _currentEditor = null;  // session_id of current editor (null = no one)
+
+/** Check if current session can modify. If not, show warning and return false. */
+function _canEdit() {
+  if (!_isEditor) {
+    _logActivity('warn', _currentEditor ? '画布已被其他用户锁定，无法编辑' : '请先获取编辑权');
+    return false;
+  }
+  return true;
+}
+
 // Connection state
 let _connections = [];  // [{id, fromCardId, fromPort, toCardId, toPort, format}]
 let _execConnections = []; // [{id, fromCardId, toCardId, toToolName, toMcpId}]
@@ -126,7 +144,14 @@ export async function initCanvas(initialMcps) {
     if (window.innerWidth <= 768 && _cards.length > 0) {
       _fitToViewport();
     }
+
+    // Initialize editor lock state from layout response
+    _currentEditor = layoutJson.editor || null;
+    if (_currentEditor === _sessionId) _isEditor = true;
   } catch { /* start empty */ }
+
+  // Show editor status bar
+  _updateEditorUI();
 
   // Restore project running state from backend
   try {
@@ -436,6 +461,11 @@ function _setupDropZone() {
       return;
     }
 
+    if (!_isEditor) {
+      _showDropReject(e, _currentEditor ? '画布已被其他用户锁定' : '请先获取编辑权');
+      return;
+    }
+
     let data;
     try {
       data = JSON.parse(e.dataTransfer.getData('application/x-cap-card'));
@@ -558,6 +588,7 @@ function _removeCard(id) {
     _logActivity('warn', '请停止智能控制后修改');
     return;
   }
+  if (!_canEdit()) return;
   const idx = _cards.findIndex(c => c.id === id);
   if (idx === -1) return;
   _cards[idx].el.remove();
@@ -1161,6 +1192,7 @@ function _setupPortDrag() {
       _logActivity('warn', '请停止智能控制后修改');
       return;
     }
+    if (!_canEdit()) return;
     e.preventDefault();
     e.stopPropagation();
 
@@ -1942,6 +1974,7 @@ function _debouncedSave() {
 }
 
 async function _saveLayout() {
+  if (!_isEditor) return;  // Only editor can save
   const cards = _cards.map(c => ({
     id:         c.id,
     mcpId:      c.mcpId,
@@ -1953,11 +1986,17 @@ async function _saveLayout() {
     topicOut:   c.topicOut || [],
   }));
   try {
-    await fetch('/api/canvas/layout', {
+    const resp = await fetch('/api/canvas/layout', {
       method:  'POST',
       headers: { 'Content-Type': 'application/json' },
-      body:    JSON.stringify({ cards, connections: _connections, execConnections: _execConnections, transform: { zoom: _zoom, tx: _tx, ty: _ty } }),
+      body:    JSON.stringify({ cards, connections: _connections, execConnections: _execConnections, transform: { zoom: _zoom, tx: _tx, ty: _ty }, session_id: _sessionId }),
     });
+    if (resp.status === 403) {
+      // Lost edit permission — reload layout from server
+      _isEditor = false;
+      _updateEditorUI();
+      await _reloadLayout();
+    }
   } catch { /* silent */ }
 }
 
@@ -1971,3 +2010,122 @@ function _syncEmptyState() {
 function _esc(s) {
   return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
+
+// ── Editor Lock UI ───────────────────────────────────────────────────────────
+
+function _createEditorBar() {
+  const bar = document.createElement('div');
+  bar.id = 'canvas-editor-bar';
+  bar.style.cssText = 'position:absolute;top:12px;right:12px;z-index:999;background:var(--bg-card,#fff);border-radius:8px;padding:6px 14px;box-shadow:0 2px 8px rgba(0,0,0,.12);font-size:13px;display:flex;align-items:center;gap:8px;';
+  _canvasEl.appendChild(bar);
+  return bar;
+}
+
+function _updateEditorUI() {
+  let bar = document.getElementById('canvas-editor-bar');
+  if (!bar) bar = _createEditorBar();
+
+  if (_isEditor) {
+    bar.innerHTML = '<span style="color:var(--color-success,#4caf50);">&#9998; 编辑中</span><button id="canvas-release-btn" style="font-size:12px;padding:2px 8px;border-radius:4px;border:1px solid #ccc;cursor:pointer;background:transparent;">释放</button>';
+    bar.querySelector('#canvas-release-btn').onclick = _releaseEdit;
+    _setCanvasReadonly(false);
+  } else if (_currentEditor) {
+    bar.innerHTML = `<span style="color:var(--color-warning,#ff9800);">&#128274; 他人编辑中</span>`;
+    _setCanvasReadonly(true);
+  } else {
+    bar.innerHTML = '<button id="canvas-claim-btn" style="font-size:12px;padding:4px 12px;border-radius:4px;border:1px solid var(--color-primary,#e87040);color:var(--color-primary,#e87040);cursor:pointer;background:transparent;">获取编辑权</button>';
+    bar.querySelector('#canvas-claim-btn').onclick = _claimEdit;
+    _setCanvasReadonly(true);
+  }
+}
+
+function _setCanvasReadonly(readonly) {
+  if (_viewport) {
+    _viewport.style.pointerEvents = readonly ? 'none' : '';
+  }
+  // Also disable sidebar drag if readonly
+  document.querySelectorAll('.sidebar-tool-item').forEach(el => {
+    el.draggable = !readonly;
+  });
+}
+
+async function _claimEdit() {
+  try {
+    const resp = await fetch('/api/canvas/claim-edit', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ session_id: _sessionId }),
+    });
+    const data = await resp.json();
+    if (resp.ok) {
+      _isEditor = true;
+      _currentEditor = _sessionId;
+    } else {
+      _currentEditor = data.editor || null;
+    }
+  } catch { /* silent */ }
+  _updateEditorUI();
+}
+
+async function _releaseEdit() {
+  try {
+    await fetch('/api/canvas/release-edit', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ session_id: _sessionId }),
+    });
+  } catch { /* silent */ }
+  _isEditor = false;
+  _currentEditor = null;
+  _updateEditorUI();
+}
+
+async function _checkEditStatus() {
+  try {
+    const resp = await fetch('/api/canvas/edit-status');
+    const data = await resp.json();
+    const prevEditor = _isEditor;
+    _currentEditor = data.editor || null;
+    if (_currentEditor === _sessionId) {
+      _isEditor = true;
+    } else if (_isEditor) {
+      // We lost editor status (timeout)
+      _isEditor = false;
+      _logActivity('warn', '编辑权已超时释放（60秒无操作）');
+    }
+    _updateEditorUI();
+  } catch { /* silent */ }
+}
+
+async function _reloadLayout() {
+  try {
+    const layoutRes = await fetch('/api/canvas/layout');
+    const layoutJson = await layoutRes.json();
+    // Clear current cards
+    for (const c of _cards) c.el.remove();
+    _cards = [];
+    _connections = [];
+    _execConnections = [];
+    // Reload
+    const saved = layoutJson.data?.cards || [];
+    for (const c of saved) _addCard(c, false);
+    const cardIds = new Set(_cards.map(c => c.id));
+    _connections = (layoutJson.data?.connections || []).filter(c => cardIds.has(c.fromCardId) && cardIds.has(c.toCardId));
+    _execConnections = (layoutJson.data?.execConnections || []).filter(c => cardIds.has(c.fromCardId) && cardIds.has(c.toCardId));
+    _resolveAllTopics();
+    _redrawConnections();
+    _syncEmptyState();
+    // Update editor info
+    _currentEditor = layoutJson.editor || null;
+    if (_currentEditor === _sessionId) _isEditor = true;
+    _updateEditorUI();
+  } catch { /* silent */ }
+}
+
+// Release on page close
+window.addEventListener('beforeunload', () => {
+  if (_isEditor) {
+    navigator.sendBeacon('/api/canvas/release-edit', JSON.stringify({ session_id: _sessionId }));
+  }
+});
+
+// Periodically check edit status (piggyback on existing polling interval)
+setInterval(_checkEditStatus, 10000);
