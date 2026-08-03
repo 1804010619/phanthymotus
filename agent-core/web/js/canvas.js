@@ -1609,15 +1609,15 @@ async function _triggerAction(mcpId, toolName, action, extraArgs = {}) {
 
 // ── Startup Modal ──────────────────────────────────────────────────────────────
 
-function _showStartupError(modal, close) {
-  const cancelBtn = modal.querySelector('.startup-cancel-btn');
+function _showStartupError(modalWrapper) {
+  const modalEl = modalWrapper.modal;
+  const cancelBtn = modalEl.querySelector('.startup-cancel-btn');
   if (cancelBtn) {
     cancelBtn.textContent = '关闭';
-    cancelBtn.onclick = close;
+    cancelBtn.onclick = () => modalWrapper.close();
   }
-  modal.onCancel = null;
   // Update modal title to indicate failure
-  const title = modal.querySelector('.modal-title');
+  const title = modalEl.querySelector('.modal-title');
   if (title) title.textContent = '启动失败';
 }
 

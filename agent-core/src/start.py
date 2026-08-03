@@ -4,6 +4,12 @@ import logging
 import pathlib
 import shutil
 import subprocess
+import sys
+
+# Fix Python "dual module" bug: start.py runs as __main__, but other modules
+# `import start` which creates a SEPARATE module instance with its own globals.
+# This ensures `import start` returns the same object as __main__.
+sys.modules['start'] = sys.modules[__name__]
 
 import config
 import auth
