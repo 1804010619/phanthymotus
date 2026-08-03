@@ -1496,6 +1496,20 @@ async function _startProject() {
 
   onMotusEvent(null, _onEvent);
 
+  // 立即启动浏览器麦克风（与 API 调用并行，解决 self-check 时序问题）
+  const remoteMicCard = _cards.find(c => c.toolName === 'remote_mic');
+  if (remoteMicCard && !isMicActive()) {
+    const wsProto = location.protocol === 'https:' ? 'wss' : 'ws';
+    const wsUrl = `${wsProto}://${location.host}/ws/mic`;
+    toggleMicStream(wsUrl, (active) => {
+      const micBtn = remoteMicCard.el?.querySelector('.canvas-mic-btn');
+      if (micBtn) {
+        micBtn.textContent = active ? '\u23F9 停止录音' : '\uD83C\uDF99 开始录音';
+        micBtn.classList.toggle('recording', active);
+      }
+    }).catch(err => _logActivity('warn', `麦克风启动失败: ${err.message}`));
+  }
+
   // Call unified backend start-project
   try {
     const res = await fetch('/api/config/start-project', { method: 'POST' });
@@ -1504,23 +1518,6 @@ async function _startProject() {
       _syncProjectBtn();
       document.querySelectorAll('.canvas-exec-btn').forEach(btn => btn.classList.remove('locked'));
       _logActivity('project', '智能控制已开启');
-      // Auto-start browser mic for remote_mic cards
-      const remoteMicCard = _cards.find(c => c.toolName === 'remote_mic');
-      if (remoteMicCard && !isMicActive()) {
-        const wsProto = location.protocol === 'https:' ? 'wss' : 'ws';
-        const wsUrl = `${wsProto}://${location.host}/ws/mic`;
-        try {
-          await toggleMicStream(wsUrl, (active) => {
-            const micBtn = remoteMicCard.el?.querySelector('.canvas-mic-btn');
-            if (micBtn) {
-              micBtn.textContent = active ? '\u23F9 停止录音' : '\uD83C\uDF99 开始录音';
-              micBtn.classList.toggle('recording', active);
-            }
-          });
-        } catch (err) {
-          _logActivity('warn', `麦克风启动失败: ${err.message}`);
-        }
-      }
     } else {
       const data = await res.json().catch(() => ({}));
       _logActivity('error', `启动失败: ${data.detail || res.status}`);

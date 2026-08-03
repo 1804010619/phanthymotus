@@ -741,7 +741,8 @@ async def mcp_call_tool(mcp_id: str, req: MCPCallRequest):
                 pub = _ensure_mic_pub()
                 if pub is None:
                     return {'code': 200, 'data': {'state': 'error', 'message': 'ROS2 mic publisher not available'}}
-                # Wait up to 10s for browser WebSocket to connect and send data
+                # Wait up to 10s for browser to connect and send audio chunks
+                # (browser mic is started in parallel by frontend before this API call)
                 import asyncio
                 initial_count = _start_mod._mic_chunk_count
                 for _ in range(20):  # 20 × 0.5s = 10s
@@ -749,13 +750,11 @@ async def mcp_call_tool(mcp_id: str, req: MCPCallRequest):
                         return {'code': 200, 'data': {'state': 'running', 'ws_path': '/ws/mic',
                                                        'chunks_received': _start_mod._mic_chunk_count}}
                     await asyncio.sleep(0.5)
-                # Timeout — but if WS is connected, treat as success (audio will flow shortly)
-                if _start_mod._mic_ws_connected:
-                    return {'code': 200, 'data': {'state': 'running', 'ws_path': '/ws/mic',
-                                                   'chunks_received': _start_mod._mic_chunk_count,
-                                                   'note': 'WebSocket connected, waiting for audio data'}}
-                else:
+                # Timeout — no audio received
+                if not _start_mod._mic_ws_connected:
                     return {'code': 200, 'data': {'state': 'error', 'message': '等待浏览器麦克风连接超时（10s）— 请在 dashboard 开启麦克风'}}
+                else:
+                    return {'code': 200, 'data': {'state': 'error', 'message': '浏览器已连接但未收到音频数据 — 请检查麦克风权限'}}
             elif action == 'stop':
                 return {'code': 200, 'data': {'state': 'idle'}}
             elif action == 'info':
