@@ -32,6 +32,15 @@ if (!_sessionId) {
 let _isEditor = false;
 let _currentEditor = null;  // session_id of current editor (null = no one)
 
+/** Check if current session can modify. If not, show warning and return false. */
+function _canEdit() {
+  if (!_isEditor) {
+    _logActivity('warn', _currentEditor ? '画布已被其他用户锁定，无法编辑' : '请先获取编辑权');
+    return false;
+  }
+  return true;
+}
+
 // Connection state
 let _connections = [];  // [{id, fromCardId, fromPort, toCardId, toPort, format}]
 let _execConnections = []; // [{id, fromCardId, toCardId, toToolName, toMcpId}]
@@ -452,6 +461,11 @@ function _setupDropZone() {
       return;
     }
 
+    if (!_isEditor) {
+      _showDropReject(e, _currentEditor ? '画布已被其他用户锁定' : '请先获取编辑权');
+      return;
+    }
+
     let data;
     try {
       data = JSON.parse(e.dataTransfer.getData('application/x-cap-card'));
@@ -574,6 +588,7 @@ function _removeCard(id) {
     _logActivity('warn', '请停止智能控制后修改');
     return;
   }
+  if (!_canEdit()) return;
   const idx = _cards.findIndex(c => c.id === id);
   if (idx === -1) return;
   _cards[idx].el.remove();
@@ -1177,6 +1192,7 @@ function _setupPortDrag() {
       _logActivity('warn', '请停止智能控制后修改');
       return;
     }
+    if (!_canEdit()) return;
     e.preventDefault();
     e.stopPropagation();
 
@@ -2066,12 +2082,14 @@ async function _checkEditStatus() {
   try {
     const resp = await fetch('/api/canvas/edit-status');
     const data = await resp.json();
+    const prevEditor = _isEditor;
     _currentEditor = data.editor || null;
     if (_currentEditor === _sessionId) {
       _isEditor = true;
-    } else if (_currentEditor && _isEditor) {
-      // We lost editor status (timeout?)
+    } else if (_isEditor) {
+      // We lost editor status (timeout)
       _isEditor = false;
+      _logActivity('warn', '编辑权已超时释放（60秒无操作）');
     }
     _updateEditorUI();
   } catch { /* silent */ }
