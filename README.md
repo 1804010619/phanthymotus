@@ -48,6 +48,42 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for building and running from source code
 
 Hardware drivers are maintained in a separate repository: **[phanthymotus-driver](https://github.com/4paradigm/phanthymotus-driver)**.
 
+### Memory & Long-Running Agent Architecture
+
+The Agent Core is designed for **continuous operation over days or months**. The architecture separates real-time interaction from background intelligence:
+
+```
+┌─────────────────────────────────────────────────────┐
+│                   Main Agent Loop                     │
+│  • Only processes user interactions (ASR/message)    │
+│  • Lean history → stable prefix caching (~90% hit)   │
+│  • Uses memory_recall for on-demand context retrieval│
+└──────────────┬──────────────────────┬───────────────┘
+               │ spawn                │ memory_recall
+               ▼                      ▼
+┌──────────────────────┐   ┌──────────────────────────┐
+│   User Task Subagent │   │    Memory Store (SQLite)  │
+│  • Isolated context  │   │  • subagent_conclusions   │
+│  • Full tool access  │   │  • chat_history (FTS5)    │
+│  • Returns summary   │   │  • daily_summary          │
+└──────────────────────┘   └──────────────────────────┘
+               ▲
+┌──────────────────────┐
+│    BG Monitor Agent   │
+│  • Sensor analysis   │
+│  • Results → DB only │
+│  • urgent=true → push│
+└──────────────────────┘
+```
+
+**Key design principles:**
+
+- **Main agent stays lean** — only user interactions enter the conversation history. Background monitoring conclusions are stored in the memory database, not pushed to the main thread.
+- **Memory recall on demand** — `memory_recall` tool provides FTS-based retrieval from past conversations, subagent conclusions, and daily summaries. Both main agent and subagents can use it.
+- **Urgent interrupts only** — background subagents only interrupt the main agent for safety-critical alerts (battery critical, hardware faults). Routine reports go to the database silently.
+- **Daily auto-summary** — a scheduled subagent generates daily reports covering user interactions, task completion, anomalies, performance review, and skill discovery opportunities.
+- **Prefix caching optimized** — stable system prompt (L1 + L2-static) is frozen per turn; dynamic status is minimal and placed in user messages to maximize LLM prefix cache hits.
+
 ## Web Dashboard
 
 The dashboard at `http://<device-ip>:15678` provides:

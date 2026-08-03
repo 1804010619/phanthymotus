@@ -21,40 +21,38 @@ class SubagentTools:
         self._mgr = manager
 
     def _build_context_with_history(self, explicit_context: str, goal: str) -> str:
-        """自动注入 main agent 对话历史 + 已完成 subagent 结果，减少重复劳动。
+        """构建 subagent 初始上下文。
 
-        无论 LLM 是否传了 context，都会注入系统提取的历史信息。
-        纯字符串提取，零额外 LLM 调用。
+        注入确定性信息（任务列表）+ 最近决策摘要。
+        subagent 可通过 memory_recall 自行按需检索更多历史。
         """
         sections = []
 
-        # 1. Main agent 近期对话（20轮内）
+        # 1. 活跃任务列表（确定性上下文，保证任务意图传递）
         try:
-            from event.llm import get_recent_context_rich
-            recent = get_recent_context_rich(max_turns=20, max_chars=6000)
-            if recent:
-                sections.append(f'[主代理近期对话]\n{recent}')
+            import task_store
+            active = task_store.active_tasks()
+            if active:
+                task_lines = [f'  - [{t.id}] {t.goal}{" — " + t.progress if t.progress else ""}' for t in active]
+                sections.append(f'[当前活跃任务]\n' + '\n'.join(task_lines))
         except (ImportError, AttributeError):
             pass
 
-        # 2. 已完成的 subagent 结果（非 bg，最近3个）
-        recent_results = []
-        for agent_id, result in self._mgr._completed.items():
-            if result.status != 'completed' or not result.output:
-                continue
-            # Skip background monitoring results
-            if result.output.startswith('电池') or result.output.startswith('后台监控'):
-                continue
-            output_summary = result.output[:1500]
-            if len(result.output) > 1500:
-                output_summary += '...'
-            recent_results.append(f'[子代理 {agent_id[:8]} 结果] {output_summary}')
-        if recent_results:
-            sections.append('\n\n'.join(recent_results[-3:]))
+        # 2. 最近 10 轮 main agent 对话（足够理解上下文）
+        try:
+            from event.llm import get_recent_context
+            recent = get_recent_context(max_turns=10)
+            if recent:
+                sections.append(f'[主代理最近对话]\n{recent}')
+        except (ImportError, AttributeError):
+            pass
 
-        # 3. LLM 显式传入的 context（合并，不丢弃）
+        # 3. LLM 显式传入的 context
         if explicit_context:
             sections.append(f'[额外上下文]\n{explicit_context}')
+
+        # 4. 提示 subagent 可使用 memory_recall
+        sections.append('[提示] 如需更多历史信息，可使用 memory_recall 工具检索。')
 
         return '\n\n'.join(sections) if sections else ''
 
@@ -70,11 +68,19 @@ class SubagentTools:
         """创建子代理异步执行任务。返回 agent_id 用于后续查询。适合不需要立即结果的后台任务。"""
         context_seed = self._build_context_with_history(context, goal)
         tool_filter = None if tools == '*' else [t.strip() for t in tools.split(',')]
+
+        # 默认 deny MCP 工具（subagent 通常不需要 tts/asr/channel 等硬件工具）
+        # 除非 tools 参数显式包含 mcp 相关模式
+        tool_deny = None
+        if tools == '*' or (tool_filter and not any('mcp' in t for t in tool_filter)):
+            tool_deny = ['mcp__*']
+
         spec = SubagentSpec(
             goal=goal,
             priority=max(0, min(3, priority)),
             model=model or None,
             tool_filter=tool_filter,
+            tool_deny=tool_deny,
             max_rounds=max_rounds,
             context_seed=context_seed,
         )
@@ -94,11 +100,18 @@ class SubagentTools:
         """创建子代理并等待结果返回。适合需要立即获得结果的查询类任务。会阻塞当前轮直到完成。"""
         context_seed = self._build_context_with_history(context, goal)
         tool_filter = None if tools == '*' else [t.strip() for t in tools.split(',')]
+
+        # 默认 deny MCP 工具
+        tool_deny = None
+        if tools == '*' or (tool_filter and not any('mcp' in t for t in tool_filter)):
+            tool_deny = ['mcp__*']
+
         spec = SubagentSpec(
             goal=goal,
             priority=max(0, min(3, priority)),
             model=model or None,
             tool_filter=tool_filter,
+            tool_deny=tool_deny,
             max_rounds=max_rounds,
             context_seed=context_seed,
         )

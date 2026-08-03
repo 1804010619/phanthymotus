@@ -741,7 +741,8 @@ async def mcp_call_tool(mcp_id: str, req: MCPCallRequest):
                 pub = _ensure_mic_pub()
                 if pub is None:
                     return {'code': 200, 'data': {'state': 'error', 'message': 'ROS2 mic publisher not available'}}
-                # Wait up to 10s for browser WebSocket to connect and send data
+                # Wait up to 10s for browser to connect and send audio chunks
+                # (browser mic is started in parallel by frontend before this API call)
                 import asyncio
                 initial_count = _start_mod._mic_chunk_count
                 for _ in range(20):  # 20 × 0.5s = 10s
@@ -749,7 +750,7 @@ async def mcp_call_tool(mcp_id: str, req: MCPCallRequest):
                         return {'code': 200, 'data': {'state': 'running', 'ws_path': '/ws/mic',
                                                        'chunks_received': _start_mod._mic_chunk_count}}
                     await asyncio.sleep(0.5)
-                # Timeout
+                # Timeout — no audio received
                 if not _start_mod._mic_ws_connected:
                     return {'code': 200, 'data': {'state': 'error', 'message': '等待浏览器麦克风连接超时（10s）— 请在 dashboard 开启麦克风'}}
                 else:
@@ -804,21 +805,24 @@ async def mcp_call_tool(mcp_id: str, req: MCPCallRequest):
         if req.tool == 'channel_request':
             action = req.arguments.get('action', 'start')
             if action == 'start':
-                # Self-check: verify channel adapter is connected
+                # Self-check: verify channel adapter is connected (with retry wait)
                 from channel.manager import manager as channel_mgr
+                import asyncio
                 instance_id = req.arguments.get('instance_id', '')
                 channel_id = ''
                 if instance_id:
                     cfg = config.main.get(f'tool_config:channel:channel_request:{instance_id}', None)
                     if cfg:
                         channel_id = cfg.get('channel_id', '')
-                if channel_id and channel_id in channel_mgr._adapters:
-                    adapter = channel_mgr._adapters[channel_id]
-                    connected = getattr(adapter, 'is_running', False)
-                    if connected:
-                        return {'code': 200, 'data': {'state': 'running', 'channel': channel_id}}
-                    else:
-                        return {'code': 200, 'data': {'state': 'error', 'message': f'channel {channel_id} adapter not connected'}}
+                if channel_id:
+                    # Wait up to 10s for adapter to connect
+                    for _ in range(20):  # 20 × 0.5s = 10s
+                        if channel_id in channel_mgr._adapters:
+                            adapter = channel_mgr._adapters[channel_id]
+                            if adapter.status() == 'connected':
+                                return {'code': 200, 'data': {'state': 'running', 'channel': channel_id}}
+                        await asyncio.sleep(0.5)
+                    return {'code': 200, 'data': {'state': 'error', 'message': f'channel {channel_id} adapter not connected (10s timeout)'}}
                 return {'code': 200, 'data': {'state': 'running'}}
             elif action == 'stop':
                 return {'code': 200, 'data': {'state': 'idle'}}

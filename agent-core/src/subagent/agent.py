@@ -144,7 +144,7 @@ class Subagent:
         from event.llm import _event_instance
         if not _event_instance:
             return []
-        _DESKTOP_TOOLS = {'Bash', 'PythonExec', 'Read', 'Write', 'Edit', 'Glob', 'Grep', 'WebFetch', 'WebSearch'}
+        _DESKTOP_TOOLS = {'Bash', 'PythonExec', 'Read', 'Write', 'Edit', 'Glob', 'Grep', 'WebFetch', 'WebSearch', 'memory_recall'}
         return [
             info['schema']
             for name, info in _event_instance._sys_tools.items()
@@ -178,11 +178,12 @@ class Subagent:
             },
             {
                 'name': 'subagent_report',
-                'description': '向主代理汇报中间进度。不终止执行。',
+                'description': '向主代理汇报。默认存入记忆库供按需检索。仅紧急情况（安全/硬件告警）设 urgent=true 立即中断主代理。',
                 'parameters': {
                     'type': 'object',
                     'properties': {
-                        'progress': {'type': 'string', 'description': '当前进度描述'},
+                        'progress': {'type': 'string', 'description': '进度/结论描述'},
+                        'urgent': {'type': 'boolean', 'description': '是否紧急（默认false存DB，true立即通知主代理）'},
                     },
                     'required': ['progress'],
                 },
@@ -430,16 +431,32 @@ class Subagent:
             return args.get('reason', 'failed')
         if name == 'subagent_report':
             progress = args.get('progress', '')
+            urgent = args.get('urgent', False)
             if not progress.strip():
                 return 'ok'
             self._progress_reports.append(progress)
-            print(f'[subagent:{self.id}] progress: {progress[:100]}')
-            # Inject report into event_bus so main agent can see it
-            import event_bus
-            await event_bus.enqueue(
-                source=f'subagent:{self.id}/report',
-                text=progress,
-            )
+            print(f'[subagent:{self.id}] progress{"(urgent)" if urgent else ""}: {progress[:100]}')
+            if urgent:
+                # 紧急：直接进 event_bus → 触发 main agent
+                import event_bus
+                await event_bus.enqueue(
+                    source=f'subagent:{self.id}/report',
+                    text=progress,
+                )
+            else:
+                # 非紧急：存入 DB 供 memory_recall 检索，不触发 main agent
+                try:
+                    import time as _time
+                    from config import _get_conn
+                    with _get_conn() as conn:
+                        conn.execute(
+                            'INSERT INTO subagent_conclusions (agent_id, goal, conclusion, source_type, created_at) '
+                            'VALUES (?, ?, ?, ?, ?)',
+                            (self.id, self.spec.goal[:100], progress, 'bg_monitor', _time.time())
+                        )
+                        conn.commit()
+                except Exception as e:
+                    print(f'[subagent:{self.id}] save report to DB failed: {e}')
             return 'ok'
 
         # MCP tool call
@@ -458,7 +475,12 @@ class Subagent:
             try:
                 fn = _event_instance._sys_tools[name]['object']
                 result = await fn(**args)
-                return str(result) if result else '(no output)'
+                result_str = str(result) if result else '(no output)'
+                # 截断大结果（WebSearch/WebFetch 等可能返回 6K+ chars）
+                _MAX_TOOL_RESULT = 2500
+                if len(result_str) > _MAX_TOOL_RESULT:
+                    result_str = result_str[:_MAX_TOOL_RESULT] + '\n...(结果已截断，如需更多请细化查询)'
+                return result_str
             except Exception as e:
                 return f'[tool error] {type(e).__name__}: {e}'
 

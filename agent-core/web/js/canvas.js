@@ -1489,14 +1489,26 @@ async function _startProject() {
       if (modal && !p.has_error) {
         // Show countdown close button, auto-close after 15s
         modal.startCountdown(15);
-      } else if (modal && p.has_error) {
-        _showStartupError(modal.modal, modal.close);
       }
       offMotusEvent(_onEvent);
     }
   }
 
   onMotusEvent(null, _onEvent);
+
+  // 立即启动浏览器麦克风（与 API 调用并行，解决 self-check 时序问题）
+  const remoteMicCard = _cards.find(c => c.toolName === 'remote_mic');
+  if (remoteMicCard && !isMicActive()) {
+    const wsProto = location.protocol === 'https:' ? 'wss' : 'ws';
+    const wsUrl = `${wsProto}://${location.host}/ws/mic`;
+    toggleMicStream(wsUrl, (active) => {
+      const micBtn = remoteMicCard.el?.querySelector('.canvas-mic-btn');
+      if (micBtn) {
+        micBtn.textContent = active ? '\u23F9 停止录音' : '\uD83C\uDF99 开始录音';
+        micBtn.classList.toggle('recording', active);
+      }
+    }).catch(err => _logActivity('warn', `麦克风启动失败: ${err.message}`));
+  }
 
   // Call unified backend start-project
   try {
@@ -1506,32 +1518,18 @@ async function _startProject() {
       _syncProjectBtn();
       document.querySelectorAll('.canvas-exec-btn').forEach(btn => btn.classList.remove('locked'));
       _logActivity('project', '智能控制已开启');
-      // Auto-start browser mic for remote_mic cards
-      const remoteMicCard = _cards.find(c => c.toolName === 'remote_mic');
-      if (remoteMicCard && !isMicActive()) {
-        const wsProto = location.protocol === 'https:' ? 'wss' : 'ws';
-        const wsUrl = `${wsProto}://${location.host}/ws/mic`;
-        try {
-          await toggleMicStream(wsUrl, (active) => {
-            const micBtn = remoteMicCard.el?.querySelector('.canvas-mic-btn');
-            if (micBtn) {
-              micBtn.textContent = active ? '\u23F9 停止录音' : '\uD83C\uDF99 开始录音';
-              micBtn.classList.toggle('recording', active);
-            }
-          });
-        } catch (err) {
-          _logActivity('warn', `麦克风启动失败: ${err.message}`);
-        }
-      }
     } else {
       const data = await res.json().catch(() => ({}));
       _logActivity('error', `启动失败: ${data.detail || res.status}`);
       offMotusEvent(_onEvent);
+      if (modal) {
+        _showStartupError(modal);
+      }
     }
   } catch (e) {
     _logActivity('error', `启动失败: ${e.message}`);
     offMotusEvent(_onEvent);
-    if (modal) _showStartupError(modal.modal, modal.close);
+    if (modal) modal.close();
   }
 }
 
@@ -1611,15 +1609,15 @@ async function _triggerAction(mcpId, toolName, action, extraArgs = {}) {
 
 // ── Startup Modal ──────────────────────────────────────────────────────────────
 
-function _showStartupError(modal, close) {
-  const cancelBtn = modal.querySelector('.startup-cancel-btn');
+function _showStartupError(modalWrapper) {
+  const modalEl = modalWrapper.modal;
+  const cancelBtn = modalEl.querySelector('.startup-cancel-btn');
   if (cancelBtn) {
     cancelBtn.textContent = '关闭';
-    cancelBtn.onclick = close;
+    cancelBtn.onclick = () => modalWrapper.close();
   }
-  modal.onCancel = null;
   // Update modal title to indicate failure
-  const title = modal.querySelector('.modal-title');
+  const title = modalEl.querySelector('.modal-title');
   if (title) title.textContent = '启动失败';
 }
 
@@ -1682,7 +1680,11 @@ function _showStartupModal(items) {
   }
 
   const cancelBtn = modal.querySelector('.startup-cancel-btn');
-  cancelBtn.addEventListener('click', () => { if (modal.onCancel) modal.onCancel(); close(); });
+  cancelBtn.addEventListener('click', () => {
+    close();
+    // Actually stop the project when user cancels during startup
+    _stopProject();
+  });
   return { modal, updateItem, close, startCountdown };
 }
 

@@ -219,15 +219,15 @@ async def _route_to_bg_subagent(batch: list[dict]) -> bool:
 
     summary = _format_bg_batch(batch)
 
-    # 同步 main agent 最近对话上下文
+    # 同步 main agent 最近对话上下文（精简，subagent 可自行 memory_recall）
     try:
         from event.llm import get_recent_context
-        recent_context = get_recent_context(max_turns=5)
+        recent_context = get_recent_context(max_turns=2)
     except (ImportError, AttributeError):
         recent_context = ''
 
     if recent_context:
-        message = f'[主代理最近对话]\n{recent_context}\n\n[新数据]\n{summary}'
+        message = f'[主代理最近决策]\n{recent_context}\n\n[新数据]\n{summary}'
     else:
         message = summary
 
@@ -240,10 +240,17 @@ async def _route_to_bg_subagent(batch: list[dict]) -> bool:
     else:
         from subagent.protocol import SubagentSpec, P_LOW
         spec = SubagentSpec(
-            goal='[bg] 后台监控：分析传入的信息。如果发现值得注意的变化或异常，调用 subagent_report 上报。无重要变化时直接调用 subagent_finish。不要主动调用任何工具去查询数据，只分析传入的内容。',
+            goal=(
+                '[bg] 后台监控：分析传入的信息。\n'
+                '- 需要历史对比时，用 memory_recall 检索之前的结论\n'
+                '- 无变化 → subagent_finish\n'
+                '- 有变化但非紧急 → subagent_report(progress=结论)\n'
+                '- 安全/硬件告警（SOC<10%、温度>50°C、碰撞） → subagent_report(progress=..., urgent=true)\n'
+                '不要主动调用 Bash/Read 等工具，只分析传入内容或通过 memory_recall 检索历史。'
+            ),
             priority=P_LOW,
             model=bg_config.get('bg_model'),
-            tool_deny=['mcp__*'],
+            tool_deny=['mcp__*', 'Bash', 'Read', 'Write', 'Edit', 'Glob', 'Grep', 'WebFetch', 'WebSearch'],
             max_rounds=50,
             timeout_s=3600,
             context_seed=message,

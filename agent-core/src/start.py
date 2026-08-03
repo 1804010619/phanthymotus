@@ -4,12 +4,19 @@ import logging
 import pathlib
 import shutil
 import subprocess
+import sys
+
+# Fix Python "dual module" bug: start.py runs as __main__, but other modules
+# `import start` which creates a SEPARATE module instance with its own globals.
+# This ensures `import start` returns the same object as __main__.
+sys.modules['start'] = sys.modules[__name__]
 
 import config
 import auth
 import event
 import collector
 import scheduler
+import daily_summary
 import topic_subscriber
 import mcp_client
 from channel.manager import manager as channel_manager
@@ -338,6 +345,7 @@ async def lifespan(app):
         tasks = [
             asyncio.create_task(event.llm.run_forever()),
             asyncio.create_task(scheduler.run()),
+            asyncio.create_task(daily_summary.run()),
         ]
         try:
             yield

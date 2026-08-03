@@ -185,14 +185,14 @@ def _env_dynamic() -> str:
     """
     now = datetime.datetime.now(_TZ_CN).strftime('%Y-%m-%d %H:%M:%S')
 
-    # 最近事件来源统计
+    # 最近事件来源统计（精简格式）
     recents = event_bus.recent(10)
     if recents:
         from collections import Counter
-        counts = Counter(e['source'] for e in recents)
-        recent_str = ', '.join(f'{src} ×{n}' for src, n in counts.most_common())
+        counts = Counter(e['source'].split('/')[-1] for e in recents)
+        recent_str = ', '.join(f'{src} ×{n}' for src, n in counts.most_common(5))
     else:
-        recent_str = 'no recent events'
+        recent_str = 'none'
 
     # 活跃任务
     import task_store
@@ -212,22 +212,13 @@ def _env_dynamic() -> str:
             task_lines.append(f'  <task id="{t.id}" status="{t.status}" elapsed="{elapsed_str}">{t.goal}{" — " + t.progress if t.progress else ""}</task>')
         tasks_section = f'<active_tasks>\n' + '\n'.join(task_lines) + '\n</active_tasks>\n'
 
-    # 活跃子代理
-    subagents_section = ''
-    try:
-        from subagent import _get_active_subagents
-        sa_list = _get_active_subagents()
-        if sa_list:
-            sa_lines = [f'  <subagent>{s.to_display()}</subagent>' for s in sa_list]
-            subagents_section = f'<active_subagents>\n' + '\n'.join(sa_lines) + '\n</active_subagents>\n'
-    except (ImportError, AttributeError):
-        pass
+    # 不再显示 active_subagents — bg subagent 结论通过 memory_recall 按需检索，
+    # 用户任务 subagent 完成后会发精简通知。
 
     return (
         f'<status time="{now}">\n'
-        f'  <recent_sources>last {len(recents)} events from: {recent_str}</recent_sources>\n'
+        f'  <recent_sources>{len(recents)} events ({recent_str})</recent_sources>\n'
         f'{tasks_section}'
-        f'{subagents_section}'
         f'</status>'
     )
 
