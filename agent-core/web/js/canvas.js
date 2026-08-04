@@ -2014,10 +2014,13 @@ function _esc(s) {
 
 // ── Editor Lock UI ───────────────────────────────────────────────────────────
 
+const _SVG_PEN = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 3a2.85 2.85 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z"/><path d="m15 5 4 4"/></svg>';
+const _SVG_LOCK = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="18" height="11" x="3" y="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>';
+
 function _createEditorBar() {
   const bar = document.createElement('div');
   bar.id = 'canvas-editor-bar';
-  bar.style.cssText = 'position:absolute;top:12px;right:12px;z-index:999;background:var(--bg-card,#fff);border-radius:8px;padding:6px 14px;box-shadow:0 2px 8px rgba(0,0,0,.12);font-size:13px;display:flex;align-items:center;gap:8px;';
+  bar.className = 'canvas-editor-bar';
   _canvasEl.appendChild(bar);
   return bar;
 }
@@ -2027,14 +2030,14 @@ function _updateEditorUI() {
   if (!bar) bar = _createEditorBar();
 
   if (_isEditor) {
-    bar.innerHTML = '<span style="color:var(--color-success,#4caf50);">&#9998; 编辑中</span><button id="canvas-release-btn" style="font-size:12px;padding:2px 8px;border-radius:4px;border:1px solid #ccc;cursor:pointer;background:transparent;">释放</button>';
+    bar.innerHTML = `${_SVG_PEN}<span class="editor-label editor-label--active">编辑中</span><button class="editor-btn" id="canvas-release-btn">释放</button>`;
     bar.querySelector('#canvas-release-btn').onclick = _releaseEdit;
     _setCanvasReadonly(false);
   } else if (_currentEditor) {
-    bar.innerHTML = `<span style="color:var(--color-warning,#ff9800);">&#128274; 他人编辑中</span>`;
+    bar.innerHTML = `${_SVG_LOCK}<span class="editor-label editor-label--locked">已锁定</span>`;
     _setCanvasReadonly(true);
   } else {
-    bar.innerHTML = '<button id="canvas-claim-btn" style="font-size:12px;padding:4px 12px;border-radius:4px;border:1px solid var(--color-primary,#e87040);color:var(--color-primary,#e87040);cursor:pointer;background:transparent;">获取编辑权</button>';
+    bar.innerHTML = `${_SVG_PEN}<button class="editor-btn editor-btn--claim" id="canvas-claim-btn">编辑</button>`;
     bar.querySelector('#canvas-claim-btn').onclick = _claimEdit;
     _setCanvasReadonly(true);
   }

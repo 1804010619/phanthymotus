@@ -887,6 +887,11 @@ class Event:
             if finish_tool in [c['function']['name'] for c in tool_calls]:
                 break
 
+            # ── Rebuild frozen_system if skill state changed (activate/deactivate) ─
+            skill_tools = {'activate_skill', 'deactivate_skill'}
+            if any(c['function']['name'] in skill_tools for c in tool_calls):
+                frozen_system = prompt_mod.build_system(mcp_client.registry, bound_tool_names)
+
             # ── 取消检查点：工具执行完毕后，下一轮 LLM 调用前 ────────────────
             if cancel_event and cancel_event.is_set():
                 raise TurnCancelled("Interrupted after tool dispatch")
