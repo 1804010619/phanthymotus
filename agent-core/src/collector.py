@@ -96,8 +96,9 @@ def set_busy(busy: bool):
     """由 agent loop 调用：标记当前是否正在执行 turn。"""
     global _busy
     _busy = busy
-    if not busy and _priority_pending:
-        asyncio.ensure_future(_emit_priority())
+    if not busy:
+        # turn 结束时立即排空所有 pending 队列，避免消息跨 turn 滞留
+        _flush_all_pending()
 
 
 def set_cancel_event(ev: asyncio.Event | None):
@@ -143,6 +144,8 @@ async def drain_steering() -> list[dict]:
 
 async def next_trigger() -> dict:
     """阻塞等待下一批 P>0 事件（main agent 消费端）。"""
+    # Fallback: 每次等待前再检查一次 pending 队列，防止遗漏
+    _flush_all_pending()
     return await _output.get()
 
 
@@ -160,6 +163,39 @@ def get_available_sources() -> list[str]:
 
 
 # ── 内部：P>0 管道 ────────────────────────────────────────────────────────────
+
+def _flush_all_pending():
+    """同步排空 _steering_queue 和 _priority_pending 到 _output。
+    在 turn 结束时和 next_trigger 前调用，确保消息不跨 turn 滞留。"""
+    # 先把 steering_queue 里的消息移到 _priority_pending
+    while not _steering_queue.empty():
+        try:
+            _priority_pending.append(_steering_queue.get_nowait())
+        except asyncio.QueueEmpty:
+            break
+    # 再把 _priority_pending 全部 emit 到 _output
+    if _priority_pending:
+        batch = list(_priority_pending)
+        _priority_pending.clear()
+        # 同步放入 _output（非 async，避免 fire-and-forget 丢失）
+        formatted = _format_priority_batch(batch)
+        trigger = {
+            'source': 'collector',
+            'text': formatted,
+            'payload': {'event_count': len(batch), 'sources': [e['source'] for e in batch]},
+            'ts': batch[-1]['ts'],
+            '_perf_trigger_emit_ts': time.time(),
+            '_urgent': True,
+        }
+        for ev in reversed(batch):
+            if '_perf_spans' in ev:
+                trigger['_perf_spans'] = ev['_perf_spans']
+                break
+        try:
+            _output.put_nowait(trigger)
+        except asyncio.QueueFull:
+            print('[collector] WARNING: _output queue full, pending messages dropped')
+
 
 async def _emit_priority():
     """busy 结束后，立即 emit 暂存的 P>0 事件。"""
