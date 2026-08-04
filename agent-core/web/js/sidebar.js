@@ -448,6 +448,7 @@ function _openToolConfigModal(mcpId, toolName, configSchema) {
     alert('Stop agent before modifying');
     return;
   }
+  if (!canEdit()) return;
   const overlay = document.getElementById('tool-config-overlay');
   const titleEl = document.getElementById('tool-config-title');
   const bodyEl  = document.getElementById('tool-config-body');
@@ -774,6 +775,7 @@ export function openInstanceConfigModal(mcpId, toolName, instanceId, configSchem
     alert('Stop agent before modifying');
     return;
   }
+  if (!canEdit()) return;
   const overlay = document.getElementById('tool-config-overlay');
   const titleEl = document.getElementById('tool-config-title');
   const bodyEl  = document.getElementById('tool-config-body');
