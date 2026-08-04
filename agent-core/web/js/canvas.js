@@ -805,6 +805,7 @@ function _buildCardEl({ id, mcpId, toolName, driverName, x, y, topicIn: savedTop
     if (sensorExecBtn) {
       sensorExecBtn.addEventListener('click', async (e) => {
         e.stopPropagation();
+        if (!_canEdit()) return;
         await _executeCard(el, mcpId, toolName, id);
       });
     }
@@ -939,7 +940,13 @@ function _buildCardEl({ id, mcpId, toolName, driverName, x, y, topicIn: savedTop
             field.style.display = paramKeys.includes(key) ? '' : 'none';
           });
         };
-        actionSelect.addEventListener('change', _applyActionParams);
+        actionSelect.addEventListener('change', () => {
+          if (!_canEdit()) {
+            _applyActionParams();  // revert visual to match current state
+            return;
+          }
+          _applyActionParams();
+        });
         _applyActionParams();  // 初始应用
       }
     }
@@ -973,6 +980,7 @@ function _buildCardEl({ id, mcpId, toolName, driverName, x, y, topicIn: savedTop
     if (execBtn) {
       execBtn.addEventListener('click', async (e) => {
         e.stopPropagation();
+        if (!_canEdit()) return;
         await _executeCard(el, mcpId, toolName);
       });
     }
@@ -1929,6 +1937,7 @@ function _makeDraggable(el, cardData) {
     if (e.target.closest('.canvas-card-info-btn')) return;
     if (e.target.closest('.canvas-card-instance-cfg-btn')) return;
     if (_projectRunning) return;
+    if (!_canEdit()) return;
     e.preventDefault();
     e.stopPropagation();
 
@@ -2044,7 +2053,7 @@ function _updateEditorUI() {
 
 function _setCanvasReadonly(readonly) {
   if (_viewport) {
-    _viewport.style.pointerEvents = readonly ? 'none' : '';
+    _viewport.classList.toggle('canvas-readonly', readonly);
   }
   // Also disable sidebar drag if readonly
   document.querySelectorAll('.sidebar-tool-item').forEach(el => {
