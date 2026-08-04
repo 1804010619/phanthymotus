@@ -24,6 +24,11 @@ log = logging.getLogger(__name__)
 SAMPLE_RATE = 16000
 CHUNK_BYTES = 3200  # 100ms @ 16kHz 16-bit mono
 
+# EOF magic: 8 bytes (4 samples [1, -1, 1, -1])，标记 utterance 结束
+# 正常 chunk 始终 3200 bytes，8 bytes 短 chunk 不会被误判
+# 即使被不识别 EOF 的旧 Speaker 播放，也只是 0.25ms 极微弱交流声
+AUDIO_EOF_MAGIC = b'\x01\x00\xff\xff\x01\x00\xff\xff'
+
 _LOW_LAT_QOS = QoSProfile(
     reliability=ReliabilityPolicy.BEST_EFFORT,
     history=HistoryPolicy.KEEP_LAST,
@@ -335,6 +340,9 @@ class _TTSNode(Node):
                     log.info(f"[tts] utterance interrupted after {frames_sent} frames")
                 else:
                     log.info(f"[tts] spoke {len(text)} chars → {total} bytes ({frames_sent} frames) in {_time.monotonic() - t_start:.2f}s")
+
+                # 发布 EOF 标记：告知下游 Speaker 当前 utterance 已结束
+                self._publish_eof()
                 # 上报 TTS perf spans（生成 + 播放）
                 try:
                     import json as _json
@@ -370,6 +378,15 @@ class _TTSNode(Node):
             "topic_in":  [{"topic": self._input_topic,  "format": "data/json",     "desc": "text to synthesize"}],
             "topic_out": [{"topic": self._output_topic, "format": "audio/pcm-16k", "desc": "synthesized PCM audio"}],
         }
+
+    def _publish_eof(self):
+        """发布 EOF magic chunk，标记当前 utterance 结束。"""
+        from audio_msgs.msg import AudioChunk
+        msg = AudioChunk()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.format = "audio/pcm-16k"
+        msg.data = list(AUDIO_EOF_MAGIC)
+        self._pub.publish(msg)
 
 
 # ── Plugin ────────────────────────────────────────────────────────────────────
