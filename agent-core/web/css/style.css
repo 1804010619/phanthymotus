@@ -2554,7 +2554,7 @@ html, body {
   padding: 8px 14px;
   font-size: 11px;
   color: var(--text-muted);
-  max-height: 120px;
+  max-height: 240px;
   overflow-y: auto;
 }
 .deploy-log-line { line-height: 1.6; }

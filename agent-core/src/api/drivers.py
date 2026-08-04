@@ -45,18 +45,37 @@ def _container_name(driver_id: str) -> str:
     return f'embodied-{driver_id}'
 
 
+# ── Deploy log buffer (in-memory, per driver) ─────────────────────────────
+
+_deploy_logs: dict[str, str] = {}
+
+
+def _log_deploy(driver_id: str, msg: str):
+    _deploy_logs.setdefault(driver_id, '')
+    _deploy_logs[driver_id] += msg + '\n'
+
+
+def _clear_deploy_log(driver_id: str):
+    _deploy_logs.pop(driver_id, None)
+
+
 def _get_status_sync(driver_id: str) -> dict:
     try:
         client = _docker()
         name = _container_name(driver_id)
         containers = client.containers.list(all=True, filters={'name': f'^{name}$'})
         if not containers:
-            return {'status': 'stopped'}
+            deploy_log = _deploy_logs.get(driver_id, '')
+            return {'status': 'stopped', 'logs': deploy_log}
         c = containers[0]
         try:
             logs = c.logs(tail=30).decode('utf-8', errors='replace')
         except Exception:
             logs = ''
+        # Prepend deploy logs if available
+        deploy_log = _deploy_logs.get(driver_id, '')
+        if deploy_log:
+            logs = deploy_log + logs
         running_image = c.attrs.get('Config', {}).get('Image', '')
         return {'status': c.status, 'logs': logs, 'running_image': running_image}
     except Exception as e:
@@ -89,7 +108,21 @@ def _deploy_sync(driver: dict) -> dict:
         pass
 
     # Pull image
-    client.images.pull(target_image)
+    _clear_deploy_log(driver['id'])
+    _log_deploy(driver['id'], f'[pull] {target_image}')
+    try:
+        for line in client.api.pull(target_image, stream=True, decode=True):
+            status = line.get('status', '')
+            progress = line.get('progress', '')
+            layer_id = line.get('id', '')
+            if status:
+                msg = f'  {layer_id} {status}' if layer_id else f'  {status}'
+                if progress:
+                    msg += f' {progress}'
+                _log_deploy(driver['id'], msg)
+    except Exception as e:
+        _log_deploy(driver['id'], f'[pull] failed: {e}')
+        return {'status': 'error', 'error': f'pull failed: {e}'}
 
     # Extract service.yml from image
     compose_dir = os.environ.get('COMPOSE_DIR', '/opt/phanthy-motus')
@@ -153,10 +186,19 @@ def _deploy_sync(driver: dict) -> dict:
             pass
 
     # docker compose up
-    subprocess.run(
+    _log_deploy(driver['id'], f'[compose] up -d {service_name}')
+    result = subprocess.run(
         ['docker', 'compose', '-f', compose_file, 'up', '-d', '--no-deps', '--force-recreate', service_name],
-        check=True,
+        capture_output=True, text=True,
     )
+    if result.stdout:
+        _log_deploy(driver['id'], result.stdout.strip())
+    if result.stderr:
+        _log_deploy(driver['id'], result.stderr.strip())
+    if result.returncode != 0:
+        _log_deploy(driver['id'], f'[compose] exit code {result.returncode}')
+        return {'status': 'error', 'error': f'compose up failed (rc={result.returncode})'}
+    _log_deploy(driver['id'], '[deploy] done')
     return {'status': 'starting', 'service': service_name}
 
 
@@ -222,7 +264,9 @@ def _deploy_sync_legacy(driver: dict) -> dict:
 
     run_kwargs['log_config'] = {'type': 'local'}
 
+    _log_deploy(driver['id'], f'[run] {name}')
     container = client.containers.run(**run_kwargs)
+    _log_deploy(driver['id'], f'[deploy] done, container={container.id[:12]}')
     return {'status': 'starting', 'container_id': container.id[:12]}
 
 

@@ -947,7 +947,7 @@ function _startLogPolling(driverId) {
 
       const el = document.getElementById(`log-${driverId}`);
       if (el && logs) {
-        const lines = logs.trim().split('\n').slice(-5);
+        const lines = logs.trim().split('\n').slice(-20);
         el.querySelectorAll('.log-output').forEach(e => e.remove());
         const pre = document.createElement('pre');
         pre.className = 'log-output';
