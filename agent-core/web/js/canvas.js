@@ -1323,6 +1323,7 @@ function _redrawConnections() {
         _logActivity('warn', '请停止智能控制后修改');
         return;
       }
+      if (!_canEdit()) return;
       _connections = _connections.filter(c => c.id !== conn.id);
       _resolveAllTopics();
       _autoStopOnDisconnect(conn.toCardId, conn.toPortIdx, conn.fromTopic);
@@ -1398,6 +1399,7 @@ function _redrawConnections() {
     delBtn.addEventListener('mouseleave', () => delBtn.classList.remove('visible'));
 
     const removeExec = () => {
+      if (!_canEdit()) return;
       _execConnections = _execConnections.filter(c => c.id !== conn.id);
       _logActivity('executor', `解绑执行器: ${conn.toToolName || conn.toCardId}`);
       _redrawConnections();
@@ -2057,10 +2059,8 @@ function _updateEditorUI() {
 }
 
 function _setCanvasReadonly(readonly) {
-  if (_viewport) {
-    _viewport.style.pointerEvents = readonly ? 'none' : '';
-  }
-  // Also disable sidebar drag if readonly
+  // Don't use pointer-events: none — it blocks all interaction including toast triggers.
+  // Instead, each action handler checks _canEdit() individually.
   document.querySelectorAll('.sidebar-tool-item').forEach(el => {
     el.draggable = !readonly;
   });
