@@ -48,8 +48,8 @@ function _showToast(msg) {
   const toast = document.createElement('div');
   toast.id = 'canvas-toast';
   toast.textContent = msg;
-  toast.style.cssText = 'position:fixed;bottom:80px;left:0;right:0;margin:auto;width:fit-content;max-width:80vw;background:rgba(28,25,23,.85);color:#fff;padding:10px 20px;border-radius:20px;font-size:13px;z-index:9999;pointer-events:none;opacity:0;animation:canvas-toast-in 2.5s ease forwards;';
-  document.body.appendChild(toast);
+  toast.style.cssText = 'position:absolute;bottom:80px;left:50%;transform:translateX(-50%);width:fit-content;max-width:80%;background:rgba(28,25,23,.85);color:#fff;padding:10px 20px;border-radius:20px;font-size:13px;z-index:9999;pointer-events:none;opacity:0;animation:canvas-toast-in 2.5s ease forwards;';
+  _canvasEl.appendChild(toast);
   setTimeout(() => toast.remove(), 2600);
 }
 
