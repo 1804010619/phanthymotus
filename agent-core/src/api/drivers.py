@@ -231,8 +231,17 @@ def _deploy_sync_legacy(driver: dict) -> dict:
     )
 
     if '-jetson' in target_image:
-        run_kwargs['runtime'] = 'nvidia'
-        env_base = {'NVIDIA_VISIBLE_DEVICES': 'all'}
+        # Only use nvidia runtime if available on host
+        try:
+            runtimes = client.info().get('Runtimes', {})
+        except Exception:
+            runtimes = {}
+        if 'nvidia' in runtimes:
+            run_kwargs['runtime'] = 'nvidia'
+            env_base = {'NVIDIA_VISIBLE_DEVICES': 'all'}
+        else:
+            run_kwargs['privileged'] = True
+            env_base = {}
     else:
         run_kwargs['privileged'] = True
         env_base = {}
