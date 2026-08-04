@@ -491,6 +491,33 @@ class Event:
 
         return schemas
 
+    # ── 打断：中止正在进行的输出 ─────────────────────────────────────────────
+
+    async def _interrupt_active_outputs(self):
+        """中止所有正在进行的输出（TTS + 动作）。在 TurnCancelled 时调用。"""
+        tasks = []
+        for mcp_id, info in mcp_client.registry.items():
+            tools = info.get('tools', [])
+            tool_meta = info.get('tool_meta', {})
+            # 查找 TTS 工具并发送 interrupt
+            for t in tools:
+                short_name = t.split('__')[-1] if '__' in t else t
+                if short_name == 'tts':
+                    tasks.append(mcp_client.call_tool(t, {'action': 'interrupt'}))
+                    break
+            # 查找 loco 工具并发送 stop_move
+            for t in tools:
+                short_name = t.split('__')[-1] if '__' in t else t
+                if short_name == 'loco':
+                    tasks.append(mcp_client.call_tool(t, {'action': 'stop_move'}))
+                    break
+        if tasks:
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            for i, r in enumerate(results):
+                if isinstance(r, Exception):
+                    print(f'[decision] interrupt_active_outputs: task {i} failed: {r}')
+            print(f'[decision] interrupted {len(tasks)} active output(s)')
+
     # ── 主循环 ───────────────────────────────────────────────────────────────
 
     async def run_forever(self):
@@ -511,6 +538,8 @@ class Event:
                     'role': 'assistant',
                     'content': '[turn interrupted by user message]',
                 })
+                # 中止正在进行的 TTS 播放和动作
+                await self._interrupt_active_outputs()
                 await push_event({'type': 'turn_cancelled', 'payload': {}})
             except asyncio.CancelledError:
                 raise
@@ -891,6 +920,22 @@ class Event:
             skill_tools = {'activate_skill', 'deactivate_skill'}
             if any(c['function']['name'] in skill_tools for c in tool_calls):
                 frozen_system = prompt_mod.build_system(mcp_client.registry, bound_tool_names)
+
+            # ── Steering: 检查是否有用户消息需要注入 ─────────────────────────
+            steered = await collector.drain_steering()
+            if steered:
+                for sev in steered:
+                    s_text = sev.get('text', '')
+                    s_source = sev.get('source', '')
+                    turn_messages.append({
+                        'role': 'user',
+                        'content': f'[用户插入消息 source={s_source}]\n{s_text}',
+                    })
+                await push_event({'type': 'turn_steered', 'payload': {
+                    'count': len(steered),
+                    'sources': [s.get('source', '') for s in steered],
+                }})
+                print(f'[decision] steered {len(steered)} user message(s) into current turn')
 
             # ── 取消检查点：工具执行完毕后，下一轮 LLM 调用前 ────────────────
             if cancel_event and cancel_event.is_set():

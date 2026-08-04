@@ -59,6 +59,8 @@ _DB_DEFAULTS = {
             'compress_threshold_chars': 80000,  # 约 20K tokens，超过此字符数触发压缩
             'compress_keep_recent': 6,          # 压缩时保留最近 N 轮不动
             'source_ring_size': 50,             # per-source ring buffer 大小（供 raw_input_info 查询）
+            'interrupt_mode': 'steer',          # 打断模式: steer | interrupt | followup
+            'barge_in_threshold_ms': 500,       # 语音 barge-in 阈值（ms），低于此值视为 backchannel
         },
         'subscribe_topics': [],  # DDS topics core subscribes to directly (e.g. ["/robot/mic/audio/asr_event"])
     },
