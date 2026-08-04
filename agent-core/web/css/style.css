@@ -1,6 +1,13 @@
 /* ── Reset & Base ─────────────────────────────────────────────────────────── */
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
+@keyframes canvas-toast-in {
+  0% { opacity: 0; transform: translateX(-50%) translateY(8px); }
+  12% { opacity: 1; transform: translateX(-50%) translateY(0); }
+  80% { opacity: 1; transform: translateX(-50%) translateY(0); }
+  100% { opacity: 0; transform: translateX(-50%) translateY(0); }
+}
+
 :root {
   /* ── Warm parchment palette (Claude Code light inspired) ── */
   --bg:          #F5F0E8;
@@ -6030,6 +6037,9 @@ html, body {
     padding: 4px 8px;
     font-size: 11px;
     gap: 5px;
+  }
+  #canvas-toast {
+    bottom: calc(56px + env(safe-area-inset-bottom, 0px) + 16px) !important;
   }
 }
 

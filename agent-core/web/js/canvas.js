@@ -35,10 +35,22 @@ let _currentEditor = null;  // session_id of current editor (null = no one)
 /** Check if current session can modify. If not, show warning and return false. */
 function _canEdit() {
   if (!_isEditor) {
-    _logActivity('warn', _currentEditor ? '画布已被其他用户锁定，无法编辑' : '请先获取编辑权');
+    const msg = _currentEditor ? '画布已被其他用户锁定，无法编辑' : '请先点击「编辑」进入编辑状态';
+    _showToast(msg);
     return false;
   }
   return true;
+}
+
+function _showToast(msg) {
+  const old = document.getElementById('canvas-toast');
+  if (old) old.remove();
+  const toast = document.createElement('div');
+  toast.id = 'canvas-toast';
+  toast.textContent = msg;
+  toast.style.cssText = 'position:absolute;bottom:80px;left:50%;transform:translateX(-50%);width:fit-content;max-width:80%;background:rgba(28,25,23,.85);color:#fff;padding:10px 20px;border-radius:20px;font-size:13px;z-index:9999;pointer-events:none;opacity:0;animation:canvas-toast-in 2.5s ease forwards;';
+  _canvasEl.appendChild(toast);
+  setTimeout(() => toast.remove(), 2600);
 }
 
 // Connection state
@@ -51,6 +63,7 @@ let _projectRunning = false;
 
 export function isProjectRunning() { return _projectRunning; }
 export function redrawCanvas() { _redrawConnections(); }
+export function canEdit() { return _canEdit(); }
 
 /**
  * Programmatically add a card to the canvas (used by mobile tap-to-add).
@@ -1309,6 +1322,7 @@ function _redrawConnections() {
         _logActivity('warn', '请停止智能控制后修改');
         return;
       }
+      if (!_canEdit()) return;
       _connections = _connections.filter(c => c.id !== conn.id);
       _resolveAllTopics();
       _autoStopOnDisconnect(conn.toCardId, conn.toPortIdx, conn.fromTopic);
@@ -1384,6 +1398,7 @@ function _redrawConnections() {
     delBtn.addEventListener('mouseleave', () => delBtn.classList.remove('visible'));
 
     const removeExec = () => {
+      if (!_canEdit()) return;
       _execConnections = _execConnections.filter(c => c.id !== conn.id);
       _logActivity('executor', `解绑执行器: ${conn.toToolName || conn.toCardId}`);
       _redrawConnections();
@@ -2043,10 +2058,8 @@ function _updateEditorUI() {
 }
 
 function _setCanvasReadonly(readonly) {
-  if (_viewport) {
-    _viewport.style.pointerEvents = readonly ? 'none' : '';
-  }
-  // Also disable sidebar drag if readonly
+  // Don't use pointer-events: none — it blocks all interaction including toast triggers.
+  // Instead, each action handler checks _canEdit() individually.
   document.querySelectorAll('.sidebar-tool-item').forEach(el => {
     el.draggable = !readonly;
   });
