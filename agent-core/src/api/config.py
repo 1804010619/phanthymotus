@@ -232,6 +232,11 @@ async def _do_start_project():
                             topic_out = data.get('topic_out', [])
                             if topic_out:
                                 resolved_topics[card_id] = topic_out
+                                # Register resolved topics so WebSocket relay works
+                                from api.inspection import register_topic_internal
+                                for tp in topic_out:
+                                    if tp.get('topic') and tp.get('format'):
+                                        await register_topic_internal(tp['topic'], tp['format'], mcp_id)
                 except Exception:
                     pass  # info() failure is non-fatal
             else:
