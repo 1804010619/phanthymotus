@@ -178,21 +178,12 @@ def _env_static(mcp_registry: dict, bound_tools: set | None = None) -> str:
 # ── L2 动态部分（时间/任务/事件统计）─────────────────────────────────────────
 
 def _env_dynamic() -> str:
-    """生成 L2 动态环境快照（时间、活跃任务、最近事件）。
+    """生成 L2 动态环境快照（时间、活跃任务）。
 
     每次调用都重新生成，但作为 user message 放在历史之后，
     不影响 system message 的缓存命中。
     """
     now = datetime.datetime.now(_TZ_CN).strftime('%Y-%m-%d %H:%M:%S')
-
-    # 最近事件来源统计（精简格式）
-    recents = event_bus.recent(10)
-    if recents:
-        from collections import Counter
-        counts = Counter(e['source'].split('/')[-1] for e in recents)
-        recent_str = ', '.join(f'{src} ×{n}' for src, n in counts.most_common(5))
-    else:
-        recent_str = 'none'
 
     # 活跃任务
     import task_store
@@ -217,7 +208,6 @@ def _env_dynamic() -> str:
 
     return (
         f'<status time="{now}">\n'
-        f'  <recent_sources>{len(recents)} events ({recent_str})</recent_sources>\n'
         f'{tasks_section}'
         f'</status>'
     )

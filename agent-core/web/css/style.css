@@ -1523,6 +1523,14 @@ html, body {
   pointer-events: none;
 }
 
+/* Read-only mode: visual hint that editing is disabled */
+.canvas-readonly .canvas-card-close,
+.canvas-readonly .canvas-exec-btn:not(.locked),
+.canvas-readonly .canvas-field-input {
+  cursor: not-allowed;
+  opacity: 0.6;
+}
+
 .canvas-mic-btn {
   all: unset;
   cursor: pointer;
@@ -6030,13 +6038,14 @@ html, body {
 
   .canvas-editor-bar {
     position: fixed;
-    top: auto;
-    bottom: calc(56px + env(safe-area-inset-bottom, 0px) + 52px);
+    top: 12px;
     left: 12px;
+    bottom: auto;
     right: auto;
     padding: 4px 8px;
     font-size: 11px;
     gap: 5px;
+    z-index: 100;
   }
   #canvas-toast {
     bottom: calc(56px + env(safe-area-inset-bottom, 0px) + 16px) !important;
