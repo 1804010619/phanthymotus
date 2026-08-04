@@ -4,7 +4,7 @@
  * Tools with configSchema show config status and config button.
  */
 
-import { isProjectRunning, addCardFromSidebar } from './canvas.js';
+import { isProjectRunning, addCardFromSidebar, canEdit } from './canvas.js';
 import { isMobile, closeSidebarMobile } from './mobile.js';
 
 let _scroll = null;
@@ -281,6 +281,7 @@ function _buildChip(mcp, tool) {
   });
 
   chip.addEventListener('dragstart', (e) => {
+    if (!canEdit()) { e.preventDefault(); return; }
     chip.classList.add('dragging-source');
     e.dataTransfer.effectAllowed = 'copy';
     e.dataTransfer.setData('application/x-cap-card', JSON.stringify({
@@ -409,6 +410,7 @@ function _buildToolCard(mcp, tool) {
 
   // Drag (for canvas drop)
   card.addEventListener('dragstart', (e) => {
+    if (!canEdit()) { e.preventDefault(); return; }
     card.classList.add('dragging-source');
     e.dataTransfer.effectAllowed = 'copy';
     e.dataTransfer.setData('application/x-cap-card', JSON.stringify({
@@ -651,6 +653,7 @@ function _openToolConfigModal(mcpId, toolName, configSchema) {
   // Handlers
   const close = () => { overlay.classList.add('hidden'); };
   const save = async () => {
+    if (!canEdit()) return;
     const values = {};
     bodyEl.querySelectorAll('[data-key]').forEach(input => {
       const v = input.value.trim();
@@ -936,6 +939,7 @@ export function openInstanceConfigModal(mcpId, toolName, instanceId, configSchem
 
   const close = () => { overlay.classList.add('hidden'); };
   const save = async () => {
+    if (!canEdit()) return;
     const values = {};
     bodyEl.querySelectorAll('[data-key]').forEach(input => {
       const v = input.value.trim();

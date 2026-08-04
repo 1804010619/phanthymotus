@@ -51,6 +51,7 @@ let _projectRunning = false;
 
 export function isProjectRunning() { return _projectRunning; }
 export function redrawCanvas() { _redrawConnections(); }
+export function canEdit() { return _canEdit(); }
 
 /**
  * Programmatically add a card to the canvas (used by mobile tap-to-add).
