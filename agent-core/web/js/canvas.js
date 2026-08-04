@@ -35,10 +35,23 @@ let _currentEditor = null;  // session_id of current editor (null = no one)
 /** Check if current session can modify. If not, show warning and return false. */
 function _canEdit() {
   if (!_isEditor) {
-    _logActivity('warn', _currentEditor ? '画布已被其他用户锁定，无法编辑' : '请先获取编辑权');
+    const msg = _currentEditor ? '画布已被其他用户锁定，无法编辑' : '请先点击「编辑」进入编辑状态';
+    _showToast(msg);
     return false;
   }
   return true;
+}
+
+function _showToast(msg) {
+  // Remove existing toast
+  const old = document.getElementById('canvas-toast');
+  if (old) old.remove();
+  const toast = document.createElement('div');
+  toast.id = 'canvas-toast';
+  toast.textContent = msg;
+  toast.style.cssText = 'position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);background:rgba(0,0,0,.8);color:#fff;padding:12px 24px;border-radius:8px;font-size:14px;z-index:9999;pointer-events:none;animation:toast-fade 2.5s forwards;';
+  document.body.appendChild(toast);
+  setTimeout(() => toast.remove(), 2500);
 }
 
 // Connection state
