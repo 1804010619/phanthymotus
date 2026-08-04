@@ -818,10 +818,10 @@ class Event:
             # ── 用量广播 ──────────────────────────────────────────────────
             _usage = response.get('_usage')
             if _usage:
-                _turn_usage['prompt_tokens'] += _usage.get('prompt_tokens', 0)
-                _turn_usage['completion_tokens'] += _usage.get('completion_tokens', 0)
-                _turn_usage['total_tokens'] += _usage.get('total_tokens', 0)
-                _turn_usage['cached_tokens'] += _usage.get('cached_tokens', 0)
+                _turn_usage['prompt_tokens'] += _usage.get('prompt_tokens') or 0
+                _turn_usage['completion_tokens'] += _usage.get('completion_tokens') or 0
+                _turn_usage['total_tokens'] += _usage.get('total_tokens') or 0
+                _turn_usage['cached_tokens'] += _usage.get('cached_tokens') or 0
                 await push_event({'type': 'llm_usage', 'payload': _usage})
 
             # ── 工具调用 ──────────────────────────────────────────────────
