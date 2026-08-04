@@ -336,10 +336,8 @@ function _svcRowHTML({ item, id, s, latestTag, currentTag, hasUpdate }) {
     actions += `<button class="svc-btn svc-btn-remove" data-action="remove" data-driver-id="${id}">卸载</button>`;
   }
 
-  // Log button (always available for non-core)
-  if (item._cat !== 'core') {
-    actions += `<button class="svc-btn svc-btn-log" data-action="log" data-driver-id="${id}">日志</button>`;
-  }
+  // Log button (always available)
+  actions += `<button class="svc-btn svc-btn-log" data-action="log" data-driver-id="${id}">日志</button>`;
 
   const versionText = currentTag || (s.running_image?.split(':').pop()) || '—';
 
@@ -457,7 +455,7 @@ function _mpCardHTML(item) {
   const isInstalled = s && (s.running || s.last_deploy);
   const tags = item.tags || [];
   const imageBase = item.full_repo || item.image;
-  const desc = item.description || '';
+  const desc = item.description || (cat === 'perception' ? '语音感知套件 — ASR 语音识别 + TTS 语音合成 + VAD 静音检测 + 唤醒词检测' : '');
   const fullName = item.name || label;
 
   const versionOpts = tags.map(t => {
@@ -485,6 +483,7 @@ function _mpCardHTML(item) {
       ${desc ? `<div class="mp-card-desc">${_escHTML(desc)}</div>` : ''}
       <div class="mp-card-action">${installBtn}</div>
       <div class="mp-versions hidden">${versionOpts}</div>
+      <div class="mp-card-log hidden" id="mp-log-${driverId}"></div>
     </div>`;
 }
 
@@ -611,6 +610,7 @@ function _showDriverDetail(card) {
         ${isInstalled ? '<span class="mp-installed-badge" style="margin-top:8px;display:inline-block">已安装</span>' : ''}
       </div>
       ${desc ? `<div class="mp-detail-desc">${desc}</div>` : '<div class="mp-detail-desc" style="color:var(--text-dim)">暂无描述</div>'}
+      <div class="deploy-log hidden" id="mp-log-${driverId}"></div>
       <div class="mp-detail-versions">
         <div class="mp-detail-section-title">可用版本</div>
         ${versionsHTML || '<div style="color:var(--text-dim);font-size:12px">暂无版本</div>'}
@@ -634,6 +634,20 @@ function _showDriverDetail(card) {
       );
     });
   });
+
+  // Always fetch and show deploy logs on detail page
+  const logEl = document.getElementById(`mp-log-${driverId}`);
+  if (logEl) {
+    fetch(`/api/drivers/${driverId}/status`).then(r => r.json()).then(json => {
+      const logs = (json.data || {}).logs || '';
+      if (logs.trim()) {
+        const lines = logs.trim().split('\n');
+        logEl.innerHTML = `<div class="deploy-log-title">上次部署日志</div><pre class="log-output">${lines.join('\n')}</pre>`;
+        logEl.scrollTop = logEl.scrollHeight;
+        logEl.classList.remove('hidden');
+      }
+    }).catch(() => {});
+  }
 }
 
 // ══════════════════════════════════════════════════════════════════════════
@@ -859,7 +873,7 @@ async function _executeDeploys(entries) {
         _appendLog(driverId, `✗ 网络错误: ${e.message}`, 'error');
       }
     } else {
-      _showDeployLog(driverId, '正在请求部署…');
+      _showDeployLogAny(driverId, '正在请求部署…');
       try {
         const res = await fetch(`/api/drivers/${driverId}/deploy`, {
           method: 'POST',
@@ -868,13 +882,13 @@ async function _executeDeploys(entries) {
         });
         const json = await res.json();
         if (json.code !== 200) {
-          _appendLog(driverId, `✗ 错误: ${json.message || '未知错误'}`, 'error');
+          _appendLogAny(driverId, `✗ 错误: ${json.message || '未知错误'}`, 'error');
         } else {
-          _appendLog(driverId, '容器启动中…');
+          _appendLogAny(driverId, '镜像拉取中…');
           _startLogPolling(driverId);
         }
       } catch (e) {
-        _appendLog(driverId, `✗ 网络错误: ${e.message}`, 'error');
+        _appendLogAny(driverId, `✗ 网络错误: ${e.message}`, 'error');
       }
     }
   }
@@ -885,6 +899,23 @@ async function _executeDeploys(entries) {
 }
 
 // ── Deploy log (inline) ───────────────────────────────────────────────────
+
+function _ensureLogElement(driverId) {
+  if (document.getElementById(`log-${driverId}`)) return;
+  // Create a temporary card + log area for new installs
+  const container = document.getElementById('pane-my-services');
+  if (!container) return;
+  const html = `
+    <div class="svc-row" id="card-${driverId}">
+      <div class="svc-row-dot deploying" id="dot-${driverId}"></div>
+      <div class="svc-row-info">
+        <span class="svc-row-name">${driverId}</span>
+        <div class="svc-row-version-line"><span class="svc-row-version">部署中…</span></div>
+      </div>
+    </div>
+    <div class="deploy-log" id="log-${driverId}"></div>`;
+  container.insertAdjacentHTML('afterbegin', html);
+}
 
 async function _toggleLog(driverId) {
   const el = document.getElementById(`log-${driverId}`);
@@ -932,6 +963,42 @@ function _appendLog(driverId, msg, type = '') {
   el.scrollTop = el.scrollHeight;
 }
 
+// Variants that check both marketplace (mp-log-) and my-services (log-) elements
+function _getLogEl(driverId) {
+  return document.getElementById(`mp-log-${driverId}`) || document.getElementById(`log-${driverId}`);
+}
+
+function _isCardLog(el) {
+  return el && el.classList.contains('mp-card-log');
+}
+
+function _showDeployLogAny(driverId, msg) {
+  const el = _getLogEl(driverId);
+  if (!el) return;
+  el.textContent = msg;
+  el.classList.remove('hidden');
+}
+
+function _appendLogAny(driverId, msg, type = '') {
+  const el = _getLogEl(driverId);
+  if (!el) return;
+  if (_isCardLog(el)) {
+    // Single-line overwrite on card
+    el.textContent = msg;
+    if (type === 'error') { el.style.color = 'var(--red)'; }
+    else if (type === 'success') { el.style.color = 'var(--green)'; }
+    else { el.style.color = ''; }
+    el.classList.remove('hidden');
+  } else {
+    // Multi-line append on detail/my-services
+    const line = document.createElement('div');
+    line.className = 'deploy-log-line' + (type ? ` ${type}` : '');
+    line.textContent = msg;
+    el.appendChild(line);
+    el.scrollTop = el.scrollHeight;
+  }
+}
+
 function _startLogPolling(driverId) {
   if (_logPolls[driverId]) clearInterval(_logPolls[driverId]);
 
@@ -945,28 +1012,37 @@ function _startLogPolling(driverId) {
       const status = data.status || '';
       const logs   = data.logs   || '';
 
-      const el = document.getElementById(`log-${driverId}`);
+      const el = _getLogEl(driverId);
       if (el && logs) {
-        const lines = logs.trim().split('\n').slice(-20);
-        el.querySelectorAll('.log-output').forEach(e => e.remove());
-        const pre = document.createElement('pre');
-        pre.className = 'log-output';
-        pre.textContent = lines.join('\n');
-        el.appendChild(pre);
+        if (_isCardLog(el)) {
+          // Single-line: show last meaningful line
+          const lastLine = logs.trim().split('\n').filter(Boolean).pop() || '';
+          el.textContent = lastLine;
+          el.style.color = '';
+        } else {
+          // Multi-line: show full log
+          const lines = logs.trim().split('\n').slice(-30);
+          el.querySelectorAll('.log-output').forEach(e => e.remove());
+          const pre = document.createElement('pre');
+          pre.className = 'log-output';
+          pre.textContent = lines.join('\n');
+          el.appendChild(pre);
+          el.scrollTop = el.scrollHeight;
+        }
       }
 
       if (status === 'running') {
         _stopLogPolling(driverId);
-        _appendLog(driverId, '✓ 运行中', 'success');
+        _appendLogAny(driverId, '✓ 运行中', 'success');
         setTimeout(() => {
-          const logEl = document.getElementById(`log-${driverId}`);
+          const logEl = _getLogEl(driverId);
           if (logEl) logEl.classList.add('hidden');
         }, 5000);
         await _loadStatuses();
         _render();
       } else if (status === 'error' || attempts > 30) {
         _stopLogPolling(driverId);
-        _appendLog(driverId, `✗ ${status === 'error' ? (data.error || '启动失败') : '部署超时'}`, 'error');
+        _appendLogAny(driverId, `✗ ${status === 'error' ? (data.error || '启动失败') : '部署超时'}`, 'error');
       }
     } catch {
       // ignore

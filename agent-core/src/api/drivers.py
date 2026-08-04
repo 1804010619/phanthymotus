@@ -69,7 +69,7 @@ def _get_status_sync(driver_id: str) -> dict:
             return {'status': 'stopped', 'logs': deploy_log}
         c = containers[0]
         try:
-            logs = c.logs(tail=30).decode('utf-8', errors='replace')
+            logs = c.logs(tail=100).decode('utf-8', errors='replace')
         except Exception:
             logs = ''
         # Prepend deploy logs if available
@@ -265,7 +265,11 @@ def _deploy_sync_legacy(driver: dict) -> dict:
     run_kwargs['log_config'] = {'type': 'local'}
 
     _log_deploy(driver['id'], f'[run] {name}')
-    container = client.containers.run(**run_kwargs)
+    try:
+        container = client.containers.run(**run_kwargs)
+    except Exception as e:
+        _log_deploy(driver['id'], f'[error] {e}')
+        raise
     _log_deploy(driver['id'], f'[deploy] done, container={container.id[:12]}')
     return {'status': 'starting', 'container_id': container.id[:12]}
 
@@ -469,6 +473,7 @@ async def driver_deploy(driver_id: str, body: dict = fastapi.Body(default={})):
     try:
         result = await _run_in_executor(_deploy_sync, driver)
     except Exception as e:
+        _log_deploy(driver_id, f'[error] {e}')
         return {'code': 500, 'message': str(e)}
 
     # Persist updated image into manifest (so DB remembers last deployed image)

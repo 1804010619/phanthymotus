@@ -2557,6 +2557,33 @@ html, body {
   max-height: 240px;
   overflow-y: auto;
 }
+.mp-card .deploy-log {
+  border: none;
+  border-top: 1px solid var(--border);
+  border-radius: 0;
+  margin: 6px -14px -12px;
+  padding: 8px 14px;
+}
+.mp-card-log {
+  font-size: 10px;
+  color: var(--text-dim);
+  margin-top: 4px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  line-height: 1.6;
+}
+.mp-detail .deploy-log {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  margin: 10px 0;
+}
+.deploy-log-title {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-muted);
+  margin-bottom: 4px;
+}
 .deploy-log-line { line-height: 1.6; }
 .deploy-log-line.success { color: var(--green); }
 .deploy-log-line.error   { color: var(--red); }
