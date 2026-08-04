@@ -2039,6 +2039,9 @@ html, body {
 .svc-btn-remove { color: var(--text-dim); }
 .svc-btn-remove:hover:not(:disabled) { color: var(--red); border-color: var(--red); }
 
+.svc-btn-log { color: var(--text-dim); }
+.svc-btn-log:hover:not(:disabled) { color: var(--text); border-color: var(--border-med); }
+
 /* Version switcher in My Services */
 .svc-ver-wrap { position: relative; }
 .svc-btn-ver { color: var(--text-muted); }
@@ -2281,7 +2284,7 @@ html, body {
   overflow: hidden;
 }
 .mp-card-action {
-  margin-top: 4px;
+  margin-top: auto;
   text-align: center;
 }
 

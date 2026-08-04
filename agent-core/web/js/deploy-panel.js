@@ -239,6 +239,9 @@ function _renderMyServices() {
   container.querySelectorAll('[data-action="remove"]').forEach(btn => {
     btn.addEventListener('click', () => _removeDriver(btn.dataset.driverId, btn));
   });
+  container.querySelectorAll('[data-action="log"]').forEach(btn => {
+    btn.addEventListener('click', () => _toggleLog(btn.dataset.driverId));
+  });
   // Version switcher dropdowns
   container.querySelectorAll('[data-action="switch-version"]').forEach(btn => {
     btn.addEventListener('click', (e) => {
@@ -331,6 +334,11 @@ function _svcRowHTML({ item, id, s, latestTag, currentTag, hasUpdate }) {
       actions += `<button class="svc-btn svc-btn-start" data-action="start" data-driver-id="${id}" data-image="${lastImage}">启动</button>`;
     }
     actions += `<button class="svc-btn svc-btn-remove" data-action="remove" data-driver-id="${id}">卸载</button>`;
+  }
+
+  // Log button (always available for non-core)
+  if (item._cat !== 'core') {
+    actions += `<button class="svc-btn svc-btn-log" data-action="log" data-driver-id="${id}">日志</button>`;
   }
 
   const versionText = currentTag || (s.running_image?.split(':').pop()) || '—';
@@ -877,6 +885,35 @@ async function _executeDeploys(entries) {
 }
 
 // ── Deploy log (inline) ───────────────────────────────────────────────────
+
+async function _toggleLog(driverId) {
+  const el = document.getElementById(`log-${driverId}`);
+  if (!el) return;
+
+  if (!el.classList.contains('hidden')) {
+    el.classList.add('hidden');
+    return;
+  }
+
+  el.innerHTML = `<div class="deploy-log-line" style="color:var(--text-dim)">加载中…</div>`;
+  el.classList.remove('hidden');
+
+  try {
+    const res = await fetch(`/api/drivers/${driverId}/status`);
+    const json = await res.json();
+    const data = json.data || {};
+    const logs = data.logs || '';
+
+    if (logs.trim()) {
+      const lines = logs.trim().split('\n').slice(-20);
+      el.innerHTML = `<pre class="log-output">${lines.join('\n')}</pre>`;
+    } else {
+      el.innerHTML = `<div class="deploy-log-line" style="color:var(--text-dim)">暂无日志</div>`;
+    }
+  } catch {
+    el.innerHTML = `<div class="deploy-log-line error">获取日志失败</div>`;
+  }
+}
 
 function _showDeployLog(driverId, msg) {
   const el = document.getElementById(`log-${driverId}`);
