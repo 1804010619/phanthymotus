@@ -1,9 +1,9 @@
 /* ── Reset & Base ─────────────────────────────────────────────────────────── */
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
-@keyframes toast-fade {
-  0% { opacity: 0; transform: translate(-50%, -50%) scale(0.9); }
-  10% { opacity: 1; transform: translate(-50%, -50%) scale(1); }
+@keyframes canvas-toast-in {
+  0% { opacity: 0; transform: translateY(8px); }
+  12% { opacity: 1; transform: translateY(0); }
   80% { opacity: 1; }
   100% { opacity: 0; }
 }
@@ -6037,6 +6037,9 @@ html, body {
     padding: 4px 8px;
     font-size: 11px;
     gap: 5px;
+  }
+  #canvas-toast {
+    bottom: calc(56px + env(safe-area-inset-bottom, 0px) + 16px) !important;
   }
 }
 

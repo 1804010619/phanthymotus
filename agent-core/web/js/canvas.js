@@ -43,15 +43,14 @@ function _canEdit() {
 }
 
 function _showToast(msg) {
-  // Remove existing toast
   const old = document.getElementById('canvas-toast');
   if (old) old.remove();
   const toast = document.createElement('div');
   toast.id = 'canvas-toast';
   toast.textContent = msg;
-  toast.style.cssText = 'position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);background:rgba(0,0,0,.8);color:#fff;padding:12px 24px;border-radius:8px;font-size:14px;z-index:9999;pointer-events:none;animation:toast-fade 2.5s forwards;';
+  toast.style.cssText = 'position:fixed;bottom:80px;left:0;right:0;margin:auto;width:fit-content;max-width:80vw;background:rgba(28,25,23,.85);color:#fff;padding:10px 20px;border-radius:20px;font-size:13px;z-index:9999;pointer-events:none;opacity:0;animation:canvas-toast-in 2.5s ease forwards;';
   document.body.appendChild(toast);
-  setTimeout(() => toast.remove(), 2500);
+  setTimeout(() => toast.remove(), 2600);
 }
 
 // Connection state
