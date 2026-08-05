@@ -38,6 +38,7 @@ registry: dict[str, dict] = {}   # mcp_id → info
 _pending_actions: dict[str, asyncio.Event] = {}   # action_id → Event (set on completion)
 _pending_results: dict[str, dict] = {}            # action_id → completion payload
 _pending_timeouts: dict[str, float] = {}          # action_id → dynamic timeout (seconds)
+_pending_tools: dict[str, str] = {}               # action_id → tool_name (资源冲突检测用)
 
 
 # ── 内部 JSON-RPC 助手 ─────────────────────────────────────────────────────────
@@ -424,6 +425,8 @@ async def call_tool(full_name: str, args: dict) -> str:
             action_id = parsed_result.get('action_id')
             if action_id:
                 _pending_actions[action_id] = asyncio.Event()
+                # 记录该 pending 属于哪个工具（用于 barrier 资源冲突判断）
+                _pending_tools[action_id] = tool_name
                 # 动态 timeout：有 text 参数时按字数算（字数/3 + 5），否则用 schema 默认值
                 text_arg = args.get('text', '')
                 default_timeout = completion_spec.get('timeout', 120)
@@ -432,7 +435,7 @@ async def call_tool(full_name: str, args: dict) -> str:
                 else:
                     dynamic_timeout = default_timeout
                 _pending_timeouts[action_id] = dynamic_timeout
-                print(f'[acp] registered pending: {action_id} (tool={full_name}, timeout={dynamic_timeout:.0f}s)')
+                print(f'[acp] registered pending: {action_id} (tool={tool_name}, timeout={dynamic_timeout:.0f}s)')
         except (json.JSONDecodeError, IndexError):
             pass
 
@@ -504,19 +507,24 @@ def _should_await_completion(completion_spec: dict, action: str | None) -> bool:
     return action in actions_list
 
 
-async def await_pending(cancel_event: asyncio.Event | None = None, timeout: float = 120) -> dict:
-    """等待所有 pending actions 完成（actuator barrier 用）。timeout 取各 action 的动态值中的最大值。"""
-    if not _pending_actions:
+async def await_pending(cancel_event: asyncio.Event | None = None, timeout: float = 120,
+                        tool_name: str | None = None) -> dict:
+    """等待 pending actions 完成。如果指定 tool_name，只等该工具的 pending（资源冲突模式）。"""
+    if tool_name:
+        aids = get_pending_for_tool(tool_name)
+    else:
+        aids = list(_pending_actions.keys())
+
+    if not aids:
         return {"status": "no_pending"}
 
-    aids = list(_pending_actions.keys())
     events = [_pending_actions[aid] for aid in aids if aid in _pending_actions]
     if not events:
         return {"status": "no_pending"}
 
     # 取所有 pending action 中最大的 timeout
     effective_timeout = max(_pending_timeouts.get(aid, timeout) for aid in aids)
-    print(f'[acp] barrier: waiting for {aids} (timeout={effective_timeout:.0f}s)')
+    print(f'[acp] barrier: waiting for {aids} (tool={tool_name}, timeout={effective_timeout:.0f}s)')
 
     async def _wait_all():
         await asyncio.gather(*[ev.wait() for ev in events])
@@ -538,6 +546,7 @@ async def await_pending(cancel_event: asyncio.Event | None = None, timeout: floa
                     _pending_actions.pop(aid, None)
                     _pending_results.pop(aid, None)
                     _pending_timeouts.pop(aid, None)
+                    _pending_tools.pop(aid, None)
                 return {"status": "cancelled"}
         else:
             await asyncio.wait_for(_wait_all(), timeout=effective_timeout)
@@ -547,6 +556,7 @@ async def await_pending(cancel_event: asyncio.Event | None = None, timeout: floa
             _pending_actions.pop(aid, None)
             _pending_results.pop(aid, None)
             _pending_timeouts.pop(aid, None)
+            _pending_tools.pop(aid, None)
         print(f'[acp] barrier cleared: {aids}')
         return {"status": "completed", "actions": aids}
     except asyncio.TimeoutError:
@@ -554,6 +564,7 @@ async def await_pending(cancel_event: asyncio.Event | None = None, timeout: floa
             _pending_actions.pop(aid, None)
             _pending_results.pop(aid, None)
             _pending_timeouts.pop(aid, None)
+            _pending_tools.pop(aid, None)
         print(f'[acp] barrier timeout: {aids}')
         return {"status": "timeout", "actions": aids}
 
@@ -613,6 +624,11 @@ async def sync(action_ids: list[str] | None = None, timeout: float = 120,
 def get_pending_actions() -> list[str]:
     """返回当前所有 pending action_ids（供 prompt 展示）。"""
     return list(_pending_actions.keys())
+
+
+def get_pending_for_tool(tool_name: str) -> list[str]:
+    """返回指定工具的 pending action_ids（barrier 资源冲突用）。"""
+    return [aid for aid, tn in _pending_tools.items() if tn == tool_name and aid in _pending_actions]
 
 
 def cleanup_stale_actions(max_age_s: float = 300):

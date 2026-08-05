@@ -857,9 +857,22 @@ class Event:
                 if name in self._sys_tools:
                     result = await self._sys_tools[name]['object'](**args)
                 elif name.startswith('mcp__'):
-                    # ACP barrier: actuator/processor 工具 dispatch 前等待所有 pending 异步动作完成
+                    # ACP barrier: 只等同一工具的 pending（资源冲突模式）
+                    # 例：tts pending → 另一个 tts 等；navigate pending → tts 不等（可并行）
                     if mcp_client.get_pending_actions() and _needs_barrier(name):
-                        await mcp_client.await_pending(cancel_event, timeout=120)
+                        # 提取 tool_name（split 工具取原始工具名）
+                        _barrier_tool = None
+                        for _mid, _info in mcp_client.registry.items():
+                            _split = _info.get('split_map', {}).get(name)
+                            if _split:
+                                _barrier_tool = _split['tool']
+                                break
+                        if _barrier_tool is None:
+                            _parts = name.split('__', 2)
+                            _barrier_tool = _parts[2] if len(_parts) == 3 else name
+                        if mcp_client.get_pending_for_tool(_barrier_tool):
+                            await mcp_client.await_pending(cancel_event, timeout=120,
+                                                           tool_name=_barrier_tool)
                     args['_trace_id'] = _trace_id
                     args['_cancel_event'] = cancel_event
                     result = await mcp_client.call_tool(name, args)
