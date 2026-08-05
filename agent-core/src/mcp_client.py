@@ -413,7 +413,7 @@ async def call_tool(full_name: str, args: dict) -> str:
         except Exception:
             pass
 
-    # ── ACP: 异步工具注册 pending action ────────────────────────────────────────
+    # ── ACP: 异步工具 — 阻塞等待完成 ──────────────────────────────────────────
     action = args.get('action')
     meta = info.get('tool_meta', {}).get(full_name, {})
     completion_spec = meta.get('completion')
@@ -422,8 +422,40 @@ async def call_tool(full_name: str, args: dict) -> str:
             parsed_result = json.loads(texts[0]) if texts else {}
             action_id = parsed_result.get('action_id')
             if action_id:
-                _pending_actions[action_id] = asyncio.Event()
-                print(f'[acp] registered pending action: {action_id} (tool={full_name})')
+                ev = asyncio.Event()
+                _pending_actions[action_id] = ev
+                timeout_s = completion_spec.get('timeout', 120)
+                print(f'[acp] awaiting action: {action_id} (tool={full_name}, timeout={timeout_s}s)')
+                # 阻塞等待：直到 /api/acp/complete 回调 set 此 event
+                try:
+                    if cancel_event:
+                        # 支持用户打断
+                        wait_task = asyncio.create_task(ev.wait())
+                        cancel_task = asyncio.create_task(cancel_event.wait())
+                        done, pending = await asyncio.wait(
+                            [wait_task, cancel_task],
+                            timeout=timeout_s,
+                            return_when=asyncio.FIRST_COMPLETED,
+                        )
+                        for p in pending:
+                            p.cancel()
+                        if cancel_task in done:
+                            _pending_actions.pop(action_id, None)
+                            print(f'[acp] action {action_id} cancelled by user')
+                            return json.dumps({**parsed_result, "status": "cancelled"})
+                    else:
+                        await asyncio.wait_for(ev.wait(), timeout=timeout_s)
+                    # 完成：返回 completion 结果
+                    completion = _pending_results.pop(action_id, {})
+                    _pending_actions.pop(action_id, None)
+                    final_status = completion.get('status', 'completed')
+                    print(f'[acp] action {action_id} → {final_status}')
+                    return json.dumps({**parsed_result, "status": final_status,
+                                       "completion_result": completion.get('result', {})})
+                except asyncio.TimeoutError:
+                    _pending_actions.pop(action_id, None)
+                    print(f'[acp] action {action_id} timed out ({timeout_s}s)')
+                    return json.dumps({**parsed_result, "status": "timeout"})
         except (json.JSONDecodeError, IndexError):
             pass
 
