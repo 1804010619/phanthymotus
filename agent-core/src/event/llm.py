@@ -827,8 +827,8 @@ class Event:
             # ── 工具调用 ──────────────────────────────────────────────────
             tool_calls = response.get('tool_calls') or []
 
-            def _is_actuator_tool(name: str) -> bool:
-                """判断 MCP 工具是否为 actuator 类型（ACP barrier 检查用）。"""
+            def _needs_barrier(name: str) -> bool:
+                """actuator/processor 类型的 MCP 工具需要 ACP barrier。"""
                 if not name.startswith('mcp__'):
                     return False
                 mcp_id = name.split('__')[1]
@@ -836,7 +836,9 @@ class Event:
                 if not entry:
                     return False
                 meta = entry.get('tool_meta', {}).get(name)
-                return bool(meta and meta.get('type') == 'actuator')
+                if not meta:
+                    return True  # 无 meta 默认 barrier（安全）
+                return meta.get('type') in ('actuator', 'processor')
 
             async def _dispatch(call: dict) -> dict:
                 name   = call['function']['name']
@@ -855,8 +857,8 @@ class Event:
                 if name in self._sys_tools:
                     result = await self._sys_tools[name]['object'](**args)
                 elif name.startswith('mcp__'):
-                    # ACP barrier: actuator 工具 dispatch 前等待所有 pending 异步动作完成
-                    if mcp_client.get_pending_actions() and _is_actuator_tool(name):
+                    # ACP barrier: actuator/processor 工具 dispatch 前等待所有 pending 异步动作完成
+                    if mcp_client.get_pending_actions() and _needs_barrier(name):
                         await mcp_client.await_pending(cancel_event, timeout=120)
                     args['_trace_id'] = _trace_id
                     args['_cancel_event'] = cancel_event
