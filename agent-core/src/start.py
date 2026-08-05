@@ -445,7 +445,7 @@ app.include_router(api.inspection.ws_router)
 
 # ── ACP: 异步动作完成回调接口 ─────────────────────────────────────────────────
 
-@app.post('/api/acp/complete')
+@app_api.post('/acp/complete')
 async def acp_complete(request: fastapi.Request):
     """Driver 动作完成后回调此接口，通知 Agent Core 解锁 sync() 并注入 steering。"""
     body = await request.json()
