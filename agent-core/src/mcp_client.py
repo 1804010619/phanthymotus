@@ -509,12 +509,8 @@ def _should_await_completion(completion_spec: dict, action: str | None) -> bool:
 
 async def await_pending(cancel_event: asyncio.Event | None = None, timeout: float = 120,
                         tool_name: str | None = None) -> dict:
-    """等待 pending actions 完成。如果指定 tool_name，只等该工具的 pending（资源冲突模式）。"""
-    if tool_name:
-        aids = get_pending_for_tool(tool_name)
-    else:
-        aids = list(_pending_actions.keys())
-
+    """等待 pending actions 完成。全局 barrier：等所有 pending。"""
+    aids = list(_pending_actions.keys())
     if not aids:
         return {"status": "no_pending"}
 
@@ -524,7 +520,7 @@ async def await_pending(cancel_event: asyncio.Event | None = None, timeout: floa
 
     # 取所有 pending action 中最大的 timeout
     effective_timeout = max(_pending_timeouts.get(aid, timeout) for aid in aids)
-    print(f'[acp] barrier: waiting for {aids} (tool={tool_name}, timeout={effective_timeout:.0f}s)')
+    print(f'[acp] barrier: waiting for {aids} (timeout={effective_timeout:.0f}s)')
 
     async def _wait_all():
         await asyncio.gather(*[ev.wait() for ev in events])
