@@ -518,11 +518,13 @@ async def _do_ping(mcp_id: str) -> dict:
         if len(tool_schemas) == 1:
             schema = tool_schemas[0]
             schemas[schema['name']] = schema
-            action_enum = (tool.get('inputSchema') or {}).get('properties', {}).get('action', {}).get('enum')
+            raw_input_schema = tool.get('inputSchema') or {}
+            action_enum = raw_input_schema.get('properties', {}).get('action', {}).get('enum')
             tool_meta_map[schema['name']] = {
                 'type': tool.get('type'),
                 'action_enum': action_enum,
                 'has_config_schema': bool(tool.get('configSchema')),
+                'completion': raw_input_schema.get('x-completion'),
             }
         else:
             group = []
@@ -532,6 +534,7 @@ async def _do_ping(mcp_id: str) -> dict:
                     'type': tool.get('type'),
                     'action_enum': None,
                     'has_config_schema': bool(tool.get('configSchema')),
+                    'completion': (tool.get('inputSchema') or {}).get('x-completion'),
                 }
                 action_name = schema['name'].split('__')[-1]
                 split_map[schema['name']] = {
