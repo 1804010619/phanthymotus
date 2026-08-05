@@ -427,11 +427,11 @@ async def call_tool(full_name: str, args: dict) -> str:
                 _pending_actions[action_id] = asyncio.Event()
                 # 记录该 pending 属于哪个工具（用于 barrier 资源冲突判断）
                 _pending_tools[action_id] = tool_name
-                # 动态 timeout：有 text 参数时按字数算（字数/3 + 5），否则用 schema 默认值
+                # 动态 timeout：有 text 参数时按字数算（合成+播放: 字数/3 + 10s余量），否则用 schema 默认值
                 text_arg = args.get('text', '')
                 default_timeout = completion_spec.get('timeout', 120)
                 if text_arg:
-                    dynamic_timeout = len(text_arg) / 3 + 5
+                    dynamic_timeout = len(text_arg) / 3 + 10
                 else:
                     dynamic_timeout = default_timeout
                 _pending_timeouts[action_id] = dynamic_timeout
