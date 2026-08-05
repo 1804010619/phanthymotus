@@ -413,7 +413,7 @@ async def call_tool(full_name: str, args: dict) -> str:
         except Exception:
             pass
 
-    # ── ACP: 异步工具 — 阻塞等待完成 ──────────────────────────────────────────
+    # ── ACP: 异步工具 — 注册 pending，立即返回（barrier 在 _dispatch 层）────────
     action = args.get('action')
     meta = info.get('tool_meta', {}).get(full_name, {})
     completion_spec = meta.get('completion')
@@ -422,40 +422,8 @@ async def call_tool(full_name: str, args: dict) -> str:
             parsed_result = json.loads(texts[0]) if texts else {}
             action_id = parsed_result.get('action_id')
             if action_id:
-                ev = asyncio.Event()
-                _pending_actions[action_id] = ev
-                timeout_s = completion_spec.get('timeout', 120)
-                print(f'[acp] awaiting action: {action_id} (tool={full_name}, timeout={timeout_s}s)')
-                # 阻塞等待：直到 /api/acp/complete 回调 set 此 event
-                try:
-                    if cancel_event:
-                        # 支持用户打断
-                        wait_task = asyncio.create_task(ev.wait())
-                        cancel_task = asyncio.create_task(cancel_event.wait())
-                        done, pending = await asyncio.wait(
-                            [wait_task, cancel_task],
-                            timeout=timeout_s,
-                            return_when=asyncio.FIRST_COMPLETED,
-                        )
-                        for p in pending:
-                            p.cancel()
-                        if cancel_task in done:
-                            _pending_actions.pop(action_id, None)
-                            print(f'[acp] action {action_id} cancelled by user')
-                            return json.dumps({**parsed_result, "status": "cancelled"})
-                    else:
-                        await asyncio.wait_for(ev.wait(), timeout=timeout_s)
-                    # 完成：返回 completion 结果
-                    completion = _pending_results.pop(action_id, {})
-                    _pending_actions.pop(action_id, None)
-                    final_status = completion.get('status', 'completed')
-                    print(f'[acp] action {action_id} → {final_status}')
-                    return json.dumps({**parsed_result, "status": final_status,
-                                       "completion_result": completion.get('result', {})})
-                except asyncio.TimeoutError:
-                    _pending_actions.pop(action_id, None)
-                    print(f'[acp] action {action_id} timed out ({timeout_s}s)')
-                    return json.dumps({**parsed_result, "status": "timeout"})
+                _pending_actions[action_id] = asyncio.Event()
+                print(f'[acp] registered pending: {action_id} (tool={full_name})')
         except (json.JSONDecodeError, IndexError):
             pass
 
@@ -525,6 +493,55 @@ def _should_await_completion(completion_spec: dict, action: str | None) -> bool:
     if not actions_list:
         return True  # 无 filter → 所有 action 都是异步的
     return action in actions_list
+
+
+async def await_pending(cancel_event: asyncio.Event | None = None, timeout: float = 120) -> dict:
+    """等待所有 pending actions 完成（actuator barrier 用）。"""
+    if not _pending_actions:
+        return {"status": "no_pending"}
+
+    aids = list(_pending_actions.keys())
+    events = [_pending_actions[aid] for aid in aids if aid in _pending_actions]
+    if not events:
+        return {"status": "no_pending"}
+
+    print(f'[acp] barrier: waiting for {aids}')
+
+    async def _wait_all():
+        await asyncio.gather(*[ev.wait() for ev in events])
+
+    try:
+        if cancel_event:
+            wait_task = asyncio.create_task(_wait_all())
+            cancel_task = asyncio.create_task(cancel_event.wait())
+            done, pending = await asyncio.wait(
+                [wait_task, cancel_task],
+                timeout=timeout,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            for p in pending:
+                p.cancel()
+            if cancel_task in done:
+                # 用户打断：清理所有 pending
+                for aid in aids:
+                    _pending_actions.pop(aid, None)
+                    _pending_results.pop(aid, None)
+                return {"status": "cancelled"}
+        else:
+            await asyncio.wait_for(_wait_all(), timeout=timeout)
+
+        # 清理已完成的
+        for aid in aids:
+            _pending_actions.pop(aid, None)
+            _pending_results.pop(aid, None)
+        print(f'[acp] barrier cleared: {aids}')
+        return {"status": "completed", "actions": aids}
+    except asyncio.TimeoutError:
+        for aid in aids:
+            _pending_actions.pop(aid, None)
+            _pending_results.pop(aid, None)
+        print(f'[acp] barrier timeout: {aids}')
+        return {"status": "timeout", "actions": aids}
 
 
 async def sync(action_ids: list[str] | None = None, timeout: float = 120,
