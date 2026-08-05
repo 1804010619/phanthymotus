@@ -1,5 +1,6 @@
 import contextlib
 import asyncio
+import json
 import logging
 import pathlib
 import shutil
@@ -441,6 +442,36 @@ import api.motus_stream
 app.include_router(api.motus_stream.router)
 
 app.include_router(api.inspection.ws_router)
+
+# ── ACP: 异步动作完成回调接口 ─────────────────────────────────────────────────
+
+@app.post('/api/acp/complete')
+async def acp_complete(request: fastapi.Request):
+    """Driver 动作完成后回调此接口，通知 Agent Core 解锁 sync() 并注入 steering。"""
+    body = await request.json()
+    action_id = body.get('action_id')
+    status = body.get('status', 'completed')
+    result = body.get('result', {})
+
+    if not action_id:
+        return {'ok': False, 'error': 'action_id required'}
+
+    # 通道1: 解锁 sync() 等待
+    if action_id in mcp_client._pending_actions:
+        mcp_client._pending_results[action_id] = body
+        mcp_client._pending_actions[action_id].set()
+
+    # 通道2: 进 event_bus → steering 注入 LLM
+    import event_bus
+    await event_bus.enqueue(
+        source=f'acp:{action_id}',
+        text=json.dumps({'type': 'action_complete', 'action_id': action_id,
+                         'status': status, 'result': result}, ensure_ascii=False),
+        payload={'type': 'action_complete', 'action_id': action_id,
+                 'status': status, 'result': result},
+    )
+
+    return {'ok': True, 'action_id': action_id}
 
 # ── Remote Audio: convert file to PCM-16k and publish to ROS2 ──────────────────
 _audio_pub = None

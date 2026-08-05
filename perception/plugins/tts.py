@@ -380,19 +380,32 @@ class _TTSNode(Node):
                 except Exception:
                     pass
 
-                # ACP: 推送动作完成 SSE 事件
+                # ACP: 推送动作完成回调到 Agent Core
                 if _action_id:
                     try:
-                        from main import sse_push
+                        import urllib.request as _urllib
+                        import ssl as _ssl
+                        import os as _os
+                        _agent_core_url = _os.environ.get("AGENT_CORE_URL", "https://localhost:15678")
+                        _ctx = _ssl.create_default_context()
+                        _ctx.check_hostname = False
+                        _ctx.verify_mode = _ssl.CERT_NONE
                         was_interrupted = self._interrupt_flag.is_set()
-                        sse_push({
-                            "type": "action_complete",
+                        _payload = json.dumps({
                             "action_id": _action_id,
                             "status": "cancelled" if was_interrupted else "completed",
                             "result": {"text": text[:100], "frames": frames_sent},
-                        })
-                    except Exception:
-                        pass
+                        }).encode()
+                        _req = _urllib.Request(
+                            f"{_agent_core_url}/api/acp/complete",
+                            data=_payload,
+                            headers={"Content-Type": "application/json"},
+                            method="POST",
+                        )
+                        _urllib.urlopen(_req, timeout=3, context=_ctx)
+                        log.info(f"[tts] ACP complete: {_action_id} ({'cancelled' if was_interrupted else 'completed'})")
+                    except Exception as e:
+                        log.warning(f"[tts] ACP callback failed: {e}")
             except Exception as e:
                 log.error(f"[tts] synthesis error: {e}", exc_info=True)
 
