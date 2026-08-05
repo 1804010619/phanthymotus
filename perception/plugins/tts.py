@@ -59,7 +59,11 @@ TOOLS = [
                     "description": "Text to synthesize (required for action=speak)"
                 },
             },
-            "required": ["action"]
+            "required": ["action"],
+            "x-completion": {
+                "actions": ["speak"],
+                "timeout": 60
+            }
         },
         "configSchema": {
             "type": "object",
@@ -223,10 +227,10 @@ class _TTSNode(Node):
         log.info(f"[tts] interrupted: cleared {cleared} queued item(s)")
         return {"status": "interrupted", "cleared": cleared}
 
-    def enqueue(self, text: str, trace_id: str = ''):
+    def enqueue(self, text: str, trace_id: str = '', action_id: str = ''):
         if self.state != "running":
             raise RuntimeError("TTS not running; call start first")
-        self._text_queue.put((text, trace_id))
+        self._text_queue.put((text, trace_id, action_id))
 
     def _text_cb(self, msg: String):
         if self.state != "running": return
@@ -251,11 +255,17 @@ class _TTSNode(Node):
                 item = self._text_queue.get(timeout=1)
             except queue.Empty:
                 continue
-            # Unpack queue item: (text, trace_id) or plain text for backward compat
+            # Unpack queue item: (text, trace_id, action_id) or legacy formats
             if isinstance(item, tuple):
-                text, _trace_id = item
+                if len(item) == 3:
+                    text, _trace_id, _action_id = item
+                elif len(item) == 2:
+                    text, _trace_id = item
+                    _action_id = ''
+                else:
+                    text, _trace_id, _action_id = str(item[0]), '', ''
             else:
-                text, _trace_id = item, ''
+                text, _trace_id, _action_id = item, '', ''
             try:
                 import time as _time
                 t_start = _time.monotonic()
@@ -369,6 +379,33 @@ class _TTSNode(Node):
                         self._perf_pub.publish(perf_msg)
                 except Exception:
                     pass
+
+                # ACP: 推送动作完成回调到 Agent Core
+                if _action_id:
+                    try:
+                        import urllib.request as _urllib
+                        import ssl as _ssl
+                        import os as _os
+                        _agent_core_url = _os.environ.get("AGENT_CORE_URL", "https://localhost:15678")
+                        _ctx = _ssl.create_default_context()
+                        _ctx.check_hostname = False
+                        _ctx.verify_mode = _ssl.CERT_NONE
+                        was_interrupted = self._interrupt_flag.is_set()
+                        _payload = json.dumps({
+                            "action_id": _action_id,
+                            "status": "cancelled" if was_interrupted else "completed",
+                            "result": {"text": text[:100], "frames": frames_sent},
+                        }).encode()
+                        _req = _urllib.Request(
+                            f"{_agent_core_url}/api/acp/complete",
+                            data=_payload,
+                            headers={"Content-Type": "application/json"},
+                            method="POST",
+                        )
+                        _urllib.urlopen(_req, timeout=3, context=_ctx)
+                        log.info(f"[tts] ACP complete: {_action_id} ({'cancelled' if was_interrupted else 'completed'})")
+                    except Exception as e:
+                        log.warning(f"[tts] ACP callback failed: {e}")
             except Exception as e:
                 log.error(f"[tts] synthesis error: {e}", exc_info=True)
 
@@ -547,8 +584,11 @@ class TTSPlugin:
                     node = self._nodes[node_key]
                 if node.state != "running":
                     node.start()
-            node.enqueue(text, trace_id=args.get('_trace_id', ''))
-            return {"status": "queued", "text": text}
+            # ACP: 生成 action_id
+            import uuid as _uuid
+            action_id = f"speak-{_uuid.uuid4().hex[:8]}"
+            node.enqueue(text, trace_id=args.get('_trace_id', ''), action_id=action_id)
+            return {"status": "queued", "action_id": action_id, "text": text}
 
         elif action == "config":
             cfg = {k: v for k, v in args.items() if k not in ('action', 'instance_id') and v}

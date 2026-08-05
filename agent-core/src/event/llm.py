@@ -827,6 +827,19 @@ class Event:
             # ── 工具调用 ──────────────────────────────────────────────────
             tool_calls = response.get('tool_calls') or []
 
+            def _needs_barrier(name: str) -> bool:
+                """actuator/processor 类型的 MCP 工具需要 ACP barrier。"""
+                if not name.startswith('mcp__'):
+                    return False
+                mcp_id = name.split('__')[1]
+                entry = mcp_client.registry.get(mcp_id)
+                if not entry:
+                    return False
+                meta = entry.get('tool_meta', {}).get(name)
+                if not meta:
+                    return True  # 无 meta 默认 barrier（安全）
+                return meta.get('type') not in ('sensor', 'resource')
+
             async def _dispatch(call: dict) -> dict:
                 name   = call['function']['name']
                 args   = json.loads(call['function']['arguments'] or '{}')
@@ -844,7 +857,11 @@ class Event:
                 if name in self._sys_tools:
                     result = await self._sys_tools[name]['object'](**args)
                 elif name.startswith('mcp__'):
+                    # ACP barrier: 有 pending 时，非 sensor/resource 工具等待所有 pending 完成
+                    if mcp_client.get_pending_actions() and _needs_barrier(name):
+                        await mcp_client.await_pending(cancel_event, timeout=120)
                     args['_trace_id'] = _trace_id
+                    args['_cancel_event'] = cancel_event
                     result = await mcp_client.call_tool(name, args)
                 else:
                     result = f'未知工具: {name}'

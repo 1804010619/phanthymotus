@@ -75,6 +75,9 @@ async def auth_middleware(request: Request, call_next):
     # MCP registration from driver containers
     if path == '/api/mcp' and request.method == 'POST':
         return await call_next(request)
+    # ACP completion callback from driver containers
+    if path == '/api/acp/complete' and request.method == 'POST':
+        return await call_next(request)
     # /ws/mic stays open (internal browser mic)
     if path == '/ws/mic':
         return await call_next(request)
