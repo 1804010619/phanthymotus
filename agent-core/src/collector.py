@@ -55,8 +55,15 @@ def _extract_priority(ev: dict) -> int:
             p = data.get('priority')
             if p is not None:
                 return int(p)
+            # ACP: action_complete 事件自动为 P>0（需要 steering 注入 LLM turn）
+            if data.get('type') == 'action_complete':
+                return 1
         except (ValueError, TypeError):
             pass
+    # ACP: payload 中的 action_complete 也处理
+    payload = ev.get('payload', {})
+    if isinstance(payload, dict) and payload.get('type') == 'action_complete':
+        return 1
     source = ev.get('source', '').lower()
     for key in _PRIORITY_SOURCES:
         if key in source:

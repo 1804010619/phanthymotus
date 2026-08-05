@@ -309,6 +309,24 @@ async def _raw_input_info(
 
 _event_instance: 'Event | None' = None
 
+# ── ACP sync 系统工具 ──────────────────────────────────────────────────────────
+
+_acp_cancel_event: asyncio.Event | None = None  # 由 _one_turn 设置
+
+
+async def _acp_sync(
+    action_ids: typing.Annotated[str, "要等待的 action_id 列表（逗号分隔），留空则等待全部"] = '',
+    timeout: typing.Annotated[int, "最大等待秒数，默认 120"] = 120,
+) -> str:
+    """等待异步动作完成。当发起了异步动作（如 speak、navigate）后，调用此工具等待其完成。"""
+    ids = [s.strip() for s in action_ids.split(',') if s.strip()] if action_ids else None
+    result = await mcp_client.sync(
+        action_ids=ids,
+        timeout=float(timeout),
+        cancel_event=_acp_cancel_event,
+    )
+    return json.dumps(result, ensure_ascii=False)
+
 
 def get_recent_context(max_turns: int = 5) -> str:
     """返回最近 N 轮 main agent 的 assistant 输出摘要，供 bg subagent 同步上下文。"""
@@ -425,6 +443,10 @@ class Event:
             ('WebFetch', self._desktop_tools.WebFetch),
             ('WebSearch', self._desktop_tools.WebSearch),
         ])
+        # 注册 ACP sync 系统工具
+        self._sys_tools.update(_build_system_tools([
+            ('sync', _acp_sync),
+        ]))
         # 连接并注册所有 MCP 工具
         await mcp_client.init_all()
         # 恢复持久化的活跃任务及其定时检查
@@ -626,6 +648,10 @@ class Event:
 
         # Reset Python sandbox namespace for this turn
         self._desktop_tools.reset_python_namespace()
+
+        # ACP: 设置当前 turn 的 cancel_event 供 sync() 使用
+        global _acp_cancel_event
+        _acp_cancel_event = cancel_event
 
         # 性能追踪（开放 span 式）
         _trace_id = str(uuid4())
@@ -845,6 +871,7 @@ class Event:
                     result = await self._sys_tools[name]['object'](**args)
                 elif name.startswith('mcp__'):
                     args['_trace_id'] = _trace_id
+                    args['_cancel_event'] = cancel_event
                     result = await mcp_client.call_tool(name, args)
                 else:
                     result = f'未知工具: {name}'
