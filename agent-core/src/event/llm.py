@@ -838,7 +838,7 @@ class Event:
                 meta = entry.get('tool_meta', {}).get(name)
                 if not meta:
                     return True  # 无 meta 默认 barrier（安全）
-                return meta.get('type') in ('actuator', 'processor')
+                return meta.get('type') not in ('sensor', 'resource')
 
             async def _dispatch(call: dict) -> dict:
                 name   = call['function']['name']
