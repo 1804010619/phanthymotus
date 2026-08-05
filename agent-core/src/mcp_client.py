@@ -37,6 +37,7 @@ registry: dict[str, dict] = {}   # mcp_id → info
 # ── ACP: 异步动作完成协议 ──────────────────────────────────────────────────────
 _pending_actions: dict[str, asyncio.Event] = {}   # action_id → Event (set on completion)
 _pending_results: dict[str, dict] = {}            # action_id → completion payload
+_pending_timeouts: dict[str, float] = {}          # action_id → dynamic timeout (seconds)
 
 
 # ── 内部 JSON-RPC 助手 ─────────────────────────────────────────────────────────
@@ -423,7 +424,15 @@ async def call_tool(full_name: str, args: dict) -> str:
             action_id = parsed_result.get('action_id')
             if action_id:
                 _pending_actions[action_id] = asyncio.Event()
-                print(f'[acp] registered pending: {action_id} (tool={full_name})')
+                # 动态 timeout：有 text 参数时按字数算（字数/3 + 5），否则用 schema 默认值
+                text_arg = args.get('text', '')
+                default_timeout = completion_spec.get('timeout', 120)
+                if text_arg:
+                    dynamic_timeout = len(text_arg) / 3 + 5
+                else:
+                    dynamic_timeout = default_timeout
+                _pending_timeouts[action_id] = dynamic_timeout
+                print(f'[acp] registered pending: {action_id} (tool={full_name}, timeout={dynamic_timeout:.0f}s)')
         except (json.JSONDecodeError, IndexError):
             pass
 
@@ -496,7 +505,7 @@ def _should_await_completion(completion_spec: dict, action: str | None) -> bool:
 
 
 async def await_pending(cancel_event: asyncio.Event | None = None, timeout: float = 120) -> dict:
-    """等待所有 pending actions 完成（actuator barrier 用）。"""
+    """等待所有 pending actions 完成（actuator barrier 用）。timeout 取各 action 的动态值中的最大值。"""
     if not _pending_actions:
         return {"status": "no_pending"}
 
@@ -505,7 +514,9 @@ async def await_pending(cancel_event: asyncio.Event | None = None, timeout: floa
     if not events:
         return {"status": "no_pending"}
 
-    print(f'[acp] barrier: waiting for {aids}')
+    # 取所有 pending action 中最大的 timeout
+    effective_timeout = max(_pending_timeouts.get(aid, timeout) for aid in aids)
+    print(f'[acp] barrier: waiting for {aids} (timeout={effective_timeout:.0f}s)')
 
     async def _wait_all():
         await asyncio.gather(*[ev.wait() for ev in events])
@@ -516,7 +527,7 @@ async def await_pending(cancel_event: asyncio.Event | None = None, timeout: floa
             cancel_task = asyncio.create_task(cancel_event.wait())
             done, pending = await asyncio.wait(
                 [wait_task, cancel_task],
-                timeout=timeout,
+                timeout=effective_timeout,
                 return_when=asyncio.FIRST_COMPLETED,
             )
             for p in pending:
@@ -526,20 +537,23 @@ async def await_pending(cancel_event: asyncio.Event | None = None, timeout: floa
                 for aid in aids:
                     _pending_actions.pop(aid, None)
                     _pending_results.pop(aid, None)
+                    _pending_timeouts.pop(aid, None)
                 return {"status": "cancelled"}
         else:
-            await asyncio.wait_for(_wait_all(), timeout=timeout)
+            await asyncio.wait_for(_wait_all(), timeout=effective_timeout)
 
         # 清理已完成的
         for aid in aids:
             _pending_actions.pop(aid, None)
             _pending_results.pop(aid, None)
+            _pending_timeouts.pop(aid, None)
         print(f'[acp] barrier cleared: {aids}')
         return {"status": "completed", "actions": aids}
     except asyncio.TimeoutError:
         for aid in aids:
             _pending_actions.pop(aid, None)
             _pending_results.pop(aid, None)
+            _pending_timeouts.pop(aid, None)
         print(f'[acp] barrier timeout: {aids}')
         return {"status": "timeout", "actions": aids}
 
