@@ -330,12 +330,18 @@ class SubagentManager:
         print(f'[subagent:{agent_id}] preempted and suspended')
 
     async def _timeout_watchdog(self, agent_id: str, timeout_s: float):
-        """Cancel agent after timeout."""
-        await asyncio.sleep(timeout_s)
-        agent = self._agents.get(agent_id)
-        if agent and agent.status == STATUS_RUNNING:
-            print(f'[subagent:{agent_id}] timeout after {timeout_s}s')
-            agent.cancel()
+        """Cancel agent if idle (no progress) for timeout_s seconds."""
+        idle_timeout = timeout_s  # timeout_s 现在是"无进展超时"而非绝对超时
+        while True:
+            await asyncio.sleep(30)  # 每 30 秒检查一次
+            agent = self._agents.get(agent_id)
+            if not agent or agent.status != STATUS_RUNNING:
+                return
+            idle_time = time.time() - agent.updated_at
+            if idle_time >= idle_timeout:
+                print(f'[subagent:{agent_id}] idle timeout: no progress for {idle_time:.0f}s')
+                agent.cancel()
+                return
 
     # ── Lifecycle Helpers ─────────────────────────────────────────────────────
 
