@@ -80,7 +80,7 @@ async def fire(hook_id: str, extra_params: dict | None = None) -> list[dict]:
     Returns:
         List of results from each binding execution.
     """
-    from src import mcp_client  # deferred to avoid circular import
+    import mcp_client  # deferred to avoid circular import
 
     bindings = _registry.get(hook_id, [])
     if not bindings:
