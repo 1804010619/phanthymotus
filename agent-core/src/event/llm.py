@@ -946,7 +946,7 @@ class Event:
                     s_source = sev.get('source', '')
                     turn_messages.append({
                         'role': 'user',
-                        'content': f'[用户插入消息 source={s_source}]\n{s_text}',
+                        'content': f'[system notification source={s_source}]\n{s_text}',
                     })
                 await push_event({'type': 'turn_steered', 'payload': {
                     'count': len(steered),
