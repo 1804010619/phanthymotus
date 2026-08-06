@@ -61,7 +61,7 @@ _DB_DEFAULTS = {
             'tier1_turns': 6,                   # tiered retention: 全量保留最近 N 轮
             'tier2_turns': 8,                   # tiered retention: 降质保留再往前 N 轮
             'summary_max_chars': 5000,          # rolling summary 最大字符数
-            'turn_compact_threshold': 30,       # turn 内消息超过此数触发 compaction
+            'turn_compact_threshold': 20,       # turn 内消息超过此数触发 compaction
             'turn_compact_keep_recent': 12,     # turn 内 compaction 保留最近 N 条完整
             'save_compact_chars': 500,          # turn 保存时 tool result 截断到此长度
             'source_ring_size': 50,             # per-source ring buffer 大小（供 raw_input_info 查询）
