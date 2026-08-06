@@ -889,7 +889,7 @@ class Event:
                     args['_trace_id'] = _trace_id
                     args['_cancel_event'] = cancel_event
                     result = await mcp_client.call_tool(name, args)
-                    # interrupt hook 绑定的工具执行后，清掉 pending（被打断的动作不会再 callback）
+                    # interrupt hook 绑定的工具执行后：清 pending + 通知其他绑定方
                     if not _needs_barrier(name) and mcp_client.get_pending_actions():
                         import hooks as _hooks
                         parts = name.split('__')
@@ -901,7 +901,11 @@ class Event:
                         if _hooks.is_interrupt_binding(_mcp_id, _tool, _act):
                             for aid in list(mcp_client._pending_actions.keys()):
                                 mcp_client._pending_actions[aid].set()
-                            print(f'[acp] cleared pending after hook-registered interrupt: {_tool}.{_act}')
+                            # Fire hook to notify ALL registered parties (e.g. perception TTS)
+                            _hook_id = _hooks.get_hook_for_binding(_mcp_id, _tool, _act)
+                            if _hook_id:
+                                asyncio.create_task(_hooks.fire(_hook_id, exclude_mcp_id=_mcp_id))
+                            print(f'[acp] interrupt: cleared pending + fired {_hook_id} (source: {_tool}.{_act})')
                 else:
                     result = f'未知工具: {name}'
 

@@ -80,14 +80,24 @@ def is_interrupt_binding(mcp_id: str, tool: str, action: str) -> bool:
     return False
 
 
+def get_hook_for_binding(mcp_id: str, tool: str, action: str) -> str | None:
+    """Find the hook_id that a tool+action is registered under."""
+    for hook_id, bindings in _registry.items():
+        for b in bindings:
+            if b.mcp_id == mcp_id and b.tool == tool and b.action == action:
+                return hook_id
+    return None
+
+
 # ── Executor ─────────────────────────────────────────────────────────────────
 
-async def fire(hook_id: str, extra_params: dict | None = None) -> list[dict]:
+async def fire(hook_id: str, extra_params: dict | None = None, exclude_mcp_id: str | None = None) -> list[dict]:
     """Fire a hook: execute all bound tool calls immediately, bypassing LLM and barrier.
 
     Args:
         hook_id: Hook identifier (e.g. "on_interrupt_all")
         extra_params: Additional params merged into each tool call
+        exclude_mcp_id: Skip bindings from this mcp_id (avoid double-fire)
 
     Returns:
         List of results from each binding execution.
@@ -95,6 +105,8 @@ async def fire(hook_id: str, extra_params: dict | None = None) -> list[dict]:
     import mcp_client  # deferred to avoid circular import
 
     bindings = _registry.get(hook_id, [])
+    if exclude_mcp_id:
+        bindings = [b for b in bindings if b.mcp_id != exclude_mcp_id]
     if not bindings:
         return []
 
