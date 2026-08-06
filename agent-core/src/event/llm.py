@@ -657,6 +657,16 @@ class Event:
     def _save_current_turn(self, trigger_event: dict):
         """保存 _current_turn 到内存历史 + SQLite。"""
         turn = self._current_turn
+        # 保存前 compact：截断大 tool results，减少 tier1 历史占用
+        llm_cfg = config.main.get('event', {}).get('llm', {})
+        save_compact_limit = llm_cfg.get('save_compact_chars', 500)
+        for i, msg in enumerate(turn):
+            if msg.get('role') == 'tool':
+                content = msg.get('content', '')
+                if isinstance(content, str) and len(content) > save_compact_limit:
+                    turn[i] = {**msg, 'content': content[:save_compact_limit] + '...(trimmed)'}
+                elif isinstance(content, list):
+                    turn[i] = {**msg, 'content': '(多模态内容已省略)'}
         self._turns.append(turn)
         # 持久化（延迟创建 session）
         import chat_history
