@@ -181,6 +181,38 @@ The platform can optionally connect to a [Resource Center](https://motus.phanthy
 
 Configure via the `RESOURCE_CENTER_URL` environment variable.
 
+## System Hooks
+
+System hooks provide **instant, bypass-LLM actions** for time-critical responses. Drivers declare hook bindings via `x-hooks` in their MCP tool schema; Agent Core fires them directly on system events without waiting for LLM or ACP barrier.
+
+### Architecture
+
+```
+System Event (ASR arrives / LLM starts / error)
+  → Agent Core hooks.fire("on_thinking")
+  → call_tool_direct() to driver (bypasses barrier + ACP)
+  → Driver executes immediately (LED effect, interrupt, etc.)
+```
+
+### Available Hooks
+
+| Hook | Trigger | Example |
+|------|---------|---------|
+| `on_hearing` | Voice activity detected | LED blink blue |
+| `on_kws_wakeup` | Wake word detected | LED solid blue 2s |
+| `on_thinking` | LLM inference starts | LED rainbow breathe |
+| `on_error` | LLM failure | LED red flash 5s |
+| `on_interrupt_all` | User barge-in | Stop TTS + motion |
+
+### API
+
+```bash
+POST /api/hooks/fire  {"hook": "on_interrupt_all"}
+GET  /api/hooks       # list all registered hooks
+```
+
+See [phanthymotus-driver/README_dev.md](../phanthymotus-driver/README_dev.md) for driver implementation guide.
+
 ## Contributing
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for development setup, architecture details, and guidelines.
