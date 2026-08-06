@@ -230,7 +230,35 @@ class _TTSNode(Node):
     def enqueue(self, text: str, trace_id: str = '', action_id: str = ''):
         if self.state != "running":
             raise RuntimeError("TTS not running; call start first")
-        self._text_queue.put((text, trace_id, action_id))
+        # 分段：超过 280 字按标点切分，避免超长合成导致延迟或失败
+        segments = self._split_text(text, max_chars=280)
+        if len(segments) <= 1:
+            self._text_queue.put((text, trace_id, action_id))
+        else:
+            # 只有最后一段带 action_id（触发 ACP callback）
+            for i, seg in enumerate(segments):
+                is_last = (i == len(segments) - 1)
+                self._text_queue.put((seg, trace_id, action_id if is_last else ''))
+            log.info(f"[tts] split {len(text)} chars into {len(segments)} segments")
+
+    @staticmethod
+    def _split_text(text: str, max_chars: int = 280) -> list:
+        """按标点分段，每段不超过 max_chars 字。"""
+        import re as _re
+        sentences = _re.split(r'(?<=[。！？；\n])', text)
+        segments = []
+        current = ""
+        for sent in sentences:
+            if not sent:
+                continue
+            if len(current) + len(sent) > max_chars and current:
+                segments.append(current)
+                current = sent
+            else:
+                current += sent
+        if current:
+            segments.append(current)
+        return segments if segments else [text]
 
     def _text_cb(self, msg: String):
         if self.state != "running": return
