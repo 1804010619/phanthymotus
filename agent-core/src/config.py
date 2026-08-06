@@ -56,8 +56,11 @@ _DB_DEFAULTS = {
             'history_turns': 30,
             'max_rounds': 100,                  # 单 turn 触发截断续跑的轮数阈值
             'truncate_keep_rounds': 50,         # 截断时保留最新消息条数
-            'compress_threshold_chars': 80000,  # 约 20K tokens，超过此字符数触发压缩
-            'compress_keep_recent': 6,          # 压缩时保留最近 N 轮不动
+            'compress_threshold_chars': 80000,  # 约 20K tokens，超过此字符数触发压缩（兜底）
+            'compress_keep_recent': 6,          # 压缩时保留最近 N 轮不动（旧逻辑兼容）
+            'tier1_turns': 6,                   # tiered retention: 全量保留最近 N 轮
+            'tier2_turns': 8,                   # tiered retention: 降质保留再往前 N 轮
+            'summary_max_chars': 5000,          # rolling summary 最大字符数
             'source_ring_size': 50,             # per-source ring buffer 大小（供 raw_input_info 查询）
             'interrupt_mode': 'steer',          # 打断模式: steer | interrupt | followup
             'barge_in_threshold_ms': 500,       # 语音 barge-in 阈值（ms），低于此值视为 backchannel
