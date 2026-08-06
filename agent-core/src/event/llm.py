@@ -905,12 +905,16 @@ class Event:
                         _act = _split.get('action', parts[-1] if len(parts) > 2 else '')
                         if _hooks.is_interrupt_binding(_mcp_id, _tool, _act):
                             for aid in list(mcp_client._pending_actions.keys()):
+                                mcp_client._pending_results[aid] = {
+                                    "status": "cancelled",
+                                    "reason": "interrupted by user instruction",
+                                }
                                 mcp_client._pending_actions[aid].set()
                             # Fire hook to notify ALL registered parties (e.g. perception TTS)
                             _hook_id = _hooks.get_hook_for_binding(_mcp_id, _tool, _act)
                             if _hook_id:
                                 asyncio.create_task(_hooks.fire(_hook_id, exclude_mcp_id=_mcp_id))
-                            print(f'[acp] interrupt: cleared pending + fired {_hook_id} (source: {_tool}.{_act})')
+                            print(f'[acp] interrupt: cancelled pending + fired {_hook_id} (source: {_tool}.{_act})')
                 else:
                     result = f'未知工具: {name}'
 
