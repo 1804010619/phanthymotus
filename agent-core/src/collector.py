@@ -62,8 +62,13 @@ def _extract_priority(ev: dict) -> int:
             pass
     # ACP: payload 中的 action_complete 也处理
     payload = ev.get('payload', {})
-    if isinstance(payload, dict) and payload.get('type') == 'action_complete':
-        return 1
+    if isinstance(payload, dict):
+        if payload.get('type') == 'action_complete':
+            return 1
+        # Subagent 完成事件：继承 subagent 的 priority（反转映射回 event priority）
+        sub_p = payload.get('priority')
+        if sub_p is not None:
+            return max(1, 3 - int(sub_p))  # sub P=0(紧急) → event P=3, sub P=2 → event P=1
     source = ev.get('source', '').lower()
     for key in _PRIORITY_SOURCES:
         if key in source:

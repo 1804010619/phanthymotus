@@ -30,7 +30,8 @@ from .store import SubagentStore
 def _get_config() -> dict:
     """Get subagent configuration with defaults."""
     defaults = {
-        'max_concurrent': 2,
+        'max_concurrent': 5,
+        'max_concurrent_bg': 1,
         'max_total': 10,
         'default_max_rounds': 10,
         'default_timeout_s': 300,
@@ -255,6 +256,19 @@ class SubagentManager:
         if not agent or agent.status in TERMINAL_STATUSES:
             return  # Skip stale entries
 
+        # BG concurrency limit: bg agents (goal starts with [bg]) max 1 concurrent
+        if agent.spec.goal.startswith('[bg]'):
+            max_bg = self._cfg.get('max_concurrent_bg', 1)
+            bg_running = sum(
+                1 for aid in self._running
+                if aid in self._agents and self._agents[aid].spec.goal.startswith('[bg]')
+            )
+            if bg_running >= max_bg:
+                # Re-push to queue and wait
+                self._queue.push(agent.id, agent.spec.priority)
+                await self._queue.wait_for_item()
+                return
+
         # Launch agent
         task = asyncio.create_task(self._run_agent(agent))
         self._running[agent.id] = task
@@ -412,6 +426,7 @@ class SubagentManager:
                 'output': result.output[:200] if result.output else '',
                 'error': result.error,
                 'rounds_used': result.rounds_used,
+                'priority': agent.spec.priority,
             },
         )
 
