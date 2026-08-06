@@ -31,6 +31,7 @@ class LLMErrorKind:
     CONTEXT_OVERFLOW = 'context_overflow' # 上下文溢出
     AUTH            = 'auth'             # 401/403
     TIMEOUT         = 'timeout'          # 超时
+    CONNECTION      = 'connection'       # 网络连接失败
     UNKNOWN         = 'unknown'
 
 
@@ -41,6 +42,9 @@ def _classify_error(e: Exception) -> tuple[str, float | None]:
 
     if isinstance(e, (asyncio.TimeoutError, httpx.TimeoutException, openai.APITimeoutError)):
         return LLMErrorKind.TIMEOUT, 5.0
+
+    if isinstance(e, openai.APIConnectionError):
+        return LLMErrorKind.CONNECTION, 2.0
 
     if status == 429:
         # 尝试解析 retry-after
@@ -93,7 +97,7 @@ class Client():
                 base_url=config_it['url'],
                 api_key=config_it['key'],
                 max_retries=0,  # 由我们自己管理重试
-                timeout=120.0,
+                timeout=httpx.Timeout(connect=5.0, read=120.0, write=10.0, pool=10.0),
                 http_client=httpx.AsyncClient(
                     event_hooks={"request": [_log_request]},
                 ),
@@ -265,6 +269,15 @@ class Client():
                 if attempt < max_retries:
                     print(f'[llm] timeout — retrying immediately')
                     continue
+
+            if kind == LLMErrorKind.CONNECTION:
+                if attempt < max_retries:
+                    wait = retry_after or 2.0
+                    print(f'[llm] connection failed — retrying in {wait:.1f}s (check network)')
+                    await asyncio.sleep(wait)
+                    continue
+                else:
+                    print(f'[llm] connection failed after {max_retries + 1} attempts — LLM unreachable, check network connectivity')
 
             if kind == LLMErrorKind.CONTEXT_OVERFLOW:
                 # 上下文溢出：不重试，由调用方处理（需要压缩历史）
