@@ -792,7 +792,8 @@ def _vad_worker(pcm_q: multiprocessing.Queue, result_q: multiprocessing.Queue,
                     if save_vad_segments:
                         _save_segment_pcm(speech_buf, _seg_count)
                         _seg_count[0] += 1
-                    result_q.put((speech_buf, start_ts or ts, end_ts or ts))
+                    result_q.put((speech_buf, start_ts or ts, end_ts or ts, _kws_triggered))
+                    _kws_triggered = False
                     speech_buf = b''
                     start_ts = None
                     end_ts = None
@@ -959,6 +960,7 @@ class _ASRNode(Node):
 
     def _worker_inner(self):
         # Pre-compute keyword IPA if in asr_kws mode
+        _kws_triggered = False  # track whether current utterance was KWS-triggered
         trigger_mode = self._kws_cfg.get('trigger_mode', 'kws')
         keyword_ipa = None
         asr_kws_threshold = float(self._kws_cfg.get('asr_kws_threshold', 0.3))
@@ -977,7 +979,12 @@ class _ASRNode(Node):
 
         while not self._stop_event.is_set():
             try:
-                utterance, start_ts, end_ts = self._utterance_queue.get(timeout=1)
+                item = self._utterance_queue.get(timeout=1)
+                if len(item) == 4:
+                    utterance, start_ts, end_ts, _kws_from_vad = item
+                else:
+                    utterance, start_ts, end_ts = item[:3]
+                    _kws_from_vad = False
             except Exception:
                 continue
             try:
@@ -1012,18 +1019,21 @@ class _ASRNode(Node):
                     # Extract text after keyword
                     remaining = _extract_after_keyword(text, kw_text, end_pos)
                     log.info(f"[asr] asr_kws TRIGGERED: '{text}' → '{remaining}'")
+                    _kws_triggered = True
                     if not remaining.strip():
                         continue
                     text = remaining
 
+                _kws_was_triggered = _kws_triggered or _kws_from_vad
+                _kws_triggered = False
+                self._kws_triggered = False
                 result = {"text": text, "audio_start_ts": start_ts,
                           "audio_end_ts": end_ts, "asr_complete_ts": time.time(),
                           "audio_duration_ms": int(len(utterance) / 32),
                           "text_length": len(text),
                           "priority": 1,
-                          "kws_triggered": _kws_triggered,
+                          "kws_triggered": _kws_was_triggered,
                           "spans": _spans}
-                _kws_triggered = False
                 msg = String(); msg.data = json.dumps(result, ensure_ascii=False)
                 self._pub.publish(msg)
                 log.info(f"[asr] {text!r}")
