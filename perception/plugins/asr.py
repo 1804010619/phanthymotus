@@ -672,6 +672,7 @@ def _vad_worker(pcm_q: multiprocessing.Queue, result_q: multiprocessing.Queue,
     # ── State machine ──
     # States: 'waiting_wake' (KWS mode) or 'listening' (direct mode / post-wake)
     state = 'waiting_wake' if kws_enabled else 'listening'
+    _kws_triggered = False
     speech_buf = b''
     start_ts = None
     end_ts = None
@@ -759,6 +760,7 @@ def _vad_worker(pcm_q: multiprocessing.Queue, result_q: multiprocessing.Queue,
                         _log.info(f"[vad-worker] WAKE WORD detected: {kw.strip()}")
                         # Transition to listening — start recording immediately
                         state = 'listening'
+                        _kws_triggered = True
                         speech_buf = pcm  # include current frame (user may already be speaking)
                         start_ts = ts
                         end_ts = ts
@@ -1019,7 +1021,9 @@ class _ASRNode(Node):
                           "audio_duration_ms": int(len(utterance) / 32),
                           "text_length": len(text),
                           "priority": 1,
+                          "kws_triggered": _kws_triggered,
                           "spans": _spans}
+                _kws_triggered = False
                 msg = String(); msg.data = json.dumps(result, ensure_ascii=False)
                 self._pub.publish(msg)
                 log.info(f"[asr] {text!r}")

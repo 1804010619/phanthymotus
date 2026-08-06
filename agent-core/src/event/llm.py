@@ -494,18 +494,26 @@ class Event:
     # ── 打断：中止正在进行的输出 ─────────────────────────────────────────────
 
     async def _interrupt_active_outputs(self):
-        """中止所有正在进行的输出（TTS + 动作）。在 TurnCancelled 时调用。"""
+        """中止所有正在进行的输出（TTS + 动作）。在 TurnCancelled 时调用。
+        优先使用 hook 系统；fallback 到硬编码查找。"""
+        import hooks
+        results = await hooks.fire('on_interrupt_all')
+        if results:
+            # Hook handled it — also clear pending ACP
+            for aid in list(mcp_client._pending_actions.keys()):
+                mcp_client._pending_actions[aid].set()
+            print(f'[decision] interrupted via on_interrupt_all hook ({len(results)} binding(s))')
+            return
+
+        # Fallback: hardcoded lookup (no hook registered)
         tasks = []
         for mcp_id, info in mcp_client.registry.items():
             tools = info.get('tools', [])
-            tool_meta = info.get('tool_meta', {})
-            # 查找 TTS 工具并发送 interrupt
             for t in tools:
                 short_name = t.split('__')[-1] if '__' in t else t
                 if short_name == 'tts':
                     tasks.append(mcp_client.call_tool(t, {'action': 'interrupt'}))
                     break
-            # 查找 loco 工具并发送 stop_move
             for t in tools:
                 short_name = t.split('__')[-1] if '__' in t else t
                 if short_name == 'loco':
@@ -516,7 +524,7 @@ class Event:
             for i, r in enumerate(results):
                 if isinstance(r, Exception):
                     print(f'[decision] interrupt_active_outputs: task {i} failed: {r}')
-            print(f'[decision] interrupted {len(tasks)} active output(s)')
+            print(f'[decision] interrupted {len(tasks)} active output(s) (fallback)')
 
     # ── 主循环 ───────────────────────────────────────────────────────────────
 
@@ -545,6 +553,9 @@ class Event:
                 raise
             except Exception as e:
                 print(f'[decision] error in _one_turn: {e}')
+                # Fire on_error hook (LED feedback etc.)
+                import hooks
+                asyncio.create_task(hooks.fire('on_error'))
                 # 把错误也记入本轮消息
                 self._current_turn.append({
                     'role': 'assistant',
@@ -649,6 +660,10 @@ class Event:
         # Log incoming event
         _urgent_tag = ' [URGENT]' if trigger_event.get('_urgent') else ''
         print(f'[decision] received{_urgent_tag} event: source={trigger_event.get("source", "?")} text={trigger_event.get("text", "")[:300]}')
+
+        # Fire on_thinking hook (non-blocking LED feedback etc.)
+        import hooks
+        asyncio.create_task(hooks.fire('on_thinking'))
         # Subagent status in log
         if self._subagent_mgr:
             _sa_active = self._subagent_mgr.list_active()

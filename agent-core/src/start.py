@@ -473,6 +473,27 @@ async def acp_complete(request: fastapi.Request):
 
     return {'ok': True, 'action_id': action_id}
 
+
+# ── System Hooks API ─────────────────────────────────────────────────────────
+
+@app_api.get('/hooks')
+async def hooks_list():
+    import hooks
+    return hooks.list_hooks()
+
+
+@app_api.post('/hooks/fire')
+async def hooks_fire(request: fastapi.Request):
+    import hooks
+    body = await request.json()
+    hook_id = body.get('hook', '')
+    params = body.get('params', {})
+    if not hook_id:
+        return {'error': 'hook field required'}
+    results = await hooks.fire(hook_id, extra_params=params)
+    return {'ok': True, 'hook': hook_id, 'results': results}
+
+
 # ── Remote Audio: convert file to PCM-16k and publish to ROS2 ──────────────────
 _audio_pub = None
 

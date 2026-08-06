@@ -627,6 +627,47 @@ def get_pending_for_tool(tool_name: str) -> list[str]:
     return [aid for aid, tn in _pending_tools.items() if tn == tool_name and aid in _pending_actions]
 
 
+# ── Direct Tool Call (bypass barrier/ACP) ────────────────────────────────────
+
+async def call_tool_direct(mcp_id: str, tool_name: str, args: dict) -> dict:
+    """Direct MCP tool call — bypasses barrier, ACP, and schema validation.
+
+    Used by system hooks for immediate execution (e.g. interrupt, LED effects).
+    Does NOT register pending actions or check barriers.
+    """
+    entry = registry.get(mcp_id)
+    if not entry:
+        return {"error": f"device {mcp_id} not registered"}
+    if not entry.get('online'):
+        return {"error": f"device {mcp_id} offline"}
+    url = entry['url']
+    payload = {
+        "jsonrpc": "2.0",
+        "id": int(time.time() * 1000) % 1_000_000,
+        "method": "tools/call",
+        "params": {"name": tool_name, "arguments": args},
+    }
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+                data = await resp.json()
+                if "error" in data:
+                    return {"error": data["error"]}
+                result = data.get("result", {})
+                # Extract text content from MCP response
+                content = result.get("content", [])
+                if content and isinstance(content, list):
+                    text_parts = [c.get("text", "") for c in content if c.get("type") == "text"]
+                    if text_parts:
+                        try:
+                            return json.loads(text_parts[0])
+                        except (json.JSONDecodeError, IndexError):
+                            return {"raw": text_parts[0]}
+                return result
+    except Exception as e:
+        return {"error": f"call_tool_direct failed: {e}"}
+
+
 def cleanup_stale_actions(max_age_s: float = 300):
     """清理超时的 pending actions（防泄漏，由定时器调用）。"""
     # 简单实现：如果 action 超过 max_age 仍未完成，移除
