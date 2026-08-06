@@ -843,8 +843,13 @@ class Event:
             tool_calls = response.get('tool_calls') or []
 
             def _needs_barrier(name: str) -> bool:
-                """actuator/processor 类型的 MCP 工具需要 ACP barrier。"""
+                """actuator/processor 类型的 MCP 工具需要 ACP barrier。
+                例外：interrupt/stop 类动作永远不阻塞（用于打断当前输出）。"""
                 if not name.startswith('mcp__'):
+                    return False
+                # 打断/停止类动作永远不等 barrier
+                action_part = name.split('__')[-1] if '__' in name else ''
+                if action_part.startswith('interrupt') or action_part == 'stop_move' or action_part == 'stop_nav':
                     return False
                 mcp_id = name.split('__')[1]
                 entry = mcp_client.registry.get(mcp_id)
@@ -878,6 +883,12 @@ class Event:
                     args['_trace_id'] = _trace_id
                     args['_cancel_event'] = cancel_event
                     result = await mcp_client.call_tool(name, args)
+                    # Interrupt/stop 执行后，清掉被打断的 pending（不会再收到 callback）
+                    action_part = name.split('__')[-1] if '__' in name else ''
+                    if action_part.startswith('interrupt') or action_part == 'stop_move':
+                        for aid in list(mcp_client._pending_actions.keys()):
+                            mcp_client._pending_actions[aid].set()
+                        print(f'[acp] cleared pending after interrupt: {action_part}')
                 else:
                     result = f'未知工具: {name}'
 
