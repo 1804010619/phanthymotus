@@ -842,21 +842,26 @@ class Event:
             # ── 工具调用 ──────────────────────────────────────────────────
             tool_calls = response.get('tool_calls') or []
 
-            def _needs_barrier(name: str) -> bool:
+            def _needs_barrier(name: str, call_args: dict = None) -> bool:
                 """actuator/processor 类型的 MCP 工具需要 ACP barrier。
                 例外：在 on_interrupt_* hook 中注册的 tool+action 免 barrier。"""
                 if not name.startswith('mcp__'):
                     return False
                 parts = name.split('__')
                 mcp_id = parts[1] if len(parts) > 1 else ''
-                action = parts[-1] if len(parts) > 2 else ''
-                # 从 split_map 获取原始 tool name
+                # 从 split_map 获取原始 tool name + action
                 entry = mcp_client.registry.get(mcp_id)
                 if not entry:
                     return False
                 split_info = entry.get('split_map', {}).get(name, {})
-                tool_name = split_info.get('tool', action)
-                action_name = split_info.get('action', action)
+                if split_info:
+                    # Split tool: action is encoded in schema name
+                    tool_name = split_info.get('tool', '')
+                    action_name = split_info.get('action', '')
+                else:
+                    # Non-split tool: action comes from call args
+                    tool_name = parts[-1] if len(parts) > 2 else ''
+                    action_name = (call_args or {}).get('action', '')
                 # 在 interrupt hook 中注册的 → 免 barrier
                 import hooks
                 if hooks.is_interrupt_binding(mcp_id, tool_name, action_name):
@@ -884,13 +889,13 @@ class Event:
                     result = await self._sys_tools[name]['object'](**args)
                 elif name.startswith('mcp__'):
                     # ACP barrier: 有 pending 时，非 sensor/resource 工具等待所有 pending 完成
-                    if mcp_client.get_pending_actions() and _needs_barrier(name):
+                    if mcp_client.get_pending_actions() and _needs_barrier(name, args):
                         await mcp_client.await_pending(cancel_event, timeout=120)
                     args['_trace_id'] = _trace_id
                     args['_cancel_event'] = cancel_event
                     result = await mcp_client.call_tool(name, args)
                     # interrupt hook 绑定的工具执行后：清 pending + 通知其他绑定方
-                    if not _needs_barrier(name) and mcp_client.get_pending_actions():
+                    if not _needs_barrier(name, args) and mcp_client.get_pending_actions():
                         import hooks as _hooks
                         parts = name.split('__')
                         _mcp_id = parts[1] if len(parts) > 1 else ''
