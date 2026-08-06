@@ -844,16 +844,22 @@ class Event:
 
             def _needs_barrier(name: str) -> bool:
                 """actuator/processor 类型的 MCP 工具需要 ACP barrier。
-                例外：interrupt/stop 类动作永远不阻塞（用于打断当前输出）。"""
+                例外：在 on_interrupt_* hook 中注册的 tool+action 免 barrier。"""
                 if not name.startswith('mcp__'):
                     return False
-                # 打断/停止类动作永远不等 barrier
-                action_part = name.split('__')[-1] if '__' in name else ''
-                if action_part.startswith('interrupt') or action_part == 'stop_move' or action_part == 'stop_nav':
-                    return False
-                mcp_id = name.split('__')[1]
+                parts = name.split('__')
+                mcp_id = parts[1] if len(parts) > 1 else ''
+                action = parts[-1] if len(parts) > 2 else ''
+                # 从 split_map 获取原始 tool name
                 entry = mcp_client.registry.get(mcp_id)
                 if not entry:
+                    return False
+                split_info = entry.get('split_map', {}).get(name, {})
+                tool_name = split_info.get('tool', action)
+                action_name = split_info.get('action', action)
+                # 在 interrupt hook 中注册的 → 免 barrier
+                import hooks
+                if hooks.is_interrupt_binding(mcp_id, tool_name, action_name):
                     return False
                 meta = entry.get('tool_meta', {}).get(name)
                 if not meta:
@@ -883,12 +889,19 @@ class Event:
                     args['_trace_id'] = _trace_id
                     args['_cancel_event'] = cancel_event
                     result = await mcp_client.call_tool(name, args)
-                    # Interrupt/stop 执行后，清掉被打断的 pending（不会再收到 callback）
-                    action_part = name.split('__')[-1] if '__' in name else ''
-                    if action_part.startswith('interrupt') or action_part == 'stop_move':
-                        for aid in list(mcp_client._pending_actions.keys()):
-                            mcp_client._pending_actions[aid].set()
-                        print(f'[acp] cleared pending after interrupt: {action_part}')
+                    # interrupt hook 绑定的工具执行后，清掉 pending（被打断的动作不会再 callback）
+                    if not _needs_barrier(name) and mcp_client.get_pending_actions():
+                        import hooks as _hooks
+                        parts = name.split('__')
+                        _mcp_id = parts[1] if len(parts) > 1 else ''
+                        _entry = mcp_client.registry.get(_mcp_id, {})
+                        _split = _entry.get('split_map', {}).get(name, {})
+                        _tool = _split.get('tool', parts[-1] if len(parts) > 2 else '')
+                        _act = _split.get('action', parts[-1] if len(parts) > 2 else '')
+                        if _hooks.is_interrupt_binding(_mcp_id, _tool, _act):
+                            for aid in list(mcp_client._pending_actions.keys()):
+                                mcp_client._pending_actions[aid].set()
+                            print(f'[acp] cleared pending after hook-registered interrupt: {_tool}.{_act}')
                 else:
                     result = f'未知工具: {name}'
 

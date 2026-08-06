@@ -68,6 +68,18 @@ def list_hooks() -> dict[str, list[dict]]:
     }
 
 
+def is_interrupt_binding(mcp_id: str, tool: str, action: str) -> bool:
+    """Check if tool+action is registered under an on_interrupt_* hook.
+    Used by barrier logic to exempt interrupt actions from blocking."""
+    for hook_id, bindings in _registry.items():
+        if not hook_id.startswith('on_interrupt'):
+            continue
+        for b in bindings:
+            if b.mcp_id == mcp_id and b.tool == tool and b.action == action:
+                return True
+    return False
+
+
 # ── Executor ─────────────────────────────────────────────────────────────────
 
 async def fire(hook_id: str, extra_params: dict | None = None) -> list[dict]:
