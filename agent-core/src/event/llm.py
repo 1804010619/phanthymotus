@@ -902,7 +902,7 @@ class Event:
                         _entry = mcp_client.registry.get(_mcp_id, {})
                         _split = _entry.get('split_map', {}).get(name, {})
                         _tool = _split.get('tool', parts[-1] if len(parts) > 2 else '')
-                        _act = _split.get('action', parts[-1] if len(parts) > 2 else '')
+                        _act = _split.get('action', args.get('action', ''))
                         if _hooks.is_interrupt_binding(_mcp_id, _tool, _act):
                             for aid in list(mcp_client._pending_actions.keys()):
                                 mcp_client._pending_results[aid] = {
