@@ -210,6 +210,34 @@ def _degrade_turn(turn: list[dict]) -> list[dict]:
     return degraded
 
 
+def _compact_turn_messages(turn_messages: list[dict], keep_recent: int = 12) -> None:
+    """Turn 内 compaction：保留最近 keep_recent 条完整，早期消息的 tool results 截短。
+    直接修改 turn_messages（in-place）。"""
+    if len(turn_messages) <= keep_recent:
+        return
+    # 只压缩 [0 : -keep_recent] 范围内的消息
+    compact_end = len(turn_messages) - keep_recent
+    for i in range(compact_end):
+        msg = turn_messages[i]
+        if msg.get('role') == 'tool':
+            content = msg.get('content', '')
+            if isinstance(content, str) and len(content) > 150:
+                turn_messages[i] = {**msg, 'content': content[:150] + '...(compacted)'}
+            elif isinstance(content, list):
+                turn_messages[i] = {**msg, 'content': '(多模态内容已省略)'}
+        elif msg.get('role') == 'assistant' and msg.get('tool_calls'):
+            # 保留 tool_calls 结构（API 需要），但截短 arguments
+            new_calls = []
+            for tc in msg['tool_calls']:
+                args = tc.get('function', {}).get('arguments', '')
+                if len(args) > 100:
+                    new_tc = {**tc, 'function': {**tc['function'], 'arguments': args[:100] + '...'}}
+                else:
+                    new_tc = tc
+                new_calls.append(new_tc)
+            turn_messages[i] = {**msg, 'tool_calls': new_calls}
+
+
 _REWRITE_SUMMARY_PROMPT = """将以下两段历史摘要合并为一段简洁摘要。
 要求：保留活跃任务、关键决策、未完成事项。去除已完成/过时的细节。
 最终控制在 {budget} 字以内，以「[历史摘要]」开头。
@@ -792,6 +820,13 @@ class Event:
                 round_idx = 0
                 print(f'[decision] hit max_rounds={max_rounds}, truncated turn_messages to {len(turn_messages)}, continuing')
                 await push_event({'type': 'turn_truncated', 'payload': {'kept': len(turn_messages), 'total_rounds': total_rounds}})
+
+            # ── Turn 内 compaction：消息过多时压缩早期 tool results ────────────
+            compact_threshold = llm_cfg.get('turn_compact_threshold', 30)
+            compact_keep_recent = llm_cfg.get('turn_compact_keep_recent', 12)
+            if len(turn_messages) > compact_threshold:
+                _compact_turn_messages(turn_messages, compact_keep_recent)
+
             # ── 构建分层 prompt ────────────────────────────────────────────
             history = self._build_history()
             # 本轮已产生的消息也要加入历史（多轮工具调用场景）

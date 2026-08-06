@@ -61,6 +61,8 @@ _DB_DEFAULTS = {
             'tier1_turns': 6,                   # tiered retention: 全量保留最近 N 轮
             'tier2_turns': 8,                   # tiered retention: 降质保留再往前 N 轮
             'summary_max_chars': 5000,          # rolling summary 最大字符数
+            'turn_compact_threshold': 30,       # turn 内消息超过此数触发 compaction
+            'turn_compact_keep_recent': 12,     # turn 内 compaction 保留最近 N 条完整
             'source_ring_size': 50,             # per-source ring buffer 大小（供 raw_input_info 查询）
             'interrupt_mode': 'steer',          # 打断模式: steer | interrupt | followup
             'barge_in_threshold_ms': 500,       # 语音 barge-in 阈值（ms），低于此值视为 backchannel
