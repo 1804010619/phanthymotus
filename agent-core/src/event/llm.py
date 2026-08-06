@@ -291,20 +291,25 @@ async def _memory_recall(
     if source in ('all', 'subagent'):
         try:
             with _get_conn() as conn:
+                # 分词搜索：将 query 按空格拆分，每个关键词都必须匹配（AND 逻辑）
+                keywords = [k.strip() for k in query.split() if k.strip()]
+                if not keywords:
+                    keywords = [query]
+                where_clauses = ' AND '.join(['(conclusion LIKE ? OR goal LIKE ?)'] * len(keywords))
+                params = []
+                for kw in keywords:
+                    params.extend([f'%{kw}%', f'%{kw}%'])
                 if time_cutoff > 0:
-                    rows = conn.execute(
-                        'SELECT agent_id, goal, conclusion, source_type, created_at '
-                        'FROM subagent_conclusions WHERE conclusion LIKE ? AND created_at > ? '
-                        'ORDER BY created_at DESC LIMIT ?',
-                        (f'%{query}%', time_cutoff, limit)
-                    ).fetchall()
+                    sql = (f'SELECT agent_id, goal, conclusion, source_type, created_at '
+                           f'FROM subagent_conclusions WHERE ({where_clauses}) AND created_at > ? '
+                           f'ORDER BY created_at DESC LIMIT ?')
+                    params.extend([time_cutoff, limit])
                 else:
-                    rows = conn.execute(
-                        'SELECT agent_id, goal, conclusion, source_type, created_at '
-                        'FROM subagent_conclusions WHERE conclusion LIKE ? '
-                        'ORDER BY created_at DESC LIMIT ?',
-                        (f'%{query}%', limit)
-                    ).fetchall()
+                    sql = (f'SELECT agent_id, goal, conclusion, source_type, created_at '
+                           f'FROM subagent_conclusions WHERE ({where_clauses}) '
+                           f'ORDER BY created_at DESC LIMIT ?')
+                    params.append(limit)
+                rows = conn.execute(sql, params).fetchall()
                 for agent_id, goal, conclusion, source_type, ts in rows:
                     time_str = _dt.datetime.fromtimestamp(ts).strftime('%m-%d %H:%M')
                     results.append({

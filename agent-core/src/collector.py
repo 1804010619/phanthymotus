@@ -38,7 +38,7 @@ _current_turn_priority: int = 0
 _source_ring: dict[str, deque] = {}  # per-source ring buffer（所有事件）
 
 # 优先级判定规则
-_PRIORITY_SOURCES = {'asr', 'message', 'channel', 'subagent', 'acp'}
+_PRIORITY_SOURCES = {'asr', 'message', 'channel', 'subagent', 'acp', 'scheduler'}
 
 # 打断模式：steer(默认) | interrupt | followup
 _interrupt_mode: str = "steer"
