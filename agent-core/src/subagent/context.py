@@ -172,9 +172,22 @@ class SubagentContext:
             else:
                 self._summary = new_summary
         except Exception:
-            # If compression fails, just drop old turns (better than overflow)
-            if not self._summary:
-                self._summary = f'(压缩失败，丢弃了 {len(old_turns)} 轮历史)'
+            # Compression LLM call failed — fallback to simple text truncation
+            # Keep key info (tool results, decisions) without LLM summarization
+            fallback_parts = []
+            for turn in old_turns:
+                for msg in turn:
+                    role = msg.get('role', '')
+                    content = msg.get('content', '')
+                    if role == 'tool' and content:
+                        fallback_parts.append(content[:200])
+                    elif role == 'assistant' and content:
+                        fallback_parts.append(content[:100])
+            fallback = '\n'.join(fallback_parts)[:3000]
+            if self._summary:
+                self._summary = f'{self._summary}\n\n[简要回顾] {fallback}'
+            else:
+                self._summary = f'[简要回顾] {fallback}'
 
     def to_checkpoint(self) -> dict:
         """Serialize context state for persistence."""

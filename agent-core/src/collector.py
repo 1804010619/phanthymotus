@@ -416,6 +416,15 @@ async def _drain_loop():
 
                 # 按模式处理
                 if _interrupt_mode == 'steer':
+                    # Scheduler 去重：如果 steering_queue 中已有相同 source 的 scheduler 事件，跳过
+                    if 'scheduler:' in source.lower():
+                        _dedup = False
+                        for item in list(_steering_queue._queue):
+                            if item.get('source', '') == ev.get('source', ''):
+                                _dedup = True
+                                break
+                        if _dedup:
+                            continue  # 已有相同 task 的 check 事件，跳过
                     # Steer: 推入 steering_queue，agent loop 在 tool batch 间消费
                     try:
                         _steering_queue.put_nowait(ev)
