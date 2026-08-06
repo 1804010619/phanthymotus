@@ -63,6 +63,9 @@ TOOLS = [
             "x-completion": {
                 "actions": ["speak"],
                 "timeout": 60
+            },
+            "x-hooks": {
+                "on_interrupt_speak": {"action": "interrupt"},
             }
         },
         "configSchema": {

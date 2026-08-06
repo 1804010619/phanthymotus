@@ -78,6 +78,9 @@ async def auth_middleware(request: Request, call_next):
     # ACP completion callback from driver containers
     if path == '/api/acp/complete' and request.method == 'POST':
         return await call_next(request)
+    # System hooks fire (internal/driver calls)
+    if path == '/api/hooks/fire' and request.method == 'POST':
+        return await call_next(request)
     # /ws/mic stays open (internal browser mic)
     if path == '/ws/mic':
         return await call_next(request)

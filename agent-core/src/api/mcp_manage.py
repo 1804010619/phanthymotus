@@ -558,6 +558,13 @@ async def _do_ping(mcp_id: str) -> dict:
         'tool_groups': tool_groups,
     }
 
+    # Register system hooks from x-hooks declarations
+    import hooks
+    for tool in caps['tools']:
+        x_hooks = (tool.get('inputSchema') or {}).get('x-hooks')
+        if x_hooks and isinstance(x_hooks, dict):
+            hooks.register(mcp_id, tool.get('name', ''), x_hooks)
+
     # Notify inspection module about all topics from this device
     asyncio.create_task(_notify_inspector(mcp_id, topic_out + topic_in))
 

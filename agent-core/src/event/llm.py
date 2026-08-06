@@ -494,18 +494,26 @@ class Event:
     # ── 打断：中止正在进行的输出 ─────────────────────────────────────────────
 
     async def _interrupt_active_outputs(self):
-        """中止所有正在进行的输出（TTS + 动作）。在 TurnCancelled 时调用。"""
+        """中止所有正在进行的输出（TTS + 动作）。在 TurnCancelled 时调用。
+        优先使用 hook 系统；fallback 到硬编码查找。"""
+        import hooks
+        results = await hooks.fire('on_interrupt_all')
+        if results:
+            # Hook handled it — also clear pending ACP
+            for aid in list(mcp_client._pending_actions.keys()):
+                mcp_client._pending_actions[aid].set()
+            print(f'[decision] interrupted via on_interrupt_all hook ({len(results)} binding(s))')
+            return
+
+        # Fallback: hardcoded lookup (no hook registered)
         tasks = []
         for mcp_id, info in mcp_client.registry.items():
             tools = info.get('tools', [])
-            tool_meta = info.get('tool_meta', {})
-            # 查找 TTS 工具并发送 interrupt
             for t in tools:
                 short_name = t.split('__')[-1] if '__' in t else t
                 if short_name == 'tts':
                     tasks.append(mcp_client.call_tool(t, {'action': 'interrupt'}))
                     break
-            # 查找 loco 工具并发送 stop_move
             for t in tools:
                 short_name = t.split('__')[-1] if '__' in t else t
                 if short_name == 'loco':
@@ -516,7 +524,7 @@ class Event:
             for i, r in enumerate(results):
                 if isinstance(r, Exception):
                     print(f'[decision] interrupt_active_outputs: task {i} failed: {r}')
-            print(f'[decision] interrupted {len(tasks)} active output(s)')
+            print(f'[decision] interrupted {len(tasks)} active output(s) (fallback)')
 
     # ── 主循环 ───────────────────────────────────────────────────────────────
 
@@ -545,6 +553,9 @@ class Event:
                 raise
             except Exception as e:
                 print(f'[decision] error in _one_turn: {e}')
+                # Fire on_error hook (LED feedback etc.)
+                import hooks
+                asyncio.create_task(hooks.fire('on_error'))
                 # 把错误也记入本轮消息
                 self._current_turn.append({
                     'role': 'assistant',
@@ -649,6 +660,10 @@ class Event:
         # Log incoming event
         _urgent_tag = ' [URGENT]' if trigger_event.get('_urgent') else ''
         print(f'[decision] received{_urgent_tag} event: source={trigger_event.get("source", "?")} text={trigger_event.get("text", "")[:300]}')
+
+        # Fire on_thinking hook (non-blocking LED feedback etc.)
+        import hooks
+        asyncio.create_task(hooks.fire('on_thinking'))
         # Subagent status in log
         if self._subagent_mgr:
             _sa_active = self._subagent_mgr.list_active()
@@ -827,13 +842,29 @@ class Event:
             # ── 工具调用 ──────────────────────────────────────────────────
             tool_calls = response.get('tool_calls') or []
 
-            def _needs_barrier(name: str) -> bool:
-                """actuator/processor 类型的 MCP 工具需要 ACP barrier。"""
+            def _needs_barrier(name: str, call_args: dict = None) -> bool:
+                """actuator/processor 类型的 MCP 工具需要 ACP barrier。
+                例外：在 on_interrupt_* hook 中注册的 tool+action 免 barrier。"""
                 if not name.startswith('mcp__'):
                     return False
-                mcp_id = name.split('__')[1]
+                parts = name.split('__')
+                mcp_id = parts[1] if len(parts) > 1 else ''
+                # 从 split_map 获取原始 tool name + action
                 entry = mcp_client.registry.get(mcp_id)
                 if not entry:
+                    return False
+                split_info = entry.get('split_map', {}).get(name, {})
+                if split_info:
+                    # Split tool: action is encoded in schema name
+                    tool_name = split_info.get('tool', '')
+                    action_name = split_info.get('action', '')
+                else:
+                    # Non-split tool: action comes from call args
+                    tool_name = parts[-1] if len(parts) > 2 else ''
+                    action_name = (call_args or {}).get('action', '')
+                # 在 interrupt hook 中注册的 → 免 barrier
+                import hooks
+                if hooks.is_interrupt_binding(mcp_id, tool_name, action_name):
                     return False
                 meta = entry.get('tool_meta', {}).get(name)
                 if not meta:
@@ -858,11 +889,32 @@ class Event:
                     result = await self._sys_tools[name]['object'](**args)
                 elif name.startswith('mcp__'):
                     # ACP barrier: 有 pending 时，非 sensor/resource 工具等待所有 pending 完成
-                    if mcp_client.get_pending_actions() and _needs_barrier(name):
+                    if mcp_client.get_pending_actions() and _needs_barrier(name, args):
                         await mcp_client.await_pending(cancel_event, timeout=120)
                     args['_trace_id'] = _trace_id
                     args['_cancel_event'] = cancel_event
                     result = await mcp_client.call_tool(name, args)
+                    # interrupt hook 绑定的工具执行后：清 pending + 通知其他绑定方
+                    if not _needs_barrier(name, args) and mcp_client.get_pending_actions():
+                        import hooks as _hooks
+                        parts = name.split('__')
+                        _mcp_id = parts[1] if len(parts) > 1 else ''
+                        _entry = mcp_client.registry.get(_mcp_id, {})
+                        _split = _entry.get('split_map', {}).get(name, {})
+                        _tool = _split.get('tool', parts[-1] if len(parts) > 2 else '')
+                        _act = _split.get('action', parts[-1] if len(parts) > 2 else '')
+                        if _hooks.is_interrupt_binding(_mcp_id, _tool, _act):
+                            for aid in list(mcp_client._pending_actions.keys()):
+                                mcp_client._pending_results[aid] = {
+                                    "status": "cancelled",
+                                    "reason": "interrupted by user instruction",
+                                }
+                                mcp_client._pending_actions[aid].set()
+                            # Fire hook to notify ALL registered parties (e.g. perception TTS)
+                            _hook_id = _hooks.get_hook_for_binding(_mcp_id, _tool, _act)
+                            if _hook_id:
+                                asyncio.create_task(_hooks.fire(_hook_id, exclude_mcp_id=_mcp_id))
+                            print(f'[acp] interrupt: cancelled pending + fired {_hook_id} (source: {_tool}.{_act})')
                 else:
                     result = f'未知工具: {name}'
 
