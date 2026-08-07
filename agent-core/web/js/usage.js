@@ -94,7 +94,10 @@ function _renderChart(el, breakdown, granularity) {
   // Generate Y-axis reference lines (3-4 lines)
   const yLines = _calcYLines(maxVal);
 
-  const bars = days.map(d => {
+  // Show every Nth label to avoid x-axis crowding
+  const labelStep = days.length > 24 ? Math.ceil(days.length / 12) : days.length > 12 ? 2 : 1;
+
+  const bars = days.map((d, i) => {
     const total = d.prompt_tokens + d.completion_tokens;
     const h = Math.max((total / maxVal) * 100, 3);
     const uncached = Math.max(d.prompt_tokens - (d.cached_tokens || 0), 0);
@@ -103,12 +106,12 @@ function _renderChart(el, breakdown, granularity) {
     // Format label based on granularity
     let dateLabel;
     if (granularity === 'hourly') {
-      // d.date is "2026-07-29 14" → show "14:00" or "07-29 14h"
       const parts = d.date.split(' ');
       dateLabel = parts.length > 1 ? parts[1] + ':00' : d.date;
     } else {
       dateLabel = d.date.slice(5); // MM-DD
     }
+    const showLabel = i % labelStep === 0;
     return `
       <div class="usage-bar" title="${d.date}\n非缓存输入: ${_fmt(uncached)}\n缓存输入: ${_fmt(cached)}\n输出: ${_fmt(comp)}">
         <div class="usage-bar-track">
@@ -118,7 +121,7 @@ function _renderChart(el, breakdown, granularity) {
             ${uncached ? `<div class="usage-bar-segment prompt" style="flex-grow:${uncached}"></div>` : ''}
           </div>
         </div>
-        <span class="usage-bar-date">${dateLabel}</span>
+        <span class="usage-bar-date">${showLabel ? dateLabel : ''}</span>
       </div>`;
   }).join('');
 
