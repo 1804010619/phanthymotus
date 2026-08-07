@@ -38,7 +38,7 @@ _current_turn_priority: int = 0
 _source_ring: dict[str, deque] = {}  # per-source ring buffer（所有事件）
 
 # 优先级判定规则
-_PRIORITY_SOURCES = {'asr', 'message', 'channel', 'subagent', 'acp'}
+_PRIORITY_SOURCES = {'asr', 'message', 'channel', 'subagent', 'acp', 'scheduler'}
 
 # 打断模式：steer(默认) | interrupt | followup
 _interrupt_mode: str = "steer"
@@ -62,8 +62,13 @@ def _extract_priority(ev: dict) -> int:
             pass
     # ACP: payload 中的 action_complete 也处理
     payload = ev.get('payload', {})
-    if isinstance(payload, dict) and payload.get('type') == 'action_complete':
-        return 1
+    if isinstance(payload, dict):
+        if payload.get('type') == 'action_complete':
+            return 1
+        # Subagent 完成事件：继承 subagent 的 priority（反转映射回 event priority）
+        sub_p = payload.get('priority')
+        if sub_p is not None:
+            return max(1, 3 - int(sub_p))  # sub P=0(紧急) → event P=3, sub P=2 → event P=1
     source = ev.get('source', '').lower()
     for key in _PRIORITY_SOURCES:
         if key in source:
@@ -411,6 +416,15 @@ async def _drain_loop():
 
                 # 按模式处理
                 if _interrupt_mode == 'steer':
+                    # Scheduler 去重：如果 steering_queue 中已有相同 source 的 scheduler 事件，跳过
+                    if 'scheduler:' in source.lower():
+                        _dedup = False
+                        for item in list(_steering_queue._queue):
+                            if item.get('source', '') == ev.get('source', ''):
+                                _dedup = True
+                                break
+                        if _dedup:
+                            continue  # 已有相同 task 的 check 事件，跳过
                     # Steer: 推入 steering_queue，agent loop 在 tool batch 间消费
                     try:
                         _steering_queue.put_nowait(ev)

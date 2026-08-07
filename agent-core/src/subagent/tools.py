@@ -59,13 +59,19 @@ class SubagentTools:
     async def subagent_spawn(
         self,
         goal: Annotated[str, "子代理的任务目标描述"],
-        priority: Annotated[int, "优先级: 0=紧急 1=高 2=普通 3=低"] = 2,
+        priority: Annotated[int, "优先级: 0=紧急 1=高 2=普通 3=低, -1=自动继承"] = -1,
         tools: Annotated[str, "工具过滤: '*'=全部, 逗号分隔的 fnmatch 模式"] = '*',
         model: Annotated[str, "LLM模型覆盖,为空则用默认模型"] = '',
         max_rounds: Annotated[int, "最大推理轮数"] = 10,
         context: Annotated[str, "传递给子代理的初始上下文信息"] = '',
     ) -> str:
         """创建子代理异步执行任务。返回 agent_id 用于后续查询。适合不需要立即结果的后台任务。"""
+        # priority=-1 表示自动继承: 反转映射 turn priority → subagent priority
+        if priority < 0:
+            import collector
+            priority = max(0, min(3, 3 - collector._current_turn_priority))
+        else:
+            priority = max(0, min(3, priority))
         context_seed = self._build_context_with_history(context, goal)
         tool_filter = None if tools == '*' else [t.strip() for t in tools.split(',')]
 
@@ -77,7 +83,7 @@ class SubagentTools:
 
         spec = SubagentSpec(
             goal=goal,
-            priority=max(0, min(3, priority)),
+            priority=priority,
             model=model or None,
             tool_filter=tool_filter,
             tool_deny=tool_deny,

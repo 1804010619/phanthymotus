@@ -190,6 +190,86 @@ async def _compress_turns(turns: list[list[dict]]) -> str:
         return f'[历史摘要] 之前有 {len(turns)} 轮对话，因压缩失败仅保留最近内容。'
 
 
+# ── Tiered Retention helpers ──────────────────────────────────────────────────
+
+def _degrade_turn(turn: list[dict]) -> list[dict]:
+    """降质 turn：tool results 截短，tool_calls 只留名称列表。用于 tier2 历史。"""
+    degraded = []
+    for msg in turn:
+        if msg.get('role') == 'tool':
+            content = msg.get('content', '')
+            if isinstance(content, str) and len(content) > 80:
+                msg = {**msg, 'content': content[:80] + '...'}
+            elif isinstance(content, list):
+                msg = {**msg, 'content': '(多模态内容已省略)'}
+        elif msg.get('role') == 'assistant' and msg.get('tool_calls'):
+            names = [tc['function']['name'] for tc in msg['tool_calls']]
+            text = msg.get('content', '') or ''
+            msg = {'role': 'assistant', 'content': (text + '\n[调用: ' + ', '.join(names) + ']').strip()}
+        degraded.append(msg)
+    return degraded
+
+
+def _compact_turn_messages(turn_messages: list[dict], keep_recent: int = 12) -> None:
+    """Turn 内 compaction：保留最近 keep_recent 条完整，早期消息的 tool results 截短。
+    直接修改 turn_messages（in-place）。"""
+    if len(turn_messages) <= keep_recent:
+        return
+    # 只压缩 [0 : -keep_recent] 范围内的消息
+    compact_end = len(turn_messages) - keep_recent
+    for i in range(compact_end):
+        msg = turn_messages[i]
+        if msg.get('role') == 'tool':
+            content = msg.get('content', '')
+            if isinstance(content, str) and len(content) > 150:
+                turn_messages[i] = {**msg, 'content': content[:150] + '...(compacted)'}
+            elif isinstance(content, list):
+                turn_messages[i] = {**msg, 'content': '(多模态内容已省略)'}
+        elif msg.get('role') == 'assistant' and msg.get('tool_calls'):
+            # 保留 tool_calls 结构（API 需要），但截短 arguments
+            new_calls = []
+            for tc in msg['tool_calls']:
+                args = tc.get('function', {}).get('arguments', '')
+                if len(args) > 100:
+                    new_tc = {**tc, 'function': {**tc['function'], 'arguments': args[:100] + '...'}}
+                else:
+                    new_tc = tc
+                new_calls.append(new_tc)
+            turn_messages[i] = {**msg, 'tool_calls': new_calls}
+
+
+_REWRITE_SUMMARY_PROMPT = """将以下两段历史摘要合并为一段简洁摘要。
+要求：保留活跃任务、关键决策、未完成事项。去除已完成/过时的细节。
+最终控制在 {budget} 字以内，以「[历史摘要]」开头。
+
+旧摘要：
+{old}
+
+新摘要：
+{new}
+"""
+
+
+async def _rewrite_summary(old: str, new: str, budget: int = 5000) -> str:
+    """合并两段摘要为固定预算内的单一摘要。"""
+    try:
+        resp = await client.call(
+            message_list=[
+                {'role': 'system', 'content': '你是高效的信息压缩器。'},
+                {'role': 'user', 'content': _REWRITE_SUMMARY_PROMPT.format(budget=budget, old=old, new=new)},
+            ],
+            tool_list=[],
+        )
+        result = resp.get('content', '') or new
+        # 硬上限兜底
+        if len(result) > budget * 2:
+            result = result[:budget * 2]
+        return result
+    except Exception as e:
+        print(f'[decision] rewrite_summary failed: {e}')
+        return new  # 失败时只保留新摘要
+
+
 # ── detailed_info 系统工具实现 ────────────────────────────────────────────────────
 
 import datetime as _dt
@@ -239,20 +319,25 @@ async def _memory_recall(
     if source in ('all', 'subagent'):
         try:
             with _get_conn() as conn:
+                # 分词搜索：将 query 按空格拆分，每个关键词都必须匹配（AND 逻辑）
+                keywords = [k.strip() for k in query.split() if k.strip()]
+                if not keywords:
+                    keywords = [query]
+                where_clauses = ' AND '.join(['(conclusion LIKE ? OR goal LIKE ?)'] * len(keywords))
+                params = []
+                for kw in keywords:
+                    params.extend([f'%{kw}%', f'%{kw}%'])
                 if time_cutoff > 0:
-                    rows = conn.execute(
-                        'SELECT agent_id, goal, conclusion, source_type, created_at '
-                        'FROM subagent_conclusions WHERE conclusion LIKE ? AND created_at > ? '
-                        'ORDER BY created_at DESC LIMIT ?',
-                        (f'%{query}%', time_cutoff, limit)
-                    ).fetchall()
+                    sql = (f'SELECT agent_id, goal, conclusion, source_type, created_at '
+                           f'FROM subagent_conclusions WHERE ({where_clauses}) AND created_at > ? '
+                           f'ORDER BY created_at DESC LIMIT ?')
+                    params.extend([time_cutoff, limit])
                 else:
-                    rows = conn.execute(
-                        'SELECT agent_id, goal, conclusion, source_type, created_at '
-                        'FROM subagent_conclusions WHERE conclusion LIKE ? '
-                        'ORDER BY created_at DESC LIMIT ?',
-                        (f'%{query}%', limit)
-                    ).fetchall()
+                    sql = (f'SELECT agent_id, goal, conclusion, source_type, created_at '
+                           f'FROM subagent_conclusions WHERE ({where_clauses}) '
+                           f'ORDER BY created_at DESC LIMIT ?')
+                    params.append(limit)
+                rows = conn.execute(sql, params).fetchall()
                 for agent_id, goal, conclusion, source_type, ts in rows:
                     time_str = _dt.datetime.fromtimestamp(ts).strftime('%m-%d %H:%M')
                     results.append({
@@ -572,6 +657,16 @@ class Event:
     def _save_current_turn(self, trigger_event: dict):
         """保存 _current_turn 到内存历史 + SQLite。"""
         turn = self._current_turn
+        # 保存前 compact：截断大 tool results，减少 tier1 历史占用
+        llm_cfg = config.main.get('event', {}).get('llm', {})
+        save_compact_limit = llm_cfg.get('save_compact_chars', 500)
+        for i, msg in enumerate(turn):
+            if msg.get('role') == 'tool':
+                content = msg.get('content', '')
+                if isinstance(content, str) and len(content) > save_compact_limit:
+                    turn[i] = {**msg, 'content': content[:save_compact_limit] + '...(trimmed)'}
+                elif isinstance(content, list):
+                    turn[i] = {**msg, 'content': '(多模态内容已省略)'}
         self._turns.append(turn)
         # 持久化（延迟创建 session）
         import chat_history
@@ -584,47 +679,65 @@ class Event:
                 chat_history.update_summary(self._session_id, summary_text)
         except Exception as e:
             print(f'[chat_history] save_turn failed: {e}')
-        # 裁剪
-        max_turns = config.main.get('event', {}).get('llm', {}).get('history_turns', 30)
+        # 裁剪：保留 tier1 + tier2 + 少量缓冲（压缩在 _maybe_compress 中处理）
+        llm_cfg = config.main.get('event', {}).get('llm', {})
+        tier1 = llm_cfg.get('tier1_turns', 6)
+        tier2 = llm_cfg.get('tier2_turns', 8)
+        max_turns = llm_cfg.get('history_turns', tier1 + tier2 + 4)
         if len(self._turns) > max_turns:
             self._turns = self._turns[-max_turns:]
 
     # ── 单轮推理 ─────────────────────────────────────────────────────────────
 
     def _build_history(self) -> list[dict]:
-        """从 _turns 构建 L3 历史（取最近 N 轮 flatten）。若有摘要则前置。"""
-        max_turns = config.main.get('event', {}).get('llm', {}).get('history_turns', 30)
-        recent_turns = self._turns[-max_turns:] if len(self._turns) > max_turns else self._turns
+        """从 _turns 构建 L3 历史（tiered retention: tier1 全量 + tier2 降质 + summary）。"""
+        llm_cfg = config.main.get('event', {}).get('llm', {})
+        tier1 = llm_cfg.get('tier1_turns', 6)
+        tier2 = llm_cfg.get('tier2_turns', 8)
+
+        n = len(self._turns)
+        recent = self._turns[-tier1:] if n > tier1 else self._turns
+        medium = self._turns[max(0, n - tier1 - tier2):max(0, n - tier1)]
+
         history = []
         # 前置历史摘要（如果有）
         if self._summary:
             history.append({'role': 'user', 'content': self._summary})
             history.append({'role': 'assistant', 'content': '好的，我已了解之前的对话背景。'})
-        for turn in recent_turns:
+        for turn in medium:
+            history.extend(_degrade_turn(turn))
+        for turn in recent:
             history.extend(turn)
         return _sanitize(history)
 
     async def _maybe_compress(self):
-        """检查历史是否超过阈值，如果是则压缩旧轮次为摘要。"""
+        """检查历史是否需要压缩（基于轮数或字符数），压缩旧轮次为 rolling summary。"""
         llm_cfg = config.main.get('event', {}).get('llm', {})
+        tier1 = llm_cfg.get('tier1_turns', 6)
+        tier2 = llm_cfg.get('tier2_turns', 8)
+        max_kept = tier1 + tier2
         threshold = llm_cfg.get('compress_threshold_chars', 80000)
-        keep_recent = llm_cfg.get('compress_keep_recent', 6)
+        summary_budget = llm_cfg.get('summary_max_chars', 5000)
 
-        total_chars = _estimate_chars(self._turns)
-        if total_chars <= threshold:
+        # 触发条件1: 轮数超限
+        need_compress = len(self._turns) > max_kept + 2
+        # 触发条件2: 字符超限（兜底）
+        if not need_compress:
+            need_compress = _estimate_chars(self._turns) > threshold
+        if not need_compress:
             return
-        if len(self._turns) <= keep_recent:
+        if len(self._turns) <= max_kept:
             return  # 不够分割，跳过
 
         # 分割：压缩旧的，保留最近的
-        old_turns = self._turns[:-keep_recent]
-        recent_turns = self._turns[-keep_recent:]
+        old_turns = self._turns[:-max_kept]
+        recent_turns = self._turns[-max_kept:]
 
-        print(f'[decision] compressing history: {len(old_turns)} old turns ({total_chars} chars > {threshold} threshold)')
+        print(f'[decision] compressing history: {len(old_turns)} old turns, keeping {max_kept} recent')
         summary = await _compress_turns(old_turns)
-        # 合并旧摘要
+        # Rolling summary: 合并旧摘要（固定预算重写，而非无限拼接）
         if self._summary:
-            summary = self._summary + '\n\n' + summary
+            summary = await _rewrite_summary(self._summary, summary, summary_budget)
 
         self._summary = summary
         self._turns = recent_turns
@@ -717,6 +830,13 @@ class Event:
                 round_idx = 0
                 print(f'[decision] hit max_rounds={max_rounds}, truncated turn_messages to {len(turn_messages)}, continuing')
                 await push_event({'type': 'turn_truncated', 'payload': {'kept': len(turn_messages), 'total_rounds': total_rounds}})
+
+            # ── Turn 内 compaction：消息过多时压缩早期 tool results ────────────
+            compact_threshold = llm_cfg.get('turn_compact_threshold', 30)
+            compact_keep_recent = llm_cfg.get('turn_compact_keep_recent', 12)
+            if len(turn_messages) > compact_threshold:
+                _compact_turn_messages(turn_messages, compact_keep_recent)
+
             # ── 构建分层 prompt ────────────────────────────────────────────
             history = self._build_history()
             # 本轮已产生的消息也要加入历史（多轮工具调用场景）
@@ -784,7 +904,11 @@ class Event:
                     if len(self._turns) > 2:
                         old = self._turns[:-2]
                         summary = await _compress_turns(old)
-                        self._summary = (self._summary + '\n\n' + summary) if self._summary else summary
+                        if self._summary:
+                            llm_cfg = config.main.get('event', {}).get('llm', {})
+                            budget = llm_cfg.get('summary_max_chars', 5000)
+                            summary = await _rewrite_summary(self._summary, summary, budget)
+                        self._summary = summary
                         self._turns = self._turns[-2:]
                         # 重建 history 并重试（复用冻结的 system）
                         history = self._build_history()

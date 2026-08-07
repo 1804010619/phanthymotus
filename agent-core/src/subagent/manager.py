@@ -30,7 +30,8 @@ from .store import SubagentStore
 def _get_config() -> dict:
     """Get subagent configuration with defaults."""
     defaults = {
-        'max_concurrent': 2,
+        'max_concurrent': 5,
+        'max_concurrent_bg': 1,
         'max_total': 10,
         'default_max_rounds': 10,
         'default_timeout_s': 300,
@@ -255,6 +256,19 @@ class SubagentManager:
         if not agent or agent.status in TERMINAL_STATUSES:
             return  # Skip stale entries
 
+        # BG concurrency limit: bg agents (goal starts with [bg]) max 1 concurrent
+        if agent.spec.goal.startswith('[bg]'):
+            max_bg = self._cfg.get('max_concurrent_bg', 1)
+            bg_running = sum(
+                1 for aid in self._running
+                if aid in self._agents and self._agents[aid].spec.goal.startswith('[bg]')
+            )
+            if bg_running >= max_bg:
+                # Re-push to queue and wait
+                self._queue.push(agent.id, agent.spec.priority)
+                await self._queue.wait_for_item()
+                return
+
         # Launch agent
         task = asyncio.create_task(self._run_agent(agent))
         self._running[agent.id] = task
@@ -316,12 +330,18 @@ class SubagentManager:
         print(f'[subagent:{agent_id}] preempted and suspended')
 
     async def _timeout_watchdog(self, agent_id: str, timeout_s: float):
-        """Cancel agent after timeout."""
-        await asyncio.sleep(timeout_s)
-        agent = self._agents.get(agent_id)
-        if agent and agent.status == STATUS_RUNNING:
-            print(f'[subagent:{agent_id}] timeout after {timeout_s}s')
-            agent.cancel()
+        """Cancel agent if idle (no progress) for timeout_s seconds."""
+        idle_timeout = timeout_s  # timeout_s 现在是"无进展超时"而非绝对超时
+        while True:
+            await asyncio.sleep(30)  # 每 30 秒检查一次
+            agent = self._agents.get(agent_id)
+            if not agent or agent.status != STATUS_RUNNING:
+                return
+            idle_time = time.time() - agent.updated_at
+            if idle_time >= idle_timeout:
+                print(f'[subagent:{agent_id}] idle timeout: no progress for {idle_time:.0f}s')
+                agent.cancel()
+                return
 
     # ── Lifecycle Helpers ─────────────────────────────────────────────────────
 
@@ -412,6 +432,7 @@ class SubagentManager:
                 'output': result.output[:200] if result.output else '',
                 'error': result.error,
                 'rounds_used': result.rounds_used,
+                'priority': agent.spec.priority,
             },
         )
 
