@@ -160,7 +160,7 @@ class Client():
                             pass
                     print(f'[llm] WARNING: message.to_dict() failed ({parse_err}), using fallback parse')
                 # OpenAI SDK 可能生成 tool_calls: None，清理以避免下游迭代报错
-                if msg.get('tool_calls') is None:
+                if 'tool_calls' in msg and msg['tool_calls'] is None:
                     del msg['tool_calls']
                 # glm 有时返回 tool_calls 内部缺少必要字段，清理无效条目
                 if 'tool_calls' in msg and isinstance(msg['tool_calls'], list):
