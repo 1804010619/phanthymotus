@@ -19,7 +19,7 @@ plugins:
         - "x iǎo f àn x iǎo f àn @小范小范"
 
   tts:
-    enabled: false
+    enabled: true
     model_dir: /models/sherpa-onnx/tts
     speaker_id: 0
     speed: 1.0
@@ -55,7 +55,7 @@ plugins:
     language: "zh"     # default language hint
 
   obstacle:
-    enabled: true
+    enabled: false
     provider: local    # openai | qwen | local
     url: ""          # API URL (empty = default endpoint)
     key: ""          # API Key
