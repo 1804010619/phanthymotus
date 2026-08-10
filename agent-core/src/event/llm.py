@@ -650,6 +650,9 @@ class Event:
             finally:
                 collector.set_cancel_event(None)
                 collector.set_busy(False)
+                # Fire on_idle hook (LED state reset etc.)
+                import hooks as _hooks_idle
+                asyncio.create_task(_hooks_idle.fire('on_idle'))
                 # 无论成功失败，只要有消息就持久化
                 if self._current_turn:
                     self._save_current_turn(ev)

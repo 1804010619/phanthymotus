@@ -329,6 +329,23 @@ class _TTSNode(Node):
                                 # Flush pre-buffer and start real-time clock
                                 t0 = _time.monotonic()
                                 t0_wall = _time.time()
+                                # Fire on_speaking hook (playback starting)
+                                try:
+                                    import urllib.request as _ureq
+                                    import json as _jhook
+                                    _hreq = _ureq.Request(
+                                        "https://localhost:15678/api/hooks/fire",
+                                        data=_jhook.dumps({"hook": "on_speaking"}).encode(),
+                                        headers={"Content-Type": "application/json"},
+                                        method="POST"
+                                    )
+                                    import ssl as _ssl
+                                    _sctx = _ssl.create_default_context()
+                                    _sctx.check_hostname = False
+                                    _sctx.verify_mode = _ssl.CERT_NONE
+                                    _ureq.urlopen(_hreq, timeout=2, context=_sctx)
+                                except Exception:
+                                    pass
                                 for pf in prebuf:
                                     msg = AudioChunk()
                                     msg.header.stamp = self.get_clock().now().to_msg()
@@ -412,6 +429,7 @@ class _TTSNode(Node):
                     pass
 
                 # ACP: 推送动作完成回调到 Agent Core
+                # Also fire on_idle hook (LED off immediately after playback)
                 if _action_id:
                     try:
                         import urllib.request as _urllib
@@ -421,6 +439,14 @@ class _TTSNode(Node):
                         _ctx = _ssl.create_default_context()
                         _ctx.check_hostname = False
                         _ctx.verify_mode = _ssl.CERT_NONE
+                        # Fire on_idle to turn off LED
+                        _idle_req = _urllib.Request(
+                            f"{_agent_core_url}/api/hooks/fire",
+                            data=json.dumps({"hook": "on_idle"}).encode(),
+                            headers={"Content-Type": "application/json"},
+                            method="POST"
+                        )
+                        _urllib.urlopen(_idle_req, timeout=2, context=_ctx)
                         was_interrupted = self._interrupt_flag.is_set()
                         _payload = json.dumps({
                             "action_id": _action_id,
