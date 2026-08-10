@@ -15,9 +15,35 @@ log = logging.getLogger(__name__)
 
 COS_BASE = "https://agi-phanthy-dev-1252788780.cos.ap-beijing.myqcloud.com/public"
 
+
+def _progress_hook(name: str):
+    """Create a reporthook for urlretrieve that logs download progress."""
+    last_pct = [0]
+    def hook(block_num, block_size, total_size):
+        if total_size > 0:
+            pct = min(int(block_num * block_size * 100 / total_size), 100)
+            if pct >= last_pct[0] + 10:
+                last_pct[0] = pct
+                mb_done = block_num * block_size / (1024 * 1024)
+                mb_total = total_size / (1024 * 1024)
+                log.info(f"[model_downloader] {name}: {pct}% ({mb_done:.1f}/{mb_total:.1f} MB)")
+    return hook
+
 MODELS = {
     "asr": {
         "url": f"{COS_BASE}/sherpa-onnx-streaming-paraformer-bilingual-zh-en.zip",
+        "check_file": "tokens.txt",
+    },
+    "asr_en": {
+        "url": f"{COS_BASE}/sherpa-onnx-streaming-zipformer-en-2023-06-26.zip",
+        "check_file": "tokens.txt",
+    },
+    "asr_sensevoice": {
+        "url": f"{COS_BASE}/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17.zip",
+        "check_file": "tokens.txt",
+    },
+    "asr_paraformer_offline": {
+        "url": f"{COS_BASE}/sherpa-onnx-paraformer-zh-small-2024-03-09.tar.bz2",
         "check_file": "tokens.txt",
     },
     "tts": {
@@ -33,10 +59,23 @@ MODELS = {
         "url": f"{COS_BASE}/sherpa-onnx-kws-zipformer-zh-en-3M-2025-12-20.tar.bz2",
         "check_file": "tokens.txt",
     },
+    "kws_zh": {
+        "url": f"{COS_BASE}/sherpa-onnx-kws-zipformer-wenetspeech-3.3M-2024-01-01.zip",
+        "check_file": "tokens.txt",
+    },
+    "kws_en": {
+        "url": f"{COS_BASE}/sherpa-onnx-kws-zipformer-gigaspeech-3.3M-2024-01-01.zip",
+        "check_file": "tokens.txt",
+    },
     "vad": {
         "url": f"{COS_BASE}/silero_vad.onnx",
         "check_file": "silero_vad.onnx",
         "single_file": True,  # Not an archive, just a single file download
+    },
+    "denoise": {
+        "url": f"{COS_BASE}/gtcrn_simple.onnx",
+        "check_file": "gtcrn_simple.onnx",
+        "single_file": True,
     },
 }
 
@@ -59,7 +98,7 @@ def ensure_model(name: str, model_dir: str) -> None:
     if info.get("single_file"):
         # Direct file download (not an archive)
         dest = os.path.join(model_dir, info["check_file"])
-        urlretrieve(url, dest)
+        urlretrieve(url, dest, reporthook=_progress_hook(name))
         log.info(f"[model_downloader] {name}: done.")
         return
 
@@ -73,7 +112,7 @@ def ensure_model(name: str, model_dir: str) -> None:
         tmp_path = tmp.name
 
     try:
-        urlretrieve(url, tmp_path)
+        urlretrieve(url, tmp_path, reporthook=_progress_hook(name))
         log.info(f"[model_downloader] {name}: extracting to {model_dir} ...")
 
         if suffix == ".zip":
