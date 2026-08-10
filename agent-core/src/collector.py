@@ -383,9 +383,8 @@ async def _drain_loop():
         _extract_perf_timestamps(ev)
         priority = _extract_priority(ev)
 
-        # System hooks: fire on_hearing / on_kws_wakeup for ASR events
+        # KWS wake-word hook (fires regardless of busy state)
         if 'asr' in source.lower():
-            import hooks
             payload = ev.get('payload', {})
             if isinstance(payload, str):
                 try:
@@ -394,9 +393,8 @@ async def _drain_loop():
                 except Exception:
                     payload = {}
             if payload.get('kws_triggered'):
+                import hooks
                 asyncio.create_task(hooks.fire('on_kws_wakeup'))
-            else:
-                asyncio.create_task(hooks.fire('on_hearing'))
 
         # Ring buffer 始终存储（所有事件，供 raw_input_info 查询）
         if source not in _source_ring:

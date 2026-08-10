@@ -677,6 +677,7 @@ def _vad_worker(pcm_q: multiprocessing.Queue, result_q: multiprocessing.Queue,
     start_ts = None
     end_ts = None
     kws_cooldown_until = 0.0
+    _was_speaking = False  # Track speech onset for hook notification
 
     _log.info(f"[vad-worker] process started (pid={os.getpid()}, backend=sherpa_onnx, kws={kws_enabled})")
     audio_count = 0
@@ -775,6 +776,12 @@ def _vad_worker(pcm_q: multiprocessing.Queue, result_q: multiprocessing.Queue,
                 vad.pop()
 
         elif state == 'listening':
+            # Detect speech onset → notify main thread for on_hearing hook
+            _is_speaking = vad.is_speech_detected()
+            if _is_speaking and not _was_speaking:
+                result_q.put(("speech_start", ts, ts, False))
+            _was_speaking = _is_speaking
+
             # Collect completed VAD segments
             while not vad.empty():
                 seg = vad.front
@@ -980,6 +987,25 @@ class _ASRNode(Node):
         while not self._stop_event.is_set():
             try:
                 item = self._utterance_queue.get(timeout=1)
+                # Handle speech onset signal from VAD worker
+                if len(item) >= 2 and item[0] == "speech_start":
+                    try:
+                        import urllib.request as _urllib_req
+                        import json as _json_hook
+                        _hook_req = _urllib_req.Request(
+                            "https://localhost:15678/api/hooks/fire",
+                            data=_json_hook.dumps({"hook": "on_hearing"}).encode(),
+                            headers={"Content-Type": "application/json"},
+                            method="POST"
+                        )
+                        import ssl as _ssl
+                        _ctx = _ssl.create_default_context()
+                        _ctx.check_hostname = False
+                        _ctx.verify_mode = _ssl.CERT_NONE
+                        _urllib_req.urlopen(_hook_req, timeout=2, context=_ctx)
+                    except Exception as _he:
+                        log.debug(f"[asr] fire on_hearing failed: {_he}")
+                    continue
                 if len(item) == 4:
                     utterance, start_ts, end_ts, _kws_from_vad = item
                 else:
