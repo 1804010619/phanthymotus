@@ -206,11 +206,13 @@ def _env_dynamic() -> str:
     # 不再显示 active_subagents — bg subagent 结论通过 memory_recall 按需检索，
     # 用户任务 subagent 完成后会发精简通知。
 
-    return (
-        f'<status time="{now}">\n'
-        f'{tasks_section}'
-        f'</status>'
-    )
+    if tasks_section:
+        return (
+            f'<status time="{now}">\n'
+            f'{tasks_section}'
+            f'</status>'
+        )
+    return f'<status time="{now}" />'
 
 
 # ── L4 ────────────────────────────────────────────────────────────────────────

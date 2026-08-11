@@ -102,6 +102,28 @@ def _extract_perf_timestamps(ev: dict):
         ev['_perf_spans'] = spans
 
 
+def _extract_asr_text_field(ev: dict) -> str:
+    """从 ASR 事件中提取纯文本（用于去重比较）。"""
+    text = ev.get('text', '')
+    if text.startswith('{'):
+        try:
+            return _json.loads(text).get('text', '')
+        except (ValueError, TypeError):
+            pass
+    return text
+
+
+def _pending_has_same_asr_text(asr_text: str) -> bool:
+    """检查 steering_queue 或 priority_pending 中是否已有相同 ASR 文本。"""
+    for item in list(_steering_queue._queue):
+        if _extract_asr_text_field(item) == asr_text:
+            return True
+    for item in _priority_pending:
+        if _extract_asr_text_field(item) == asr_text:
+            return True
+    return False
+
+
 # ── 公开接口 ──────────────────────────────────────────────────────────────────
 
 def set_busy(busy: bool):
@@ -236,14 +258,37 @@ async def _emit_batch(batch: list[dict], urgent: bool = False):
     await _output.put(trigger)
 
 
+# 对 LLM 决策无意义的 perf/trace 字段（已独立存入 perf_spans 表）
+_LLM_IRRELEVANT_KEYS = frozenset({
+    'audio_start_ts', 'audio_end_ts', 'asr_complete_ts',
+    'spans', 'priority', 'text_length',
+})
+
+
+def _slim_event_text(text: str) -> str:
+    """剥离对 LLM 决策无意义的 perf/trace 字段，只保留语义信息。"""
+    if not text or not text.startswith('{'):
+        return text
+    try:
+        data = _json.loads(text)
+    except (ValueError, TypeError):
+        return text
+    keys_to_remove = _LLM_IRRELEVANT_KEYS & data.keys()
+    if not keys_to_remove:
+        return text
+    for key in keys_to_remove:
+        del data[key]
+    return _json.dumps(data, ensure_ascii=False)
+
+
 def _format_priority_batch(events: list[dict]) -> str:
-    """格式化 P>0 事件为 XML（保留原文）。"""
+    """格式化 P>0 事件为 XML（精简 perf 字段后的文本）。"""
     parts = []
     for ev in events:
         ts = datetime.datetime.fromtimestamp(ev['ts']).strftime('%Y-%m-%dT%H:%M:%S')
         channel = _infer_channel(ev)
         source = ev.get('source', '')
-        text = ev.get('text', '')
+        text = _slim_event_text(ev.get('text', ''))
         parts.append(f'<event source="{source}" channel="{channel}" ts="{ts}">\n{text}\n</event>')
     return '\n'.join(parts)
 
@@ -412,6 +457,13 @@ async def _drain_loop():
                     if 0 < duration_ms < _barge_in_threshold_ms:
                         continue  # backchannel，不打断
 
+                # ASR 去重：busy 时如果相同 text 已在排队中，丢弃重复
+                if 'asr' in source.lower():
+                    _asr_text = _extract_asr_text_field(ev)
+                    if _asr_text and _pending_has_same_asr_text(_asr_text):
+                        print(f'[collector] dedup: ASR text "{_asr_text[:30]}" already pending, skip')
+                        continue
+
                 # 按模式处理
                 if _interrupt_mode == 'steer':
                     # Scheduler 去重：如果 steering_queue 中已有相同 source 的 scheduler 事件，跳过
@@ -444,6 +496,26 @@ async def _drain_loop():
             _bg_buffer_add(ev)
 
 
+def _bg_buffer_has_substance(batch: list[dict]) -> bool:
+    """检查事件批次是否包含有意义的传感器数据。空文本或无数值的事件不值得 spawn bg_monitor。"""
+    for ev in batch:
+        text = ev.get('text', '').strip()
+        if not text:
+            continue
+        if text.startswith('{'):
+            try:
+                data = _json.loads(text)
+                # 含数值字段 = 有传感器数据（SOC/温度/电压/IMU 等）
+                if any(isinstance(v, (int, float)) for v in data.values()):
+                    return True
+            except (ValueError, TypeError):
+                pass
+        elif len(text) > 5:
+            # 非 JSON 但有文本内容
+            return True
+    return False
+
+
 async def _bg_trigger_loop():
     """独立节奏：每 interval 把 bg_buffer 送给 bg subagent。"""
     while True:
@@ -453,6 +525,9 @@ async def _bg_trigger_loop():
             continue
         batch = list(_bg_buffer)
         _bg_buffer.clear()
+        # 只在 buffer 含有实质性传感器数据时才路由到 bg subagent
+        if not _bg_buffer_has_substance(batch):
+            continue
         await _route_to_bg_subagent(batch)
 
 
