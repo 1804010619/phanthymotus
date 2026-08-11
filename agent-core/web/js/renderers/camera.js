@@ -176,16 +176,12 @@ export const DepthZlibRenderer = {
   async onData(buffer, hint) {
     if (!this._ctx) return;
 
-    // Decompress zlib using native DecompressionStream
+    // Decompress zlib using native DecompressionStream('deflate') which handles zlib format
     let raw;
     try {
       const ds = new DecompressionStream('deflate');
-      // zlib format = 2-byte header + raw deflate + 4-byte adler32
-      // DecompressionStream('deflate') expects raw deflate, so strip zlib wrapper
-      const input = new Uint8Array(buffer);
-      const deflateData = input.slice(2, -4);
       const writer = ds.writable.getWriter();
-      writer.write(deflateData);
+      writer.write(new Uint8Array(buffer));
       writer.close();
       const reader = ds.readable.getReader();
       const chunks = [];
