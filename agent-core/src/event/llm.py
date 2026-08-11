@@ -462,6 +462,7 @@ class Event:
         self._session_id: str | None  = None  # chat history session
         self._current_turn: list[dict] = []   # 当前轮消息（供 run_forever 保存）
         self._subagent_mgr = None             # SubagentManager instance
+        self._bound_instance_ids: dict = {}   # full_name → card_id (canvas binding)
 
     async def __aenter__(self):
         global _event_instance
@@ -548,11 +549,13 @@ class Event:
 
         # 从 executor connections 直接收集绑定的工具 schemas
         schemas = []
+        self._bound_instance_ids = {}  # full_name → card_id (for multiInstance tools)
         for ec in exec_conns:
             if ec.get('fromCardId') not in core_card_ids:
                 continue
             mcp_id = ec.get('toMcpId', '')
             tool_name = ec.get('toToolName', '')
+            card_id = ec.get('toCardId', '')
             if not mcp_id or not tool_name:
                 continue
             # 从 mcp_client registry 中取该工具的 schema
@@ -560,6 +563,8 @@ class Event:
             if not info or not info.get('online'):
                 continue
             full_name = f"mcp__{mcp_id}__{tool_name}"
+            if card_id:
+                self._bound_instance_ids[full_name] = card_id
             schema = info.get('schemas', {}).get(full_name)
             if schema:
                 schemas.append(schema)
@@ -569,6 +574,8 @@ class Event:
                     s = info.get('schemas', {}).get(split_name)
                     if s:
                         schemas.append(s)
+                        if card_id:
+                            self._bound_instance_ids[split_name] = card_id
 
         if not schemas:
             # 没有绑定任何工具时，仅使用系统工具（不暴露全部 MCP 工具）
@@ -1020,6 +1027,9 @@ class Event:
                         await mcp_client.await_pending(cancel_event, timeout=120)
                     args['_trace_id'] = _trace_id
                     args['_cancel_event'] = cancel_event
+                    # Inject instance_id from canvas binding (multiInstance tools need it)
+                    if name in self._bound_instance_ids and 'instance_id' not in args:
+                        args['instance_id'] = self._bound_instance_ids[name]
                     result = await mcp_client.call_tool(name, args)
                     # interrupt hook 绑定的工具执行后：清 pending + 通知其他绑定方
                     if not _needs_barrier(name, args) and mcp_client.get_pending_actions():
