@@ -95,8 +95,8 @@ EXPOSE 15720
 EXPOSE 15721
 
 # 确保 ROS2 Python 包始终在 PYTHONPATH 中（不依赖 source setup.bash）
-RUN find /ros_ws/install -name "site-packages" -type d > /usr/local/lib/python${PYTHON_VERSION}/dist-packages/ros_ws.pth && \
-    find /opt/ros/humble/install -name "site-packages" -type d >> /usr/local/lib/python${PYTHON_VERSION}/dist-packages/ros_ws.pth
+RUN find /ros_ws/install -name "site-packages" -type d > /usr/local/lib/python${PYTHON_VERSION-3.8}/dist-packages/ros_ws.pth && \
+    find /opt/ros/humble/install -name "site-packages" -type d >> /usr/local/lib/python${PYTHON_VERSION-3.8}/dist-packages/ros_ws.pth
 
 # ROS2 shared libraries（audio_msgs .so 等）
 ENV LD_LIBRARY_PATH="/ros_ws/install/audio_msgs/lib:/opt/ros/humble/install/lib:${LD_LIBRARY_PATH}"
