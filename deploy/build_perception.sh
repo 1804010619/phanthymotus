@@ -63,13 +63,14 @@ case "${VARIANT}" in
         ;;
 esac
 
+BUILD_ARGS=""
 # ── 根据 jp_version 选择 base image  ────────────────────────
 case "${JP_VERSION}" in
     5.11)
-        BASE_IMAGE="bj-warehouse.tencentcloudcr.com/phanthy-motus/jetson-base:jp511-torch"
+        BUILD_ARGS="${BUILD_ARGS} JP_VERSION=511"
         ;;
     6.1)
-        BASE_IMAGE="bj-warehouse.tencentcloudcr.com/phanthy-motus/jetson-base:jp61-torch"
+        BUILD_ARGS="${BUILD_ARGS} JP_VERSION=61"
         ;;
     *)
         echo "Unknown JetPack version: ${JP_VERSION} (support: 5.11, 6.1)"
@@ -94,7 +95,11 @@ fi
 
 select_mirror
 
-do_build "${DOCKERFILE}" "${BUILD_CONTEXT}" "${FULL_IMAGE}" "BASE_IMAGE=${BASE_IMAGE}"
+# trim leading and trailing space
+BUILD_ARGS="${BUILD_ARGS#${BUILD_ARGS%%[![:space:]]*}}"
+BUILD_ARGS="${BUILD_ARGS%${BUILD_ARGS##*[![:space:]]}}"
+
+do_build "${DOCKERFILE}" "${BUILD_CONTEXT}" "${FULL_IMAGE}" "${BUILD_ARGS}"
 
 if ${PUSH_ENABLED}; then
     do_push "${FULL_IMAGE}"
