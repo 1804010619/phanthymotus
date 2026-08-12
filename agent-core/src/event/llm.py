@@ -787,6 +787,22 @@ class Event:
         # Fire on_thinking hook (non-blocking LED feedback etc.)
         import hooks
         asyncio.create_task(hooks.fire('on_thinking'))
+
+        # ── Auto-interrupt: 新用户 turn 开始时清除旧的 pending ACP ──
+        if mcp_client.get_pending_actions():
+            _int_results = await hooks.fire('on_interrupt_all')
+            if _int_results:
+                for aid in list(mcp_client._pending_actions.keys()):
+                    mcp_client._pending_results[aid] = {
+                        "status": "cancelled",
+                        "reason": "auto-interrupted by new user message",
+                    }
+                    mcp_client._pending_actions[aid].set()
+                print(f'[decision] auto-interrupt: {len(_int_results)} hook(s) fired, pending cleared')
+            else:
+                # Fallback: 没有 hook 注册时用硬编码查找
+                await self._interrupt_active_outputs()
+
         # Subagent status in log
         if self._subagent_mgr:
             _sa_active = self._subagent_mgr.list_active()
