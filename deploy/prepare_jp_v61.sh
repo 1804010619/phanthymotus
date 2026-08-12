@@ -44,6 +44,10 @@ RUN rm -f /etc/apt/sources.list.d/* && rm -rf /var/lib/apt/lists/* /var/cache/ap
     apt-get install -y --no-install-recommends --allow-unauthenticated libopenblas-base && \
     rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*
 RUN apt-get remove -y --purge python3-sympy && pip3 install --no-cache-dir --index-url https://pypi.jetson-ai-lab.io/ --extra-index-url https://pypi.tuna.tsinghua.edu.cn/simple/ ${TORCH_URL}
+RUN wget -q -O /tmp/libcusparse_lt.tar.xz 'https://developer.download.nvidia.com/compute/cusparselt/redist/libcusparse_lt/linux-aarch64/libcusparse_lt-linux-aarch64-0.6.3.2-archive.tar.xz' && \
+    tar xJf /tmp/libcusparse_lt.tar.xz -C /tmp/ && \
+    cp -r /tmp/libcusparse_lt-*/lib/libcusparseLt.so* /usr/local/lib/ && ldconfig && \
+    rm -rf /tmp/libcusparse_lt.tar.xz /tmp/libcusparse_lt-*
 # Copy pre-compiled torchvision (with CUDA NMS ops) from dustynv image
 COPY --from=pytorch-donor /usr/local/lib/python3.10/dist-packages/torchvision /usr/local/lib/python3.10/dist-packages/torchvision
 COPY --from=pytorch-donor /usr/local/lib/python3.10/dist-packages/torchvision-0.19.0a0+48b1edf.dist-info/ /usr/local/lib/python3.10/dist-packages/torchvision-0.19.0a0+48b1edf.dist-info
