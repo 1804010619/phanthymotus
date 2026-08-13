@@ -10,7 +10,7 @@ RUN apt-get -o Acquire::AllowInsecureRepositories=true update && \
     curl -fsSL https://mirrors.tuna.tsinghua.edu.cn/docker-ce/linux/static/stable/aarch64/docker-27.5.1.tgz \
         | tar -xz --strip-components=1 -C /usr/local/bin/ docker/docker && \
     mkdir -p /usr/local/lib/docker/cli-plugins && \
-    curl -fsSL https://agi-phanthy-dev-1252788780.cos.ap-beijing.myqcloud.com/public/docker-compose-linux-aarch64 \
+    curl -fsSL https://github.com/docker/compose/releases/download/v2.37.0/docker-compose-linux-aarch64 \
         -o /usr/local/lib/docker/cli-plugins/docker-compose && \
     chmod +x /usr/local/lib/docker/cli-plugins/docker-compose && \
     rm -rf /var/lib/apt/lists/*
