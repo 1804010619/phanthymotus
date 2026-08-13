@@ -41,8 +41,9 @@ def _docker():
     return docker.from_env()
 
 
-def _container_name(driver_id: str) -> str:
-    return f'embodied-{driver_id}'
+def _container_name(driver_id: str, override: str = '') -> str:
+    """Return container name: use override from manifest if available, else embodied-{id}."""
+    return override if override else f'embodied-{driver_id}'
 
 
 # ── Deploy log buffer (in-memory, per driver) ─────────────────────────────
@@ -59,10 +60,10 @@ def _clear_deploy_log(driver_id: str):
     _deploy_logs.pop(driver_id, None)
 
 
-def _get_status_sync(driver_id: str) -> dict:
+def _get_status_sync(driver_id: str, container_name_override: str = '') -> dict:
     try:
         client = _docker()
-        name = _container_name(driver_id)
+        name = _container_name(driver_id, container_name_override)
         containers = client.containers.list(all=True, filters={'name': f'^{name}$'})
         if not containers:
             deploy_log = _deploy_logs.get(driver_id, '')
@@ -94,7 +95,7 @@ def _deploy_sync(driver: dict) -> dict:
     import docker as docker_sdk
 
     client = _docker()
-    name = _container_name(driver['id'])
+    name = _container_name(driver['id'], driver.get('container_name', ''))
     target_image = driver['image']
 
     # Check if already running with the same image — skip re-deploy
@@ -199,14 +200,14 @@ def _deploy_sync(driver: dict) -> dict:
         _log_deploy(driver['id'], f'[compose] exit code {result.returncode}')
         return {'status': 'error', 'error': f'compose up failed (rc={result.returncode})'}
     _log_deploy(driver['id'], '[deploy] done')
-    return {'status': 'starting', 'service': service_name}
+    return {'status': 'starting', 'service': service_name, 'container_name': svc_container_name}
 
 
 def _deploy_sync_legacy(driver: dict) -> dict:
     """Fallback: deploy via docker run for images without /deploy/service.yml."""
     import docker as docker_sdk
     client = _docker()
-    name = _container_name(driver['id'])
+    name = _container_name(driver['id'], driver.get('container_name', ''))
     target_image = driver['image']
 
     # Remove existing
@@ -280,14 +281,14 @@ def _deploy_sync_legacy(driver: dict) -> dict:
         _log_deploy(driver['id'], f'[error] {e}')
         raise
     _log_deploy(driver['id'], f'[deploy] done, container={container.id[:12]}')
-    return {'status': 'starting', 'container_id': container.id[:12]}
+    return {'status': 'starting', 'container_id': container.id[:12], 'container_name': name}
 
 
-def _stop_sync(driver_id: str) -> dict:
+def _stop_sync(driver_id: str, container_name_override: str = '') -> dict:
     import docker as docker_sdk
     try:
         client = _docker()
-        name = _container_name(driver_id)
+        name = _container_name(driver_id, container_name_override)
         container = client.containers.get(name)
         container.stop(timeout=5)
         return {'status': 'stopped'}
@@ -297,12 +298,12 @@ def _stop_sync(driver_id: str) -> dict:
         raise RuntimeError(str(e))
 
 
-def _remove_sync(driver_id: str) -> dict:
+def _remove_sync(driver_id: str, container_name_override: str = '') -> dict:
     """Stop and remove container."""
     import docker as docker_sdk
     try:
         client = _docker()
-        name = _container_name(driver_id)
+        name = _container_name(driver_id, container_name_override)
         container = client.containers.get(name)
         container.remove(force=True)
         return {'status': 'removed'}
@@ -421,7 +422,7 @@ async def drivers_list():
                 'last_deploy':   d.get('last_deploy'),
             })
         else:
-            status_info = await _run_in_executor(_get_status_sync, d['id'])
+            status_info = await _run_in_executor(_get_status_sync, d['id'], d.get('container_name', ''))
             result.append({
                 'id':            d['id'],
                 'name':          d['name'],
@@ -485,13 +486,15 @@ async def driver_deploy(driver_id: str, body: dict = fastapi.Body(default={})):
         _log_deploy(driver_id, f'[error] {e}')
         return {'code': 500, 'message': str(e)}
 
-    # Persist updated image into manifest (so DB remembers last deployed image)
+    # Persist updated image and container_name into manifest
     if not result.get('skipped'):
         import time as _time
         manifest = _load_manifest()
         for d in manifest:
             if d.get('id') == driver_id:
                 d['image'] = driver['image']
+                if result.get('container_name'):
+                    d['container_name'] = result['container_name']
                 d['last_deploy'] = {
                     'image':  driver['image'],
                     'ts':     int(_time.time()),
@@ -505,8 +508,11 @@ async def driver_deploy(driver_id: str, body: dict = fastapi.Body(default={})):
 
 @router.post('/{driver_id}/stop')
 async def driver_stop(driver_id: str):
+    manifest = _load_manifest()
+    entry = next((d for d in manifest if d['id'] == driver_id), None)
+    cn = entry.get('container_name', '') if entry else ''
     try:
-        result = await _run_in_executor(_stop_sync, driver_id)
+        result = await _run_in_executor(_stop_sync, driver_id, cn)
         return {'code': 200, 'data': result}
     except Exception as e:
         return {'code': 500, 'message': str(e)}
@@ -515,8 +521,11 @@ async def driver_stop(driver_id: str):
 @router.post('/{driver_id}/remove')
 async def driver_remove(driver_id: str):
     """Stop + remove container, clear last_deploy from manifest."""
+    manifest = _load_manifest()
+    entry = next((d for d in manifest if d.get('id') == driver_id), None)
+    cn = entry.get('container_name', '') if entry else ''
     try:
-        result = await _run_in_executor(_remove_sync, driver_id)
+        result = await _run_in_executor(_remove_sync, driver_id, cn)
     except Exception as e:
         return {'code': 500, 'message': str(e)}
     manifest = _load_manifest()
@@ -529,6 +538,9 @@ async def driver_remove(driver_id: str):
 
 @router.get('/{driver_id}/status')
 async def driver_status(driver_id: str):
-    status = await _run_in_executor(_get_status_sync, driver_id)
+    manifest = _load_manifest()
+    entry = next((d for d in manifest if d['id'] == driver_id), None)
+    cn = entry.get('container_name', '') if entry else ''
+    status = await _run_in_executor(_get_status_sync, driver_id, cn)
     return {'code': 200, 'data': status}
 
