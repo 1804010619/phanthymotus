@@ -30,6 +30,40 @@ GIT_LOCAL_TIMEOUT = 120
 # already-deployed clones stop paying for it without needing a re-clone.
 LEGACY_PR_REFSPEC = "+refs/pull/*/head:refs/pull/*/head"
 
+# Environment applied to every git invocation.
+#
+# The identity matters: merging a PR onto its base creates a merge commit, and
+# git refuses to do that with no committer configured. A container has no
+# ~/.gitconfig, so without this every merge fails with "Committer identity
+# unknown" — which an earlier version reported to authors as a merge conflict.
+# Set here rather than via `git config --global` so it travels with the process
+# and cannot be lost by a rebuilt image.
+_GIT_ENV = {
+    "GIT_TERMINAL_PROMPT": "0",   # never block waiting for credentials
+    "GIT_ASKPASS": "",
+    "GIT_AUTHOR_NAME": os.environ.get("GIT_AUTHOR_NAME", "PR Review Agent"),
+    "GIT_AUTHOR_EMAIL": os.environ.get(
+        "GIT_AUTHOR_EMAIL", "pr-review-agent@phanthy.local"
+    ),
+    "GIT_COMMITTER_NAME": os.environ.get("GIT_COMMITTER_NAME", "PR Review Agent"),
+    "GIT_COMMITTER_EMAIL": os.environ.get(
+        "GIT_COMMITTER_EMAIL", "pr-review-agent@phanthy.local"
+    ),
+}
+
+# Phrases git uses when a merge fails specifically because of a conflict.
+_CONFLICT_MARKERS = (
+    "CONFLICT",
+    "Automatic merge failed",
+    "would be overwritten by merge",
+    "Your local changes to the following files would be overwritten",
+)
+
+
+def _looks_like_conflict(merge_output: str) -> bool:
+    """Whether a failed `git merge` failed because of an actual conflict."""
+    return any(m in merge_output for m in _CONFLICT_MARKERS)
+
 
 class GitWorkspaceManager:
     """Manages bare git clones and worktrees for parallel PR builds."""
@@ -166,21 +200,31 @@ class GitWorkspaceManager:
         )
 
         pr_ref = f"refs/pull/{pr_number}/head"
-        try:
-            await self._run_git(
-                ["git", "merge", pr_ref, "--no-edit"],
-                cwd=str(wt_path),
-                timeout=GIT_LOCAL_TIMEOUT,
-            )
-        except RuntimeError as e:
+        rc, out = await self._run_git_status(
+            ["git", "merge", pr_ref, "--no-edit"],
+            cwd=str(wt_path),
+            timeout=GIT_LOCAL_TIMEOUT,
+        )
+        if rc != 0:
             await self._run_git(
                 ["git", "merge", "--abort"], cwd=str(wt_path), check=False
             )
             await self._remove_worktree_force(bare_path, wt_path)
-            raise MergeConflictError(
-                f"PR #{pr_number} conflicts with {base_ref} and cannot be "
-                "merged. Please resolve the conflicts in the PR first."
-            ) from e
+
+            # Only call it a conflict when git actually says so. Anything else
+            # is our problem, not the author's, and telling them to "resolve
+            # conflicts" that do not exist wastes their time — a missing git
+            # identity in the container was reported that way for exactly one
+            # commit too long.
+            if _looks_like_conflict(out):
+                raise MergeConflictError(
+                    f"PR #{pr_number} conflicts with {base_ref} and cannot be "
+                    "merged. Please resolve the conflicts in the PR first."
+                )
+            raise RuntimeError(
+                f"git merge of PR #{pr_number} into {base_ref} failed "
+                f"(rc={rc}), and not because of a conflict:\n{out.strip()}"
+            )
 
         logger.info(f"Worktree ready: {wt_path} ({base_ref} + PR #{pr_number})")
         return wt_path
@@ -276,24 +320,32 @@ class GitWorkspaceManager:
     ) -> str:
         return await self._run_cmd(cmd, cwd=cwd, check=check, timeout=timeout)
 
+    async def _run_git_status(
+        self, cmd: list[str], cwd: str, timeout: int | None = None
+    ) -> tuple[int, str]:
+        """Run git and return (returncode, output) instead of raising.
+
+        Needed where the *kind* of failure matters — a failed merge has to be
+        told apart from a conflicting one.
+        """
+        return await self._run_cmd(
+            cmd, cwd=cwd, check=False, timeout=timeout, with_status=True
+        )
+
     async def _run_cmd(
         self,
         cmd: list[str],
         cwd: str | None = None,
         check: bool = True,
         timeout: int | None = None,
-    ) -> str:
+        with_status: bool = False,
+    ):
         proc = await asyncio.create_subprocess_exec(
             *cmd,
             cwd=cwd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
-            env={
-                **os.environ,
-                # Never block waiting for credentials — fail fast instead.
-                "GIT_TERMINAL_PROMPT": "0",
-                "GIT_ASKPASS": "",
-            },
+            env={**os.environ, **_GIT_ENV},
             start_new_session=True,
         )
 
@@ -311,9 +363,13 @@ class GitWorkspaceManager:
             ) from e
 
         stdout = stdout_bytes.decode(errors="replace")
-        if check and proc.returncode != 0:
+        rc = proc.returncode or 0
+
+        if with_status:
+            return rc, stdout
+        if check and rc != 0:
             raise RuntimeError(
-                f"Command failed (rc={proc.returncode}): {' '.join(cmd)}\n{stdout}"
+                f"Command failed (rc={rc}): {' '.join(cmd)}\n{stdout}"
             )
         return stdout
 
