@@ -1,36 +1,49 @@
 #!/usr/bin/env bash
-# deploy.sh — Build and start PR Review Agent
+# deploy.sh — build and start the PR Review Agent.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
 if [ ! -f .env ]; then
-    echo "Error: .env not found. Copy .env.example and fill in values:"
+    echo "Error: .env not found. Create it first:"
     echo "  cp .env.example .env"
+    echo "  \$EDITOR .env      # set GITHUB_TOKEN, REGISTRY_*, LLM_*"
     exit 1
 fi
 
-# Setup QEMU for ARM64 cross-compilation (idempotent)
-echo "Setting up QEMU for ARM64 cross-compilation..."
-docker run --rm --privileged tonistiigi/binfmt --install arm64 2>/dev/null || true
-
-# Setup buildx builder if not exists
-if ! docker buildx inspect pr-review-builder &>/dev/null; then
-    echo "Creating buildx builder..."
-    docker buildx create --name pr-review-builder --use
-else
-    docker buildx use pr-review-builder
+# Fail early on the settings that produce confusing runtime behaviour rather
+# than a clean error.
+missing=()
+for var in GITHUB_TOKEN REGISTRY REGISTRY_USER REGISTRY_PASSWORD; do
+    value="$(grep -E "^${var}=" .env | tail -1 | cut -d= -f2- || true)"
+    if [ -z "$value" ] || [[ "$value" == your_* ]] || [[ "$value" == ghp_your_* ]]; then
+        missing+=("$var")
+    fi
+done
+if [ ${#missing[@]} -gt 0 ]; then
+    echo "Error: these .env values are unset or still placeholders:"
+    printf '  - %s\n' "${missing[@]}"
+    exit 1
 fi
 
-# Build and start
-echo "Building PR Review Agent..."
+# QEMU registration for ARM64 cross-compilation. Idempotent, and it persists
+# on the host until reboot — the build scripts rely on it being present.
+echo "==> Registering QEMU for ARM64 cross-compilation"
+docker run --rm --privileged tonistiigi/binfmt --install arm64 >/dev/null 2>&1 \
+    || echo "    warning: QEMU registration failed; ARM64 builds may not work"
+
+echo "==> Building agent image"
 docker compose build
 
-echo "Starting PR Review Agent..."
+echo "==> Starting agent"
 docker compose up -d
 
-echo ""
-echo "PR Review Agent is running on port 15690"
-echo "  Status: curl http://localhost:15690/status"
-echo "  Logs:   docker compose logs -f"
+echo
+echo "PR Review Agent is running."
+echo "  Status:  curl -s http://localhost:15690/status | python3 -m json.tool"
+echo "  Jobs:    curl -s http://localhost:15690/jobs | python3 -m json.tool"
+echo "  Logs:    docker compose -f $SCRIPT_DIR/docker-compose.yml logs -f"
+echo
+echo "Trigger a review by commenting /request_bot_review on a PR."
+echo "Polling picks it up within POLL_INTERVAL_SECONDS (default 30s)."

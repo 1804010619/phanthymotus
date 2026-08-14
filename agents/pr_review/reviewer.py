@@ -35,11 +35,15 @@ def _check_dockerfile_changes(changed_files: list[str]) -> list[Finding]:
     """Warn if Dockerfiles are modified (minimal Dockerfile change principle)."""
     findings = []
     for f in changed_files:
-        if Path(f).name == "Dockerfile" or Path(f).name.startswith("Dockerfile."):
+        name = Path(f).name
+        if name == "Dockerfile" or name.startswith("Dockerfile."):
             findings.append(Finding(
                 severity="warning",
                 file=f,
-                message="Dockerfile 被修改 — 请确认是否必要（最小 Dockerfile 改动原则）",
+                message=(
+                    "Dockerfile modified — confirm this is necessary "
+                    "(minimal Dockerfile change principle)"
+                ),
             ))
     return findings
 
@@ -47,20 +51,22 @@ def _check_dockerfile_changes(changed_files: list[str]) -> list[Finding]:
 def _check_large_files(diff_stat: str) -> list[Finding]:
     """Detect newly added large files (>1MB) from diff stat output."""
     findings = []
-    # git diff --stat lines look like: " path/to/file | 1234 +++"
-    # For binary files: " path/to/file | Bin 0 -> 1234567 bytes"
+    # Binary entries look like: " path/to/file | Bin 0 -> 1234567 bytes"
     bin_pattern = re.compile(r"^\s*(.+?)\s*\|\s*Bin\s+\d+\s*->\s*(\d+)\s+bytes")
     for line in diff_stat.splitlines():
         m = bin_pattern.match(line)
         if m:
             filepath = m.group(1).strip()
             size_bytes = int(m.group(2))
-            if size_bytes > 1_000_000:  # 1MB
+            if size_bytes > 1_000_000:
                 size_mb = size_bytes / 1_000_000
                 findings.append(Finding(
                     severity="error",
                     file=filepath,
-                    message=f"大文件 ({size_mb:.1f}MB) — >1MB 的文件必须有充分理由",
+                    message=(
+                        f"Large file ({size_mb:.1f}MB) — files over 1MB need "
+                        "a strong justification"
+                    ),
                 ))
     return findings
 
@@ -71,12 +77,18 @@ def _check_sensitive_files(changed_files: list[str]) -> list[Finding]:
     findings = []
     for f in changed_files:
         name_lower = Path(f).name.lower()
+        # .env.example is a template, not a secret.
+        if name_lower.endswith(".example") or name_lower.endswith(".sample"):
+            continue
         for pattern in sensitive_patterns:
             if pattern in name_lower:
                 findings.append(Finding(
                     severity="error",
                     file=f,
-                    message=f"可能包含敏感信息的文件被修改 (匹配: {pattern})",
+                    message=(
+                        f"File may contain secrets (matched: {pattern}) — "
+                        "verify nothing sensitive is committed"
+                    ),
                 ))
                 break
     return findings
@@ -89,29 +101,36 @@ You are a code reviewer for an embodied AI platform. The project has two repos:
 - phanthymotus: Agent Core (FastAPI + LLM + ROS2) and Perception (ASR/TTS)
 - phanthymotus-driver: Hardware drivers for robots/drones (Unitree, DJI, etc.)
 
-Architecture: 3 layers — Driver (MCP HTTP) → Perception (MCP) → Agent Core (FastAPI + LLM).
-All communication uses MCP JSON-RPC 2.0 over HTTP. Drivers implement `dispatch()` returning plain dicts.
+Architecture: three layers — Driver (MCP HTTP) -> Perception (MCP) -> Agent Core
+(FastAPI + LLM). All control-plane communication is MCP JSON-RPC 2.0 over HTTP.
+Driver `dispatch()` must return a plain dict; the MCP handler wraps it, so
+returning a pre-wrapped `[{"type": "text", ...}]` array double-encodes and
+breaks the frontend.
 
-Review guidelines:
-1. Minimal Dockerfile changes — only modify when truly necessary
-2. No large files (>1MB) without strong justification
-3. Do not break the motus/driver architecture separation
-4. Check for security issues, bugs, and code quality
-5. Be concise and actionable — developers need specific feedback
+Review priorities, in order:
+1. Correctness — bugs, race conditions, unhandled errors, incorrect logic
+2. Security — injected secrets, unvalidated input, unsafe subprocess/shell use
+3. Architecture — do not break the Agent Core / Perception / Driver separation
+4. Minimal Dockerfile changes — flag Dockerfile edits that are not necessary
+5. No large files (>1MB) without strong justification
+6. Code quality — naming, dead code, duplicated logic
 
-Output your review in this markdown format:
+Ground every point in the diff. Cite `file:line` where you can. Do not
+speculate about code you cannot see, and do not restate what the diff does as
+if it were a finding. If the PR looks fine, say so plainly rather than
+manufacturing issues.
+
+Write the review in English. Output exactly this markdown structure:
+
 ### Summary
-[1-2 sentence summary of the PR]
+[1-2 sentences on what this PR does]
 
 ### Issues
-[Bulleted list of issues found, with file:line references where possible]
-[If no issues, write "No issues found."]
+[Bulleted list, most severe first, each with a `file:line` reference and the
+concrete consequence. Write "No issues found." if there are none.]
 
 ### Suggestions
-[Bulleted list of optional improvements]
-[If none, write "No suggestions."]
-
-Review in the language matching the code comments (Chinese if comments are Chinese, English otherwise).
+[Optional improvements, clearly non-blocking. Write "No suggestions." if none.]
 """
 
 

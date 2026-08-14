@@ -4,6 +4,7 @@ import asyncio
 import logging
 import os
 import re
+import signal
 from pathlib import Path
 
 from .config import Config
@@ -174,15 +175,24 @@ async def _run_build(
     env: dict[str, str],
     timeout: int,
 ) -> _BuildOutput:
-    """Run a build command with timeout, capturing output."""
+    """Run a build command with timeout, capturing output.
+
+    The subprocess is killed on both timeout and cancellation. Cancellation
+    matters because the whole-job timeout cancels this coroutine from the
+    outside — without the explicit kill, `docker build` would keep running
+    orphaned, holding the build cache and CPU for the retry to contend with.
+    """
     logger.info(f"Running build: {' '.join(cmd[:3])}... (cwd={cwd})")
 
+    # start_new_session puts the child in its own process group so the whole
+    # build tree (bash -> docker -> buildx) dies with it, not just bash.
     proc = await asyncio.create_subprocess_exec(
         *cmd,
         cwd=cwd,
         env=env,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.STDOUT,
+        start_new_session=True,
     )
 
     try:
@@ -190,12 +200,16 @@ async def _run_build(
             proc.communicate(), timeout=timeout
         )
     except asyncio.TimeoutError:
-        proc.kill()
-        await proc.wait()
+        await _terminate(proc)
+        logger.error(f"Build timed out after {timeout}s: {' '.join(cmd[:3])}")
         return _BuildOutput(
             success=False,
             stdout=f"Build timed out after {timeout}s",
         )
+    except asyncio.CancelledError:
+        await _terminate(proc)
+        logger.warning(f"Build cancelled, subprocess killed: {' '.join(cmd[:3])}")
+        raise
 
     stdout = stdout_bytes.decode(errors="replace")
     success = proc.returncode == 0
@@ -206,3 +220,26 @@ async def _run_build(
         logger.error(f"Build failed (rc={proc.returncode}): {' '.join(cmd[:3])}")
 
     return _BuildOutput(success=success, stdout=stdout)
+
+
+async def _terminate(proc: asyncio.subprocess.Process):
+    """Kill a build subprocess and its process group, then reap it."""
+    if proc.returncode is not None:
+        return
+
+    # Kill the whole process group so docker/buildx children go too.
+    try:
+        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        # Group already gone, or we cannot signal it — fall back to the child.
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            return
+
+    # Reap so we do not leave a zombie. Shielded because we are often already
+    # being cancelled, and an unshielded await would abort immediately.
+    try:
+        await asyncio.wait_for(asyncio.shield(proc.wait()), timeout=10)
+    except (asyncio.TimeoutError, asyncio.CancelledError):
+        pass

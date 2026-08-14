@@ -5,6 +5,8 @@ import logging
 import os
 from pathlib import Path
 
+from .models import MergeConflictError
+
 logger = logging.getLogger(__name__)
 
 
@@ -104,9 +106,9 @@ class GitWorkspaceManager:
                 check=False,
             )
             await self._remove_worktree_force(bare_path, wt_path)
-            raise RuntimeError(
-                f"Merge conflict: PR #{pr_number} conflicts with main. "
-                "Please resolve conflicts in the PR first."
+            raise MergeConflictError(
+                f"PR #{pr_number} conflicts with main and cannot be merged. "
+                "Please resolve the conflicts in the PR first."
             ) from e
 
         logger.info(f"Worktree created: {wt_path}")

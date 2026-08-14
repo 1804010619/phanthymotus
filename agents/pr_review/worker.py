@@ -1,18 +1,39 @@
-"""Worker — orchestrates the full PR review pipeline for a single job."""
+"""Worker — runs the review pipeline for one job, with timeout and retry.
 
+Retry policy: a job that exceeds `job_timeout_seconds` is presumed lost and
+retried, as are infrastructure failures (network, git, registry). Conditions
+caused by the PR itself are terminal and reported immediately — a merge
+conflict or a genuinely broken build is the answer, not something to retry.
+"""
+
+import asyncio
 import logging
 from datetime import datetime, timezone
 from pathlib import Path
 
+from . import comments
 from .build_detector import detect_targets
 from .builder import build_core, build_driver, build_perception
 from .config import Config
-from .github_client import GitHubClient
 from .git_workspace import GitWorkspaceManager
-from .models import BuildResult, BuildTarget, JobStatus, ReviewJob
-from .reviewer import Finding, llm_review, run_rule_checks
+from .github_client import GitHubClient
+from .models import (
+    BuildResult,
+    BuildTarget,
+    JobStatus,
+    ReviewError,
+    ReviewJob,
+)
+from .reviewer import llm_review, run_rule_checks
 
 logger = logging.getLogger(__name__)
+
+# Marks a timeout reason string, so the final status can distinguish a lost
+# job from a hard error without threading an extra flag through the loop.
+TIMEOUT_PREFIX = "Job timed out"
+
+
+# ── Entry point: retry wrapper ─────────────────────────────────────────────────
 
 
 async def run_job(
@@ -21,135 +42,186 @@ async def run_job(
     github_client: GitHubClient,
     workspace_mgr: GitWorkspaceManager,
 ):
-    """Execute the full review pipeline for a job."""
-    job.status = JobStatus.RUNNING
+    """Run a job, retrying on timeout or infrastructure failure."""
     job.started_at = datetime.now(timezone.utc)
 
-    worktree_path: Path | None = None
+    for attempt in range(1, config.max_attempts + 1):
+        job.attempt = attempt
+        job.status = JobStatus.RUNNING
 
-    try:
-        # 1. Fetch latest refs
-        await workspace_mgr.fetch(job.repo_full_name)
-
-        # 2. Create worktree (PR merged onto main)
-        worktree_path = await workspace_mgr.create_worktree(
-            job.repo_full_name, job.pr_number, job.pr_head_sha
-        )
-        job.worktree_path = str(worktree_path)
-
-        # 3. Get changed files
-        changed_files = await workspace_mgr.get_changed_files(worktree_path)
-        if not changed_files:
-            await github_client.post_comment(
-                job.repo_full_name, job.pr_number,
-                _format_no_changes(),
+        if attempt > 1:
+            logger.info(
+                f"Job {job.id}: attempt {attempt}/{config.max_attempts} "
+                f"for {job.repo_full_name}#{job.pr_number}"
             )
-            job.status = JobStatus.REVIEW_DONE
+
+        try:
+            await asyncio.wait_for(
+                _run_once(job, config, github_client, workspace_mgr),
+                timeout=config.job_timeout_seconds,
+            )
+            # A terminal state was reached and reported inside the pipeline
+            # (review posted, or a real build failure). Either way, done.
+            job.finished_at = datetime.now(timezone.utc)
+            await _cleanup(job, workspace_mgr)
             return
 
-        # 4. Detect build targets
-        if job.force_targets:
-            targets, driver_paths = _parse_forced_targets(job.force_targets)
+        except asyncio.TimeoutError:
+            minutes = config.job_timeout_seconds // 60
+            reason = (
+                f"{TIMEOUT_PREFIX}: exceeded {config.job_timeout_seconds}s "
+                f"({minutes} min) without completing — presumed lost."
+            )
+            retryable = True
+
+        except ReviewError as e:
+            reason = str(e)
+            retryable = e.retryable
+
+        except asyncio.CancelledError:
+            # Agent is shutting down — do not retry, do not comment.
+            job.status = JobStatus.CANCELLED
+            job.finished_at = datetime.now(timezone.utc)
+            await _cleanup(job, workspace_mgr)
+            raise
+
+        except Exception as e:
+            reason = f"{type(e).__name__}: {e}"
+            retryable = True
+            logger.exception(f"Job {job.id} attempt {attempt} raised")
+
+        # This attempt failed. Record it and clean up before deciding.
+        job.attempt_errors.append(reason)
+        job.error = reason
+        await _cleanup(job, workspace_mgr)
+
+        if not retryable:
+            job.status = JobStatus.ERROR
+            job.finished_at = datetime.now(timezone.utc)
+            await _report(
+                job, github_client,
+                comments.format_error(job.pr_head_sha, reason),
+            )
+            return
+
+        if attempt < config.max_attempts:
+            job.status = JobStatus.RETRYING
+            await _report(
+                job, github_client,
+                comments.format_retrying(
+                    job.pr_head_sha, attempt, config.max_attempts,
+                    reason, config.retry_backoff_seconds,
+                ),
+            )
+            await asyncio.sleep(config.retry_backoff_seconds)
         else:
-            targets, driver_paths = detect_targets(job.repo_full_name, changed_files)
-
-        # 5. Build phase
-        if not job.skip_build and targets:
-            # Post progress comment
-            progress_body = _format_building(targets, driver_paths)
-            job.progress_comment_id = await github_client.post_comment(
-                job.repo_full_name, job.pr_number, progress_body
+            job.status = (
+                JobStatus.TIMEOUT
+                if reason.startswith(TIMEOUT_PREFIX)
+                else JobStatus.ERROR
             )
-
-            # Execute builds
-            build_results = await _execute_builds(
-                targets, driver_paths, worktree_path, config
+            job.finished_at = datetime.now(timezone.utc)
+            logger.error(
+                f"Job {job.id} failed after {config.max_attempts} attempts: {reason}"
             )
-            job.build_results = build_results
-
-            # Check for failures
-            any_failed = any(not r.success for r in build_results)
-            if any_failed:
-                job.status = JobStatus.BUILD_FAILED
-                await github_client.edit_comment(
-                    job.repo_full_name, job.progress_comment_id,
-                    _format_build_result(build_results, failed=True),
-                )
-                return
-
-            # Update progress comment with success
-            await github_client.edit_comment(
-                job.repo_full_name, job.progress_comment_id,
-                _format_build_result(build_results, failed=False),
+            await _report(
+                job, github_client,
+                comments.format_final_failure(
+                    job.pr_head_sha, config.max_attempts, job.attempt_errors,
+                ),
             )
-            job.status = JobStatus.BUILD_SUCCESS
+            return
 
-        # 6. Review phase
-        if not job.build_only:
-            # Rule checks
-            diff_stat = await workspace_mgr.get_diff_stat(worktree_path)
-            findings = run_rule_checks(changed_files, diff_stat)
 
-            # LLM review
-            diff = await workspace_mgr.get_diff(worktree_path, config.max_diff_lines)
-            review_text = await llm_review(config, changed_files, diff, findings)
-            job.review_text = review_text
+# ── The pipeline itself ────────────────────────────────────────────────────────
 
-            # Post review comment
-            review_body = _format_review(findings, review_text)
-            await github_client.post_comment(
-                job.repo_full_name, job.pr_number, review_body
-            )
 
-        job.status = JobStatus.REVIEW_DONE
+async def _run_once(
+    job: ReviewJob,
+    config: Config,
+    github_client: GitHubClient,
+    workspace_mgr: GitWorkspaceManager,
+):
+    """One attempt at the full pipeline.
 
-    except RuntimeError as e:
-        # Known errors (merge conflict, etc.)
-        job.status = JobStatus.ERROR
-        job.error = str(e)
-        await github_client.post_comment(
-            job.repo_full_name, job.pr_number,
-            _format_error(str(e)),
+    Raises on failure. Returns normally once a terminal state has been reached
+    and reported (review posted, or build failure reported).
+    """
+    # 1. Fetch latest refs
+    await workspace_mgr.fetch(job.repo_full_name)
+
+    # 2. Create an isolated worktree with the PR merged onto main
+    worktree = await workspace_mgr.create_worktree(
+        job.repo_full_name, job.pr_number, job.pr_head_sha
+    )
+    job.worktree_path = str(worktree)
+
+    # 3. Determine what changed
+    changed_files = await workspace_mgr.get_changed_files(worktree)
+    if not changed_files:
+        await _report(
+            job, github_client, comments.format_no_changes(job.pr_head_sha)
         )
-    except Exception as e:
-        job.status = JobStatus.ERROR
-        job.error = str(e)
-        logger.exception(f"Job {job.id} failed")
-        try:
-            await github_client.post_comment(
-                job.repo_full_name, job.pr_number,
-                _format_error(f"Unexpected error: {e}"),
-            )
-        except Exception:
-            pass
-    finally:
-        job.finished_at = datetime.now(timezone.utc)
-        # Clean up worktree
-        if worktree_path:
-            try:
-                await workspace_mgr.remove_worktree(job.repo_full_name, worktree_path)
-            except Exception:
-                logger.warning(f"Failed to clean up worktree: {worktree_path}")
+        job.status = JobStatus.REVIEW_DONE
+        return
+
+    if job.force_targets:
+        targets, driver_paths = _parse_forced_targets(job.force_targets)
+    else:
+        targets, driver_paths = detect_targets(job.repo_full_name, changed_files)
+
+    # 4. Build
+    if not job.skip_build and targets:
+        await _report(
+            job, github_client,
+            comments.format_building(
+                job.requester, job.pr_head_sha, targets, driver_paths
+            ),
+        )
+
+        results = await _execute_builds(targets, driver_paths, worktree, config)
+        job.build_results = results
+
+        await _report(
+            job, github_client,
+            comments.format_build_result(job.pr_head_sha, results),
+        )
+
+        if any(not r.success for r in results):
+            # A real build failure — terminal and already reported. Not
+            # retried: the author needs to fix the code, and rebuilding the
+            # same commit twice more would just burn an hour saying the same.
+            job.status = JobStatus.BUILD_FAILED
+            return
+
+        job.status = JobStatus.BUILD_SUCCESS
+
+    elif not job.skip_build:
+        await _report(
+            job, github_client,
+            comments.format_no_build_needed(job.pr_head_sha),
+        )
+
+    # 5. Review
+    if not job.build_only:
+        diff_stat = await workspace_mgr.get_diff_stat(worktree)
+        findings = run_rule_checks(changed_files, diff_stat)
+
+        diff = await workspace_mgr.get_diff(worktree, config.max_diff_lines)
+        job.review_text = await llm_review(config, changed_files, diff, findings)
+
+        # The review is its own comment — the progress comment keeps the build
+        # result, which stays useful to refer back to.
+        await github_client.post_comment(
+            job.repo_full_name,
+            job.pr_number,
+            comments.format_review(findings, job.review_text),
+        )
+
+    job.status = JobStatus.REVIEW_DONE
 
 
-def _parse_forced_targets(
-    force_targets: list[str],
-) -> tuple[list[BuildTarget], list[str]]:
-    """Parse user-specified forced targets."""
-    targets = []
-    driver_paths = []
-    for t in force_targets:
-        if t == "core":
-            targets.append(BuildTarget.CORE)
-        elif t == "perception":
-            targets.append(BuildTarget.PERCEPTION)
-        elif "/" in t:
-            # Assume driver path
-            targets.append(BuildTarget.DRIVER)
-            driver_paths.append(t)
-    # Deduplicate
-    targets = list(dict.fromkeys(targets))
-    return targets, driver_paths
+# ── Helpers ───────────────────────────────────────────────────────────────────
 
 
 async def _execute_builds(
@@ -158,112 +230,65 @@ async def _execute_builds(
     worktree: Path,
     config: Config,
 ) -> list[BuildResult]:
-    """Execute all builds for detected targets."""
+    """Build each detected target in sequence."""
     results = []
-
     for target in targets:
         if target == BuildTarget.CORE:
-            result = await build_core(worktree, config)
-            results.append(result)
+            results.append(await build_core(worktree, config))
         elif target == BuildTarget.PERCEPTION:
-            result = await build_perception(worktree, config)
-            results.append(result)
+            results.append(await build_perception(worktree, config))
         elif target == BuildTarget.DRIVER:
             for dp in driver_paths:
-                result = await build_driver(worktree, dp, config)
-                results.append(result)
-
+                results.append(await build_driver(worktree, dp, config))
     return results
 
 
-# ── Comment formatting ─────────────────────────────────────────────────────────
-
-BOT_MARKER = "<!-- pr-review-agent -->"
-
-
-def _format_building(targets: list[BuildTarget], driver_paths: list[str]) -> str:
-    target_names = []
-    for t in targets:
-        if t == BuildTarget.DRIVER:
-            target_names.extend(f"driver:{dp}" for dp in driver_paths)
-        else:
-            target_names.append(t.value)
-
-    return f"""{BOT_MARKER}
-## PR Review Agent — Building
-
-Targets: {', '.join(f'`{n}`' for n in target_names)}
-
-Status: building...
-"""
+def _parse_forced_targets(
+    force_targets: list[str],
+) -> tuple[list[BuildTarget], list[str]]:
+    """Resolve user-specified targets from the trigger command."""
+    targets: list[BuildTarget] = []
+    driver_paths: list[str] = []
+    for t in force_targets:
+        if t == "core":
+            targets.append(BuildTarget.CORE)
+        elif t == "perception":
+            targets.append(BuildTarget.PERCEPTION)
+        elif "/" in t:
+            targets.append(BuildTarget.DRIVER)
+            driver_paths.append(t)
+    return list(dict.fromkeys(targets)), driver_paths
 
 
-def _format_build_result(results: list[BuildResult], failed: bool) -> str:
-    rows = []
-    for r in results:
-        name = r.driver_path or r.target.value
-        if r.success:
-            rows.append(f"| {name} | :white_check_mark: | `{r.image_tag}` |")
-        else:
-            rows.append(f"| {name} | :x: Build failed | — |")
+async def _report(job: ReviewJob, github_client: GitHubClient, body: str):
+    """Update the job's status comment, falling back to posting a new one.
 
-    table = "| Target | Status | Image |\n|--------|--------|-------|\n" + "\n".join(rows)
-
-    body = f"""{BOT_MARKER}
-## PR Review Agent — Build Result
-
-{table}
-"""
-
-    # Append logs for failures
-    for r in results:
-        if not r.success and r.log_tail:
-            name = r.driver_path or r.target.value
-            body += f"""
-<details><summary>{name} build log (last {len(r.log_tail.splitlines())} lines)</summary>
-
-```
-{r.log_tail}
-```
-
-</details>
-"""
-
-    return body
-
-
-def _format_review(findings: list[Finding], review_text: str) -> str:
-    body = f"""{BOT_MARKER}
-## PR Review Agent — Code Review
-
-{review_text}
-"""
-
-    if findings:
-        body += "\n### Rule Checks\n\n"
-        for f in findings:
-            icon = {"error": ":x:", "warning": ":warning:", "info": ":information_source:"}.get(
-                f.severity, ":grey_question:"
+    Everything funnels through the acknowledgment comment created at trigger
+    time, so a PR gets one comment tracking progress rather than one per stage.
+    Reporting must never break the pipeline, so failures are logged only.
+    """
+    try:
+        if job.progress_comment_id is not None:
+            await github_client.edit_comment(
+                job.repo_full_name, job.progress_comment_id, body
             )
-            body += f"- {icon} `{f.file}` — {f.message}\n"
-
-    body += "\n---\n<sub>Generated by PR Review Agent</sub>\n"
-    return body
-
-
-def _format_no_changes() -> str:
-    return f"""{BOT_MARKER}
-## PR Review Agent
-
-No file changes detected relative to main. Nothing to build or review.
-"""
+        else:
+            job.progress_comment_id = await github_client.post_comment(
+                job.repo_full_name, job.pr_number, body
+            )
+    except Exception as e:
+        logger.warning(f"Job {job.id}: failed to report status to GitHub: {e}")
 
 
-def _format_error(error: str) -> str:
-    return f"""{BOT_MARKER}
-## PR Review Agent — Error
-
-```
-{error}
-```
-"""
+async def _cleanup(job: ReviewJob, workspace_mgr: GitWorkspaceManager):
+    """Remove the worktree so a retry starts from a clean tree."""
+    if not job.worktree_path:
+        return
+    try:
+        await workspace_mgr.remove_worktree(
+            job.repo_full_name, Path(job.worktree_path)
+        )
+    except Exception as e:
+        logger.warning(f"Job {job.id}: failed to remove worktree: {e}")
+    finally:
+        job.worktree_path = ""

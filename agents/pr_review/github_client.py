@@ -39,6 +39,38 @@ class GitHubClient:
         resp.raise_for_status()
         return resp.json()
 
+    async def list_repo_comments(
+        self,
+        repo: str,
+        since: str,
+        page: int = 1,
+        per_page: int = 100,
+    ) -> list[dict]:
+        """List issue comments across a whole repo, updated since `since`.
+
+        This is the endpoint the poller uses. A PR is an issue underneath, so
+        this returns PR conversation comments too — callers filter by looking
+        for "/pull/" in each comment's html_url.
+
+        Note `since` filters on updated_at, not created_at, so editing an old
+        comment resurfaces it. The poller dedups by comment ID.
+
+        Args:
+            since: ISO8601 timestamp, e.g. "2026-08-15T10:00:00Z"
+        """
+        resp = await self._client.get(
+            f"/repos/{repo}/issues/comments",
+            params={
+                "since": since,
+                "sort": "created",
+                "direction": "asc",
+                "per_page": per_page,
+                "page": page,
+            },
+        )
+        resp.raise_for_status()
+        return resp.json()
+
     async def post_comment(self, repo: str, pr_number: int, body: str) -> int:
         """Post a comment on a PR. Returns the comment ID."""
         resp = await self._client.post(

@@ -6,19 +6,30 @@ services:
     image: phanthy-pr-review:latest
     container_name: phanthy-pr-review
     restart: unless-stopped
+
+    # Bound to loopback because the default trigger is polling (outbound only)
+    # — nothing needs to reach this port from outside. It stays published on
+    # localhost so `curl http://localhost:15690/status` works on the host.
+    # Change to "15690:15690" only if you also want the webhook reachable.
     ports:
-      - "15690:15690"
+      - "127.0.0.1:15690:15690"
+
     volumes:
-      # Docker socket for building images
+      # Docker socket — the agent shells out to the repos' own build scripts,
+      # which invoke `docker buildx`. This grants root-equivalent access to the
+      # host, so keep this container's env file readable only by root.
       - /var/run/docker.sock:/var/run/docker.sock
-      # Persistent git bare clones and worktrees
+      # Persistent bare clones, worktrees, and poller watermarks. Keeping this
+      # across restarts is what makes fetches incremental instead of full
+      # re-clones, and stops the poller replaying old comments.
       - pr-review-data:/data/repos
-      # SSH keys for git clone (read-only)
-      - ~/.ssh:/root/.ssh:ro
+
     env_file:
       - .env
+
     environment:
       - PYTHONUNBUFFERED=1
+
     logging:
       driver: local
       options:
