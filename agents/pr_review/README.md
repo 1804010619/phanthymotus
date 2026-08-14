@@ -181,8 +181,52 @@ $EDITOR .env          # GITHUB_TOKEN, REGISTRY_*, LLM_*
 ./deploy.sh
 ```
 
-`deploy.sh` validates the required `.env` values, registers QEMU for ARM64
-cross-compilation, then builds and starts the container.
+### Lifecycle commands
+
+| Command | Effect |
+|---------|--------|
+| `./deploy.sh` / `up` | Build and start |
+| `./deploy.sh rebuild` | Rebuild without cache, recreate container |
+| `./deploy.sh stop` | Stop, keeping container and data |
+| `./deploy.sh start` | Start a stopped container (no rebuild) |
+| `./deploy.sh restart` | Restart (no rebuild) |
+| `./deploy.sh down` | Remove container, keep the data volume |
+| `./deploy.sh down --purge` | Also delete the data volume (prompts first) |
+| `./deploy.sh status` | Container state plus the agent's `/status` |
+| `./deploy.sh logs [-n N]` | Follow logs |
+
+`stop` and `restart` are graceful. Compose allows `stop_grace_period` (30s),
+during which the agent posts an interruption notice on the PR of every job that
+was queued or in flight — otherwise a build killed mid-run would leave a comment
+frozen at "Building..." forever. The grace window is deliberately too short to
+finish a build: waiting out a 30-minute build on every restart would be worse
+than asking the author to retrigger.
+
+`down --purge` deletes the bare clones and the poller watermarks. The next start
+re-clones both repos, and the poller only looks back
+`POLL_INITIAL_LOOKBACK_MINUTES`, so trigger comments older than that window are
+missed. Use plain `down` unless you specifically want a clean slate.
+
+### Mirrors
+
+Everything defaults to Tencent Cloud mirrors, matching the rest of the project.
+
+Two separate layers, both configured in `.env`:
+
+| Scope | Variable | Default |
+|-------|----------|---------|
+| Builds the agent performs (core / perception / drivers) | `MIRROR` | `tencent` |
+| The agent's own image — base image | `MIRROR_BASE` | `mirror.ccs.tencentyun.com` |
+| The agent's own image — PyPI | `PYPI_MIRROR` | `https://mirrors.tencentyun.com/pypi/simple/` |
+| The agent's own image — apt | `APT_MIRROR` | `mirrors.tencentyun.com` |
+| QEMU binfmt image | `BINFMT_IMAGE` | `mirror.ccs.tencentyun.com/tonistiigi/binfmt` |
+
+`MIRROR` is passed to the repos' build scripts both as an env var and as
+`--mirror tencent`, so their interactive mirror prompt never fires — which
+matters because that prompt defaults to *tuna*, not tencent, when it cannot
+read a TTY.
+
+For a host outside the Tencent VPC, uncomment the override block in `.env`.
 
 ### Setup notes
 
@@ -198,6 +242,13 @@ repos are public; the token is used for the API, not for cloning.
 
 The container mounts the Docker socket, which is root-equivalent access to the
 host. Keep `.env` root-readable only — it holds registry and API credentials.
+
+`RESOURCE_CENTER_API_KEY` is intentionally left unset. The build scripts
+auto-register successful builds into the Resource Center image catalog, and
+their interactive "sync?" confirmation defaults to *yes* whenever it cannot
+read a TTY — which is always, in a container. Setting it here would silently
+publish every PR build, including unreviewed and unmerged code, into the
+catalog that production deployments draw from.
 
 ## Monitoring
 

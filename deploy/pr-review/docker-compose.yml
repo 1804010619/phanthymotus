@@ -3,6 +3,12 @@ services:
     build:
       context: ../../
       dockerfile: agents/pr_review/Dockerfile
+      args:
+        # Tencent Cloud mirrors by default. Override in .env for a host
+        # outside the Tencent VPC.
+        MIRROR_BASE: ${MIRROR_BASE:-mirror.ccs.tencentyun.com}
+        PYPI_MIRROR: ${PYPI_MIRROR:-https://mirrors.tencentyun.com/pypi/simple/}
+        APT_MIRROR: ${APT_MIRROR:-mirrors.tencentyun.com}
     image: phanthy-pr-review:latest
     container_name: phanthy-pr-review
     restart: unless-stopped
@@ -29,6 +35,13 @@ services:
 
     environment:
       - PYTHONUNBUFFERED=1
+
+    # On stop, in-flight jobs are told on their PR that the agent restarted, so
+    # a build killed mid-flight does not leave a "Building..." comment that
+    # never resolves. This is the window for those API calls — not enough to
+    # finish a build, which is deliberate: waiting out a 30 min build on every
+    # restart would be worse than asking the author to retrigger.
+    stop_grace_period: 30s
 
     logging:
       driver: local

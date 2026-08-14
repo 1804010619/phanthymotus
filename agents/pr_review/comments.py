@@ -166,6 +166,22 @@ build or review.
 """
 
 
+def format_interrupted(head_sha: str, was_running: bool) -> str:
+    """The agent shut down before this job finished.
+
+    Restarts are operational events the author cannot infer from a comment
+    frozen at "Building...", so say plainly what happened and what to do.
+    """
+    what = "was interrupted mid-run" if was_running else "never started"
+    return f"""{BOT_MARKER}
+## PR Review Agent — Interrupted
+
+Review of `{head_sha[:7]}` {what} because the agent was stopped or restarted.
+
+Comment `/request_bot_review` again to retrigger.
+"""
+
+
 def format_superseded(old_sha: str, new_sha: str) -> str:
     """A queued job dropped because a newer request arrived for the same PR."""
     return f"""{BOT_MARKER}

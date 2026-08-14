@@ -54,10 +54,52 @@ class JobQueue:
         logger.info(f"Started {self._max_workers} workers")
 
     async def stop(self):
+        """Stop workers, telling in-flight jobs' PRs that they were cut short.
+
+        Notification happens *before* cancelling, deliberately. Once a task is
+        cancelled, any `await` inside it raises immediately, so a comment
+        posted from the CancelledError handler would never actually send.
+        """
+        await self._notify_interrupted()
+
         for w in self._workers:
             w.cancel()
         await asyncio.gather(*self._workers, return_exceptions=True)
         self._workers.clear()
+
+    async def _notify_interrupted(self):
+        """Update the PR comment for every job that will not complete.
+
+        Without this, a job killed mid-build leaves a comment frozen at
+        "Building..." with nothing ever resolving it.
+        """
+        pending = [
+            j for j in self._jobs
+            if j.status in (JobStatus.QUEUED, JobStatus.RUNNING, JobStatus.RETRYING)
+        ]
+        if not pending:
+            return
+
+        logger.info(f"Notifying {len(pending)} unfinished job(s) of shutdown")
+        for job in pending:
+            was_running = job.status != JobStatus.QUEUED
+            job.status = JobStatus.CANCELLED
+            job.error = "Agent stopped before the job finished"
+            if job.progress_comment_id is None:
+                continue
+            try:
+                await asyncio.wait_for(
+                    self._github_client.edit_comment(
+                        job.repo_full_name,
+                        job.progress_comment_id,
+                        comments.format_interrupted(job.pr_head_sha, was_running),
+                    ),
+                    timeout=10,
+                )
+            except Exception as e:
+                logger.warning(
+                    f"Job {job.id}: failed to post interruption notice: {e}"
+                )
 
     # ── Enqueue / introspection ───────────────────────────────────────────────
 
