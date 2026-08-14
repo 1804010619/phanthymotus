@@ -10,12 +10,23 @@ class Config:
     github_token: str = ""
     github_webhook_secret: str = ""
 
-    # Repos: mapping of full_name -> git clone URL.
-    # HTTPS is used because both repos are public — no SSH key needed on the host.
-    repos: dict[str, str] = field(default_factory=lambda: {
-        "4paradigm/phanthymotus": "https://github.com/4paradigm/phanthymotus.git",
-        "4paradigm/phanthymotus-driver": "https://github.com/4paradigm/phanthymotus-driver.git",
-    })
+    # Which transport git uses to reach GitHub.
+    #
+    # "ssh" by default, and not because of authentication — both repos are
+    # public. It is a reachability question: on the Tencent hosts, TCP to
+    # github.com:443 completes but the TLS handshake is dropped by SNI, so git
+    # over HTTPS fails every time while api.github.com works fine. SSH carries
+    # no SNI and works. Requires a key mounted at /root/.ssh.
+    #
+    # Set to "https" on a host where github.com:443 is genuinely reachable and
+    # you would rather not mount a key.
+    git_transport: str = "ssh"
+
+    # Repos to watch. Clone URLs are derived from git_transport.
+    repo_names: tuple[str, ...] = (
+        "4paradigm/phanthymotus",
+        "4paradigm/phanthymotus-driver",
+    )
 
     # Trigger mode — polling needs only outbound network, webhook needs inbound.
     poll_enabled: bool = True
@@ -62,6 +73,17 @@ class Config:
     resource_center_url: str = ""
     resource_center_api_key: str = ""
 
+    @property
+    def repos(self) -> dict[str, str]:
+        """Repo full_name -> clone URL, built from the configured transport."""
+        return {name: clone_url(name, self.git_transport) for name in self.repo_names}
+
+
+def clone_url(full_name: str, transport: str) -> str:
+    if transport == "https":
+        return f"https://github.com/{full_name}.git"
+    return f"git@github.com:{full_name}.git"
+
 
 def _env_bool(name: str, default: bool) -> bool:
     raw = os.environ.get(name)
@@ -80,7 +102,7 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
-def _load_repos() -> dict[str, str] | None:
+def _load_repo_names() -> tuple[str, ...] | None:
     """Optionally override the repo list via GITHUB_REPOS.
 
     Format: comma-separated full names, e.g.
@@ -89,24 +111,27 @@ def _load_repos() -> dict[str, str] | None:
     raw = os.environ.get("GITHUB_REPOS", "").strip()
     if not raw:
         return None
-    repos = {}
-    for item in raw.split(","):
-        full_name = item.strip()
-        if not full_name or "/" not in full_name:
-            continue
-        repos[full_name] = f"https://github.com/{full_name}.git"
-    return repos or None
+    names = tuple(
+        item.strip() for item in raw.split(",")
+        if item.strip() and "/" in item
+    )
+    return names or None
 
 
 def load_config() -> Config:
     overrides = {}
-    repos = _load_repos()
-    if repos is not None:
-        overrides["repos"] = repos
+    names = _load_repo_names()
+    if names is not None:
+        overrides["repo_names"] = names
+
+    transport = os.environ.get("GIT_TRANSPORT", "ssh").strip().lower()
+    if transport not in ("ssh", "https"):
+        transport = "ssh"
 
     return Config(
         github_token=os.environ.get("GITHUB_TOKEN", ""),
         github_webhook_secret=os.environ.get("GITHUB_WEBHOOK_SECRET", ""),
+        git_transport=transport,
         poll_enabled=_env_bool("POLL_ENABLED", True),
         poll_interval_seconds=_env_int("POLL_INTERVAL_SECONDS", 30),
         poll_initial_lookback_minutes=_env_int("POLL_INITIAL_LOOKBACK_MINUTES", 10),

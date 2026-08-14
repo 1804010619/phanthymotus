@@ -41,6 +41,16 @@ LEGACY_PR_REFSPEC = "+refs/pull/*/head:refs/pull/*/head"
 _GIT_ENV = {
     "GIT_TERMINAL_PROMPT": "0",   # never block waiting for credentials
     "GIT_ASKPASS": "",
+    # Non-interactive SSH. Without BatchMode, a missing or unreadable key makes
+    # ssh prompt and the fetch hangs until the timeout instead of failing with a
+    # usable message. Host keys are accepted on first use because the container
+    # has no known_hosts of its own — the mounted key is what authenticates us,
+    # and the alternative is every fresh container hanging on a host-key prompt.
+    "GIT_SSH_COMMAND": os.environ.get(
+        "GIT_SSH_COMMAND",
+        "ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new "
+        "-o ConnectTimeout=15",
+    ),
     "GIT_AUTHOR_NAME": os.environ.get("GIT_AUTHOR_NAME", "PR Review Agent"),
     "GIT_AUTHOR_EMAIL": os.environ.get(
         "GIT_AUTHOR_EMAIL", "pr-review-agent@phanthy.local"
@@ -50,6 +60,12 @@ _GIT_ENV = {
         "GIT_COMMITTER_EMAIL", "pr-review-agent@phanthy.local"
     ),
 }
+
+# Network git operations are retried: reaching github.com from these hosts is
+# intermittent (measured 13/15 TCP connects on a good minute), and a transient
+# failure should not cost a whole job attempt.
+NETWORK_RETRIES = 3
+NETWORK_RETRY_BACKOFF = 5
 
 # Phrases git uses when a merge fails specifically because of a conflict.
 _CONFLICT_MARKERS = (
@@ -152,17 +168,17 @@ class GitWorkspaceManager:
         # contend on the same object store.
         async with self._get_fetch_lock(repo_full_name):
             logger.info(f"Fetching {repo_full_name} {base_ref} + PR #{pr_number}")
-            await self._run_git(
+            await self._run_git_network(
                 ["git", "fetch", "origin",
                  f"+refs/heads/{base_ref}:refs/heads/{base_ref}"],
                 cwd=str(bare_path),
-                timeout=FETCH_TIMEOUT,
+                label=f"fetch {base_ref}",
             )
             # Force-update: a force-pushed PR moves its head non-fast-forward.
-            await self._run_git(
+            await self._run_git_network(
                 ["git", "fetch", "origin", f"+{pr_ref}:{pr_ref}"],
                 cwd=str(bare_path),
-                timeout=FETCH_TIMEOUT,
+                label=f"fetch PR #{pr_number}",
             )
 
     # ── Worktrees ─────────────────────────────────────────────────────────────
@@ -310,6 +326,35 @@ class GitWorkspaceManager:
         )
 
     # ── Subprocess plumbing ───────────────────────────────────────────────────
+
+    async def _run_git_network(
+        self, cmd: list[str], cwd: str, label: str
+    ) -> str:
+        """Run a network git command, retrying transient failures.
+
+        Connectivity to github.com from these hosts is intermittent, so a single
+        failed attempt is not evidence of a real problem. Retrying here rather
+        than relying on the job-level retry keeps a blip from costing a whole
+        attempt (and a 60s backoff) and from surfacing as an error on the PR.
+        """
+        last = ""
+        for attempt in range(1, NETWORK_RETRIES + 1):
+            rc, out = await self._run_git_status(cmd, cwd=cwd, timeout=FETCH_TIMEOUT)
+            if rc == 0:
+                if attempt > 1:
+                    logger.info(f"{label} succeeded on attempt {attempt}")
+                return out
+            last = out
+            logger.warning(
+                f"{label} failed (attempt {attempt}/{NETWORK_RETRIES}, rc={rc}): "
+                f"{out.strip().splitlines()[-1] if out.strip() else '(no output)'}"
+            )
+            if attempt < NETWORK_RETRIES:
+                await asyncio.sleep(NETWORK_RETRY_BACKOFF * attempt)
+
+        raise RuntimeError(
+            f"{label} failed after {NETWORK_RETRIES} attempts:\n{last.strip()}"
+        )
 
     async def _run_git(
         self,

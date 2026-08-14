@@ -52,6 +52,33 @@ class _NoCacheStaticFiles(StaticFiles):
         await super().__call__(scope, receive, send_no_cache)
 
 
+def _check_git_transport(config):
+    """Warn loudly if the configured git transport cannot possibly work.
+
+    An unusable transport otherwise shows up much later as a fetch that hangs
+    until its timeout, three attempts deep, on someone's PR.
+    """
+    if config.git_transport != "ssh":
+        logger.info("Git transport: https")
+        return
+
+    key_dir = Path("/root/.ssh")
+    keys = (
+        [p for p in key_dir.glob("id_*") if not p.name.endswith(".pub")]
+        if key_dir.is_dir() else []
+    )
+    if keys:
+        logger.info(
+            f"Git transport: ssh (keys: {', '.join(p.name for p in keys)})"
+        )
+    else:
+        logger.error(
+            "GIT_TRANSPORT=ssh but no SSH key found at /root/.ssh — every git "
+            "fetch will fail. Mount a key (compose mounts $SSH_DIR read-only) "
+            "or set GIT_TRANSPORT=https if github.com:443 is reachable here."
+        )
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     config = load_config()
@@ -59,6 +86,8 @@ async def lifespan(app: FastAPI):
 
     if not config.github_token:
         logger.warning("GITHUB_TOKEN is not set — GitHub API calls will fail")
+
+    _check_git_transport(config)
 
     app.state.github_client = GitHubClient(config.github_token)
 

@@ -37,6 +37,12 @@ services:
       # /opt/phanthy-motus/data: the path is discoverable, backups are a plain
       # tar, and `docker compose down -v` cannot take the history with it.
       - ${DATA_HOST_DIR:-/opt/phanthy-motus/pr-review}:/data/repos
+      # SSH key, read-only. Needed because GIT_TRANSPORT defaults to ssh: on
+      # these hosts TCP to github.com:443 completes but the TLS handshake is
+      # dropped by SNI, so git over HTTPS fails every time while SSH works.
+      # Not an authentication requirement — the repos are public — a
+      # reachability one. Set GIT_TRANSPORT=https where 443 actually works.
+      - ${SSH_DIR:-/root/.ssh}:/root/.ssh:ro
 
     env_file:
       - .env
