@@ -116,14 +116,39 @@ class GitWorkspaceManager:
             bare_path = self._bare_path(full_name)
             if not bare_path.exists():
                 logger.info(f"Cloning bare repo: {full_name} -> {bare_path}")
-                await self._run_git(
+                await self._run_git_network(
                     ["git", "clone", "--bare", url, str(bare_path)],
                     cwd=str(self._data_dir),
-                    timeout=FETCH_TIMEOUT,
+                    label=f"clone {full_name}",
                 )
             else:
                 logger.info(f"Bare repo exists: {bare_path}")
+                await self._sync_remote_url(bare_path, url)
             await self._drop_legacy_pr_refspec(bare_path)
+
+    async def _sync_remote_url(self, bare_path: Path, url: str):
+        """Point an existing clone's origin at the configured transport.
+
+        The URL is only set at clone time, so a clone created under a different
+        GIT_TRANSPORT keeps fetching over the old one. Switching transports
+        would otherwise appear to do nothing — the setting would change while
+        every fetch still used the URL baked in at clone time.
+        """
+        current = (
+            await self._run_git(
+                ["git", "remote", "get-url", "origin"],
+                cwd=str(bare_path),
+                check=False,
+            )
+        ).strip()
+        if current == url:
+            return
+        await self._run_git(
+            ["git", "remote", "set-url", "origin", url], cwd=str(bare_path)
+        )
+        logger.warning(
+            f"Repointed {bare_path.name} origin: {current or '(unset)'} -> {url}"
+        )
 
     async def _drop_legacy_pr_refspec(self, bare_path: Path):
         """Remove the wildcard PR refspec if a previous version installed it.
