@@ -186,7 +186,7 @@ Vanilla ES modules, no build step, reusing agent-core's design tokens.
 Open it directly:
 
 ```
-http://<host>:25690/
+http://<host>:25000/
 ```
 
 `BIND_ADDR` (in `.env`) controls who can reach it. It defaults to `0.0.0.0`,
@@ -198,8 +198,8 @@ loopback and tunnel in instead:
 BIND_ADDR=127.0.0.1
 ```
 ```bash
-ssh -L 25690:localhost:25690 <user>@<host>
-# then open http://localhost:25690
+ssh -L 25000:localhost:25000 <user>@<host>
+# then open http://localhost:25000
 ```
 
 Note that `HOST` and `BIND_ADDR` are different things: `HOST` is what uvicorn
@@ -388,7 +388,7 @@ The dashboard's Overview tab is the usual way in. For scripting, or to check
 liveness without a browser:
 
 ```bash
-curl -s http://localhost:25690/api/status | python3 -m json.tool
+curl -s http://localhost:25000/api/status | python3 -m json.tool
 ```
 
 With polling there is no inbound traffic to confirm the agent is alive, so
@@ -425,6 +425,8 @@ deploy/pr-review/
   docker-compose.yml
   deploy.sh
   .env.example
+
+PR_REVIEW_AGENT.md     this document (repo root, so it is findable)
 ```
 
 `agents/` is a namespace for operational agents; `pr_review` is the first.

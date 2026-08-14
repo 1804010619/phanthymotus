@@ -22,7 +22,7 @@ services:
     # The dashboard has NO authentication, so on a shared or internet-facing
     # host set BIND_ADDR=127.0.0.1 and reach it over an SSH tunnel instead.
     ports:
-      - "${BIND_ADDR:-0.0.0.0}:${PORT:-25690}:${PORT:-25690}"
+      - "${BIND_ADDR:-0.0.0.0}:${PORT:-25000}:${PORT:-25000}"
 
     volumes:
       # Docker socket — the agent shells out to the repos' own build scripts,

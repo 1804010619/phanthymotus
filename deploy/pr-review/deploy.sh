@@ -36,7 +36,7 @@ _env_val() {
     v="$(grep -E "^${1}=" .env | tail -1 | cut -d= -f2- | tr -d '"'"'"' \r')"
     echo "${v:-$2}"
 }
-PORT="$(_env_val PORT 25690)"
+PORT="$(_env_val PORT 25000)"
 BIND_ADDR="$(_env_val BIND_ADDR 0.0.0.0)"
 DATA_HOST_DIR="$(_env_val DATA_HOST_DIR /opt/phanthy-motus/pr-review)"
 
