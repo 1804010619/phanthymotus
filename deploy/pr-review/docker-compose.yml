@@ -9,6 +9,7 @@ services:
         MIRROR_BASE: ${MIRROR_BASE:-mirror.ccs.tencentyun.com}
         PYPI_MIRROR: ${PYPI_MIRROR:-https://mirrors.tencentyun.com/pypi/simple/}
         APT_MIRROR: ${APT_MIRROR:-mirrors.tencentyun.com}
+        DOCKER_REPO: ${DOCKER_REPO:-https://mirrors.tencentyun.com/docker-ce/linux/debian}
     image: phanthy-pr-review:latest
     container_name: phanthy-pr-review
     restart: unless-stopped

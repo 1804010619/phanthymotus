@@ -11,6 +11,9 @@ FROM ${MIRROR_BASE}/library/python:3.12-slim
 
 ARG PYPI_MIRROR=https://mirrors.tencentyun.com/pypi/simple/
 ARG APT_MIRROR=mirrors.tencentyun.com
+# Docker apt repo. download.docker.com is unreachable from the Tencent VMs, so
+# the mirror is the default; override for a host where the upstream works.
+ARG DOCKER_REPO=https://mirrors.tencentyun.com/docker-ce/linux/debian
 
 # Point apt at the mirror before the first update, so no request goes to the
 # default Debian hosts. Debian 12 ships the DEB822 sources file; the older
@@ -27,8 +30,13 @@ RUN set -eux; \
         fi; \
     fi
 
-# git for the bare clones and worktrees; docker CLI + buildx because the agent
-# shells out to the repos' build scripts, which invoke `docker buildx build`.
+# git + ssh for the bare clones and worktrees; docker CLI + buildx because the
+# agent shells out to the repos' build scripts, which invoke `docker buildx`.
+#
+# The Docker apt repo comes from the Tencent mirror, not download.docker.com:
+# that host is unreachable from these VMs (measured 0/3, failing in 0.16s) while
+# the mirror answers in 0.08s. This only surfaced when adding openssh-client
+# invalidated the cached layer — the build had been passing on cache alone.
 RUN set -eux; \
     apt-get update; \
     apt-get install -y --no-install-recommends \
@@ -38,11 +46,15 @@ RUN set -eux; \
         gnupg \
         openssh-client; \
     install -m 0755 -d /etc/apt/keyrings; \
-    curl -fsSL https://download.docker.com/linux/debian/gpg \
-        -o /etc/apt/keyrings/docker.asc; \
+    for attempt in 1 2 3; do \
+        curl -fsSL --connect-timeout 15 "${DOCKER_REPO}/gpg" \
+            -o /etc/apt/keyrings/docker.asc && break; \
+        echo "docker gpg fetch failed (attempt ${attempt})"; sleep 3; \
+    done; \
+    test -s /etc/apt/keyrings/docker.asc; \
     chmod a+r /etc/apt/keyrings/docker.asc; \
     echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] \
-https://download.docker.com/linux/debian $(. /etc/os-release && echo "$VERSION_CODENAME") stable" \
+${DOCKER_REPO} $(. /etc/os-release && echo "$VERSION_CODENAME") stable" \
         > /etc/apt/sources.list.d/docker.list; \
     apt-get update; \
     apt-get install -y --no-install-recommends \
