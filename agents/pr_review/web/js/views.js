@@ -5,6 +5,11 @@ import {
   shortSha, shortRepo, targetLabel, prUrl,
 } from './api.js';
 
+// Statuses from which a job will not advance — mirrors the server's set.
+const TERMINAL = new Set([
+  'review_done', 'build_success', 'build_failed', 'timeout', 'error', 'cancelled',
+]);
+
 // ── Overview ─────────────────────────────────────────────────────────────────
 
 export function renderStats(el, s) {
@@ -41,7 +46,7 @@ export function renderActive(bodyEl, metaEl, s) {
   bodyEl.innerHTML = `
     <table class="tbl">
       <thead><tr>
-        <th>PR</th><th>Repo</th><th>Commit</th><th>Status</th>
+        <th>PR</th><th>Repo</th><th>Commit</th><th>Stage</th>
         <th>Attempt</th><th>By</th><th class="num">Elapsed</th>
       </tr></thead>
       <tbody>
@@ -50,7 +55,7 @@ export function renderActive(bodyEl, metaEl, s) {
             <td class="mono">#${esc(j.pr_number)}</td>
             <td>${esc(shortRepo(j.repo))}</td>
             <td class="mono">${esc(shortSha(j.head_sha))}</td>
-            <td><span class="pill ${esc(j.status)}">${esc(j.status)}</span></td>
+            <td>${stageCell(j)}</td>
             <td class="mono">${esc(j.attempt)}</td>
             <td>${esc(j.requester)}</td>
             <td class="num">${esc(fmtDuration(j.elapsed))}</td>
@@ -58,6 +63,24 @@ export function renderActive(bodyEl, metaEl, s) {
         `).join('')}
       </tbody>
     </table>`;
+}
+
+/**
+ * Render the current pipeline stage.
+ *
+ * `status` alone sits at "running" through a fetch, a merge, several builds and
+ * the review, which reads as a hang. The stage plus how long it has been in that
+ * stage is what distinguishes slow from stuck.
+ */
+export function stageCell(j) {
+  if (!j.stage || j.stage === 'done') {
+    return `<span class="pill ${esc(j.status)}">${esc(j.status)}</span>`;
+  }
+  const detail = j.stage_detail ? ` <span class="stage-detail">${esc(j.stage_detail)}</span>` : '';
+  const held = j.stage_elapsed != null && j.stage_elapsed >= 20
+    ? ` <span class="stage-held">${esc(fmtDuration(j.stage_elapsed))}</span>`
+    : '';
+  return `<span class="pill running">${esc(j.stage)}</span>${detail}${held}`;
 }
 
 export function renderPoller(el, p) {
@@ -133,7 +156,9 @@ export function renderHistory(el, jobs) {
             <td>${esc(shortRepo(j.repo))}</td>
             <td class="mono">${esc(shortSha(j.head_sha))}</td>
             <td>
-              <span class="pill ${esc(j.status)}">${esc(j.status)}</span>
+              ${TERMINAL.has(j.status)
+                ? `<span class="pill ${esc(j.status)}">${esc(j.status)}</span>`
+                : stageCell(j)}
               ${j.attempt > 1 ? `<span class="pill">try ${esc(j.attempt)}</span>` : ''}
             </td>
             <td>${_buildSummary(j.build_results)}</td>
@@ -180,6 +205,7 @@ function _detailMeta(j) {
   const mode = o.skip_build ? 'review only'
     : o.build_only ? 'build only'
     : 'build + review';
+  const running = !TERMINAL.has(j.status);
   return `
     <div class="card">
       <div class="card-header">
@@ -193,6 +219,7 @@ function _detailMeta(j) {
         <span class="card-meta">${esc(j.id)}</span>
       </div>
       <div class="card-body">
+        ${running ? `<div class="stage-banner">${stageCell(j)}</div>` : ''}
         <dl class="kv">
           <dt>Commit</dt><dd>${esc(j.head_sha || '—')}</dd>
           <dt>Branch</dt><dd>${esc(j.head_ref || '—')} → ${esc(j.base_ref || '—')}</dd>

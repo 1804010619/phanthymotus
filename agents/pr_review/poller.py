@@ -48,10 +48,12 @@ class Poller:
         config: Config,
         github_client: GitHubClient,
         job_queue,
+        store,
     ):
         self._config = config
         self._github = github_client
         self._job_queue = job_queue
+        self._store = store
         self._task: asyncio.Task | None = None
         self._state_path = Path(config.data_dir) / "poller_state.json"
 
@@ -204,6 +206,7 @@ class Poller:
             config=self._config,
             github_client=self._github,
             job_queue=self._job_queue,
+            store=self._store,
             source="poll",
         )
 

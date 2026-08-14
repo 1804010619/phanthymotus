@@ -26,6 +26,7 @@ from .models import (
     JobStatus,
     ReviewError,
     ReviewJob,
+    Stage,
 )
 from .reviewer import llm_review, run_rule_checks
 from .store import JobStore
@@ -158,29 +159,46 @@ async def _run_once(
 
     Raises on failure. Returns normally once a terminal state has been reached
     and reported (review posted, or build failure reported).
-    """
-    # 1. Fetch latest refs
-    await workspace_mgr.fetch(job.repo_full_name)
 
-    # 2. Create an isolated worktree with the PR merged onto main
+    Each step advances `job.stage` and persists it. That is what makes a long
+    fetch or a long build legible on the dashboard instead of showing "running"
+    with nothing else for minutes.
+    """
+    base_ref = job.pr_base_ref or "main"
+
+    # 1. Fetch just this PR's base branch and head ref
+    job.set_stage(Stage.FETCHING, base_ref)
+    await store.save_job(job)
+    await workspace_mgr.fetch_for_pr(job.repo_full_name, job.pr_number, base_ref)
+
+    # 2. Create an isolated worktree with the PR merged onto the base
+    job.set_stage(Stage.WORKTREE, f"{base_ref} + PR #{job.pr_number}")
+    await store.save_job(job)
     worktree = await workspace_mgr.create_worktree(
-        job.repo_full_name, job.pr_number, job.pr_head_sha
+        job.repo_full_name, job.pr_number, job.pr_head_sha, base_ref
     )
     job.worktree_path = str(worktree)
 
     # 3. Determine what changed
-    changed_files = await workspace_mgr.get_changed_files(worktree)
+    job.set_stage(Stage.DETECTING)
+    await store.save_job(job)
+    changed_files = await workspace_mgr.get_changed_files(worktree, base_ref)
     if not changed_files:
         await _report(
             job, github_client, comments.format_no_changes(job.pr_head_sha)
         )
         job.status = JobStatus.REVIEW_DONE
+        job.set_stage(Stage.DONE)
         return
 
     if job.force_targets:
         targets, driver_paths = _parse_forced_targets(job.force_targets)
     else:
-        targets, driver_paths = detect_targets(job.repo_full_name, changed_files)
+        # The worktree is probed for driver.yaml/Dockerfile, so newly added
+        # vendors are picked up without editing a provider list.
+        targets, driver_paths = detect_targets(
+            job.repo_full_name, changed_files, worktree
+        )
 
     # 4. Build
     if not job.skip_build and targets:
@@ -207,6 +225,7 @@ async def _run_once(
             # retried: the author needs to fix the code, and rebuilding the
             # same commit twice more would just burn an hour saying the same.
             job.status = JobStatus.BUILD_FAILED
+            job.set_stage(Stage.DONE)
             return
 
         job.status = JobStatus.BUILD_SUCCESS
@@ -220,7 +239,9 @@ async def _run_once(
 
     # 5. Review
     if not job.build_only:
-        diff_stat = await workspace_mgr.get_diff_stat(worktree)
+        job.set_stage(Stage.RULE_CHECKS)
+        await store.save_job(job)
+        diff_stat = await workspace_mgr.get_diff_stat(worktree, base_ref)
         findings = run_rule_checks(changed_files, diff_stat)
         # Kept on the job (not just formatted into the comment) so the
         # dashboard can render them and they survive a restart.
@@ -229,10 +250,15 @@ async def _run_once(
             for f in findings
         ]
 
-        diff = await workspace_mgr.get_diff(worktree, config.max_diff_lines)
-        job.review_text = await llm_review(config, changed_files, diff, findings)
+        job.set_stage(Stage.LLM_REVIEW, config.llm_model)
         await store.save_job(job)
+        diff = await workspace_mgr.get_diff(
+            worktree, base_ref, config.max_diff_lines
+        )
+        job.review_text = await llm_review(config, changed_files, diff, findings)
 
+        job.set_stage(Stage.POSTING)
+        await store.save_job(job)
         # The review is its own comment — the progress comment keeps the build
         # result, which stays useful to refer back to.
         await github_client.post_comment(
@@ -242,6 +268,7 @@ async def _run_once(
         )
 
     job.status = JobStatus.REVIEW_DONE
+    job.set_stage(Stage.DONE)
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -273,7 +300,27 @@ async def _execute_builds(
 
     results = []
     for idx, (target, driver_path) in enumerate(plan):
+        label = driver_path or target.value
         log_path = log_dir / log_filename(idx, target, driver_path)
+
+        job.set_stage(Stage.BUILDING, f"{idx + 1}/{len(plan)} {label}")
+        await store.save_job(job)
+
+        # Persist a placeholder row *before* the build runs. The dashboard
+        # builds its log panes from build_results, so without this there is no
+        # pane to tail until the build has already finished — which is exactly
+        # when live tailing stops being useful.
+        await store.save_build_result(
+            job.id, idx,
+            BuildResult(
+                target=target,
+                driver_path=driver_path,
+                success=False,
+                image_tag="",
+                log_tail="",
+                log_path=str(log_path),
+            ),
+        )
 
         if target == BuildTarget.CORE:
             result = await build_core(worktree, config, log_path)
@@ -283,6 +330,7 @@ async def _execute_builds(
             result = await build_driver(worktree, driver_path, config, log_path)
 
         results.append(result)
+        # Overwrites the placeholder (UNIQUE(job_id, idx) + INSERT OR REPLACE).
         await store.save_build_result(job.id, idx, result)
 
     return results

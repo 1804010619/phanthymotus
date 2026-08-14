@@ -57,10 +57,33 @@ class JobStore:
         conn = self._connect()
         try:
             conn.executescript(_SCHEMA)
+            self._migrate(conn)
             conn.commit()
         finally:
             conn.close()
         logger.info(f"Job store ready at {self._db_path}")
+
+    @staticmethod
+    def _migrate(conn: sqlite3.Connection):
+        """Add columns introduced after a deployment already created its DB.
+
+        `CREATE TABLE IF NOT EXISTS` is a no-op on an existing table, so new
+        columns have to be added explicitly or every INSERT fails against an
+        older database. Following the house style (agent-core has no migration
+        ledger), this is an idempotent fixup rather than a versioned migration.
+        """
+        existing = {
+            row[1] for row in conn.execute("PRAGMA table_info(jobs)").fetchall()
+        }
+        for column, ddl in (
+            ("stage", "ALTER TABLE jobs ADD COLUMN stage TEXT"),
+            ("stage_detail", "ALTER TABLE jobs ADD COLUMN stage_detail TEXT"),
+            ("stage_started_at",
+             "ALTER TABLE jobs ADD COLUMN stage_started_at REAL"),
+        ):
+            if column not in existing:
+                conn.execute(ddl)
+                logger.info(f"Migrated jobs table: added {column}")
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(str(self._db_path), timeout=10.0)
@@ -88,11 +111,12 @@ class JobStore:
                 """
                 INSERT OR REPLACE INTO jobs (
                   id, repo, pr_number, head_sha, head_ref, base_ref,
-                  requester, source, status, attempt,
+                  requester, source, status, stage, stage_detail,
+                  stage_started_at, attempt,
                   skip_build, build_only, force_targets,
                   review_text, findings, error, attempt_errors,
                   created_at, started_at, finished_at
-                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 (
                     job.id,
@@ -104,6 +128,9 @@ class JobStore:
                     job.requester,
                     job.source,
                     job.status.value,
+                    job.stage,
+                    job.stage_detail,
+                    job.stage_started_at.timestamp() if job.stage_started_at else None,
                     job.attempt,
                     int(job.skip_build),
                     int(job.build_only),
@@ -222,6 +249,35 @@ class JobStore:
 
     async def get_job(self, job_id: str) -> dict | None:
         return await asyncio.to_thread(self._get_job_sync, job_id)
+
+    async def find_jobs_for_commit(
+        self, repo: str, pr_number: int, head_sha: str
+    ) -> list[dict]:
+        """Jobs already recorded for this exact commit, newest first.
+
+        Used to decide what a repeated `/request_bot_review` should do. Reads
+        SQLite rather than the in-memory queue, because that queue is empty
+        after a restart and would let a completed review be redone silently.
+        """
+        return await asyncio.to_thread(
+            self._find_jobs_for_commit_sync, repo, pr_number, head_sha
+        )
+
+    def _find_jobs_for_commit_sync(
+        self, repo: str, pr_number: int, head_sha: str
+    ) -> list[dict]:
+        conn = self._connect()
+        conn.row_factory = sqlite3.Row
+        try:
+            rows = conn.execute(
+                """SELECT * FROM jobs
+                   WHERE repo = ? AND pr_number = ? AND head_sha = ?
+                   ORDER BY created_at DESC""",
+                (repo, pr_number, head_sha),
+            ).fetchall()
+            return [self._row_to_summary(r) for r in rows]
+        finally:
+            conn.close()
 
     def _get_job_sync(self, job_id: str) -> dict | None:
         conn = self._connect()
@@ -398,6 +454,8 @@ class JobStore:
 
     @staticmethod
     def _row_to_summary(row: sqlite3.Row) -> dict:
+        keys = row.keys()
+        stage_started = row["stage_started_at"] if "stage_started_at" in keys else None
         return {
             "id": row["id"],
             "repo": row["repo"],
@@ -407,6 +465,9 @@ class JobStore:
             "requester": row["requester"],
             "source": row["source"],
             "status": row["status"],
+            "stage": (row["stage"] if "stage" in keys else None) or "",
+            "stage_detail": (row["stage_detail"] if "stage_detail" in keys else None) or "",
+            "stage_elapsed": _elapsed(stage_started, row["finished_at"]),
             "attempt": row["attempt"],
             "created_at": row["created_at"],
             "started_at": row["started_at"],
@@ -465,6 +526,9 @@ CREATE TABLE IF NOT EXISTS jobs (
   requester TEXT,
   source TEXT,
   status TEXT NOT NULL,
+  stage TEXT,
+  stage_detail TEXT,
+  stage_started_at REAL,
   attempt INTEGER DEFAULT 0,
   skip_build INTEGER DEFAULT 0,
   build_only INTEGER DEFAULT 0,

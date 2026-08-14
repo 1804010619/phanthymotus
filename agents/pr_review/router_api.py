@@ -95,8 +95,8 @@ async def get_job_log(
 def _summarize_active(job) -> dict:
     """Shape an in-flight job for the Overview tab.
 
-    Read from the in-memory queue rather than SQLite so elapsed time advances
-    between the coarse write-through checkpoints.
+    Read from the in-memory queue rather than SQLite so elapsed time and the
+    current stage advance between the coarse write-through checkpoints.
     """
     return {
         "id": job.id,
@@ -105,6 +105,9 @@ def _summarize_active(job) -> dict:
         "head_sha": job.pr_head_sha,
         "requester": job.requester,
         "status": job.status.value,
+        "stage": job.stage,
+        "stage_detail": job.stage_detail,
+        "stage_elapsed": job.stage_elapsed_seconds(),
         "attempt": job.attempt,
         "elapsed": job.elapsed_seconds(),
     }

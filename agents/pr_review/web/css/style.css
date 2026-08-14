@@ -236,6 +236,22 @@ html, body {
 }
 @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: .25; } }
 
+/* ── Stage indicator ──────────────────────────────────────────────────────── */
+.stage-detail {
+  font-family: var(--font-mono); font-size: 11px; color: var(--text-muted);
+}
+/* How long the job has sat in this stage — the signal that separates a slow
+   step from a stuck one. */
+.stage-held {
+  font-family: var(--font-mono); font-size: 10px; color: var(--text-dim);
+}
+.stage-banner {
+  display: flex; align-items: center; gap: 8px;
+  padding: 9px 12px; margin-bottom: 14px;
+  background: var(--blue-bg); border-radius: var(--radius-sm);
+  font-size: 12px;
+}
+
 /* ── Filters / pager ──────────────────────────────────────────────────────── */
 .filter-bar {
   display: flex; align-items: flex-end; gap: 14px;

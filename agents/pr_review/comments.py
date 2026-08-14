@@ -192,6 +192,40 @@ for `{new_sha[:7]}`. See the newer comment for status.
 """
 
 
+def format_skipped_in_flight(head_sha: str) -> str:
+    """A repeat trigger arrived for a commit that is already being reviewed."""
+    return f"""{BOT_MARKER}
+## PR Review Agent — Already in progress
+
+A review of `{head_sha[:7]}` is already running. This request was skipped rather
+than starting a second build of the same commit.
+
+Push a new commit to review the change, or use
+`/request_bot_review force` to re-run this one.
+"""
+
+
+def format_skipped_already_reviewed(
+    head_sha: str, status: str, finished_at: float | None
+) -> str:
+    """A repeat trigger arrived for a commit that was already reviewed."""
+    when = ""
+    if finished_at:
+        from datetime import datetime, timezone
+        ts = datetime.fromtimestamp(finished_at, tz=timezone.utc)
+        when = f" on {ts.strftime('%Y-%m-%d %H:%M')} UTC"
+
+    return f"""{BOT_MARKER}
+## PR Review Agent — Already reviewed
+
+`{head_sha[:7]}` was already reviewed{when} (result: `{status}`). This request
+was skipped rather than rebuilding an unchanged commit.
+
+- Pushed a fix? The new commit will be reviewed when you trigger again.
+- Want this commit re-reviewed anyway? Use `/request_bot_review force`.
+"""
+
+
 def format_retrying(
     head_sha: str,
     attempt: int,

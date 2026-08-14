@@ -1,7 +1,22 @@
 """Shared trigger logic — creates jobs from PR comments.
 
-Used by both the webhook receiver and the polling loop, so the two entry
-points behave identically and share dedup.
+Used by both the webhook receiver and the polling loop, so the two entry points
+behave identically and share dedup.
+
+Repeat-trigger policy, keyed on the commit rather than the PR:
+
+- **New commit** → new review. Pushing a fix and re-triggering is the normal
+  workflow, so it must work.
+- **Same commit, still in flight** → skipped, with a comment saying so. Running
+  two builds of one commit wastes a worker for 20 minutes to print the same
+  answer twice.
+- **Same commit, already reviewed** → skipped, with a comment pointing at the
+  earlier result and mentioning `force`. Silently redoing it is worse: the
+  requester waits, unsure whether anything is happening.
+- **`/request_bot_review force`** → re-review regardless.
+
+The check reads SQLite, not the in-memory queue, because the queue is empty
+after a restart and would let a completed review be redone unnoticed.
 """
 
 import logging
@@ -9,7 +24,7 @@ import logging
 from . import comments
 from .config import Config
 from .github_client import GitHubClient
-from .models import ReviewJob, parse_trigger_command
+from .models import TERMINAL_STATUSES, ReviewJob, parse_trigger_command
 
 logger = logging.getLogger(__name__)
 
@@ -23,11 +38,12 @@ async def create_job_from_comment(
     config: Config,
     github_client: GitHubClient,
     job_queue,
+    store,
     source: str = "webhook",
 ) -> ReviewJob | None:
     """Parse a PR comment and enqueue a review job if it contains the trigger.
 
-    Returns the enqueued job, or None if the comment was ignored / deduped.
+    Returns the enqueued job, or None if the comment was ignored or skipped.
     """
     trigger = parse_trigger_command(comment_body)
     if trigger is None:
@@ -49,12 +65,25 @@ async def create_job_from_comment(
 
     head_sha = pr_info["head"]["sha"]
 
-    # Dedup: same repo + PR + SHA already queued or running.
-    if job_queue.has_pending_job(repo_full_name, pr_number, head_sha):
-        logger.info(
-            f"Dedup: job for {repo_full_name}#{pr_number}@{head_sha[:7]} already pending"
+    # Acknowledge receipt before any skip decision, so the requester can always
+    # tell the comment was seen.
+    await github_client.add_reaction(repo_full_name, comment_id, "eyes")
+
+    if not trigger["force"]:
+        skip = await _should_skip(
+            repo_full_name, pr_number, head_sha, job_queue, store
         )
-        return None
+        if skip is not None:
+            logger.info(
+                f"Skipping {repo_full_name}#{pr_number}@{head_sha[:7]}: {skip[0]}"
+            )
+            try:
+                await github_client.post_comment(
+                    repo_full_name, pr_number, skip[1]
+                )
+            except Exception as e:
+                logger.warning(f"Failed to post skip notice: {e}")
+            return None
 
     job = ReviewJob(
         repo_full_name=repo_full_name,
@@ -70,11 +99,10 @@ async def create_job_from_comment(
         force_targets=trigger["force_targets"],
     )
 
-    # Acknowledge immediately. With polling this matters — the trigger comment
-    # may sit for up to one poll interval, and without a reply the requester
-    # cannot tell whether the agent saw it. The worker then edits this same
-    # comment through the build and result stages.
-    await github_client.add_reaction(repo_full_name, comment_id, "eyes")
+    # Acknowledge with a comment immediately. With polling this matters — the
+    # trigger may sit for up to one poll interval, and without a reply the
+    # requester cannot tell whether the agent saw it. The worker then edits this
+    # same comment through the build and result stages.
     try:
         job.progress_comment_id = await github_client.post_comment(
             repo_full_name,
@@ -97,3 +125,45 @@ async def create_job_from_comment(
         f"{repo_full_name}#{pr_number}@{head_sha[:7]} by {requester}"
     )
     return job
+
+
+async def _should_skip(
+    repo: str, pr_number: int, head_sha: str, job_queue, store
+) -> tuple[str, str] | None:
+    """Decide whether to skip this trigger. Returns (reason, comment) or None.
+
+    Scoped to the exact commit: a different commit is always a new review.
+    """
+    # In-flight in this process — authoritative and cheapest.
+    if job_queue.has_pending_job(repo, pr_number, head_sha):
+        return (
+            "already in flight",
+            comments.format_skipped_in_flight(head_sha),
+        )
+
+    # Recorded in SQLite: covers both a job running under a previous process
+    # and a review that already completed for this commit.
+    try:
+        prior = await store.find_jobs_for_commit(repo, pr_number, head_sha)
+    except Exception as e:
+        # Never block a review because the dedup lookup failed.
+        logger.warning(f"Dedup lookup failed, allowing trigger: {e}")
+        return None
+
+    if not prior:
+        return None
+
+    active = [j for j in prior if j["status"] not in TERMINAL_STATUSES]
+    if active:
+        return (
+            "already in flight (persisted)",
+            comments.format_skipped_in_flight(head_sha),
+        )
+
+    done = prior[0]
+    return (
+        f"already reviewed ({done['status']})",
+        comments.format_skipped_already_reviewed(
+            head_sha, done["status"], done["finished_at"]
+        ),
+    )

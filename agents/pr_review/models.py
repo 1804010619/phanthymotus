@@ -56,6 +56,36 @@ class BuildTarget(str, Enum):
     DRIVER = "driver"
 
 
+# Statuses from which a job will never advance. Plain strings, because the
+# store hands back rows where status is a string, not an enum member.
+TERMINAL_STATUSES = frozenset({
+    JobStatus.BUILD_FAILED.value,
+    JobStatus.REVIEW_DONE.value,
+    JobStatus.TIMEOUT.value,
+    JobStatus.ERROR.value,
+    JobStatus.CANCELLED.value,
+})
+
+
+class Stage(str, Enum):
+    """Where in the pipeline a running job is.
+
+    `status` alone is too coarse: a job sits at RUNNING through a fetch, a
+    worktree merge, several builds, and the review. Without this the dashboard
+    shows "running" with nothing else for minutes at a time.
+    """
+
+    QUEUED = "queued"
+    FETCHING = "fetching refs"
+    WORKTREE = "preparing worktree"
+    DETECTING = "detecting changes"
+    BUILDING = "building"
+    RULE_CHECKS = "running rule checks"
+    LLM_REVIEW = "generating review"
+    POSTING = "posting results"
+    DONE = "done"
+
+
 # ── Data ──────────────────────────────────────────────────────────────────────
 
 
@@ -88,6 +118,11 @@ class ReviewJob:
     # Runtime state
     id: str = field(default_factory=lambda: uuid.uuid4().hex[:12])
     status: JobStatus = JobStatus.QUEUED
+    # Finer-grained progress within RUNNING, plus a free-text detail such as
+    # "1/2 unitree/g1" so the dashboard can say what is being built.
+    stage: str = Stage.QUEUED.value
+    stage_detail: str = ""
+    stage_started_at: datetime | None = None
     attempt: int = 0
     attempt_errors: list[str] = field(default_factory=list)
     build_results: list[BuildResult] = field(default_factory=list)
@@ -108,6 +143,22 @@ class ReviewJob:
             return None
         end = self.finished_at or datetime.now(timezone.utc)
         return (end - self.started_at).total_seconds()
+
+    def stage_elapsed_seconds(self) -> float | None:
+        """How long the current stage has been running.
+
+        Surfaced so a stage that is taking unusually long (a slow fetch, a long
+        build) is visible as such rather than looking like a hang.
+        """
+        if self.stage_started_at is None:
+            return None
+        end = self.finished_at or datetime.now(timezone.utc)
+        return (end - self.stage_started_at).total_seconds()
+
+    def set_stage(self, stage: "Stage", detail: str = ""):
+        self.stage = stage.value
+        self.stage_detail = detail
+        self.stage_started_at = datetime.now(timezone.utc)
 
 
 # ── Command parsing ───────────────────────────────────────────────────────────
@@ -132,7 +183,12 @@ def parse_trigger_command(comment_body: str) -> dict | None:
             continue
 
         args = line[len(TRIGGER):].split()
-        result = {"skip_build": False, "build_only": False, "force_targets": []}
+        result = {
+            "skip_build": False,
+            "build_only": False,
+            "force": False,
+            "force_targets": [],
+        }
         for arg in args:
             token = arg.strip().strip("`,")
             lowered = token.lower()
@@ -140,6 +196,9 @@ def parse_trigger_command(comment_body: str) -> dict | None:
                 result["skip_build"] = True
             elif lowered == "build-only":
                 result["build_only"] = True
+            elif lowered in ("force", "--force", "-f"):
+                # Re-review a commit that was already reviewed.
+                result["force"] = True
             elif lowered in ("core", "perception"):
                 result["force_targets"].append(lowered)
             elif "/" in token:

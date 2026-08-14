@@ -93,7 +93,7 @@ async def lifespan(app: FastAPI):
     # public IP, no open port, and no webhook registration.
     app.state.poller = None
     if config.poll_enabled:
-        poller = Poller(config, app.state.github_client, job_queue)
+        poller = Poller(config, app.state.github_client, job_queue, store)
         await poller.start()
         app.state.poller = poller
 

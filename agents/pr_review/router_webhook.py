@@ -68,10 +68,11 @@ async def webhook(
         config=config,
         github_client=request.app.state.github_client,
         job_queue=request.app.state.job_queue,
+        store=request.app.state.store,
         source="webhook",
     )
 
     if job is None:
-        return {"status": "ignored", "reason": "no trigger, deduped, or PR closed"}
+        return {"status": "ignored", "reason": "no trigger, skipped, or PR closed"}
 
     return {"status": "queued", "job_id": job.id, "pr": job.pr_number}
