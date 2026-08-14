@@ -1,0 +1,29 @@
+services:
+  pr-review-agent:
+    build:
+      context: ../../
+      dockerfile: agents/pr_review/Dockerfile
+    image: phanthy-pr-review:latest
+    container_name: phanthy-pr-review
+    restart: unless-stopped
+    ports:
+      - "15690:15690"
+    volumes:
+      # Docker socket for building images
+      - /var/run/docker.sock:/var/run/docker.sock
+      # Persistent git bare clones and worktrees
+      - pr-review-data:/data/repos
+      # SSH keys for git clone (read-only)
+      - ~/.ssh:/root/.ssh:ro
+    env_file:
+      - .env
+    environment:
+      - PYTHONUNBUFFERED=1
+    logging:
+      driver: local
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  pr-review-data:

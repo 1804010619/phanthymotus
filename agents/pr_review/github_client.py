@@ -1,0 +1,78 @@
+"""GitHub REST API client."""
+
+import logging
+
+import httpx
+
+logger = logging.getLogger(__name__)
+
+
+class GitHubClient:
+    """Thin async wrapper around GitHub REST API."""
+
+    def __init__(self, token: str):
+        self._client = httpx.AsyncClient(
+            base_url="https://api.github.com",
+            headers={
+                "Authorization": f"token {token}",
+                "Accept": "application/vnd.github+json",
+                "X-GitHub-Api-Version": "2022-11-28",
+            },
+            timeout=30.0,
+        )
+
+    async def close(self):
+        await self._client.aclose()
+
+    async def get_pr(self, repo: str, pr_number: int) -> dict:
+        """Get PR metadata (head SHA, refs, etc.)."""
+        resp = await self._client.get(f"/repos/{repo}/pulls/{pr_number}")
+        resp.raise_for_status()
+        return resp.json()
+
+    async def get_pr_files(self, repo: str, pr_number: int) -> list[dict]:
+        """Get list of files changed in a PR."""
+        resp = await self._client.get(
+            f"/repos/{repo}/pulls/{pr_number}/files",
+            params={"per_page": 100},
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+    async def post_comment(self, repo: str, pr_number: int, body: str) -> int:
+        """Post a comment on a PR. Returns the comment ID."""
+        resp = await self._client.post(
+            f"/repos/{repo}/issues/{pr_number}/comments",
+            json={"body": body},
+        )
+        resp.raise_for_status()
+        return resp.json()["id"]
+
+    async def edit_comment(self, repo: str, comment_id: int, body: str):
+        """Edit an existing comment."""
+        resp = await self._client.patch(
+            f"/repos/{repo}/issues/comments/{comment_id}",
+            json={"body": body},
+        )
+        resp.raise_for_status()
+
+    async def add_reaction(self, repo: str, comment_id: int, reaction: str):
+        """Add a reaction to a comment (e.g. 'eyes', 'rocket', '+1')."""
+        try:
+            resp = await self._client.post(
+                f"/repos/{repo}/issues/comments/{comment_id}/reactions",
+                json={"content": reaction},
+            )
+            resp.raise_for_status()
+        except httpx.HTTPStatusError as e:
+            # Non-critical, just log
+            logger.warning(f"Failed to add reaction: {e}")
+
+    async def get_diff(self, repo: str, pr_number: int) -> str:
+        """Get the PR diff as text."""
+        resp = await self._client.get(
+            f"/repos/{repo}/pulls/{pr_number}",
+            headers={"Accept": "application/vnd.github.diff"},
+        )
+        resp.raise_for_status()
+        return resp.text
