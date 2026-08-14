@@ -39,6 +39,7 @@ logic, so they can run simultaneously without double-triggering.
 | `/request_bot_review` | Detect build targets, build, then review |
 | `/request_bot_review skip-build` | Review only |
 | `/request_bot_review build-only` | Build only |
+| `/request_bot_review force` | Re-review a commit that was already reviewed |
 | `/request_bot_review core` | Force the `core` target |
 | `/request_bot_review perception` | Force the `perception` target |
 | `/request_bot_review unitree/g1` | Force a specific driver |
@@ -62,9 +63,14 @@ Determined from `git diff --name-only origin/main...HEAD`.
 
 | Changed path | Target |
 |--------------|--------|
-| `{provider}/{model}/**` | `build.sh {provider}/{model}` |
-| `dji/base/**` | none — base image, built manually |
+| `{provider}/{model}/**` where that directory has `driver.yaml` + `Dockerfile` | `build.sh {provider}/{model}` |
+| `{provider}/{model}/**` without those markers (e.g. `dji/base/`) | none — not a buildable driver |
 | `build.sh`, `README*` | none — review only |
+
+Driver discovery probes the worktree for `driver.yaml` + `Dockerfile`, the same
+test `build.sh` applies. A hardcoded provider list would silently skip every
+newly added vendor: that is exactly what happened to PR #166 adding
+`robotera/q5_bundle`, which got a review and no image.
 
 The agent invokes the repos' existing build scripts rather than reimplementing
 the build. Image tags, mirrors, and registry handling stay in one place.
@@ -217,9 +223,23 @@ up.
 
 ### Persistence
 
-Job records go to SQLite at `$DATA_DIR/jobs.db`; full build logs to
-`$DATA_DIR/logs/<job_id>/<idx>-<target>.log`. Metadata in the database, bulky
-payloads on disk — the same split agent-core uses for LLM request logs.
+State lives on the host at `DATA_HOST_DIR` (default
+`/opt/phanthy-motus/pr-review`), bind-mounted to `/data/repos` in the container:
+
+```
+/opt/phanthy-motus/pr-review/
+  jobs.db              review history (SQLite)
+  logs/<job>/<n>-<target>.log    full build logs
+  <repo>.git/          bare clones
+  poller_state.json    poller watermarks + processed comment IDs
+  worktrees/           transient, removed after each job
+```
+
+Metadata in the database, bulky payloads on disk — the same split agent-core
+uses for LLM request logs. A bind mount rather than a named volume, matching
+agent-core's `/opt/phanthy-motus/data`: the path is discoverable, a backup is
+`tar czf backup.tar.gz /opt/phanthy-motus/pr-review`, and `down -v` cannot take
+the history with it.
 
 `JOB_HISTORY_DAYS` (default 30) bounds retention. Pruning runs at startup and
 deletes log directories along with their job rows, so the two never drift.
@@ -228,6 +248,23 @@ Nothing resumes across a restart, so any job left non-terminal by an unclean
 shutdown (`docker kill`, OOM) is reconciled to `cancelled` at boot. A graceful
 `./deploy.sh stop` already notifies those jobs on their PRs; this covers the case
 that bypasses it, so the dashboard never shows work that no longer exists.
+
+### Repeat triggers
+
+Handled per commit, not per PR:
+
+| Situation | Behaviour |
+|-----------|-----------|
+| New commit | New review — this is the normal fix-and-retrigger flow |
+| Same commit, in flight | Skipped, with a comment saying so |
+| Same commit, already reviewed (`review_done` / `build_failed`) | Skipped, pointing at the earlier result |
+| Same commit, previous attempt produced no result (`cancelled` / `timeout` / `error`) | Allowed — those delivered nothing |
+| `/request_bot_review force` | Re-reviewed regardless |
+
+The distinction in the last two rows matters: a job killed by a restart or an
+infrastructure failure must not leave a commit permanently un-reviewable. The
+check reads SQLite, not the in-memory queue, which is empty after a restart and
+would otherwise let a completed review be silently redone.
 
 ### API
 

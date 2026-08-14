@@ -29,10 +29,14 @@ services:
       # which invoke `docker buildx`. This grants root-equivalent access to the
       # host, so keep this container's env file readable only by root.
       - /var/run/docker.sock:/var/run/docker.sock
-      # Persistent bare clones, worktrees, and poller watermarks. Keeping this
-      # across restarts is what makes fetches incremental instead of full
-      # re-clones, and stops the poller replaying old comments.
-      - pr-review-data:/data/repos
+      # Job history (jobs.db), full build logs, bare clones, and the poller
+      # watermarks. Keeping this across restarts is what makes history durable,
+      # fetches incremental, and stops the poller replaying old comments.
+      #
+      # A bind mount rather than a named volume, matching how agent-core mounts
+      # /opt/phanthy-motus/data: the path is discoverable, backups are a plain
+      # tar, and `docker compose down -v` cannot take the history with it.
+      - ${DATA_HOST_DIR:-/opt/phanthy-motus/pr-review}:/data/repos
 
     env_file:
       - .env
@@ -52,6 +56,3 @@ services:
       options:
         max-size: "10m"
         max-file: "3"
-
-volumes:
-  pr-review-data:

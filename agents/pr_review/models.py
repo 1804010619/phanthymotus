@@ -66,6 +66,18 @@ TERMINAL_STATUSES = frozenset({
     JobStatus.CANCELLED.value,
 })
 
+# Terminal statuses that actually produced an answer for the requester. Only
+# these should block a repeat trigger on the same commit.
+#
+# The rest — cancelled, timeout, error — are terminal but delivered nothing, so
+# re-triggering is the correct response to them, not something to refuse. A job
+# killed by a restart or by an infrastructure failure must not leave a commit
+# permanently un-reviewable.
+CONCLUSIVE_STATUSES = frozenset({
+    JobStatus.REVIEW_DONE.value,
+    JobStatus.BUILD_FAILED.value,
+})
+
 
 class Stage(str, Enum):
     """Where in the pipeline a running job is.

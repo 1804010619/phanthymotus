@@ -13,6 +13,9 @@ Repeat-trigger policy, keyed on the commit rather than the PR:
 - **Same commit, already reviewed** → skipped, with a comment pointing at the
   earlier result and mentioning `force`. Silently redoing it is worse: the
   requester waits, unsure whether anything is happening.
+- **Same commit, previous attempt produced no result** (cancelled by a restart,
+  timed out, or errored) → allowed. Those delivered nothing, so refusing would
+  leave the commit permanently un-reviewable.
 - **`/request_bot_review force`** → re-review regardless.
 
 The check reads SQLite, not the in-memory queue, because the queue is empty
@@ -24,7 +27,12 @@ import logging
 from . import comments
 from .config import Config
 from .github_client import GitHubClient
-from .models import TERMINAL_STATUSES, ReviewJob, parse_trigger_command
+from .models import (
+    CONCLUSIVE_STATUSES,
+    TERMINAL_STATUSES,
+    ReviewJob,
+    parse_trigger_command,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -160,7 +168,19 @@ async def _should_skip(
             comments.format_skipped_in_flight(head_sha),
         )
 
-    done = prior[0]
+    # Only a review that produced an answer blocks a repeat. A job that was
+    # cancelled, timed out, or errored delivered nothing, so re-triggering is
+    # the right response — otherwise a restart or an infrastructure failure
+    # would leave that commit permanently un-reviewable.
+    conclusive = [j for j in prior if j["status"] in CONCLUSIVE_STATUSES]
+    if not conclusive:
+        logger.info(
+            f"Prior attempt(s) for {head_sha[:7]} ended without a result "
+            f"({', '.join(sorted({j['status'] for j in prior}))}) — allowing retry"
+        )
+        return None
+
+    done = conclusive[0]
     return (
         f"already reviewed ({done['status']})",
         comments.format_skipped_already_reviewed(

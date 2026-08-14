@@ -7,9 +7,12 @@
 #   ./deploy.sh start           Start a stopped container (no rebuild)
 #   ./deploy.sh restart         Restart the container (no rebuild)
 #   ./deploy.sh down            Stop and remove the container, keep the data
-#   ./deploy.sh down --purge    Also delete the data volume (forces re-clone)
+#   ./deploy.sh down --purge    Also delete all state in DATA_HOST_DIR
 #   ./deploy.sh status          Show container state and agent status
 #   ./deploy.sh logs [-n N]     Follow logs (default: last 100 lines)
+#
+# State (review history, build logs, bare clones) lives on the host at
+# DATA_HOST_DIR, default /opt/phanthy-motus/pr-review.
 #
 # Mirrors default to Tencent Cloud. Override in .env for a host outside the
 # Tencent VPC:
@@ -35,6 +38,17 @@ _env_val() {
 }
 PORT="$(_env_val PORT 25690)"
 BIND_ADDR="$(_env_val BIND_ADDR 0.0.0.0)"
+DATA_HOST_DIR="$(_env_val DATA_HOST_DIR /opt/phanthy-motus/pr-review)"
+
+# The bind-mount target must exist before the container starts, or Docker
+# creates it root-owned with no warning and the agent writes into a path nobody
+# expects.
+ensure_data_dir() {
+    if [ ! -d "$DATA_HOST_DIR" ]; then
+        info "Creating data directory $DATA_HOST_DIR"
+        mkdir -p "$DATA_HOST_DIR"
+    fi
+}
 
 info() { echo "==> $*"; }
 die()  { echo "Error: $*" >&2; exit 1; }
@@ -96,7 +110,7 @@ show_endpoints() {
 }
 
 cmd_up() {
-    require_env; validate_env; setup_qemu
+    require_env; validate_env; ensure_data_dir; setup_qemu
     info "Building image"
     $COMPOSE build
     info "Starting agent"
@@ -106,7 +120,7 @@ cmd_up() {
 }
 
 cmd_rebuild() {
-    require_env; validate_env; setup_qemu
+    require_env; validate_env; ensure_data_dir; setup_qemu
     info "Rebuilding image without cache"
     $COMPOSE build --no-cache
     info "Recreating container"
@@ -143,20 +157,31 @@ cmd_restart() {
 cmd_down() {
     require_env
     if [ "${1:-}" = "--purge" ]; then
-        echo "This deletes the data volume: bare clones, worktrees, and the"
-        echo "poller watermarks. Next start re-clones both repos, and the"
-        echo "poller looks back only POLL_INITIAL_LOOKBACK_MINUTES, so trigger"
-        echo "comments older than that window will be missed."
-        printf "Delete the data volume? [y/N]: "
+        # `docker compose down -v` only removes named volumes; the data is a
+        # bind mount, so it has to be deleted explicitly or --purge would claim
+        # to have purged and silently left everything in place.
+        echo "This deletes ALL agent state under:"
+        echo "    $DATA_HOST_DIR"
+        echo "  - jobs.db          review history"
+        echo "  - logs/            full build logs"
+        echo "  - *.git            bare clones (re-cloned on next start)"
+        echo "  - poller_state.json watermarks; trigger comments older than"
+        echo "                     POLL_INITIAL_LOOKBACK_MINUTES will be missed"
+        printf "Type 'purge' to confirm: "
         read -r confirm
-        [[ "$confirm" =~ ^[Yy]$ ]] || die "Aborted."
-        info "Removing container and data volume"
-        $COMPOSE down -v
+        [ "$confirm" = "purge" ] || die "Aborted — nothing deleted."
+        info "Removing container"
+        $COMPOSE down
+        if [ -d "$DATA_HOST_DIR" ]; then
+            info "Deleting $DATA_HOST_DIR"
+            rm -rf -- "${DATA_HOST_DIR:?}"/*
+            rm -f -- "${DATA_HOST_DIR:?}"/.[!.]* 2>/dev/null || true
+        fi
         info "Removed, including data."
     else
-        info "Removing container (data volume kept)"
+        info "Removing container (data kept in $DATA_HOST_DIR)"
         $COMPOSE down
-        info "Removed. Data volume kept for the next start."
+        info "Removed. Data kept for the next start."
     fi
 }
 
