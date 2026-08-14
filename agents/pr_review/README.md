@@ -177,12 +177,28 @@ still posted and the review section says so.
 A web UI on the same port shows live status, review history, and full build logs.
 Vanilla ES modules, no build step, reusing agent-core's design tokens.
 
-The port is bound to loopback, so reach it over an SSH tunnel:
+Open it directly:
+
+```
+http://<host>:25690/
+```
+
+`BIND_ADDR` (in `.env`) controls who can reach it. It defaults to `0.0.0.0`,
+published by compose as `${BIND_ADDR}:${PORT}:${PORT}`. To restrict it to
+loopback and tunnel in instead:
 
 ```bash
-ssh -L 15690:localhost:15690 <user>@<tencent-host>
-# then open http://localhost:15690
+# .env
+BIND_ADDR=127.0.0.1
 ```
+```bash
+ssh -L 25690:localhost:25690 <user>@<host>
+# then open http://localhost:25690
+```
+
+Note that `HOST` and `BIND_ADDR` are different things: `HOST` is what uvicorn
+binds *inside* the container (leave it at `0.0.0.0`), while `BIND_ADDR` is what
+compose publishes on the host.
 
 Three views:
 
@@ -233,16 +249,23 @@ just repeating it.
 
 ### Security note
 
-There is no authentication, which is only acceptable because the port is bound
-to `127.0.0.1`. **Do not rebind to `0.0.0.0` without adding auth** — build logs
-and the config block would become world-readable.
+**There is no authentication.** With the default `BIND_ADDR=0.0.0.0`, anyone who
+can reach the host on `PORT` can read every build log, review, and the config
+block from `/api/status`. Build output can contain sensitive detail.
+
+That is an acceptable trade on a trusted private network, and it matches how the
+other services on these hosts are exposed. It is not acceptable on a shared or
+internet-facing host — there, set `BIND_ADDR=127.0.0.1` and tunnel.
+
+If the dashboard ever needs real exposure, agent-core's `auth.py` is the pattern
+to copy: a bearer token read from `.env`, with middleware guarding `/api/*` and
+leaving the static assets open.
 
 Everything the dashboard renders is escaped, because most of it is influenced by
 whoever opened the PR: branch names, build output, error text, and LLM review
 that quotes the diff. Log and error text render via `textContent`; the review's
 markdown subset escapes *before* applying its patterns, which is what makes it
-safe. agent-core's `auth.py` (bearer token from `.env`, middleware guarding
-`/api/*`) is the pattern to copy if the exposure model changes.
+safe.
 
 ## Deploy
 
@@ -328,7 +351,7 @@ The dashboard's Overview tab is the usual way in. For scripting, or to check
 liveness without a browser:
 
 ```bash
-curl -s http://localhost:15690/api/status | python3 -m json.tool
+curl -s http://localhost:25690/api/status | python3 -m json.tool
 ```
 
 With polling there is no inbound traffic to confirm the agent is alive, so

@@ -23,7 +23,18 @@ cd "$SCRIPT_DIR"
 
 COMPOSE="docker compose"
 SERVICE="pr-review-agent"
-PORT="15690"
+
+# Read PORT/BIND_ADDR from .env rather than hardcoding them, so the URLs this
+# script prints and curls always match what compose actually published. A
+# hardcoded port here is how the "dashboard unreachable" bug stayed invisible.
+_env_val() {
+    [ -f .env ] || { echo "$2"; return; }
+    local v
+    v="$(grep -E "^${1}=" .env | tail -1 | cut -d= -f2- | tr -d '"'"'"' \r')"
+    echo "${v:-$2}"
+}
+PORT="$(_env_val PORT 25690)"
+BIND_ADDR="$(_env_val BIND_ADDR 0.0.0.0)"
 
 info() { echo "==> $*"; }
 die()  { echo "Error: $*" >&2; exit 1; }
@@ -61,10 +72,21 @@ setup_qemu() {
 }
 
 show_endpoints() {
+    # Show the address the dashboard is actually reachable at, which depends on
+    # how BIND_ADDR was set — printing a localhost-only URL for an exposed
+    # deployment (or vice versa) just sends people down the wrong path.
+    local lan_ip
+    lan_ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
     echo
-    echo "  Dashboard:  http://localhost:${PORT}/"
-    echo "              (bound to loopback — from a laptop, first run:"
-    echo "               ssh -L ${PORT}:localhost:${PORT} <user>@<this-host>)"
+    if [ "$BIND_ADDR" = "127.0.0.1" ] || [ "$BIND_ADDR" = "localhost" ]; then
+        echo "  Dashboard:  http://localhost:${PORT}/"
+        echo "              bound to loopback — from a laptop, first run:"
+        echo "                ssh -L ${PORT}:localhost:${PORT} root@${lan_ip:-<this-host>}"
+    else
+        echo "  Dashboard:  http://${lan_ip:-<this-host>}:${PORT}/"
+        echo "              also http://localhost:${PORT}/ on this host"
+        echo "              NOTE: no authentication — keep this on a trusted network."
+    fi
     echo "  Status:     curl -s http://localhost:${PORT}/api/status | python3 -m json.tool"
     echo "  Jobs:       curl -s http://localhost:${PORT}/api/jobs | python3 -m json.tool"
     echo "  Logs:       $0 logs"

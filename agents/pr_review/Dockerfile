@@ -62,6 +62,6 @@ COPY agents/ /app/agents/
 
 RUN mkdir -p /data/repos
 
-EXPOSE 15690
+EXPOSE 25690
 
 CMD ["python", "-m", "agents.pr_review.server"]

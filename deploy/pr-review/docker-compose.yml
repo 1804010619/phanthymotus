@@ -13,12 +13,16 @@ services:
     container_name: phanthy-pr-review
     restart: unless-stopped
 
-    # Bound to loopback because the default trigger is polling (outbound only)
-    # — nothing needs to reach this port from outside. It stays published on
-    # localhost so `curl http://localhost:15690/status` works on the host.
-    # Change to "15690:15690" only if you also want the webhook reachable.
+    # Both sides of the mapping use ${PORT}. The container side is what uvicorn
+    # actually binds, so hardcoding it made PORT in .env silently ineffective:
+    # the app would listen on the configured port while compose published a
+    # different one, and nothing was reachable — not even from the host.
+    #
+    # BIND_ADDR defaults to 0.0.0.0 so the dashboard is reachable from the LAN.
+    # The dashboard has NO authentication, so on a shared or internet-facing
+    # host set BIND_ADDR=127.0.0.1 and reach it over an SSH tunnel instead.
     ports:
-      - "127.0.0.1:15690:15690"
+      - "${BIND_ADDR:-0.0.0.0}:${PORT:-25690}:${PORT:-25690}"
 
     volumes:
       # Docker socket — the agent shells out to the repos' own build scripts,

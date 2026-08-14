@@ -56,7 +56,7 @@ class Config:
 
     # Server
     host: str = "0.0.0.0"
-    port: int = 15690
+    port: int = 25690
 
     # Resource Center (optional)
     resource_center_url: str = ""
@@ -132,7 +132,7 @@ def load_config() -> Config:
         job_history_days=_env_int("JOB_HISTORY_DAYS", 30),
         data_dir=os.environ.get("DATA_DIR", "/data/repos"),
         host=os.environ.get("HOST", "0.0.0.0"),
-        port=_env_int("PORT", 15690),
+        port=_env_int("PORT", 25690),
         resource_center_url=os.environ.get("RESOURCE_CENTER_URL", ""),
         resource_center_api_key=os.environ.get("RESOURCE_CENTER_API_KEY", ""),
         **overrides,
