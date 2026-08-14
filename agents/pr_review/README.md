@@ -172,6 +172,78 @@ there is nothing for a loop to decide. Diffs are truncated to
 `MAX_DIFF_LINES`. If the LLM is unconfigured or fails, the build result is
 still posted and the review section says so.
 
+## Dashboard
+
+A web UI on the same port shows live status, review history, and full build logs.
+Vanilla ES modules, no build step, reusing agent-core's design tokens.
+
+The port is bound to loopback, so reach it over an SSH tunnel:
+
+```bash
+ssh -L 15690:localhost:15690 <user>@<tencent-host>
+# then open http://localhost:15690
+```
+
+Three views:
+
+- **Overview** — queue depth, in-flight jobs, poller health (last poll, last
+  error), effective config. Polls every 5s.
+- **History** — every job, filterable by status and repo, paged. Survives
+  restarts.
+- **Job detail** — metadata, build results with copyable image tags, a log
+  viewer per build target, the rendered review, rule findings, and per-attempt
+  failure reasons. Deep-linkable via `#job/<id>`.
+
+While a build runs, its log pane tails live: the client re-requests from the
+byte offset it last received. The pane only autoscrolls if you are already at the
+bottom, so tailing does not yank the view away while you read an error further
+up.
+
+### Persistence
+
+Job records go to SQLite at `$DATA_DIR/jobs.db`; full build logs to
+`$DATA_DIR/logs/<job_id>/<idx>-<target>.log`. Metadata in the database, bulky
+payloads on disk — the same split agent-core uses for LLM request logs.
+
+`JOB_HISTORY_DAYS` (default 30) bounds retention. Pruning runs at startup and
+deletes log directories along with their job rows, so the two never drift.
+
+Nothing resumes across a restart, so any job left non-terminal by an unclean
+shutdown (`docker kill`, OOM) is reconciled to `cancelled` at boot. A graceful
+`./deploy.sh stop` already notifies those jobs on their PRs; this covers the case
+that bypasses it, so the dashboard never shows work that no longer exists.
+
+### API
+
+| Endpoint | Purpose |
+|----------|---------|
+| `GET /api/status` | Queue depth, active jobs, poller health, config |
+| `GET /api/jobs?limit&offset&status&repo` | Paginated history |
+| `GET /api/jobs/{id}` | Full detail incl. review text and findings |
+| `GET /api/jobs/{id}/log/{idx}?offset=N` | Log bytes from `offset` |
+
+Raw JSON, not agent-core's `{code, message, data}` envelope — `deploy.sh status`
+curls these directly.
+
+Log tailing is HTTP offset polling rather than a WebSocket. The project uses WS
+for its data plane, but that carries high-frequency sensor data; build logs are
+low-frequency text already being written to a file, so polling avoids connection
+lifecycle, fan-out, and reconnect logic, and recovering from a dropped request is
+just repeating it.
+
+### Security note
+
+There is no authentication, which is only acceptable because the port is bound
+to `127.0.0.1`. **Do not rebind to `0.0.0.0` without adding auth** — build logs
+and the config block would become world-readable.
+
+Everything the dashboard renders is escaped, because most of it is influenced by
+whoever opened the PR: branch names, build output, error text, and LLM review
+that quotes the diff. Log and error text render via `textContent`; the review's
+markdown subset escapes *before* applying its patterns, which is what makes it
+safe. agent-core's `auth.py` (bearer token from `.env`, middleware guarding
+`/api/*`) is the pattern to copy if the exposure model changes.
+
 ## Deploy
 
 ```bash
@@ -252,40 +324,42 @@ catalog that production deployments draw from.
 
 ## Monitoring
 
-With polling there is no inbound traffic to confirm liveness, so check the
-status endpoint:
+The dashboard's Overview tab is the usual way in. For scripting, or to check
+liveness without a browser:
 
 ```bash
-curl -s http://localhost:15690/status | python3 -m json.tool
+curl -s http://localhost:15690/api/status | python3 -m json.tool
 ```
 
-`poller.last_poll_at` should be within one interval, and `poller.last_error`
-should be null. Also available:
-
-| Endpoint | Purpose |
-|----------|---------|
-| `GET /status` | Queue depth, active jobs, poller health, effective config |
-| `GET /jobs` | Recent jobs with status and attempt count |
-| `GET /jobs/{id}` | One job: build results, image tags, logs, review text |
+With polling there is no inbound traffic to confirm the agent is alive, so
+`poller.last_poll_at` should be within one interval and `poller.last_error`
+should be null. The dashboard flags a stale poller automatically.
 
 ## Layout
 
 ```
 agents/pr_review/
-  server.py            FastAPI app + lifespan wiring
+  server.py            FastAPI app, static mount, lifespan wiring
   config.py            Environment configuration
   models.py            Job model, error types, command parsing
+  store.py             SQLite history, build-log files, prune, reconcile
   poller.py            Polling loop + watermark persistence
+  router_api.py        /api endpoints
   router_webhook.py    Optional webhook receiver
-  router_status.py     Status / jobs endpoints
   trigger.py           Shared job creation (poll and webhook)
   job_queue.py         Async queue + worker pool
   worker.py            Pipeline, timeout, retry policy
   git_workspace.py     Bare clones, worktrees, diffs
   build_detector.py    Changed files → build targets
-  builder.py           Invokes the repos' build scripts
+  builder.py           Invokes the repos' build scripts, streams logs
   reviewer.py          Rule checks + LLM review
   comments.py          PR comment formatting
+  web/
+    index.html
+    css/style.css      Redeclares agent-core's design tokens
+    js/api.js          fetch helpers, escaping, formatting
+    js/views.js        overview / history / detail renderers
+    js/app.js          tab routing, polling loops, log tailing
 
 deploy/pr-review/
   docker-compose.yml

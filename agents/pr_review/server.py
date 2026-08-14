@@ -2,23 +2,54 @@
 
 import logging
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 import uvicorn
 from fastapi import FastAPI
+from fastapi.staticfiles import StaticFiles
 
 from .config import load_config
 from .git_workspace import GitWorkspaceManager
 from .github_client import GitHubClient
 from .job_queue import JobQueue
 from .poller import Poller
-from .router_status import router as status_router
+from .router_api import router as api_router
 from .router_webhook import router as webhook_router
+from .store import JobStore
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 logger = logging.getLogger(__name__)
+
+# Resolved from this file rather than the CWD. agent-core uses a relative
+# './web' and relies on its launcher to guarantee the working directory;
+# resolving from __file__ removes that hidden requirement so
+# `python -m agents.pr_review.server` works from anywhere.
+WEB_DIR = Path(__file__).parent / "web"
+
+
+class _NoCacheStaticFiles(StaticFiles):
+    """StaticFiles that refuses to be cached, and ignores non-HTTP scopes.
+
+    Mirrors agent-core's `_HTTPOnlyStaticFiles` (`start.py:655`): the dashboard
+    is edited in place with no build step or content hashing, so a cached JS
+    file would silently serve stale code after a deploy.
+    """
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            return
+
+        async def send_no_cache(message):
+            if message["type"] == "http.response.start":
+                headers = dict(message.get("headers", []))
+                headers[b"cache-control"] = b"no-cache, no-store, must-revalidate"
+                message = {**message, "headers": list(headers.items())}
+            await send(message)
+
+        await super().__call__(scope, receive, send_no_cache)
 
 
 @asynccontextmanager
@@ -31,6 +62,17 @@ async def lifespan(app: FastAPI):
 
     app.state.github_client = GitHubClient(config.github_token)
 
+    # Durable job history and build logs.
+    store = JobStore(config.data_dir)
+    store.init()
+    # Nothing resumes across a restart, so close out anything left mid-flight by
+    # an unclean shutdown before the dashboard can show it as still running.
+    await store.reconcile_orphans()
+    pruned = await store.prune(config.job_history_days)
+    if pruned:
+        logger.info(f"Pruned {pruned} job(s) older than {config.job_history_days}d")
+    app.state.store = store
+
     # Persistent bare clones — cloned once, then fetched incrementally.
     workspace_mgr = GitWorkspaceManager(config.data_dir, config.repos)
     await workspace_mgr.ensure_clones()
@@ -42,6 +84,7 @@ async def lifespan(app: FastAPI):
         config=config,
         github_client=app.state.github_client,
         workspace_mgr=workspace_mgr,
+        store=store,
     )
     await job_queue.start()
     app.state.job_queue = job_queue
@@ -62,6 +105,7 @@ async def lifespan(app: FastAPI):
         f"job_timeout={config.job_timeout_seconds}s, "
         f"max_attempts={config.max_attempts})"
     )
+    logger.info(f"Dashboard: http://localhost:{config.port}/")
 
     yield
 
@@ -72,18 +116,23 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="PR Review Agent", lifespan=lifespan)
+
+# Order matters: the routers are registered before the static mount so /api and
+# /webhook win over the catch-all at /.
+app.include_router(api_router)
 app.include_router(webhook_router)
-app.include_router(status_router)
+
+if WEB_DIR.is_dir():
+    app.mount(
+        "/", _NoCacheStaticFiles(directory=str(WEB_DIR), html=True), name="web"
+    )
+else:
+    logger.warning(f"Web directory not found at {WEB_DIR} — dashboard disabled")
 
 
 def main():
     config = load_config()
-    uvicorn.run(
-        "agents.pr_review.server:app",
-        host=config.host,
-        port=config.port,
-        log_level="info",
-    )
+    uvicorn.run(app, host=config.host, port=config.port, log_level="info")
 
 
 if __name__ == "__main__":

@@ -16,11 +16,13 @@ from .config import Config
 from .git_workspace import GitWorkspaceManager
 from .github_client import GitHubClient
 from .models import JobStatus, ReviewJob
+from .store import JobStore
 from .worker import run_job
 
 logger = logging.getLogger(__name__)
 
-# Retained job history for the /jobs endpoints.
+# Retained in-memory job history. SQLite holds the durable record; this deque
+# only backs dedup and supersede decisions for jobs still in flight.
 JOB_HISTORY_MAX = 100
 
 
@@ -33,11 +35,13 @@ class JobQueue:
         config: Config,
         github_client: GitHubClient,
         workspace_mgr: GitWorkspaceManager,
+        store: JobStore,
     ):
         self._max_workers = max_workers
         self._config = config
         self._github_client = github_client
         self._workspace_mgr = workspace_mgr
+        self._store = store
         self._queue: asyncio.Queue[ReviewJob] = asyncio.Queue()
         self._workers: list[asyncio.Task] = []
         self._jobs: deque[ReviewJob] = deque(maxlen=JOB_HISTORY_MAX)
@@ -85,6 +89,7 @@ class JobQueue:
             was_running = job.status != JobStatus.QUEUED
             job.status = JobStatus.CANCELLED
             job.error = "Agent stopped before the job finished"
+            await self._store.save_job(job)
             if job.progress_comment_id is None:
                 continue
             try:
@@ -107,6 +112,7 @@ class JobQueue:
         """Add a job, superseding queued jobs for the same PR."""
         await self._supersede_queued_for_pr(job)
         self._jobs.append(job)
+        await self._store.save_job(job)
         await self._queue.put(job)
 
     def has_pending_job(self, repo: str, pr_number: int, sha: str) -> bool:
@@ -124,6 +130,12 @@ class JobQueue:
 
     def active_count(self) -> int:
         return len(self._active)
+
+    def active_jobs(self) -> list[ReviewJob]:
+        """Jobs currently being worked on, newest first."""
+        return sorted(
+            self._active.values(), key=lambda j: j.created_at, reverse=True
+        )
 
     def recent_jobs(self, limit: int = 20) -> list[ReviewJob]:
         return list(self._jobs)[-limit:]
@@ -154,6 +166,7 @@ class JobQueue:
                 logger.info(
                     f"Superseded queued job {job.id} for PR #{job.pr_number}"
                 )
+                await self._store.save_job(job)
                 # Leave the PR in a truthful state rather than a stale
                 # "Queued" comment that will never advance.
                 if job.progress_comment_id is not None:
@@ -187,6 +200,7 @@ class JobQueue:
                         config=self._config,
                         github_client=self._github_client,
                         workspace_mgr=self._workspace_mgr,
+                        store=self._store,
                     )
                     self.total_processed += 1
                 except asyncio.CancelledError:
@@ -198,6 +212,7 @@ class JobQueue:
                     logger.exception(f"Worker-{worker_id}: job {job.id} escaped")
                     job.status = JobStatus.ERROR
                     job.error = f"{type(e).__name__}: {e}"
+                    await self._store.save_job(job)
                 finally:
                     self._active.pop(job.id, None)
             except asyncio.CancelledError:

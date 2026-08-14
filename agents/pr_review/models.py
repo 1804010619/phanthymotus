@@ -65,7 +65,8 @@ class BuildResult:
     driver_path: str | None  # e.g. "unitree/g1", only for DRIVER
     success: bool
     image_tag: str  # full image ref when successful
-    log_tail: str  # last N lines of build output
+    log_tail: str  # last N lines, for the PR comment
+    log_path: str = ""  # full log on disk, for the dashboard
 
 
 @dataclass
@@ -91,6 +92,9 @@ class ReviewJob:
     attempt_errors: list[str] = field(default_factory=list)
     build_results: list[BuildResult] = field(default_factory=list)
     review_text: str = ""
+    # Rule-check findings as plain dicts, so they survive persistence and can
+    # be rendered by the dashboard rather than only formatted into a comment.
+    findings: list[dict] = field(default_factory=list)
     error: str = ""
     created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     started_at: datetime | None = None

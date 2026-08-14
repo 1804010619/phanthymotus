@@ -48,6 +48,9 @@ class Config:
     max_attempts: int = 3
     retry_backoff_seconds: int = 60
 
+    # How long job history and build logs are retained. Pruned at startup.
+    job_history_days: int = 30
+
     # Paths
     data_dir: str = "/data/repos"
 
@@ -126,6 +129,7 @@ def load_config() -> Config:
         job_timeout_seconds=_env_int("JOB_TIMEOUT_SECONDS", 3600),
         max_attempts=_env_int("MAX_ATTEMPTS", 3),
         retry_backoff_seconds=_env_int("RETRY_BACKOFF_SECONDS", 60),
+        job_history_days=_env_int("JOB_HISTORY_DAYS", 30),
         data_dir=os.environ.get("DATA_DIR", "/data/repos"),
         host=os.environ.get("HOST", "0.0.0.0"),
         port=_env_int("PORT", 15690),

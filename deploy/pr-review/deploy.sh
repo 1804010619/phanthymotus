@@ -62,9 +62,12 @@ setup_qemu() {
 
 show_endpoints() {
     echo
-    echo "  Status:  curl -s http://localhost:${PORT}/status | python3 -m json.tool"
-    echo "  Jobs:    curl -s http://localhost:${PORT}/jobs | python3 -m json.tool"
-    echo "  Logs:    $0 logs"
+    echo "  Dashboard:  http://localhost:${PORT}/"
+    echo "              (bound to loopback — from a laptop, first run:"
+    echo "               ssh -L ${PORT}:localhost:${PORT} <user>@<this-host>)"
+    echo "  Status:     curl -s http://localhost:${PORT}/api/status | python3 -m json.tool"
+    echo "  Jobs:       curl -s http://localhost:${PORT}/api/jobs | python3 -m json.tool"
+    echo "  Logs:       $0 logs"
     echo
     echo "Trigger a review by commenting /request_bot_review on a PR."
     echo "Polling picks it up within POLL_INTERVAL_SECONDS (default 30s)."
@@ -141,7 +144,7 @@ cmd_status() {
     $COMPOSE ps
     echo
     info "Agent status"
-    if curl -sf --max-time 5 "http://localhost:${PORT}/status" -o /tmp/pr_review_status.json; then
+    if curl -sf --max-time 5 "http://localhost:${PORT}/api/status" -o /tmp/pr_review_status.json; then
         python3 -m json.tool /tmp/pr_review_status.json 2>/dev/null \
             || cat /tmp/pr_review_status.json
         rm -f /tmp/pr_review_status.json

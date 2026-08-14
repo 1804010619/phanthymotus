@@ -4,6 +4,9 @@ Retry policy: a job that exceeds `job_timeout_seconds` is presumed lost and
 retried, as are infrastructure failures (network, git, registry). Conditions
 caused by the PR itself are terminal and reported immediately — a merge
 conflict or a genuinely broken build is the answer, not something to retry.
+
+Job state is written through to the store at each transition, so the dashboard
+survives a restart and shows in-flight work as it happens.
 """
 
 import asyncio
@@ -13,7 +16,7 @@ from pathlib import Path
 
 from . import comments
 from .build_detector import detect_targets
-from .builder import build_core, build_driver, build_perception
+from .builder import build_core, build_driver, build_perception, log_filename
 from .config import Config
 from .git_workspace import GitWorkspaceManager
 from .github_client import GitHubClient
@@ -25,6 +28,7 @@ from .models import (
     ReviewJob,
 )
 from .reviewer import llm_review, run_rule_checks
+from .store import JobStore
 
 logger = logging.getLogger(__name__)
 
@@ -41,6 +45,7 @@ async def run_job(
     config: Config,
     github_client: GitHubClient,
     workspace_mgr: GitWorkspaceManager,
+    store: JobStore,
 ):
     """Run a job, retrying on timeout or infrastructure failure."""
     job.started_at = datetime.now(timezone.utc)
@@ -48,6 +53,7 @@ async def run_job(
     for attempt in range(1, config.max_attempts + 1):
         job.attempt = attempt
         job.status = JobStatus.RUNNING
+        await store.save_job(job)
 
         if attempt > 1:
             logger.info(
@@ -57,13 +63,14 @@ async def run_job(
 
         try:
             await asyncio.wait_for(
-                _run_once(job, config, github_client, workspace_mgr),
+                _run_once(job, config, github_client, workspace_mgr, store),
                 timeout=config.job_timeout_seconds,
             )
             # A terminal state was reached and reported inside the pipeline
             # (review posted, or a real build failure). Either way, done.
             job.finished_at = datetime.now(timezone.utc)
             await _cleanup(job, workspace_mgr)
+            await store.save_job(job)
             return
 
         except asyncio.TimeoutError:
@@ -79,7 +86,8 @@ async def run_job(
             retryable = e.retryable
 
         except asyncio.CancelledError:
-            # Agent is shutting down — do not retry, do not comment.
+            # Agent is shutting down — do not retry, do not comment. The queue's
+            # shutdown path notifies the PR and persists the final state.
             job.status = JobStatus.CANCELLED
             job.finished_at = datetime.now(timezone.utc)
             await _cleanup(job, workspace_mgr)
@@ -98,6 +106,7 @@ async def run_job(
         if not retryable:
             job.status = JobStatus.ERROR
             job.finished_at = datetime.now(timezone.utc)
+            await store.save_job(job)
             await _report(
                 job, github_client,
                 comments.format_error(job.pr_head_sha, reason),
@@ -106,6 +115,7 @@ async def run_job(
 
         if attempt < config.max_attempts:
             job.status = JobStatus.RETRYING
+            await store.save_job(job)
             await _report(
                 job, github_client,
                 comments.format_retrying(
@@ -121,6 +131,7 @@ async def run_job(
                 else JobStatus.ERROR
             )
             job.finished_at = datetime.now(timezone.utc)
+            await store.save_job(job)
             logger.error(
                 f"Job {job.id} failed after {config.max_attempts} attempts: {reason}"
             )
@@ -141,6 +152,7 @@ async def _run_once(
     config: Config,
     github_client: GitHubClient,
     workspace_mgr: GitWorkspaceManager,
+    store: JobStore,
 ):
     """One attempt at the full pipeline.
 
@@ -179,8 +191,11 @@ async def _run_once(
             ),
         )
 
-        results = await _execute_builds(targets, driver_paths, worktree, config)
+        results = await _execute_builds(
+            job, targets, driver_paths, worktree, config, store
+        )
         job.build_results = results
+        await store.save_job(job)
 
         await _report(
             job, github_client,
@@ -195,6 +210,7 @@ async def _run_once(
             return
 
         job.status = JobStatus.BUILD_SUCCESS
+        await store.save_job(job)
 
     elif not job.skip_build:
         await _report(
@@ -206,9 +222,16 @@ async def _run_once(
     if not job.build_only:
         diff_stat = await workspace_mgr.get_diff_stat(worktree)
         findings = run_rule_checks(changed_files, diff_stat)
+        # Kept on the job (not just formatted into the comment) so the
+        # dashboard can render them and they survive a restart.
+        job.findings = [
+            {"severity": f.severity, "file": f.file, "message": f.message}
+            for f in findings
+        ]
 
         diff = await workspace_mgr.get_diff(worktree, config.max_diff_lines)
         job.review_text = await llm_review(config, changed_files, diff, findings)
+        await store.save_job(job)
 
         # The review is its own comment — the progress comment keeps the build
         # result, which stays useful to refer back to.
@@ -225,21 +248,43 @@ async def _run_once(
 
 
 async def _execute_builds(
+    job: ReviewJob,
     targets: list[BuildTarget],
     driver_paths: list[str],
     worktree: Path,
     config: Config,
+    store: JobStore,
 ) -> list[BuildResult]:
-    """Build each detected target in sequence."""
-    results = []
+    """Build each detected target in sequence, persisting each result.
+
+    Each build streams to its own log file under the job's log directory, so the
+    dashboard can tail an in-progress build and the full output outlives the
+    80-line tail that goes into the PR comment.
+    """
+    log_dir = store.log_dir_for(job.id)
+    log_dir.mkdir(parents=True, exist_ok=True)
+
+    plan: list[tuple[BuildTarget, str | None]] = []
     for target in targets:
+        if target == BuildTarget.DRIVER:
+            plan.extend((target, dp) for dp in driver_paths)
+        else:
+            plan.append((target, None))
+
+    results = []
+    for idx, (target, driver_path) in enumerate(plan):
+        log_path = log_dir / log_filename(idx, target, driver_path)
+
         if target == BuildTarget.CORE:
-            results.append(await build_core(worktree, config))
+            result = await build_core(worktree, config, log_path)
         elif target == BuildTarget.PERCEPTION:
-            results.append(await build_perception(worktree, config))
-        elif target == BuildTarget.DRIVER:
-            for dp in driver_paths:
-                results.append(await build_driver(worktree, dp, config))
+            result = await build_perception(worktree, config, log_path)
+        else:
+            result = await build_driver(worktree, driver_path, config, log_path)
+
+        results.append(result)
+        await store.save_build_result(job.id, idx, result)
+
     return results
 
 
