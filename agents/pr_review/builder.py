@@ -382,6 +382,77 @@ def split_image_ref(ref: str) -> tuple[str, str]:
     return ref, ""
 
 
+def docker_run_from_service_yaml(yaml_text: str, image: str) -> tuple[str, str]:
+    """Translate a driver's `deploy/service.yml` into a `docker run` command.
+
+    Returns (container_name, command). Empty command if it cannot be parsed.
+
+    The fragment is translated rather than hand-written because these drivers
+    need privileged mode, host networking and specific device mounts — an
+    invented command would start but misbehave. Every driver in the repo uses
+    the same key set (image, container_name, network_mode, ipc, pid, privileged,
+    volumes, environment, logging, restart), so this covers all of them.
+
+    This is the throwaway-test path. The supported route is the Agent Core
+    dashboard, which merges the same fragment into the host compose file.
+    """
+    try:
+        import yaml
+        doc = yaml.safe_load(yaml_text)
+    except Exception as e:
+        logger.warning(f"Could not parse service.yml: {e}")
+        return "", ""
+
+    if not isinstance(doc, dict) or not doc:
+        return "", ""
+
+    svc = doc[next(iter(doc))]
+    if not isinstance(svc, dict):
+        return "", ""
+
+    name = svc.get("container_name") or next(iter(doc))
+    args = ["docker run -d"]
+    args.append(f"  --name {name}")
+
+    if svc.get("network_mode"):
+        args.append(f"  --network {svc['network_mode']}")
+    if svc.get("ipc"):
+        args.append(f"  --ipc {svc['ipc']}")
+    if svc.get("pid"):
+        args.append(f"  --pid {svc['pid']}")
+    if svc.get("privileged"):
+        args.append("  --privileged")
+    for vol in svc.get("volumes") or []:
+        args.append(f"  -v {vol}")
+    for env in svc.get("environment") or []:
+        # Quoted: values can contain characters the shell would otherwise eat.
+        if "=" in str(env):
+            k, v = str(env).split("=", 1)
+            args.append(f'  -e {k}="{v}"')
+        else:
+            args.append(f"  -e {env}")
+    if svc.get("restart"):
+        args.append(f"  --restart {svc['restart']}")
+
+    log = svc.get("logging") or {}
+    if log.get("driver"):
+        args.append(f"  --log-driver {log['driver']}")
+    for k, v in (log.get("options") or {}).items():
+        args.append(f"  --log-opt {k}={v}")
+
+    args.append(f"  {image}")
+    return str(name), " \\\n".join(args)
+
+
+def read_service_yaml(worktree: Path, driver_path: str) -> str:
+    """Read a driver's deploy/service.yml out of the checkout, if present."""
+    p = worktree / driver_path / "deploy" / "service.yml"
+    try:
+        return p.read_text()
+    except OSError:
+        return ""
+
+
 def log_filename(idx: int, target: BuildTarget, driver_path: str | None) -> str:
     """Log filename for one build within a job: `{idx}-{safe-label}.log`."""
     label = driver_path or target.value

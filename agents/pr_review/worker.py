@@ -16,7 +16,14 @@ from pathlib import Path
 
 from . import comments
 from .build_detector import detect_targets
-from .builder import build_core, build_driver, build_perception, log_filename
+from .builder import (
+    build_core,
+    build_driver,
+    build_perception,
+    docker_run_from_service_yaml,
+    log_filename,
+    read_service_yaml,
+)
 from .config import Config
 from .git_workspace import GitWorkspaceManager
 from .github_client import GitHubClient
@@ -330,6 +337,19 @@ async def _execute_builds(
             result = await build_driver(worktree, driver_path, config, log_path)
 
         results.append(result)
+
+        # Translate the driver's own service.yml into a runnable command while
+        # the worktree still exists, so the PR comment can offer a one-liner for
+        # a throwaway test instead of the full compose-merge procedure.
+        if result.success and driver_path and result.image_tag:
+            svc = read_service_yaml(worktree, driver_path)
+            if svc:
+                name, cmd = docker_run_from_service_yaml(svc, result.image_tag)
+                result.container_name = name
+                result.run_command = cmd
+            else:
+                logger.info(f"{driver_path} has no deploy/service.yml")
+
         # Overwrites the placeholder (UNIQUE(job_id, idx) + INSERT OR REPLACE).
         await store.save_build_result(job.id, idx, result)
 

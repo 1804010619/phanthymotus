@@ -144,49 +144,60 @@ Commit: `{head_sha[:7]}`
 
 
 def _deploy_help(built: list[BuildResult]) -> str:
-    """How to install a freshly built image.
+    """How to run a freshly built image.
 
-    The commands mirror what Agent Core does in
-    `agent-core/src/api/drivers.py:_deploy_sync`: pull the image, read
-    `/deploy/service.yml` out of it, set `image:` to this ref, and merge that
-    fragment into $COMPOSE_DIR/docker-compose.yml. A hand-written `docker run`
-    is deliberately not offered — the service fragment needs privileged mode,
-    host networking, and several device mounts, so an invented command would be
-    subtly wrong.
+    Leads with a single `docker run`, because the common case is a reviewer
+    wanting to try the build on a spare machine and throw it away — the full
+    compose-merge procedure is too much ceremony for that. The command is
+    translated from the driver's own `deploy/service.yml`, not invented, so the
+    privileged/host-network/device flags the driver actually needs are present.
     """
-    ref = built[0].image_tag
-    return f"""
-Two ways to install:
+    out = "\n### Try it\n"
 
-**1. Deploy it yourself now** — on the target machine's Agent Core dashboard,
-set the driver's image to the reference above and deploy. Agent Core pulls it,
-extracts `deploy/service.yml` from the image, and merges it into the host's
-compose file.
-
-<details><summary>Or the equivalent by hand</summary>
+    for r in built:
+        name = r.driver_path or r.target.value
+        if not r.run_command:
+            continue
+        cn = r.container_name or "the-container"
+        out += f"""
+<details open><summary><b>{name}</b> — run it directly</summary>
 
 ```bash
-IMAGE={ref}
+{r.run_command}
+```
 
-docker pull "$IMAGE"
+Follow the logs, get a shell, then clean up:
 
-# The service definition ships inside the image
-cid=$(docker create "$IMAGE")
-docker cp "$cid:/deploy/service.yml" /tmp/service.yml
-docker rm "$cid"
-
-# Merge /tmp/service.yml into the host compose file, setting image: $IMAGE
-#   (Agent Core normally does this step for you)
-sed -i "s|__IMAGE__|$IMAGE|" /tmp/service.yml
-# ...append it under `services:` in /opt/phanthy-motus/docker-compose.yml, then:
-cd /opt/phanthy-motus && docker compose up -d
+```bash
+docker logs -f {cn}
+docker exec -it {cn} bash
+docker rm -f {cn}
 ```
 
 </details>
-
-**2. Wait for review** — once this PR is approved, the version becomes
-installable from the web console.
 """
+
+    # Anything without a translated command (core, perception, or a driver with
+    # no service.yml) still gets the pull, since that is all we can honestly say.
+    plain = [r for r in built if not r.run_command]
+    if plain:
+        refs = "\n".join(r.image_tag for r in plain)
+        out += f"""
+```bash
+docker pull {plain[0].image_tag}
+```
+"""
+        if len(plain) > 1:
+            out += f"\n<details><summary>All images</summary>\n\n```\n{refs}\n```\n\n</details>\n"
+
+    out += """
+For a real deployment, use the Agent Core dashboard instead — set the driver's
+image to the reference above and deploy. It merges the same `service.yml` into
+the host's compose file so the container survives reboots.
+
+Once this PR is approved, the version becomes installable from the web console.
+"""
+    return out
 
 
 def format_no_build_needed(head_sha: str) -> str:

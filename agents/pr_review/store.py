@@ -85,6 +85,20 @@ class JobStore:
                 conn.execute(ddl)
                 logger.info(f"Migrated jobs table: added {column}")
 
+        br_existing = {
+            row[1]
+            for row in conn.execute("PRAGMA table_info(build_results)").fetchall()
+        }
+        for column, ddl in (
+            ("run_command",
+             "ALTER TABLE build_results ADD COLUMN run_command TEXT"),
+            ("container_name",
+             "ALTER TABLE build_results ADD COLUMN container_name TEXT"),
+        ):
+            if column not in br_existing:
+                conn.execute(ddl)
+                logger.info(f"Migrated build_results table: added {column}")
+
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(str(self._db_path), timeout=10.0)
         # WAL lets the dashboard read while a worker writes; without it
@@ -164,8 +178,9 @@ class JobStore:
                 """
                 INSERT OR REPLACE INTO build_results (
                   job_id, idx, target, driver_path,
-                  success, image_tag, log_path, created_at
-                ) VALUES (?,?,?,?,?,?,?,?)
+                  success, image_tag, log_path,
+                  run_command, container_name, created_at
+                ) VALUES (?,?,?,?,?,?,?,?,?,?)
                 """,
                 (
                     job_id,
@@ -175,6 +190,8 @@ class JobStore:
                     int(result.success),
                     result.image_tag,
                     result.log_path,
+                    result.run_command,
+                    result.container_name,
                     time.time(),
                 ),
             )
@@ -288,8 +305,8 @@ class JobStore:
                 return None
             job = self._row_to_detail(row)
             br = conn.execute(
-                """SELECT idx, target, driver_path, success, image_tag, log_path
-                   FROM build_results WHERE job_id = ? ORDER BY idx""",
+                """SELECT * FROM build_results
+                   WHERE job_id = ? ORDER BY idx""",
                 (job_id,),
             ).fetchall()
             job["build_results"] = [
@@ -300,6 +317,8 @@ class JobStore:
                     "success": bool(r["success"]),
                     "image_tag": r["image_tag"],
                     "has_log": bool(r["log_path"]) and Path(r["log_path"]).exists(),
+                    "run_command": _col(r, "run_command"),
+                    "container_name": _col(r, "container_name"),
                 }
                 for r in br
             ]
@@ -497,6 +516,11 @@ class JobStore:
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 
+def _col(row: sqlite3.Row, name: str, default=""):
+    """Read a column that may not exist on an un-migrated row."""
+    return (row[name] if name in row.keys() else default) or default
+
+
 def _load_json(raw, default):
     if not raw:
         return default
@@ -554,6 +578,8 @@ CREATE TABLE IF NOT EXISTS build_results (
   success INTEGER,
   image_tag TEXT,
   log_path TEXT,
+  run_command TEXT,
+  container_name TEXT,
   created_at REAL NOT NULL,
   UNIQUE(job_id, idx)
 );

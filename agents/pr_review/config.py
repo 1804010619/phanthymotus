@@ -48,6 +48,8 @@ class Config:
     llm_api_key: str = ""
     llm_model: str = "claude-sonnet-4-20250514"
     max_diff_lines: int = 3000
+    llm_max_tokens: int = 4000
+    llm_timeout_seconds: int = 180
 
     # Worker
     max_concurrent_jobs: int = 2
@@ -149,6 +151,8 @@ def load_config() -> Config:
         llm_api_key=os.environ.get("LLM_API_KEY", ""),
         llm_model=os.environ.get("LLM_MODEL", "claude-sonnet-4-20250514"),
         max_diff_lines=_env_int("MAX_DIFF_LINES", 3000),
+        llm_max_tokens=_env_int("LLM_MAX_TOKENS", 4000),
+        llm_timeout_seconds=_env_int("LLM_TIMEOUT_SECONDS", 180),
         max_concurrent_jobs=_env_int("MAX_CONCURRENT_JOBS", 2),
         build_timeout_seconds=_env_int("BUILD_TIMEOUT_SECONDS", 1800),
         job_timeout_seconds=_env_int("JOB_TIMEOUT_SECONDS", 3600),

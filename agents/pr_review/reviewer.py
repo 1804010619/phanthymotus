@@ -1,5 +1,6 @@
 """Reviewer — rule-based checks + LLM-powered code review."""
 
+import asyncio
 import json
 import logging
 import re
@@ -11,6 +12,11 @@ import httpx
 from .config import Config
 
 logger = logging.getLogger(__name__)
+
+# An empty or malformed completion is usually transient, so the call is retried
+# before giving up and reporting on the PR.
+LLM_ATTEMPTS = 3
+LLM_RETRY_BACKOFF = 4
 
 
 @dataclass
@@ -168,29 +174,46 @@ Diff:
 """
 
     endpoint = chat_completions_url(config.llm_base_url)
-    try:
-        async with httpx.AsyncClient(timeout=120.0) as client:
-            resp = await client.post(
-                endpoint,
-                headers={
-                    "Authorization": f"Bearer {config.llm_api_key}",
-                    "Content-Type": "application/json",
-                },
-                json={
-                    "model": config.llm_model,
-                    "messages": [
-                        {"role": "system", "content": SYSTEM_PROMPT},
-                        {"role": "user", "content": user_prompt},
-                    ],
-                    "temperature": 0.3,
-                    "max_tokens": 2000,
-                },
+    payload = {
+        "model": config.llm_model,
+        "messages": [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": user_prompt},
+        ],
+        "temperature": 0.3,
+        "max_tokens": config.llm_max_tokens,
+    }
+
+    # Retried, because an empty or malformed completion is usually transient —
+    # one bad response should not cost the whole review. A wrong URL or a bad
+    # key fails identically every time, so the cost of retrying those is small.
+    last = ""
+    for attempt in range(1, LLM_ATTEMPTS + 1):
+        try:
+            async with httpx.AsyncClient(timeout=config.llm_timeout_seconds) as client:
+                resp = await client.post(
+                    endpoint,
+                    headers={
+                        "Authorization": f"Bearer {config.llm_api_key}",
+                        "Content-Type": "application/json",
+                    },
+                    json=payload,
+                )
+                review = _parse_completion(resp, endpoint)
+            if attempt > 1:
+                logger.info(f"LLM review succeeded on attempt {attempt}")
+            return review
+        except Exception as e:
+            last = f"{type(e).__name__}: {e}"
+            logger.warning(
+                f"LLM review attempt {attempt}/{LLM_ATTEMPTS} failed "
+                f"({endpoint}): {last}"
             )
-            return _parse_completion(resp, endpoint)
-    except Exception as e:
-        detail = f"{type(e).__name__}: {e}"
-        logger.error(f"LLM review failed calling {endpoint} — {detail}")
-        return f"_LLM review failed ({endpoint}): {detail}_"
+            if attempt < LLM_ATTEMPTS:
+                await asyncio.sleep(LLM_RETRY_BACKOFF * attempt)
+
+    logger.error(f"LLM review failed after {LLM_ATTEMPTS} attempts: {last}")
+    return f"_LLM review failed after {LLM_ATTEMPTS} attempts ({endpoint}): {last}_"
 
 
 def _parse_completion(resp: "httpx.Response", endpoint: str) -> str:
@@ -229,12 +252,33 @@ def _parse_completion(resp: "httpx.Response", endpoint: str) -> str:
         ) from e
 
     try:
-        return data["choices"][0]["message"]["content"]
+        choice = data["choices"][0]
+        content = choice["message"].get("content")
     except (KeyError, IndexError, TypeError) as e:
         # Valid JSON in an unexpected shape, e.g. an error envelope.
         raise RuntimeError(
             f"unexpected response shape from {endpoint} ({e}): {snippet}"
         ) from e
+
+    if not content or not content.strip():
+        # A completion with no content is a failure, not a review. Passing it
+        # through posted an empty "Code Review" comment on a PR — worse than
+        # saying nothing, because it looks like the reviewer had no comments.
+        finish = choice.get("finish_reason")
+        usage = data.get("usage", {}) or {}
+        hint = {
+            "length": " The token budget was exhausted before any text was "
+                      "produced — try a smaller diff (MAX_DIFF_LINES) or a "
+                      "larger max_tokens.",
+            "content_filter": " The response was filtered.",
+        }.get(finish, "")
+        raise RuntimeError(
+            f"the model returned no content (finish_reason={finish!r}, "
+            f"prompt_tokens={usage.get('prompt_tokens')}, "
+            f"completion_tokens={usage.get('completion_tokens')}).{hint}"
+        )
+
+    return content
 
 
 def chat_completions_url(base: str) -> str:
