@@ -89,6 +89,9 @@ class JobStore:
             row[1]
             for row in conn.execute("PRAGMA table_info(build_results)").fetchall()
         }
+        # `run_command` is legacy: it held a generated `docker run`, replaced by
+        # deploy/run-pr-image.sh. Kept so existing databases are not rewritten;
+        # nothing reads or writes it.
         for column, ddl in (
             ("run_command",
              "ALTER TABLE build_results ADD COLUMN run_command TEXT"),
@@ -179,8 +182,8 @@ class JobStore:
                 INSERT OR REPLACE INTO build_results (
                   job_id, idx, target, driver_path,
                   success, image_tag, log_path,
-                  run_command, container_name, created_at
-                ) VALUES (?,?,?,?,?,?,?,?,?,?)
+                  container_name, created_at
+                ) VALUES (?,?,?,?,?,?,?,?,?)
                 """,
                 (
                     job_id,
@@ -190,7 +193,6 @@ class JobStore:
                     int(result.success),
                     result.image_tag,
                     result.log_path,
-                    result.run_command,
                     result.container_name,
                     time.time(),
                 ),
@@ -317,7 +319,6 @@ class JobStore:
                     "success": bool(r["success"]),
                     "image_tag": r["image_tag"],
                     "has_log": bool(r["log_path"]) and Path(r["log_path"]).exists(),
-                    "run_command": _col(r, "run_command"),
                     "container_name": _col(r, "container_name"),
                 }
                 for r in br
@@ -578,7 +579,7 @@ CREATE TABLE IF NOT EXISTS build_results (
   success INTEGER,
   image_tag TEXT,
   log_path TEXT,
-  run_command TEXT,
+  run_command TEXT,        -- legacy, unused (see _migrate)
   container_name TEXT,
   created_at REAL NOT NULL,
   UNIQUE(job_id, idx)

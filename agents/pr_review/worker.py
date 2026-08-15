@@ -20,7 +20,7 @@ from .builder import (
     build_core,
     build_driver,
     build_perception,
-    docker_run_from_service_yaml,
+    container_name_from_service_yaml,
     log_filename,
     read_service_yaml,
     service_yaml_path,
@@ -339,18 +339,15 @@ async def _execute_builds(
 
         results.append(result)
 
-        # Translate the target's own service.yml into a runnable command while
-        # the worktree still exists, so the PR comment can offer a one-liner for
-        # a throwaway test instead of the full compose-merge procedure. Drivers
-        # and perception have one; core does not (it self-updates via the web
-        # console), so it gets no run command by design.
+        # Note which container the target declares, while the worktree still
+        # exists. Its presence is what tells the comment that
+        # deploy/run-pr-image.sh will work. Drivers and perception ship a
+        # fragment; core does not (it self-updates via the web console).
         rel = service_yaml_path(target, driver_path)
         if result.success and result.image_tag and rel:
             svc = read_service_yaml(worktree, rel)
             if svc:
-                name, cmd = docker_run_from_service_yaml(svc, result.image_tag)
-                result.container_name = name
-                result.run_command = cmd
+                result.container_name = container_name_from_service_yaml(svc)
             else:
                 logger.info(f"{label}: no service.yml at {rel}")
 

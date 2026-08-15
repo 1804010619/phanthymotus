@@ -86,11 +86,30 @@ are deployed differently:
 | perception | yes | same path as drivers |
 | core | no | updated in place through the web console: `POST /api/system/update` pulls the image and hands over to a restart-helper container |
 
-So drivers and perception get a `docker run` translated from their own
-`service.yml` — useful for a throwaway test — while core only gets the image
-reference and a pointer to the web console. Offering a `docker run` for core
-would be wrong: it is the agent itself, and swapping it requires the restart
-helper.
+So drivers and perception get a one-line command in the comment:
+
+```bash
+./deploy/run-pr-image.sh <image-ref>
+```
+
+`deploy/run-pr-image.sh` (committed in both repos) pulls the image, reads the
+compose fragment out of `/deploy/service.yml`, substitutes the real ref, and
+starts it from a standalone compose file under `PR_IMAGE_DIR`. Then `--logs`,
+`--shell`, `--status`, `--down`.
+
+Using compose rather than a generated `docker run` matters for three reasons:
+it is the same tool production uses, the flags each service declares
+(privileged, host networking, device mounts) are used exactly as its author
+wrote them instead of being re-derived, and `--down` tears everything down
+without touching the host's real compose file.
+
+Core gets only the image reference and a pointer to the web console. It ships no
+service fragment, and starting a second copy by hand would fight the running
+agent — updating it requires the restart helper that `POST /api/system/update`
+hands over to.
+
+The script needs nothing beyond docker: the fragment is wrapped with text
+transforms, so there is no python or yq dependency on the machine under test.
 
 ## Parallelism and isolation
 

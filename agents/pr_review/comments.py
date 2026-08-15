@@ -146,41 +146,33 @@ Commit: `{head_sha[:7]}`
 def _deploy_help(built: list[BuildResult]) -> str:
     """How to run a freshly built image.
 
-    Leads with a single `docker run`, because the common case is a reviewer
-    wanting to try the build on a spare machine and throw it away — the full
-    compose-merge procedure is too much ceremony for that. The command is
-    translated from the driver's own `deploy/service.yml`, not invented, so the
-    privileged/host-network/device flags the driver actually needs are present.
+    Leads with the repo's own `deploy/run-pr-image.sh`, which pulls the image,
+    reads the compose service fragment out of `/deploy/service.yml`, and starts
+    it from a standalone compose file. That keeps the same tool production uses
+    (compose, at /opt/phanthy-motus/docker-compose.yml) instead of a
+    hand-written `docker run`, and means the flags each service declares —
+    privileged, host networking, device mounts — are used exactly as its author
+    wrote them.
     """
     out = "\n### Try it\n"
 
-    for r in built:
+    runnable = [r for r in built if r.container_name]
+    for r in runnable:
         name = r.driver_path or r.target.value
-        if not r.run_command:
-            continue
-        cn = r.container_name or "the-container"
         out += f"""
-<details open><summary><b>{name}</b> — run it directly</summary>
+**{name}**
 
 ```bash
-{r.run_command}
+./deploy/run-pr-image.sh {r.image_tag}
 ```
 
-Follow the logs, get a shell, then clean up:
-
-```bash
-docker logs -f {cn}
-docker exec -it {cn} bash
-docker rm -f {cn}
-```
-
-</details>
+Then `--logs`, `--shell`, `--down`. Starts container `{r.container_name}`, and
+`--down` removes it and the generated compose file completely.
 """
 
-    # Targets with no service.yml — in practice just core, which is the agent
-    # itself and updates in place through the web console rather than being run
-    # as a fresh container.
-    web_only = [r for r in built if not r.run_command]
+    # Targets with no service fragment — in practice just core, which is the
+    # agent itself and updates in place rather than running as a second copy.
+    web_only = [r for r in built if not r.container_name]
     if web_only:
         names = ", ".join(r.driver_path or r.target.value for r in web_only)
         out += f"""
@@ -189,13 +181,12 @@ container: Agent Core pulls the image and hands over to a restart helper. Open
 the dashboard's deploy panel and upgrade to this version.
 """
 
-    # Only mention the run command as the throwaway option when one was actually
-    # offered, or the sentence refers to something that is not there.
-    if any(r.run_command for r in built):
+    if runnable:
         out += """
-The `docker run` above is for a throwaway test. For a lasting deployment use the
-Agent Core dashboard instead — it merges the same `service.yml` into the host's
-compose file, so the container survives a reboot.
+That script is for a throwaway test and leaves the host's real deployment
+untouched. For a lasting one, deploy from the web console — it merges the same
+service fragment into the host's compose file, so the container survives a
+reboot.
 """
 
     out += """

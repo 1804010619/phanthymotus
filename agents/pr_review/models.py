@@ -109,9 +109,9 @@ class BuildResult:
     image_tag: str  # full image ref when successful
     log_tail: str  # last N lines, for the PR comment
     log_path: str = ""  # full log on disk, for the dashboard
-    # `docker run` translated from the driver's deploy/service.yml, so a
-    # reviewer can start the built image directly for a throwaway test.
-    run_command: str = ""
+    # Container the target's deploy/service.yml declares. Set only when the
+    # target ships a parseable fragment, so it doubles as the signal that
+    # deploy/run-pr-image.sh will work for this image.
     container_name: str = ""
 
 
