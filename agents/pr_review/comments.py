@@ -177,24 +177,28 @@ docker rm -f {cn}
 </details>
 """
 
-    # Anything without a translated command (core, perception, or a driver with
-    # no service.yml) still gets the pull, since that is all we can honestly say.
-    plain = [r for r in built if not r.run_command]
-    if plain:
-        refs = "\n".join(r.image_tag for r in plain)
+    # Targets with no service.yml — in practice just core, which is the agent
+    # itself and updates in place through the web console rather than being run
+    # as a fresh container.
+    web_only = [r for r in built if not r.run_command]
+    if web_only:
+        names = ", ".join(r.driver_path or r.target.value for r in web_only)
         out += f"""
-```bash
-docker pull {plain[0].image_tag}
-```
+**{names}** — deployed by updating through the web console, not by running a
+container: Agent Core pulls the image and hands over to a restart helper. Open
+the dashboard's deploy panel and upgrade to this version.
 """
-        if len(plain) > 1:
-            out += f"\n<details><summary>All images</summary>\n\n```\n{refs}\n```\n\n</details>\n"
+
+    # Only mention the run command as the throwaway option when one was actually
+    # offered, or the sentence refers to something that is not there.
+    if any(r.run_command for r in built):
+        out += """
+The `docker run` above is for a throwaway test. For a lasting deployment use the
+Agent Core dashboard instead — it merges the same `service.yml` into the host's
+compose file, so the container survives a reboot.
+"""
 
     out += """
-For a real deployment, use the Agent Core dashboard instead — set the driver's
-image to the reference above and deploy. It merges the same `service.yml` into
-the host's compose file so the container survives reboots.
-
 Once this PR is approved, the version becomes installable from the web console.
 """
     return out

@@ -444,11 +444,27 @@ def docker_run_from_service_yaml(yaml_text: str, image: str) -> tuple[str, str]:
     return str(name), " \\\n".join(args)
 
 
-def read_service_yaml(worktree: Path, driver_path: str) -> str:
-    """Read a driver's deploy/service.yml out of the checkout, if present."""
-    p = worktree / driver_path / "deploy" / "service.yml"
+def service_yaml_path(target: BuildTarget, driver_path: str | None) -> str | None:
+    """Where a target's `deploy/service.yml` lives in the checkout, if it has one.
+
+    Drivers and perception both ship one and are deployed the same way (Agent
+    Core extracts it from the image and merges it into the host compose file).
+
+    Core has none: it is the agent itself, updated in place through the web
+    console via `POST /api/system/update`, which pulls the image and hands over
+    to a restart-helper container. A `docker run` for core would be wrong.
+    """
+    if target == BuildTarget.DRIVER and driver_path:
+        return f"{driver_path}/deploy/service.yml"
+    if target == BuildTarget.PERCEPTION:
+        return "perception/deploy/service.yml"
+    return None
+
+
+def read_service_yaml(worktree: Path, rel_path: str) -> str:
+    """Read a `deploy/service.yml` out of the checkout, if present."""
     try:
-        return p.read_text()
+        return (worktree / rel_path).read_text()
     except OSError:
         return ""
 

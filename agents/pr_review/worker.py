@@ -23,6 +23,7 @@ from .builder import (
     docker_run_from_service_yaml,
     log_filename,
     read_service_yaml,
+    service_yaml_path,
 )
 from .config import Config
 from .git_workspace import GitWorkspaceManager
@@ -338,17 +339,20 @@ async def _execute_builds(
 
         results.append(result)
 
-        # Translate the driver's own service.yml into a runnable command while
+        # Translate the target's own service.yml into a runnable command while
         # the worktree still exists, so the PR comment can offer a one-liner for
-        # a throwaway test instead of the full compose-merge procedure.
-        if result.success and driver_path and result.image_tag:
-            svc = read_service_yaml(worktree, driver_path)
+        # a throwaway test instead of the full compose-merge procedure. Drivers
+        # and perception have one; core does not (it self-updates via the web
+        # console), so it gets no run command by design.
+        rel = service_yaml_path(target, driver_path)
+        if result.success and result.image_tag and rel:
+            svc = read_service_yaml(worktree, rel)
             if svc:
                 name, cmd = docker_run_from_service_yaml(svc, result.image_tag)
                 result.container_name = name
                 result.run_command = cmd
             else:
-                logger.info(f"{driver_path} has no deploy/service.yml")
+                logger.info(f"{label}: no service.yml at {rel}")
 
         # Overwrites the placeholder (UNIQUE(job_id, idx) + INSERT OR REPLACE).
         await store.save_build_result(job.id, idx, result)

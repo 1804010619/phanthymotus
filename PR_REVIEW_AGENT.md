@@ -75,6 +75,23 @@ newly added vendor: that is exactly what happened to PR #166 adding
 The agent invokes the repos' existing build scripts rather than reimplementing
 the build. Image tags, mirrors, and registry handling stay in one place.
 
+### How each target is deployed
+
+The build-result comment tailors its instructions per target, because the three
+are deployed differently:
+
+| Target | Ships `deploy/service.yml` | How it is deployed |
+|--------|---------------------------|--------------------|
+| driver | yes, per driver | Agent Core extracts it from the image and merges it into the host compose file (`api/drivers.py:_deploy_sync`) |
+| perception | yes | same path as drivers |
+| core | no | updated in place through the web console: `POST /api/system/update` pulls the image and hands over to a restart-helper container |
+
+So drivers and perception get a `docker run` translated from their own
+`service.yml` — useful for a throwaway test — while core only gets the image
+reference and a pointer to the web console. Offering a `docker run` for core
+would be wrong: it is the agent itself, and swapping it requires the restart
+helper.
+
 ## Parallelism and isolation
 
 `MAX_CONCURRENT_JOBS` (default 2) workers pull from an async queue.
