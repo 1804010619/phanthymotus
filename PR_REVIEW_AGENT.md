@@ -173,6 +173,11 @@ endpoint, with the project's architecture and review rules in the system
 prompt, and the rule-check findings passed in as context. Output is English,
 structured as Summary / Issues / Suggestions.
 
+`LLM_BASE_URL` accepts a bare host, a `/v1` root, or the full endpoint — `/v1`
+is added when missing. A gateway that serves its web UI at `/chat/completions`
+would otherwise answer 200 with HTML and the failure would read as a JSON
+parse error rather than a wrong URL.
+
 This is a single call, not an agent loop: the pipeline is deterministic, so
 there is nothing for a loop to decide. Diffs are truncated to
 `MAX_DIFF_LINES`. If the LLM is unconfigured or fails, the build result is

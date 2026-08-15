@@ -19,11 +19,35 @@ from .models import BuildResult, BuildTarget
 
 logger = logging.getLogger(__name__)
 
-# Image tag markers printed by the build scripts. "Image :" appears near the
-# start (before the build), the "Done." forms at the very end.
-IMAGE_PATTERN = re.compile(r"Image\s*:\s*(\S+)")
-DONE_PUSH_PATTERN = re.compile(r"Done\.\s*Image pushed:\s*(\S+)")
-DONE_LOCAL_PATTERN = re.compile(r"Done\.\s*Image built locally:\s*(\S+)")
+# Image reference markers, per build script. All three scripts print the ref in
+# their own wording, so each has to be matched explicitly:
+#
+#   build_core.sh:36         Image : <ref>
+#   build_perception.sh:87   Image  : <ref>            (two spaces)
+#   both, on success         Done. Image pushed: <ref>
+#                            Done. Image built locally: <ref>
+#   driver build.sh:257      构建 <name>  →  <ref>
+#   driver build.sh:302      完成：<ref>
+#
+# Completion markers come first: they mean the build actually finished, whereas
+# the declared-target lines are printed before it runs.
+COMPLETION_PATTERNS = (
+    re.compile(r"完成\s*[:：]\s*(\S+)"),
+    re.compile(r"Done\.\s*Image pushed:\s*(\S+)"),
+    re.compile(r"Done\.\s*Image built locally:\s*(\S+)"),
+)
+DECLARED_PATTERNS = (
+    re.compile(r"构建\s+.*?[→>]\s*(\S+)"),
+    re.compile(r"Image\s*:\s*(\S+)"),
+)
+# Last-resort match on the tag shape itself: release.YYMMDD.<7-hex>. Distinctive
+# enough to be a safe backstop, so a future wording change in any build script
+# degrades to this instead of silently losing the ref again — which is exactly
+# how the driver script's output went unnoticed.
+REF_SHAPE_PATTERN = re.compile(
+    r"(?<![\w./:-])"
+    r"([\w.\-]+(?::\d+)?(?:/[\w.\-]+)+:release\.\d{6}\.[0-9a-f]{7,40})"
+)
 
 LOG_TAIL_LINES = 80
 READ_CHUNK = 8192
@@ -297,8 +321,8 @@ def _read_tail(log_path: Path, lines: int = LOG_TAIL_LINES) -> str:
 def _extract_image_tag(log_path: Path) -> str:
     """Pull the built image reference out of a build log.
 
-    Scans the head and tail rather than the whole file: the markers only ever
-    appear at the start ("Image : ...") or the end ("Done. Image pushed: ...").
+    Scans the head and tail rather than the whole file: the ref is printed
+    before the build starts and again on completion, never only in the middle.
     """
     try:
         size = log_path.stat().st_size
@@ -316,15 +340,46 @@ def _extract_image_tag(log_path: Path) -> str:
     head_text = head.decode("utf-8", errors="replace")
     tail_text = tail.decode("utf-8", errors="replace")
 
-    # Most specific first: the "Done." lines confirm the build finished.
-    for pattern in (DONE_PUSH_PATTERN, DONE_LOCAL_PATTERN):
+    # Completion markers first — they mean the build finished. Tail before head,
+    # since that is where a completion line lands.
+    for pattern in COMPLETION_PATTERNS:
         for text in (tail_text, head_text):
             m = pattern.search(text)
             if m:
                 return m.group(1)
 
-    m = IMAGE_PATTERN.search(head_text) or IMAGE_PATTERN.search(tail_text)
-    return m.group(1) if m else ""
+    # Then the declared target, printed before the build ran.
+    for pattern in DECLARED_PATTERNS:
+        for text in (head_text, tail_text):
+            m = pattern.search(text)
+            if m:
+                return m.group(1)
+
+    # Backstop: anything shaped like a release ref. Last match wins, because
+    # later mentions ("pushing <ref>") come from further along the build.
+    matches = REF_SHAPE_PATTERN.findall(tail_text) or REF_SHAPE_PATTERN.findall(
+        head_text
+    )
+    if matches:
+        logger.info("Image ref recovered by shape match — build script wording may have changed")
+        return matches[-1]
+
+    return ""
+
+
+def split_image_ref(ref: str) -> tuple[str, str]:
+    """Split a full image reference into (ref, tag).
+
+    Splitting on the last colon would break on a registry port
+    (`host:5000/img`), so only a colon after the final `/` counts.
+    """
+    if not ref:
+        return "", ""
+    last_slash = ref.rfind("/")
+    colon = ref.rfind(":")
+    if colon > last_slash:
+        return ref, ref[colon + 1:]
+    return ref, ""
 
 
 def log_filename(idx: int, target: BuildTarget, driver_path: str | None) -> str:

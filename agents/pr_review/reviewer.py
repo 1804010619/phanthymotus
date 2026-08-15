@@ -166,10 +166,11 @@ Diff:
 ```
 """
 
+    endpoint = chat_completions_url(config.llm_base_url)
     try:
         async with httpx.AsyncClient(timeout=120.0) as client:
             resp = await client.post(
-                f"{config.llm_base_url.rstrip('/')}/chat/completions",
+                endpoint,
                 headers={
                     "Authorization": f"Bearer {config.llm_api_key}",
                     "Content-Type": "application/json",
@@ -184,9 +185,64 @@ Diff:
                     "max_tokens": 2000,
                 },
             )
-            resp.raise_for_status()
-            data = resp.json()
-            return data["choices"][0]["message"]["content"]
+            return _parse_completion(resp, endpoint)
     except Exception as e:
-        logger.error(f"LLM review failed: {e}")
-        return f"_LLM review failed: {e}_"
+        detail = f"{type(e).__name__}: {e}"
+        logger.error(f"LLM review failed calling {endpoint} — {detail}")
+        return f"_LLM review failed ({endpoint}): {detail}_"
+
+
+def _parse_completion(resp: "httpx.Response", endpoint: str) -> str:
+    """Extract the review text, raising errors that say what actually happened.
+
+    The previous version raised for status then called .json(), so a gateway
+    answering 200 with its HTML front-end surfaced as
+    "Expecting value: line 1 column 1" — a symptom that hid the cause (a URL
+    missing /v1) and took a shell session to diagnose. Anything unexpected here
+    now names the status, content type and a slice of the body.
+    """
+    ctype = resp.headers.get("content-type", "unknown")
+    snippet = resp.text[:200].replace("\n", " ").strip()
+
+    if resp.status_code >= 400:
+        raise RuntimeError(
+            f"HTTP {resp.status_code} ({ctype}) from {endpoint}: {snippet}"
+        )
+
+    if "json" not in ctype.lower():
+        raise RuntimeError(
+            f"HTTP {resp.status_code} but content-type is {ctype}, not JSON. "
+            f"This usually means the URL is wrong — an OpenAI-compatible "
+            f"endpoint lives at /v1/chat/completions. Body: {snippet}"
+        )
+
+    data = resp.json()
+    try:
+        return data["choices"][0]["message"]["content"]
+    except (KeyError, IndexError, TypeError) as e:
+        # A JSON body in an unexpected shape, e.g. an error envelope.
+        raise RuntimeError(
+            f"unexpected response shape from {endpoint} ({e}): {snippet}"
+        ) from e
+
+
+def chat_completions_url(base: str) -> str:
+    """Build the chat-completions endpoint from a configured base URL.
+
+    Accepts the three forms people actually configure, because requiring one
+    exact spelling is how this broke: `https://router.phanthy.com` produced
+    `/chat/completions`, which on that host is the web UI, not the API.
+
+        https://host                     -> https://host/v1/chat/completions
+        https://host/v1                  -> https://host/v1/chat/completions
+        https://host/v1/chat/completions -> unchanged
+    """
+    url = (base or "").rstrip("/")
+    if not url:
+        return ""
+    if url.endswith("/chat/completions"):
+        return url
+    if re.search(r"/v\d+$", url):
+        return f"{url}/chat/completions"
+    return f"{url}/v1/chat/completions"
+

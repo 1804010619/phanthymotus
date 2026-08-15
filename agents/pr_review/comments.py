@@ -4,6 +4,7 @@ Lives in its own module so both `trigger` (acknowledgment) and `worker`
 (progress / results) can format comments without importing each other.
 """
 
+from .builder import split_image_ref
 from .models import BuildResult, BuildTarget
 from .reviewer import Finding
 
@@ -73,19 +74,20 @@ def format_build_result(head_sha: str, results: list[BuildResult]) -> str:
     for r in results:
         name = r.driver_path or r.target.value
         if r.success:
-            image = f"`{r.image_tag}`" if r.image_tag else "built (tag not captured)"
-            rows.append(f"| {name} | :white_check_mark: Success | {image} |")
+            _, tag = split_image_ref(r.image_tag)
+            version = f"`{tag}`" if tag else "—"
+            rows.append(f"| {name} | :white_check_mark: Success | {version} |")
         else:
             rows.append(f"| {name} | :x: Failed | — |")
 
     table = (
-        "| Target | Status | Image |\n"
-        "|--------|--------|-------|\n" + "\n".join(rows)
+        "| Target | Status | Version |\n"
+        "|--------|--------|---------|\n" + "\n".join(rows)
     )
 
     all_ok = all(r.success for r in results)
     headline = (
-        "All builds succeeded. Image tags are listed below."
+        "All builds succeeded."
         if all_ok
         else "Build failed. See the collapsed logs below."
     )
@@ -99,6 +101,25 @@ Commit: `{head_sha[:7]}`
 
 {table}
 """
+
+    # Full refs, so the image can be pulled or deployed without hunting through
+    # the log for it.
+    built = [r for r in results if r.success and r.image_tag]
+    if built:
+        body += "\n### Images\n\n"
+        for r in built:
+            name = r.driver_path or r.target.value
+            body += f"**{name}**\n```\n{r.image_tag}\n```\n"
+        body += _deploy_help(built)
+
+    missing_ref = [r for r in results if r.success and not r.image_tag]
+    if missing_ref:
+        names = ", ".join(r.driver_path or r.target.value for r in missing_ref)
+        body += (
+            f"\n> Built successfully, but the image reference could not be read "
+            f"from the build log for: {names}. Check the full log on the "
+            f"dashboard.\n"
+        )
 
     for r in results:
         if not r.success and r.log_tail:
@@ -120,6 +141,52 @@ Commit: `{head_sha[:7]}`
         )
 
     return body
+
+
+def _deploy_help(built: list[BuildResult]) -> str:
+    """How to install a freshly built image.
+
+    The commands mirror what Agent Core does in
+    `agent-core/src/api/drivers.py:_deploy_sync`: pull the image, read
+    `/deploy/service.yml` out of it, set `image:` to this ref, and merge that
+    fragment into $COMPOSE_DIR/docker-compose.yml. A hand-written `docker run`
+    is deliberately not offered — the service fragment needs privileged mode,
+    host networking, and several device mounts, so an invented command would be
+    subtly wrong.
+    """
+    ref = built[0].image_tag
+    return f"""
+Two ways to install:
+
+**1. Deploy it yourself now** — on the target machine's Agent Core dashboard,
+set the driver's image to the reference above and deploy. Agent Core pulls it,
+extracts `deploy/service.yml` from the image, and merges it into the host's
+compose file.
+
+<details><summary>Or the equivalent by hand</summary>
+
+```bash
+IMAGE={ref}
+
+docker pull "$IMAGE"
+
+# The service definition ships inside the image
+cid=$(docker create "$IMAGE")
+docker cp "$cid:/deploy/service.yml" /tmp/service.yml
+docker rm "$cid"
+
+# Merge /tmp/service.yml into the host compose file, setting image: $IMAGE
+#   (Agent Core normally does this step for you)
+sed -i "s|__IMAGE__|$IMAGE|" /tmp/service.yml
+# ...append it under `services:` in /opt/phanthy-motus/docker-compose.yml, then:
+cd /opt/phanthy-motus && docker compose up -d
+```
+
+</details>
+
+**2. Wait for review** — once this PR is approved, the version becomes
+installable from the web console.
+"""
 
 
 def format_no_build_needed(head_sha: str) -> str:
