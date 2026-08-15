@@ -169,6 +169,7 @@ services:
 | Agent Core | 15678 |
 | Perception MCP | 15720 |
 | Perception WebSocket | 15721 |
+| PR Review Agent (optional) | 25000 |
 
 Hardware driver ports are documented in [phanthymotus-driver](https://github.com/4paradigm/phanthymotus-driver).
 
@@ -216,6 +217,11 @@ See [phanthymotus-driver/README_dev.md](../phanthymotus-driver/README_dev.md) fo
 ## Contributing
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for development setup, architecture details, and guidelines.
+
+Pull requests can be built and reviewed automatically by commenting
+`/request_bot_review` on the PR — see
+[PR_REVIEW_AGENT.md](PR_REVIEW_AGENT.md) for what it does, how to run it, and
+its dashboard.
 
 ## License
 
