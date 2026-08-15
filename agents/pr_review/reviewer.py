@@ -1,5 +1,6 @@
 """Reviewer — rule-based checks + LLM-powered code review."""
 
+import json
 import logging
 import re
 from dataclasses import dataclass
@@ -195,11 +196,14 @@ Diff:
 def _parse_completion(resp: "httpx.Response", endpoint: str) -> str:
     """Extract the review text, raising errors that say what actually happened.
 
-    The previous version raised for status then called .json(), so a gateway
-    answering 200 with its HTML front-end surfaced as
-    "Expecting value: line 1 column 1" — a symptom that hid the cause (a URL
-    missing /v1) and took a shell session to diagnose. Anything unexpected here
-    now names the status, content type and a slice of the body.
+    Parsing is attempted regardless of content-type: gateways commonly return a
+    valid completion labelled `text/plain`, and rejecting those on the header
+    alone throws away a perfectly good response. Content-type is used only to
+    *explain* a failure — HTML almost always means the URL is wrong.
+
+    The original version raised for status and called .json(), so a gateway
+    answering 200 with its web front-end surfaced as "Expecting value: line 1
+    column 1" — a symptom that hid the cause and took a shell session to find.
     """
     ctype = resp.headers.get("content-type", "unknown")
     snippet = resp.text[:200].replace("\n", " ").strip()
@@ -209,18 +213,25 @@ def _parse_completion(resp: "httpx.Response", endpoint: str) -> str:
             f"HTTP {resp.status_code} ({ctype}) from {endpoint}: {snippet}"
         )
 
-    if "json" not in ctype.lower():
+    try:
+        data = json.loads(resp.text)
+    except ValueError as e:
+        hint = ""
+        if "html" in ctype.lower() or snippet.lstrip().startswith("<"):
+            hint = (
+                " The response is HTML, so this URL is probably serving a web "
+                "page rather than the API — an OpenAI-compatible endpoint lives "
+                "at /v1/chat/completions."
+            )
         raise RuntimeError(
-            f"HTTP {resp.status_code} but content-type is {ctype}, not JSON. "
-            f"This usually means the URL is wrong — an OpenAI-compatible "
-            f"endpoint lives at /v1/chat/completions. Body: {snippet}"
-        )
+            f"HTTP {resp.status_code} ({ctype}) from {endpoint} was not JSON "
+            f"({e}).{hint} Body: {snippet}"
+        ) from e
 
-    data = resp.json()
     try:
         return data["choices"][0]["message"]["content"]
     except (KeyError, IndexError, TypeError) as e:
-        # A JSON body in an unexpected shape, e.g. an error envelope.
+        # Valid JSON in an unexpected shape, e.g. an error envelope.
         raise RuntimeError(
             f"unexpected response shape from {endpoint} ({e}): {snippet}"
         ) from e
