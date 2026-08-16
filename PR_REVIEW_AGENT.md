@@ -297,30 +297,104 @@ For a new driver the reference is chosen by shape — `unitree/go1` for structur
 
 The loop reads a worktree built from an **untrusted PR**, so both file names and
 file contents are attacker-authored, and the review is posted to a **public** PR
-comment. Every path is resolved and checked against the worktree root. Because
-`Path.resolve()` follows symlinks, that also blocks the dangerous case: a PR
-adding `evil -> /proc/self/environ` (which holds `GITHUB_TOKEN`,
-`REGISTRY_PASSWORD` and `LLM_API_KEY`) and getting the agent to read it into
-public. Confinement also keeps `jobs.db`, `poller_state.json` and the bare
-clones out of reach, since they live one level up in `$DATA_DIR`. An absolute
-path is reinterpreted as repo-relative rather than refused, so it reads nothing
-outside. `.git/` is excluded, binaries are refused rather than returned as
+comment.
+
+**Directory confinement is the load-bearing control.** Every path is resolved and
+checked against the worktree root. Because `Path.resolve()` follows symlinks, that
+also blocks the dangerous case: a PR adding `evil -> /proc/self/environ` (which
+holds `GITHUB_TOKEN`, `REGISTRY_PASSWORD` and `LLM_API_KEY`) and getting the agent
+to read it into public. Confinement also keeps `jobs.db`, `poller_state.json` and
+the bare clones out of reach, since they live one level up in `$DATA_DIR`. An
+absolute path is reinterpreted as repo-relative rather than refused, so it reads
+nothing outside. `.git/` is excluded, binaries are refused rather than returned as
 bytes, and every result is capped so one `read_file` cannot blow the context.
+
+Everything genuinely secret belongs to the *agent*, and all of it lives outside
+the worktree — so confinement is what protects it, and nothing below changes that.
+
+**Secret-shaped filenames inside the checkout are refused too** — hygiene rather
+than a second line of defence, since a public PR's contents are already public.
+It matters for a private or internal repo, and it keeps the bot from being the
+thing that copies a credential into a comment and the dashboard. `is_sensitive`
+in `tools.py` refuses `.env`, `.pem`, `.key`, `id_rsa`, `.netrc`, `.p12` and
+similar, sharing `SENSITIVE_NAME_PARTS` with the rule check that reports them.
+
+Two details that took a pass to get right:
+
+- **The refusal must be in `_walk` too, not just `resolve`.** `grep` never calls
+  `resolve` on the files it visits, so `resolve` alone would still let one
+  `grep "TOKEN"` return a committed `.env` line by line. That was the bigger hole.
+- **Subject-matter matches skip source code.** "secret"/"credentials" as bare
+  substrings refused `secret_manager.py` and the vendored CycloneDDS header
+  `dds_security_shared_secret.h` — real code, made unreviewable. Extensions in
+  `REVIEWABLE_SUFFIXES` are therefore exempt from those two patterns, while
+  credential *formats* (`.pem`, `id_rsa`, …) are refused unconditionally.
+  Verified against every tracked file in both repos: zero false positives.
+
+`list_dir` still *lists* a refused file, marked `[possible secret — contents not
+readable]`, because "this PR commits a `.env`" is exactly what a reviewer should
+notice. A blocked read also appears in the process timeline as `refused`, so it is
+visible that the reviewer tried and was stopped rather than silently absent.
 
 **There is no shell or exec tool**, despite `ls`/`grep`/`cat`/`diff` being the
 requested capabilities — they are provided as fixed, argument-validated,
 read-only tools instead. Adding `exec` would add an execution path and no review
 capability.
 
-What this does *not* address, stated plainly: the agent runs `docker build` on
+What none of this addresses, stated plainly: the agent runs `docker build` on
 Dockerfiles from untrusted PRs, so a malicious `RUN` executes on the build host.
-That is inherent to "build the PR" and independent of the review loop; it is
-where to look first if this ever needs hardening.
+That is a bigger exposure than anything on the read path, it is inherent to
+"build the PR", and it is where to look first if this ever needs hardening.
 
 ## Dashboard
 
-A web UI on the same port shows live status, review history, and full build logs.
-Vanilla ES modules, no build step, reusing agent-core's design tokens.
+A web UI on the same port shows live status, review history, full build logs, and
+the review process. Vanilla ES modules, no build step, reusing agent-core's design
+tokens.
+
+### The review process view
+
+The job detail page shows **how** a review was reached, not only its verdict. Per
+round: elapsed time, prompt / cached / output / reasoning tokens, any narration the
+model produced, then one row per tool call — the tool, a one-line summary of what
+it asked for (`README_dev.md:220-479`, `'port: 15793' in . (driver.yaml)`), the
+result size and duration, expandable to the exact text the model saw.
+
+This exists because "the review missed something — what did it look at?" was
+otherwise only answerable by re-running the loop by hand over SSH, which is the
+work this agent is meant to remove. A real run on PR #166 reads, in order: the
+authoritative spec, all six changed files as diffs, then two reference drivers,
+then `grep 'port: 15793' in driver.yaml` — visibly verifying the port against the
+other `driver.yaml` files rather than the wrong table in `README.md`.
+
+The per-round token line doubles as the only way to confirm prefix caching works:
+`cached_tokens` climbs 0 → 3,200 → 14,464 → 22,144 → 27,264 across a five-round
+review, which is the stable-system-prompt design paying off.
+
+Events are appended to `logs/<job_id>/review.jsonl` as they happen and tailed by
+the same cursor mechanism as a build log, so a review in progress can be watched
+live — the card appears before any review text exists. Rounds are found-or-created
+and rows appended rather than the timeline being re-rendered, so a result pane you
+have open stays open.
+
+| Event | Carries |
+|---|---|
+| `setup` | component, rule files + size, docs, references, budget, model, and the deterministic size/infra results |
+| `round` | round, elapsed, prompt / cached / completion / reasoning tokens, narration, tools requested |
+| `tool` | round, name, args, summary, result bytes, duration, the result text, `error` / `refused` flags |
+| `refusal` | a sandbox-blocked read — visible, not silently absent |
+| `nudge` | an empty completion and why, so a stalled review is legible |
+| `finish` | stopped reason, rounds, tool calls, error |
+
+A trace runs ~100 KB for a 30-call review. It lives in the job's log directory, so
+retention needs no special handling — pruning the job removes it. Recorded are the
+*names* of the rules and docs, not the ~10 KB of rules text, which is already
+readable in `agents/pr_review/rules/*.md`.
+
+Tool results are file contents from an untrusted PR, so the timeline is built with
+`createElement`/`textContent` throughout rather than HTML strings — verified with a
+trace containing `<script>`, `</pre><img onerror=…>` and `{{7*7}}`, all of which
+render as literal text.
 
 Open it directly:
 
@@ -412,7 +486,8 @@ would otherwise let a completed review be silently redone.
 | `GET /api/status` | Queue depth, active jobs, poller health, config |
 | `GET /api/jobs?limit&offset&status&repo` | Paginated history |
 | `GET /api/jobs/{id}` | Full detail incl. review text and findings |
-| `GET /api/jobs/{id}/log/{idx}?offset=N` | Log bytes from `offset` |
+| `GET /api/jobs/{id}/log/{idx}?offset=N` | Build log bytes from `offset` |
+| `GET /api/jobs/{id}/review-trace?offset=N` | Review-loop events from `offset` (404 until the review starts) |
 
 Raw JSON, not agent-core's `{code, message, data}` envelope — `deploy.sh status`
 curls these directly.
@@ -553,6 +628,7 @@ agents/pr_review/
   builder.py           Invokes the repos' build scripts, streams logs
   reviewer.py          Deterministic checks (size, infra, secrets) + LLM helpers
   review_agent.py      The review loop
+  review_trace.py      JSONL record of what the loop did
   tools.py             Sandboxed list_dir/read_file/grep/file_diff
   components.py        Component -> rules, docs, reference implementations
   rules/               Review standards as editable markdown
@@ -565,7 +641,7 @@ agents/pr_review/
     index.html
     css/style.css      Redeclares agent-core's design tokens
     js/api.js          fetch helpers, escaping, formatting
-    js/views.js        overview / history / detail renderers
+    js/views.js        overview / history / detail renderers, process timeline
     js/app.js          tab routing, polling loops, log tailing
 
 deploy/pr-review/

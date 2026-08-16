@@ -14,6 +14,12 @@ Two attacks it exists to stop:
   so resolving *first* and then checking containment catches both cases with one
   test.
 
+Confinement alone is not sufficient, because a secret can be committed *inside*
+the checkout, where every path check passes. So a credential-shaped filename is
+refused as well — see `Sandbox.is_sensitive`. That refusal has to happen in
+`_walk` too, not just `resolve`: `grep` never calls `resolve` on the files it
+visits, so it would otherwise return a committed `.env` line by line.
+
 There is deliberately no shell/exec tool. Reviewing code needs reading; `exec`
 would add an execution path and buy no review capability.
 """
@@ -23,6 +29,8 @@ import logging
 import re
 import subprocess
 from pathlib import Path
+
+from .reviewer import is_sensitive_name
 
 logger = logging.getLogger(__name__)
 
@@ -45,7 +53,7 @@ BINARY_SUFFIXES = {
 
 
 class SandboxError(Exception):
-    """A tool was asked for something outside the worktree."""
+    """A tool was asked for something it must not read."""
 
 
 class Sandbox:
@@ -84,7 +92,33 @@ class Sandbox:
         if parts & EXCLUDED_DIRS:
             raise SandboxError(f"{raw!r} is inside an excluded directory")
 
+        if self.is_sensitive(resolved):
+            # Confinement is not enough here: this file is *inside* the
+            # checkout, so it passes every path check. But a PR that commits a
+            # real .env or id_rsa would otherwise have its contents read into a
+            # public PR comment and the dashboard timeline by the reviewer
+            # itself. The rule checks already report the file; that is the right
+            # way to review it.
+            raise SandboxError(
+                f"{raw!r} matches a secret-bearing filename pattern and was "
+                "refused. Do not try to read it — the rule checks already "
+                "flag it. Review it by name and by what the PR says about it."
+            )
+
         return resolved
+
+    def is_sensitive(self, p: Path) -> bool:
+        """Whether a path inside the checkout may carry a credential.
+
+        Every path segment is tested, not just the filename: a directory called
+        `secrets/` makes `secrets/notes.txt` sensitive even though the file's own
+        name is innocuous.
+        """
+        try:
+            rel_parts = p.relative_to(self._root).parts
+        except ValueError:
+            return False
+        return any(is_sensitive_name(part) for part in rel_parts)
 
     def rel(self, p: Path) -> str:
         try:
@@ -135,6 +169,11 @@ def list_dir(sb: Sandbox, path: str = ".") -> str:
             rows.append(f"  {e.name} -> {dest}  [symlink, not followed]")
         elif e.is_dir():
             rows.append(f"  {e.name}/")
+        elif sb.is_sensitive(e):
+            rows.append(
+                f"  {e.name}  ({_human(st.st_size)})  "
+                "[possible secret — contents not readable]"
+            )
         else:
             rows.append(f"  {e.name}  ({_human(st.st_size)})")
 
@@ -272,6 +311,11 @@ def _walk(sb: Sandbox, root: Path) -> list[Path]:
             if set(p.relative_to(sb.root).parts) & EXCLUDED_DIRS:
                 continue
         except ValueError:
+            continue
+        # The more important half of the secret refusal: grep walks the whole
+        # tree, so without this one `grep "TOKEN"` spills a committed .env line
+        # by line, never going through resolve().
+        if sb.is_sensitive(p):
             continue
         found.append(p)
     return found

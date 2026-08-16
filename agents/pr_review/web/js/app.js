@@ -30,6 +30,11 @@ let statusTimer = null;
 let logTimer = null;
 // data-idx -> {offset, done}
 const logCursors = new Map();
+// The review trace has its own cursor, and the events are kept so the timeline
+// can be rebuilt after renderDetail() replaces the DOM on the running->terminal
+// transition. Without the copy, everything shown so far would vanish exactly
+// when the review finishes.
+const traceState = { jobId: null, offset: 0, events: [] };
 
 // ── Bootstrap ────────────────────────────────────────────────────────────────
 
@@ -215,7 +220,18 @@ async function loadDetail(id) {
       logCursors.set(String(b.idx), { offset: 0, done: false });
     });
 
+    if (traceState.jobId !== id) {
+      traceState.jobId = id;
+      traceState.offset = 0;
+      traceState.events = [];
+    } else {
+      // Same job, re-rendered: replay what we already have so the timeline is
+      // not lost, then continue from the existing cursor.
+      drawTrace();
+    }
+
     await tickLogs();
+    await tickTrace(id);
     // Keep tailing while the job can still produce output. A finished job's
     // logs are static, so one read is enough.
     if (!TERMINAL.has(job.status)) startLogPolling(id);
@@ -230,6 +246,7 @@ function startLogPolling(jobId) {
   stopLogPolling();
   logTimer = setInterval(async () => {
     await tickLogs();
+    await tickTrace(jobId);
     // Poll the job itself too, so the page reflects the transition out of
     // running and then stops tailing.
     try {
@@ -237,7 +254,9 @@ function startLogPolling(jobId) {
       if (TERMINAL.has(job.status)) {
         stopLogPolling();
         views.renderDetail(el('detail-body'), job);
+        drawTrace();
         await tickLogs();
+        await tickTrace(jobId);
       }
     } catch { /* transient — the next tick retries */ }
   }, LOG_POLL_MS);
@@ -245,6 +264,38 @@ function startLogPolling(jobId) {
 
 function stopLogPolling() {
   if (logTimer) { clearInterval(logTimer); logTimer = null; }
+}
+
+/** Draw every accumulated trace event into the (empty) timeline container. */
+function drawTrace() {
+  const box = document.querySelector('.trace[data-trace-job]');
+  if (!box || !traceState.events.length) return;
+  box.textContent = '';
+  views.appendTraceEvents(box, traceState.events);
+}
+
+/** Fetch new review-trace events and append them to the timeline. */
+async function tickTrace(jobId) {
+  const box = document.querySelector('.trace[data-trace-job]');
+  if (!box) return;
+  try {
+    const res = await api.getReviewTrace(jobId, traceState.offset);
+    traceState.offset = res.offset;
+    if (res.events?.length) {
+      traceState.events.push(...res.events);
+      views.appendTraceEvents(box, res.events);
+      const meta = document.querySelector('[data-trace-meta]');
+      const rounds = traceState.events.filter((e) => e.kind === 'round').length;
+      const tools = traceState.events.filter((e) => e.kind === 'tool').length;
+      if (meta && rounds) {
+        meta.textContent = `${rounds} round${rounds === 1 ? '' : 's'} · ` +
+          `${tools} tool call${tools === 1 ? '' : 's'}`;
+      }
+    }
+  } catch {
+    // 404 until the review starts — the same "not there yet" case as a build
+    // log for a queued build. Stay quiet.
+  }
 }
 
 /** Append any new bytes to each visible log pane. */

@@ -38,6 +38,7 @@ from .models import (
 )
 from .components import build_context
 from .review_agent import PRFacts, ReviewAgent
+from .review_trace import ReviewTrace
 from .reviewer import infra_files, large_files, run_rule_checks
 from .store import JobStore
 
@@ -292,6 +293,10 @@ async def _run_once(
                 infra_files=infra,
                 shared_base_files=shared,
             ),
+            # Records what the loop did, streamed to disk so the dashboard can
+            # follow a review in progress rather than only see the verdict.
+            trace=ReviewTrace(store.review_trace_path(job.id)),
+            on_round=_round_reporter(job, store, config.llm_model),
         )
         result = await agent.run()
         job.review_text = result.markdown
@@ -314,6 +319,18 @@ async def _run_once(
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
+
+
+def _round_reporter(job: ReviewJob, store: JobStore, model: str):
+    """Persist per-round progress, so the dashboard shows the review moving.
+
+    Without this the overview sits on a static "generating review" for the whole
+    loop, which is indistinguishable from a hang.
+    """
+    async def report(n: int, total: int):
+        job.set_stage(Stage.LLM_REVIEW, f"{model} · round {n}/{total}")
+        await store.save_job(job)
+    return report
 
 
 async def _execute_builds(

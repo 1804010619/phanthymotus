@@ -67,10 +67,34 @@ async def list_jobs(
 @router.get("/jobs/{job_id}")
 async def get_job(request: Request, job_id: str):
     """Full job detail: metadata, build results, review text, findings."""
-    job = await request.app.state.store.get_job(job_id)
+    store = request.app.state.store
+    job = await store.get_job(job_id)
     if job is None:
         raise HTTPException(status_code=404, detail="Job not found")
+    # A flag, not the trace itself: a trace runs to ~100 KB and the client only
+    # needs to know whether to render the process card before it starts tailing.
+    job["has_review_trace"] = store.has_review_trace(job_id)
     return job
+
+
+@router.get("/jobs/{job_id}/review-trace")
+async def get_review_trace(
+    request: Request,
+    job_id: str,
+    offset: int = Query(0, ge=0),
+):
+    """Review-loop events from `offset`, for incremental tailing.
+
+    Same cursor contract as the build log, except the unit is a whole event: the
+    returned `offset` never lands mid-line, so an event caught half-written is
+    delivered on the next poll rather than lost.
+    """
+    result = await request.app.state.store.read_review_trace(job_id, offset=offset)
+    if result is None:
+        # No trace yet — the review has not started. The client treats this the
+        # same way it treats a build log that does not exist and stays quiet.
+        raise HTTPException(status_code=404, detail="No review trace")
+    return result
 
 
 @router.get("/jobs/{job_id}/log/{idx}")

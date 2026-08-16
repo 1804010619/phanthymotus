@@ -195,16 +195,70 @@ def _check_binary_artifacts(changed_files: list[str]) -> list[Finding]:
     return findings
 
 
+# Filename fragments that mean "this file may carry a credential".
+#
+# Shared with the review sandbox (tools.py), which refuses to *read* anything
+# matching — the check below reports a committed secret, and the sandbox makes
+# sure the reviewer is not the thing that republishes it into a public PR
+# comment or the dashboard.
+#
+# Split in two because the two halves need different strictness:
+#
+# - Suffix/whole-name matches are credential *file formats*. Nothing legitimate
+#   is called `.pem` or `id_rsa`, so these are refused unconditionally.
+# - Substring matches ("secret", "credentials") describe a file's *subject*, and
+#   plenty of ordinary source code is about credentials without containing any.
+#   Applying them to source would refuse `secret_manager.py` and the vendored
+#   CycloneDDS header `dds_security_shared_secret.h`, i.e. make real code
+#   unreviewable, so these skip files with a source or docs extension.
+SENSITIVE_NAME_PARTS = frozenset({
+    ".env", "credentials", "secret",
+    ".pem", ".key", "id_rsa", "id_dsa", "id_ecdsa", "id_ed25519",
+    ".p12", ".pfx", ".keystore", ".jks", ".ppk",
+    ".netrc", ".htpasswd", ".pgpass", ".kdbx",
+})
+
+# The subject-matter half — only these get the source-extension exemption.
+_SUBJECT_PARTS = frozenset({"credentials", "secret"})
+
+# Extensions where a real credential file is implausible but review value is
+# high. A hardcoded token in one of these is still visible: it shows up in the
+# diff, which `file_diff` reads, and the rule checks flag the file by name.
+REVIEWABLE_SUFFIXES = (
+    ".py", ".pyi", ".js", ".mjs", ".ts", ".tsx", ".jsx", ".go", ".rs", ".java",
+    ".c", ".cc", ".cpp", ".h", ".hpp", ".hh", ".sh", ".zsh", ".bash",
+    ".md", ".rst", ".proto", ".urdf", ".xacro", ".dockerfile",
+)
+
+# Suffixes that make a sensitive-looking name a template rather than a secret.
+# `deploy/*/.env.example` is how every deployment here is documented, so these
+# stay readable and reviewable.
+TEMPLATE_SUFFIXES = (".example", ".sample", ".template", ".dist")
+
+
+def is_sensitive_name(name: str) -> bool:
+    """Whether a bare filename looks like it carries a credential."""
+    lowered = name.lower()
+    if lowered.endswith(TEMPLATE_SUFFIXES):
+        return False
+    reviewable = lowered.endswith(REVIEWABLE_SUFFIXES)
+    for part in SENSITIVE_NAME_PARTS:
+        if part not in lowered:
+            continue
+        if reviewable and part in _SUBJECT_PARTS:
+            continue
+        return True
+    return False
+
+
 def _check_sensitive_files(changed_files: list[str]) -> list[Finding]:
     """Check for potentially sensitive files being committed."""
-    sensitive_patterns = {".env", "credentials", "secret", ".pem", ".key"}
     findings = []
     for f in changed_files:
         name_lower = Path(f).name.lower()
-        # .env.example is a template, not a secret.
-        if name_lower.endswith(".example") or name_lower.endswith(".sample"):
+        if name_lower.endswith(TEMPLATE_SUFFIXES):
             continue
-        for pattern in sensitive_patterns:
+        for pattern in sorted(SENSITIVE_NAME_PARTS):
             if pattern in name_lower:
                 findings.append(Finding(
                     severity="error",

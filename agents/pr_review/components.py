@@ -49,6 +49,9 @@ class ComponentContext:
 
     name: str
     rules: str = ""
+    # Which rule files were concatenated into `rules`. Recorded in the review
+    # trace so the dashboard can show which standards the review was held to.
+    rule_files: list[str] = field(default_factory=list)
     docs: list[str] = field(default_factory=list)
     references: list[tuple[str, str]] = field(default_factory=list)
 
@@ -100,6 +103,7 @@ def build_context(
     return ComponentContext(
         name=" + ".join(label),
         rules=_read_rules(*names),
+        rule_files=list(names),
         docs=_dedupe(docs),
         references=[],
     )
@@ -121,6 +125,7 @@ def _driver_context(
     return ComponentContext(
         name=", ".join(driver_paths) if driver_paths else "phanthymotus-driver",
         rules=_read_rules("common.md", "driver.md"),
+        rule_files=["common.md", "driver.md"],
         docs=_dedupe([
             "README_dev.md",                  # the authoritative spec
             "README.md",                      # catalogue + rendering tables

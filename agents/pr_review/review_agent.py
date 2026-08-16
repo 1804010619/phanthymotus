@@ -17,6 +17,7 @@ correct itself instead of losing the review.
 """
 
 import asyncio
+import inspect
 import json
 import logging
 import time
@@ -28,6 +29,7 @@ import httpx
 from . import tools as tk
 from .components import ComponentContext
 from .config import Config
+from .review_trace import ReviewTrace
 from .reviewer import (
     chat_completions_url, describe_http_failure, explain_empty_completion,
 )
@@ -179,6 +181,8 @@ class ReviewAgent:
         worktree: Path,
         ctx: ComponentContext,
         facts: PRFacts,
+        trace: ReviewTrace | None = None,
+        on_round=None,
     ):
         self._cfg = config
         self._ctx = ctx
@@ -186,9 +190,16 @@ class ReviewAgent:
         self._sb = tk.Sandbox(worktree, base_ref=facts.base_ref)
         self._endpoint = chat_completions_url(config.llm_base_url)
         self._deadline = 0.0
+        # Disabled sink by default, so every emit site is unconditional.
+        self._trace = trace or ReviewTrace(None)
+        # Called with (round, max_rounds) so the caller can surface progress;
+        # a minute of "generating review" with no movement reads as a hang.
+        self._on_round = on_round
 
     async def run(self) -> ReviewResult:
         if not self._cfg.llm_base_url or not self._cfg.llm_api_key:
+            self._trace.event("finish", stopped_reason="error",
+                              error="llm not configured")
             return ReviewResult(
                 markdown="_LLM review skipped (not configured)_",
                 stopped_reason="error",
@@ -204,25 +215,38 @@ class ReviewAgent:
         ]
         result = ReviewResult()
         empties = 0
+        self._trace_setup(messages[0]["content"])
 
         async with httpx.AsyncClient(timeout=self._cfg.llm_timeout_seconds) as client:
             for rnd in range(1, self._cfg.review_max_rounds + 1):
                 result.rounds = rnd
+                if self._on_round:
+                    # Awaited if it returns an awaitable, so a caller that
+                    # persists the stage does so in order instead of leaving a
+                    # fire-and-forget task the loop cannot see fail.
+                    progress = self._on_round(rnd, self._cfg.review_max_rounds)
+                    if inspect.isawaitable(progress):
+                        await progress
 
                 if time.monotonic() > self._deadline:
                     result.stopped_reason = "timeout"
                     break
 
+                started = time.monotonic()
                 try:
-                    assistant = await self._call(client, messages)
+                    assistant, usage = await self._call(client, messages)
                 except Exception as e:
                     # A failure mid-loop still yields whatever was learned; the
                     # partial review is more useful than nothing.
                     logger.warning(f"review round {rnd} failed: {e}")
                     result.stopped_reason = "error"
                     result.error = f"{type(e).__name__}: {e}"
+                    self._trace.event("round", round=rnd,
+                                      elapsed=round(time.monotonic() - started, 2),
+                                      error=result.error)
                     break
 
+                self._trace_round(rnd, started, usage, assistant)
                 messages.append(assistant)
                 calls = assistant.get("tool_calls") or []
 
@@ -241,6 +265,9 @@ class ReviewAgent:
                             f"round {rnd} returned nothing ({why}); "
                             f"empty {empties}/{MAX_EMPTY_ROUNDS}"
                         )
+                        self._trace.event("nudge", round=rnd, reason=why,
+                                          attempt=empties,
+                                          limit=MAX_EMPTY_ROUNDS)
                         if empties >= MAX_EMPTY_ROUNDS:
                             result.stopped_reason = "error"
                             result.error = why or "the model returned nothing"
@@ -258,7 +285,7 @@ class ReviewAgent:
                     result.stopped_reason = "finished"
                     break
 
-                finished = await self._dispatch_all(calls, messages, result)
+                finished = await self._dispatch_all(calls, messages, result, rnd)
                 if finished is not None:
                     result.markdown = finished
                     result.stopped_reason = "finished"
@@ -268,9 +295,69 @@ class ReviewAgent:
 
         if not result.markdown:
             result.markdown = self._salvage(messages, result)
+        # Emitted on every exit path, so a partial trace still says why it ended.
+        self._trace.event(
+            "finish", stopped_reason=result.stopped_reason, rounds=result.rounds,
+            tool_calls=result.tool_calls, error=result.error or None,
+            review_chars=len(result.markdown),
+        )
         return result
 
-    async def _call(self, client: httpx.AsyncClient, messages: list[dict]) -> dict:
+    # ── Trace helpers ─────────────────────────────────────────────────────────
+
+    def _trace_setup(self, system_prompt: str):
+        """What the reviewer was told, before it does anything.
+
+        Records the *names* of the rules, docs and references rather than the
+        ~10 KB of rules text: the rules are readable in the repo at
+        `agents/pr_review/rules/*.md`, and repeating them per job would bloat
+        every trace to no benefit.
+        """
+        self._trace.event(
+            "setup",
+            component=self._ctx.name,
+            rules=self._ctx.rule_files,
+            rules_chars=len(self._ctx.rules),
+            docs=self._ctx.docs,
+            references=[p for p, _ in self._ctx.references],
+            prompt_chars=len(system_prompt),
+            max_rounds=self._cfg.review_max_rounds,
+            timeout_seconds=self._cfg.review_timeout_seconds,
+            model=self._cfg.llm_model,
+            changed_files=len(self._facts.changed_files),
+            large_files=[p for p, _ in self._facts.large_files],
+            infra_files=self._facts.infra_files,
+            shared_base_files=self._facts.shared_base_files,
+        )
+
+    def _trace_round(self, rnd: int, started: float, usage: dict, assistant: dict):
+        """One line per model call: cost and pacing.
+
+        `cached_tokens` is worth surfacing — it is the only way to see whether
+        the stable-system-prompt design is actually getting prefix cache hits.
+        """
+        prompt_details = usage.get("prompt_tokens_details") or {}
+        completion_details = usage.get("completion_tokens_details") or {}
+        calls = assistant.get("tool_calls") or []
+        self._trace.event(
+            "round",
+            round=rnd,
+            elapsed=round(time.monotonic() - started, 2),
+            prompt_tokens=usage.get("prompt_tokens"),
+            cached_tokens=prompt_details.get("cached_tokens"),
+            completion_tokens=usage.get("completion_tokens"),
+            reasoning_tokens=completion_details.get("reasoning_tokens"),
+            # The model sometimes narrates alongside its tool calls; that text is
+            # the closest thing available to visible reasoning, since this
+            # router returns no reasoning_content.
+            content=(assistant.get("content") or "").strip() or None,
+            tools=[c["function"]["name"] for c in calls] or None,
+        )
+
+    async def _call(
+        self, client: httpx.AsyncClient, messages: list[dict]
+    ) -> tuple[dict, dict]:
+        """One model call. Returns (assistant message, usage)."""
         resp = await client.post(
             self._endpoint,
             headers={
@@ -314,10 +401,14 @@ class ReviewAgent:
             ]
             if valid:
                 out["tool_calls"] = valid
-        return out
+        return out, (data.get("usage") or {})
 
     async def _dispatch_all(
-        self, calls: list[dict], messages: list[dict], result: ReviewResult
+        self,
+        calls: list[dict],
+        messages: list[dict],
+        result: ReviewResult,
+        rnd: int = 0,
     ) -> str | None:
         """Run each requested tool. Returns the review if finish was called."""
         finished = None
@@ -334,6 +425,7 @@ class ReviewAgent:
                 args = {}
 
             result.tool_calls += 1
+            started = time.monotonic()
 
             if name == tk.FINISH_TOOL:
                 finished = _format_review(args)
@@ -341,12 +433,40 @@ class ReviewAgent:
             else:
                 content = await self._run_tool(name, args)
 
+            self._trace_tool(rnd, name, args, content, started)
+
             messages.append({
                 "role": "tool",
                 "tool_call_id": call.get("id", ""),
                 "content": content[:MAX_TOOL_RESULT],
             })
         return finished
+
+    def _trace_tool(
+        self, rnd: int, name: str, args: dict, content: str, started: float
+    ):
+        """One event per tool call — the substance of "how it reviewed"."""
+        refused = "secret-bearing" in content or "was refused" in content
+        self._trace.event(
+            "tool",
+            round=rnd,
+            name=name,
+            args=args,
+            summary=_tool_summary(name, args),
+            bytes=len(content.encode("utf-8", errors="replace")),
+            ms=int((time.monotonic() - started) * 1000),
+            result=content[:MAX_TOOL_RESULT],
+            error=content.startswith(("error:", "[tool error]")) or None,
+            refused=refused or None,
+        )
+        if refused:
+            # A blocked read is part of the story, and the audit trail for the
+            # sandbox: it should be visible that the reviewer tried and was
+            # stopped, not silently absent.
+            self._trace.event(
+                "refusal", round=rnd, name=name,
+                path=str(args.get("path", "")), reason=content[:400],
+            )
 
     async def _run_tool(self, name: str, args: dict) -> str:
         fn = tk.DISPATCH.get(name)
@@ -375,6 +495,31 @@ class ReviewAgent:
             "_The reviewer explored the change but did not produce a written "
             "review before its budget ran out._"
         )
+
+
+def _tool_summary(name: str, args: dict) -> str:
+    """A one-line "what was asked for", for the timeline row.
+
+    The raw args are kept in the event too; this is what makes a 30-row trace
+    scannable — `README_dev.md:1-200` reads faster than a JSON blob.
+    """
+    path = str(args.get("path", "")) or "."
+    if name == "read_file":
+        start = args.get("start_line", 1) or 1
+        try:
+            end = int(start) + int(args.get("max_lines", 200) or 200) - 1
+        except (TypeError, ValueError):
+            end = start
+        return f"{path}:{start}-{end}"
+    if name == "grep":
+        glob = args.get("glob")
+        where = f"{path}{f' ({glob})' if glob else ''}"
+        return f"{args.get('pattern', '')!r} in {where}"
+    if name in ("list_dir", "file_diff"):
+        return path
+    if name == "finish_review":
+        return "wrote the review"
+    return ", ".join(f"{k}={v}" for k, v in args.items())[:120]
 
 
 def _format_review(args: dict) -> str:

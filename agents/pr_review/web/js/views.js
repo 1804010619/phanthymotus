@@ -194,6 +194,7 @@ export function renderDetail(el, job) {
   el.innerHTML = [
     _detailMeta(job),
     _detailBuilds(job),
+    _detailReviewProcess(job),
     _detailReview(job),
     _detailChangeAudit(job),
     _detailFindings(job),
@@ -348,6 +349,236 @@ function _detailChangeAudit(j) {
       </div>
     </div>`;
 }
+
+function _detailReviewProcess(j) {
+  // Rendered while the review is still running too, so the card exists before
+  // there is any review text to show. Events arrive via appendTraceEvents().
+  const running = j.stage === 'generating review' || j.stage === 'running rule checks';
+  if (!j.has_review_trace && !running) return '';
+  const r = j.review || {};
+  const tools = r.tool_calls || 0;
+  const meta = r.rounds
+    ? `${r.rounds} round${r.rounds === 1 ? '' : 's'} · ` +
+      `${tools} tool call${tools === 1 ? '' : 's'}`
+    : 'running…';
+  return `
+    <div class="card">
+      <div class="card-header">
+        <h2 class="card-title">Review process</h2>
+        <span class="card-meta" data-trace-meta>${esc(meta)}</span>
+      </div>
+      <div class="card-body no-pad">
+        <div class="trace" data-trace-job="${esc(j.id)}"></div>
+      </div>
+    </div>`;
+}
+
+/**
+ * Append trace events to the process timeline.
+ *
+ * Incremental on purpose: re-rendering the whole timeline each poll would
+ * collapse any <details> the reader has open, which is exactly the pane they are
+ * reading. So rounds are found-or-created and rows appended.
+ *
+ * Everything here is built with createElement/textContent rather than an HTML
+ * string. Tool results are file contents from an untrusted PR — this is the one
+ * place they are shown verbatim, so there is no interpolation to get wrong.
+ */
+export function appendTraceEvents(container, events) {
+  for (const ev of events) {
+    switch (ev.kind) {
+      case 'setup':   container.appendChild(_traceSetup(ev)); break;
+      case 'round':   container.appendChild(_traceRound(ev)); break;
+      case 'tool':    _traceRoundBody(container, ev.round)
+                        .appendChild(_traceTool(ev)); break;
+      case 'nudge':   _traceRoundBody(container, ev.round)
+                        .appendChild(_traceNote('warning',
+                          `Returned nothing (${ev.attempt}/${ev.limit}) — ${ev.reason || 'retrying'}`)); break;
+      case 'finish':  container.appendChild(_traceFinish(ev)); break;
+      // 'refusal' duplicates what the tool row already shows as [refused].
+      default: break;
+    }
+  }
+}
+
+function _traceBlock(summary, meta, open = false) {
+  const d = document.createElement('details');
+  d.className = 'trace-block';
+  if (open) d.open = true;
+  const s = document.createElement('summary');
+  s.className = 'trace-summary';
+  const title = document.createElement('span');
+  title.className = 'trace-title';
+  title.textContent = summary;
+  s.appendChild(title);
+  if (meta) {
+    const m = document.createElement('span');
+    m.className = 'trace-meta';
+    m.textContent = meta;
+    s.appendChild(m);
+  }
+  d.appendChild(s);
+  const body = document.createElement('div');
+  body.className = 'trace-body';
+  d.appendChild(body);
+  return d;
+}
+
+function _kv(body, label, value) {
+  if (value === undefined || value === null || value === '' ||
+      (Array.isArray(value) && !value.length)) return;
+  const row = document.createElement('div');
+  row.className = 'trace-kv';
+  const k = document.createElement('span');
+  k.className = 'trace-k';
+  k.textContent = label;
+  const v = document.createElement('span');
+  v.className = 'trace-v';
+  v.textContent = Array.isArray(value) ? value.join(', ') : String(value);
+  row.append(k, v);
+  body.appendChild(row);
+}
+
+function _traceSetup(ev) {
+  // Open by default: what the reviewer was told is the context for everything
+  // below it, and it is short.
+  const block = _traceBlock('Setup', ev.model || '', true);
+  const body = block.querySelector('.trace-body');
+  _kv(body, 'component', ev.component);
+  _kv(body, 'rules', `${(ev.rules || []).join(' + ')}  (${ev.rules_chars || 0} chars)`);
+  _kv(body, 'docs to read', ev.docs);
+  _kv(body, 'compare against', ev.references);
+  _kv(body, 'budget', `${ev.max_rounds} rounds / ${ev.timeout_seconds}s`);
+  _kv(body, 'changed files', ev.changed_files);
+  _kv(body, 'large files', ev.large_files);
+  _kv(body, 'infrastructure', ev.infra_files);
+  _kv(body, 'shared base', ev.shared_base_files);
+  return block;
+}
+
+function _traceRound(ev) {
+  const bits = [];
+  if (ev.elapsed !== undefined) bits.push(`${ev.elapsed}s`);
+  if (ev.prompt_tokens) {
+    // cached_tokens is the only visible signal that the stable-system-prompt
+    // design is actually getting prefix cache hits.
+    bits.push(ev.cached_tokens
+      ? `${_n(ev.prompt_tokens)} prompt (${_n(ev.cached_tokens)} cached)`
+      : `${_n(ev.prompt_tokens)} prompt`);
+  }
+  if (ev.completion_tokens) bits.push(`${_n(ev.completion_tokens)} out`);
+  if (ev.reasoning_tokens) bits.push(`${_n(ev.reasoning_tokens)} reasoning`);
+
+  const block = _traceBlock(`Round ${ev.round}`, bits.join(' · '), true);
+  block.dataset.traceRound = String(ev.round);
+  const body = block.querySelector('.trace-body');
+  if (ev.error) body.appendChild(_traceNote('error', ev.error));
+  if (ev.content) {
+    // The model narrating alongside its tool calls — the closest thing to
+    // visible reasoning this router returns.
+    const p = document.createElement('div');
+    p.className = 'trace-narration';
+    p.textContent = ev.content;
+    body.appendChild(p);
+  }
+  return block;
+}
+
+/** The body of round N, creating a placeholder block if it is not there yet. */
+function _traceRoundBody(container, round) {
+  const key = String(round ?? 0);
+  let block = container.querySelector(`[data-trace-round="${CSS.escape(key)}"]`);
+  if (!block) {
+    block = _traceBlock(`Round ${key}`, '', true);
+    block.dataset.traceRound = key;
+    container.appendChild(block);
+  }
+  return block.querySelector('.trace-body');
+}
+
+function _traceTool(ev) {
+  const row = document.createElement('details');
+  row.className = 'trace-tool';
+
+  const s = document.createElement('summary');
+  s.className = 'trace-tool-head';
+
+  const name = document.createElement('span');
+  name.className = 'trace-tool-name';
+  name.textContent = ev.name || '?';
+
+  const summary = document.createElement('span');
+  summary.className = 'trace-tool-arg';
+  summary.textContent = ev.summary || '';
+
+  s.append(name, summary);
+
+  if (ev.refused || ev.error) {
+    const pill = document.createElement('span');
+    pill.className = `pill ${ev.refused ? 'sev-warning' : 'sev-error'}`;
+    pill.textContent = ev.refused ? 'refused' : 'error';
+    s.appendChild(pill);
+  }
+  const size = document.createElement('span');
+  size.className = 'trace-tool-size';
+  size.textContent = [
+    ev.bytes !== undefined ? _bytes(ev.bytes) : '',
+    ev.ms ? `${ev.ms}ms` : '',
+  ].filter(Boolean).join(' · ');
+  s.appendChild(size);
+
+  row.appendChild(s);
+
+  const pre = document.createElement('pre');
+  pre.className = 'trace-result';
+  pre.textContent = ev.result || '(no output)';
+  row.appendChild(pre);
+  return row;
+}
+
+function _traceNote(sev, text) {
+  const d = document.createElement('div');
+  d.className = 'trace-note';
+  const pill = document.createElement('span');
+  pill.className = `pill sev-${sev}`;
+  pill.textContent = sev;
+  const msg = document.createElement('span');
+  msg.textContent = text;
+  d.append(pill, msg);
+  return d;
+}
+
+function _traceFinish(ev) {
+  const REASON = {
+    finished: 'Finished — review written',
+    max_rounds: 'Stopped: round limit reached — the review may be incomplete',
+    timeout: 'Stopped: time limit reached — the review may be incomplete',
+    error: 'Stopped on an error — the review may be incomplete',
+  };
+  const d = document.createElement('div');
+  d.className = `trace-finish ${ev.stopped_reason === 'finished' ? 'ok' : 'warn'}`;
+  const label = document.createElement('span');
+  label.textContent = REASON[ev.stopped_reason] || ev.stopped_reason || 'Finished';
+  d.appendChild(label);
+  const meta = document.createElement('span');
+  meta.className = 'trace-meta';
+  meta.textContent = [
+    ev.rounds ? `${ev.rounds} rounds` : '',
+    ev.tool_calls ? `${ev.tool_calls} tool calls` : '',
+    ev.t !== undefined ? `${ev.t}s total` : '',
+  ].filter(Boolean).join(' · ');
+  d.appendChild(meta);
+  if (ev.error) d.appendChild(_traceNote('error', ev.error));
+  return d;
+}
+
+const _n = (v) => Number(v).toLocaleString('en-US');
+
+function _bytes(n) {
+  if (n < 1024) return `${n} B`;
+  return `${(n / 1024).toFixed(1)} KB`;
+}
+
 
 function _detailFindings(j) {
   const findings = j.findings || [];

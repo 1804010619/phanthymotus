@@ -37,6 +37,11 @@ export function getLog(jobId, idx, offset = 0) {
   return _json(`/api/jobs/${encodeURIComponent(jobId)}/log/${idx}?${q}`);
 }
 
+export function getReviewTrace(jobId, offset = 0) {
+  const q = new URLSearchParams({ offset });
+  return _json(`/api/jobs/${encodeURIComponent(jobId)}/review-trace?${q}`);
+}
+
 // ── Escaping ─────────────────────────────────────────────────────────────────
 
 /** Escape for interpolation into innerHTML. */

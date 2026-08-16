@@ -31,6 +31,9 @@ logger = logging.getLogger(__name__)
 
 DB_FILENAME = "jobs.db"
 LOGS_DIRNAME = "logs"
+# Lives beside the build logs in the job's log directory, so prune removes it
+# with everything else and no retention code has to know about it.
+REVIEW_TRACE_FILENAME = "review.jsonl"
 
 
 class JobStore:
@@ -422,6 +425,68 @@ class JobStore:
             "size": size,
             "truncated": offset + len(chunk) < size,
         }
+
+    # ── Review trace ──────────────────────────────────────────────────────────
+
+    def review_trace_path(self, job_id: str) -> Path:
+        return self.log_dir_for(job_id) / REVIEW_TRACE_FILENAME
+
+    def has_review_trace(self, job_id: str) -> bool:
+        try:
+            return self.review_trace_path(job_id).is_file()
+        except OSError:
+            return False
+
+    async def read_review_trace(
+        self, job_id: str, offset: int = 0, max_bytes: int = 1024 * 1024
+    ) -> dict | None:
+        """Parsed trace events from `offset`, for incremental tailing.
+
+        Same offset contract as `read_log`, but the unit is a whole JSON line
+        rather than bytes: the returned `offset` never lands mid-line, so a poll
+        that catches the writer between `write()` and the newline re-reads that
+        line next tick instead of dropping the event.
+        """
+        return await asyncio.to_thread(
+            self._read_review_trace_sync, job_id, offset, max_bytes
+        )
+
+    def _read_review_trace_sync(
+        self, job_id: str, offset: int, max_bytes: int
+    ) -> dict | None:
+        path = self.review_trace_path(job_id)
+        if not path.is_file():
+            return None
+
+        size = path.stat().st_size
+        if offset < 0:
+            offset = 0
+        if offset >= size:
+            return {"events": [], "offset": size, "size": size}
+
+        with open(path, "rb") as f:
+            f.seek(offset)
+            chunk = f.read(max_bytes)
+
+        # Keep only whole lines. Anything after the last newline is a partial
+        # write, so leave the cursor before it.
+        end = chunk.rfind(b"\n")
+        if end < 0:
+            return {"events": [], "offset": offset, "size": size}
+        consumed = end + 1
+
+        events = []
+        for raw in chunk[:consumed].decode("utf-8", errors="replace").splitlines():
+            raw = raw.strip()
+            if not raw:
+                continue
+            try:
+                events.append(json.loads(raw))
+            except ValueError:
+                # One corrupt line must not blank the whole timeline.
+                logger.warning(f"Skipping malformed trace line in {job_id}")
+
+        return {"events": events, "offset": offset + consumed, "size": size}
 
     # ── Retention ─────────────────────────────────────────────────────────────
 
