@@ -59,6 +59,10 @@ class Config:
     # Added files at or above this size are reported separately and should live
     # in COS instead of the repo.
     large_file_threshold_kb: int = 500
+    # How much of the PR's own account of itself the reviewer is given. Bounded
+    # because it is untrusted text sharing a context window with the rules.
+    pr_context_max_chars: int = 4000
+    pr_context_max_comments: int = 20
 
     # Worker
     max_concurrent_jobs: int = 2
@@ -165,6 +169,8 @@ def load_config() -> Config:
         review_max_rounds=_env_int("REVIEW_MAX_ROUNDS", 20),
         review_timeout_seconds=_env_int("REVIEW_TIMEOUT_SECONDS", 600),
         large_file_threshold_kb=_env_int("LARGE_FILE_THRESHOLD_KB", 500),
+        pr_context_max_chars=_env_int("PR_CONTEXT_MAX_CHARS", 4000),
+        pr_context_max_comments=_env_int("PR_CONTEXT_MAX_COMMENTS", 20),
         max_concurrent_jobs=_env_int("MAX_CONCURRENT_JOBS", 2),
         build_timeout_seconds=_env_int("BUILD_TIMEOUT_SECONDS", 1800),
         job_timeout_seconds=_env_int("JOB_TIMEOUT_SECONDS", 3600),

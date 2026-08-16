@@ -194,6 +194,7 @@ export function renderDetail(el, job) {
   el.innerHTML = [
     _detailMeta(job),
     _detailBuilds(job),
+    _detailPRContext(job),
     _detailReviewProcess(job),
     _detailReview(job),
     _detailChangeAudit(job),
@@ -223,6 +224,7 @@ function _detailMeta(j) {
       <div class="card-body">
         ${running ? `<div class="stage-banner">${stageCell(j)}</div>` : ''}
         <dl class="kv">
+          ${j.pr_title ? `<dt>Title</dt><dd class="plain">${esc(j.pr_title)}</dd>` : ''}
           <dt>Commit</dt><dd>${esc(j.head_sha || '—')}</dd>
           <dt>Branch</dt><dd>${esc(j.head_ref || '—')} → ${esc(j.base_ref || '—')}</dd>
           <dt>Requested by</dt><dd class="plain">${esc(j.requester)} (via ${esc(j.source)})</dd>
@@ -350,6 +352,48 @@ function _detailChangeAudit(j) {
     </div>`;
 }
 
+/**
+ * What the PR said about itself — the context the reviewer was given.
+ *
+ * Shown so a reader can judge the review against the same information it had:
+ * a review that contradicts the author's claims is doing its job, and that is
+ * only visible with both side by side.
+ *
+ * The description is PR-authored, so it renders through renderMarkdown(), which
+ * escapes before substituting.
+ */
+function _detailPRContext(j) {
+  const body = (j.pr_body || '').trim();
+  const ctx = j.pr_context || {};
+  if (!body && !ctx.description_missing) return '';
+
+  const meta = [
+    body ? `${body.length} chars` : '',
+    ctx.comments_used ? `${ctx.comments_used} comments fed in` : '',
+    ctx.comments_dropped ? `${ctx.comments_dropped} omitted` : '',
+  ].filter(Boolean).join(' · ');
+
+  const warn = ctx.description_missing
+    ? `<div class="finding">
+         <span class="pill sev-warning">warning</span>
+         <div class="finding-msg">No usable description — empty or an unfilled
+           template. The reviewer was told to raise this.</div>
+       </div>`
+    : '';
+
+  return `
+    <div class="card">
+      <div class="card-header">
+        <h2 class="card-title">PR description</h2>
+        <span class="card-meta">${esc(meta)}</span>
+      </div>
+      <div class="card-body">
+        ${warn}
+        ${body ? `<div class="review-body">${renderMarkdown(body)}</div>` : ''}
+      </div>
+    </div>`;
+}
+
 function _detailReviewProcess(j) {
   // Rendered while the review is still running too, so the card exists before
   // there is any review text to show. Events arrive via appendTraceEvents().
@@ -390,7 +434,8 @@ export function appendTraceEvents(container, events) {
       case 'setup':   container.appendChild(_traceSetup(ev)); break;
       case 'round':   container.appendChild(_traceRound(ev)); break;
       case 'tool':    _traceRoundBody(container, ev.round)
-                        .appendChild(_traceTool(ev)); break;
+                        .appendChild(ev.markdown ? _traceReview(ev) : _traceTool(ev));
+                      break;
       case 'nudge':   _traceRoundBody(container, ev.round)
                         .appendChild(_traceNote('warning',
                           `Returned nothing (${ev.attempt}/${ev.limit}) — ${ev.reason || 'retrying'}`)); break;
@@ -534,6 +579,24 @@ function _traceTool(ev) {
   pre.textContent = ev.result || '(no output)';
   row.appendChild(pre);
   return row;
+}
+
+/**
+ * The written review, as its own block rather than a tool row.
+ *
+ * This is what the loop was for, so it renders as markdown like the review card
+ * instead of being dumped into a <pre> the way tool output is. renderMarkdown()
+ * escapes before applying its patterns, which is what makes that safe.
+ */
+function _traceReview(ev) {
+  const block = _traceBlock('Review written', ev.summary || '', true);
+  block.classList.add('trace-review');
+  const body = block.querySelector('.trace-body');
+  const md = document.createElement('div');
+  md.className = 'review-body';
+  md.innerHTML = renderMarkdown(ev.result || '');
+  body.appendChild(md);
+  return block;
 }
 
 function _traceNote(sev, text) {

@@ -37,6 +37,7 @@ from .models import (
     Stage,
 )
 from .components import build_context
+from .pr_context import PRContext, build_pr_context
 from .review_agent import PRFacts, ReviewAgent
 from .review_trace import ReviewTrace
 from .reviewer import infra_files, large_files, run_rule_checks
@@ -277,6 +278,17 @@ async def _run_once(
         job.infra_files = infra
         job.shared_base_files = shared
 
+        # The PR's own account of itself. Fetched here rather than at trigger
+        # time so the reviewer sees the discussion as it stands when it runs —
+        # a job can sit in the queue behind a 20-minute build.
+        pr_ctx = await _build_pr_context(job, github_client, config)
+        job.pr_context = {
+            "description_missing": pr_ctx.description_missing,
+            "comments_used": len(pr_ctx.comments),
+            "comments_total": pr_ctx.comments_total,
+            "comments_dropped": pr_ctx.comments_dropped,
+        }
+
         agent = ReviewAgent(
             config,
             worktree,
@@ -292,6 +304,7 @@ async def _run_once(
                 large_files=big,
                 infra_files=infra,
                 shared_base_files=shared,
+                context=pr_ctx,
             ),
             # Records what the loop did, streamed to disk so the dashboard can
             # follow a review in progress rather than only see the verdict.
@@ -319,6 +332,38 @@ async def _run_once(
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
+
+
+async def _build_pr_context(
+    job: ReviewJob, github_client: GitHubClient, config: Config
+) -> PRContext:
+    """Title, description and discussion, filtered and bounded.
+
+    A failure here degrades the review rather than failing it: losing the
+    author's context is worse than nothing, but far better than losing the whole
+    review to one flaky API call.
+    """
+    raw_comments = []
+    try:
+        raw_comments = await github_client.list_pr_comments(
+            job.repo_full_name, job.pr_number
+        )
+    except Exception as e:
+        logger.warning(f"Job {job.id}: could not fetch PR discussion: {e}")
+
+    ctx = build_pr_context(
+        job.pr_title,
+        job.pr_body,
+        raw_comments,
+        max_chars=config.pr_context_max_chars,
+        max_comments=config.pr_context_max_comments,
+    )
+    logger.info(
+        f"Job {job.id}: PR context — description {len(ctx.description)} chars"
+        f"{' (MISSING)' if ctx.description_missing else ''}, "
+        f"{len(ctx.comments)} of {ctx.comments_total} comments"
+    )
+    return ctx
 
 
 def _round_reporter(job: ReviewJob, store: JobStore, model: str):

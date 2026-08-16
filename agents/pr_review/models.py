@@ -125,6 +125,15 @@ class ReviewJob:
     comment_id: int  # triggering comment
     requester: str  # GitHub username
     source: str = "webhook"  # "webhook" | "poll"
+    # The PR's own account of itself. Captured at trigger time off the get_pr
+    # response already being fetched, so it costs no extra API call and survives
+    # a retry without one.
+    pr_title: str = ""
+    pr_body: str = ""
+    # Summary of what the filter actually fed the reviewer: how many comments
+    # survived, how many were dropped, whether the description was usable. Kept
+    # on the job so the dashboard does not have to wait for the trace to load.
+    pr_context: dict = field(default_factory=dict)
 
     # Options parsed from the command
     skip_build: bool = False

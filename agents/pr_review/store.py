@@ -93,6 +93,9 @@ class JobStore:
              "ALTER TABLE jobs ADD COLUMN review_stopped_reason TEXT"),
             ("review_tool_calls",
              "ALTER TABLE jobs ADD COLUMN review_tool_calls INTEGER"),
+            ("pr_title", "ALTER TABLE jobs ADD COLUMN pr_title TEXT"),
+            ("pr_body", "ALTER TABLE jobs ADD COLUMN pr_body TEXT"),
+            ("pr_context", "ALTER TABLE jobs ADD COLUMN pr_context TEXT"),
         ):
             if column not in existing:
                 conn.execute(ddl)
@@ -147,9 +150,10 @@ class JobStore:
                   review_text, findings, error, attempt_errors,
                   created_at, started_at, finished_at,
                   large_files, infra_files, shared_base_files,
-                  review_rounds, review_stopped_reason, review_tool_calls
+                  review_rounds, review_stopped_reason, review_tool_calls,
+                  pr_title, pr_body, pr_context
                 ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,
-                          ?,?,?,?,?,?)
+                          ?,?,?,?,?,?,?,?,?)
                 """,
                 (
                     job.id,
@@ -181,6 +185,9 @@ class JobStore:
                     job.review_rounds,
                     job.review_stopped_reason,
                     job.review_tool_calls,
+                    job.pr_title,
+                    job.pr_body,
+                    json.dumps(job.pr_context),
                 ),
             )
             conn.commit()
@@ -598,6 +605,9 @@ class JobStore:
             "infra_files": _load_json(_col(row, "infra_files", ""), []),
             "shared_base_files": _load_json(
                 _col(row, "shared_base_files", ""), []),
+            "pr_title": _col(row, "pr_title", ""),
+            "pr_body": _col(row, "pr_body", ""),
+            "pr_context": _load_json(_col(row, "pr_context", ""), {}),
             "review": {
                 "rounds": _col(row, "review_rounds", 0),
                 "stopped_reason": _col(row, "review_stopped_reason", ""),
@@ -661,6 +671,9 @@ CREATE TABLE IF NOT EXISTS jobs (
   review_rounds INTEGER,
   review_stopped_reason TEXT,
   review_tool_calls INTEGER,
+  pr_title TEXT,
+  pr_body TEXT,
+  pr_context TEXT,
   error TEXT,
   attempt_errors TEXT,
   created_at REAL NOT NULL,
