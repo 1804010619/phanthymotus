@@ -36,7 +36,9 @@ from .models import (
     ReviewJob,
     Stage,
 )
-from .reviewer import llm_review, run_rule_checks
+from .components import build_context
+from .review_agent import PRFacts, ReviewAgent
+from .reviewer import infra_files, large_files, run_rule_checks
 from .store import JobStore
 
 logger = logging.getLogger(__name__)
@@ -250,7 +252,9 @@ async def _run_once(
         job.set_stage(Stage.RULE_CHECKS)
         await store.save_job(job)
         diff_stat = await workspace_mgr.get_diff_stat(worktree, base_ref)
-        findings = run_rule_checks(changed_files, diff_stat)
+        findings = run_rule_checks(
+            changed_files, diff_stat, worktree, config.large_file_threshold_kb
+        )
         # Kept on the job (not just formatted into the comment) so the
         # dashboard can render them and they survive a restart.
         job.findings = [
@@ -260,10 +264,40 @@ async def _run_once(
 
         job.set_stage(Stage.LLM_REVIEW, config.llm_model)
         await store.save_job(job)
-        diff = await workspace_mgr.get_diff(
-            worktree, base_ref, config.max_diff_lines
+
+        # The loop reads the worktree itself rather than being handed the diff:
+        # a large PR would otherwise build a prompt past the model's context,
+        # which is what max_diff_lines was papering over.
+        big = large_files(
+            changed_files, worktree, config.large_file_threshold_kb
         )
-        job.review_text = await llm_review(config, changed_files, diff, findings)
+        infra, shared = infra_files(changed_files)
+        job.large_files = [{"file": f, "bytes": n} for f, n in big]
+        job.infra_files = infra
+        job.shared_base_files = shared
+
+        agent = ReviewAgent(
+            config,
+            worktree,
+            build_context(
+                job.repo_full_name, targets, driver_paths, changed_files
+            ),
+            PRFacts(
+                repo=job.repo_full_name,
+                pr_number=job.pr_number,
+                base_ref=base_ref,
+                changed_files=changed_files,
+                diff_stat=diff_stat,
+                large_files=big,
+                infra_files=infra,
+                shared_base_files=shared,
+            ),
+        )
+        result = await agent.run()
+        job.review_text = result.markdown
+        job.review_rounds = result.rounds
+        job.review_stopped_reason = result.stopped_reason
+        job.review_tool_calls = result.tool_calls
 
         job.set_stage(Stage.POSTING)
         await store.save_job(job)
@@ -272,7 +306,7 @@ async def _run_once(
         await github_client.post_comment(
             job.repo_full_name,
             job.pr_number,
-            comments.format_review(findings, job.review_text),
+            comments.format_review(findings, job.review_text, job),
         )
 
     job.status = JobStatus.REVIEW_DONE

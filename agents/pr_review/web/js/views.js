@@ -195,6 +195,7 @@ export function renderDetail(el, job) {
     _detailMeta(job),
     _detailBuilds(job),
     _detailReview(job),
+    _detailChangeAudit(job),
     _detailFindings(job),
     _detailErrors(job),
   ].join('');
@@ -286,11 +287,64 @@ function _detailBuilds(j) {
 
 function _detailReview(j) {
   if (!j.review_text) return '';
+  const r = j.review || {};
+  // A review cut short must not look like a review that found nothing, so the
+  // stop reason is shown next to the text rather than only in the PR comment.
+  const meta = r.rounds
+    ? `<span class="card-meta">${r.rounds} rounds · ${r.tool_calls || 0} tool calls</span>`
+    : '';
+  const CUT = {
+    max_rounds: 'Cut short — round limit reached; may be incomplete.',
+    timeout: 'Cut short — time limit reached; may be incomplete.',
+    error: 'Ended on an error; may be incomplete.',
+  };
+  const warn = CUT[r.stopped_reason]
+    ? `<div class="finding"><span class="pill sev-warning">warning</span>
+         <div class="finding-msg">${esc(CUT[r.stopped_reason])}</div></div>`
+    : '';
   return `
     <div class="card">
-      <div class="card-header"><h2 class="card-title">Code review</h2></div>
+      <div class="card-header"><h2 class="card-title">Code review</h2>${meta}</div>
       <div class="card-body">
+        ${warn}
         <div class="review-body">${renderMarkdown(j.review_text)}</div>
+      </div>
+    </div>`;
+}
+
+function _detailChangeAudit(j) {
+  const big = j.large_files || [];
+  const infra = j.infra_files || [];
+  if (!big.length && !infra.length) return '';
+  const shared = new Set(j.shared_base_files || []);
+
+  const bigRows = big.map((e) => `
+    <div class="finding">
+      <span class="pill sev-error">${Math.round(e.bytes / 1024)}KB</span>
+      <div class="finding-file">${esc(e.file)}</div>
+    </div>`).join('');
+  const infraRows = infra.map((f) => `
+    <div class="finding">
+      <span class="pill sev-${shared.has(f) ? 'error' : 'warning'}">
+        ${shared.has(f) ? 'shared' : 'infra'}</span>
+      <div>
+        <div class="finding-file">${esc(f)}</div>
+        ${shared.has(f)
+          ? '<div class="finding-msg">Affects every component built on it, across both repositories.</div>'
+          : ''}
+      </div>
+    </div>`).join('');
+
+  return `
+    <div class="card">
+      <div class="card-header">
+        <h2 class="card-title">Change audit</h2>
+        <span class="card-meta">${big.length} large · ${infra.length} infra</span>
+      </div>
+      <div class="card-body">
+        ${big.length ? `<div class="finding-msg">Files over the size limit — these
+          belong in COS, fetched at build time.</div>${bigRows}` : ''}
+        ${infraRows}
       </div>
     </div>`;
 }

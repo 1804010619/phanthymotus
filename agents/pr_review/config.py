@@ -51,6 +51,15 @@ class Config:
     llm_max_tokens: int = 4000
     llm_timeout_seconds: int = 180
 
+    # Agentic review loop. Rounds and wall-clock are both bounded: the round cap
+    # alone would allow a pathological review to run for hours at the per-request
+    # timeout, which is how agent-core's main loop can.
+    review_max_rounds: int = 20
+    review_timeout_seconds: int = 600
+    # Added files at or above this size are reported separately and should live
+    # in COS instead of the repo.
+    large_file_threshold_kb: int = 500
+
     # Worker
     max_concurrent_jobs: int = 2
     # Timeout for a single docker build invocation.
@@ -153,6 +162,9 @@ def load_config() -> Config:
         max_diff_lines=_env_int("MAX_DIFF_LINES", 3000),
         llm_max_tokens=_env_int("LLM_MAX_TOKENS", 4000),
         llm_timeout_seconds=_env_int("LLM_TIMEOUT_SECONDS", 180),
+        review_max_rounds=_env_int("REVIEW_MAX_ROUNDS", 20),
+        review_timeout_seconds=_env_int("REVIEW_TIMEOUT_SECONDS", 600),
+        large_file_threshold_kb=_env_int("LARGE_FILE_THRESHOLD_KB", 500),
         max_concurrent_jobs=_env_int("MAX_CONCURRENT_JOBS", 2),
         build_timeout_seconds=_env_int("BUILD_TIMEOUT_SECONDS", 1800),
         job_timeout_seconds=_env_int("JOB_TIMEOUT_SECONDS", 3600),

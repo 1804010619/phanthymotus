@@ -208,13 +208,21 @@ def format_no_build_needed(head_sha: str) -> str:
 """
 
 
-def format_review(findings: list[Finding], review_text: str) -> str:
-    """The substantive code review, posted as its own comment."""
+def format_review(findings: list[Finding], review_text: str, job=None) -> str:
+    """The substantive code review, posted as its own comment.
+
+    `job` carries the deterministic results (large files, infrastructure) and how
+    the review loop ended. Optional so a caller with only text still works.
+    """
     body = f"""{BOT_MARKER}
 ## PR Review Agent — Code Review
 
 {review_text}
 """
+
+    if job is not None:
+        body += _format_large_files(job)
+        body += _format_infra(job)
 
     if findings:
         body += "\n### Rule Checks\n\n"
@@ -226,8 +234,85 @@ def format_review(findings: list[Finding], review_text: str) -> str:
             }.get(f.severity, ":grey_question:")
             body += f"- {icon} `{f.file}` — {f.message}\n"
 
+    if job is not None:
+        body += _format_review_budget(job)
+
     body += "\n---\n<sub>Generated automatically by PR Review Agent.</sub>\n"
     return body
+
+
+def _format_large_files(job) -> str:
+    """Added/modified files over the size limit, listed separately.
+
+    Its own section because the ask is that these are impossible to miss: large
+    assets belong in COS and fetched at build time, not committed.
+    """
+    entries = getattr(job, "large_files", None) or []
+    if not entries:
+        return ""
+    out = "\n### Large files\n\n"
+    for e in entries:
+        out += f"- :x: `{e['file']}` — **{e['bytes'] / 1024:.0f}KB**\n"
+    out += (
+        "\nFiles this size should live in COS "
+        "(`agi-phanthy-dev-1252788780.cos.ap-beijing.myqcloud.com/public/`) and "
+        "be fetched at build time — see how `unitree/g1` pulls cyclonedds via a "
+        "Dockerfile `ARG`. Note `.gitignore` covers only images, so nothing "
+        "stops a large file being committed except this check.\n"
+    )
+    return out
+
+
+def _format_infra(job) -> str:
+    """Infrastructure files touched, shared bases called out first."""
+    infra = getattr(job, "infra_files", None) or []
+    if not infra:
+        return ""
+    shared = set(getattr(job, "shared_base_files", None) or [])
+    out = "\n### Infrastructure changes\n\n"
+    for f in infra:
+        if f in shared:
+            out += (
+                f"- :rotating_light: `{f}` — **shared**: affects every component "
+                "built on it, across both repositories\n"
+            )
+        else:
+            out += f"- :warning: `{f}`\n"
+    out += (
+        "\nInfrastructure changes are held to a minimal-change standard: only "
+        "modify when necessary, and do not grow the image.\n"
+    )
+    return out
+
+
+def _format_review_budget(job) -> str:
+    """Say when the review stopped early — silence would read as 'all clear'."""
+    reason = getattr(job, "review_stopped_reason", "") or ""
+    rounds = getattr(job, "review_rounds", 0) or 0
+    tools = getattr(job, "review_tool_calls", 0) or 0
+    if not reason:
+        return ""
+
+    note = ""
+    if reason == "max_rounds":
+        note = (
+            f"\n> :warning: **This review was cut short** after {rounds} rounds "
+            "(round limit). It may be incomplete — retrigger for another pass.\n"
+        )
+    elif reason == "timeout":
+        note = (
+            f"\n> :warning: **This review was cut short** by the time limit "
+            f"after {rounds} rounds. It may be incomplete.\n"
+        )
+    elif reason == "error":
+        note = (
+            f"\n> :warning: **This review ended on an error** after {rounds} "
+            "rounds, so it may be incomplete.\n"
+        )
+    return note + (
+        f"\n<sub>Explored the checkout over {rounds} rounds, "
+        f"{tools} tool calls.</sub>\n"
+    )
 
 
 def format_no_changes(head_sha: str) -> str:

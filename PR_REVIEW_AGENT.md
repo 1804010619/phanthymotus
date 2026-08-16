@@ -195,29 +195,127 @@ started on.
 
 ## Review
 
-Two phases.
+Two phases: deterministic checks, then an agentic loop that explores the
+checkout.
 
-**Rule checks** — deterministic, no LLM:
+### Deterministic checks
 
-- Dockerfile modified (minimal-change principle)
-- Files over 1MB added
-- Possible secrets (`.env`, `credentials`, `secret`, `.pem`, `.key`;
-  `*.example` and `*.sample` are exempt)
+Run first, and their results are handed to the loop as established facts so it
+does not waste rounds re-deriving them.
 
-**LLM review** — one call to an OpenAI-compatible `/v1/chat/completions`
-endpoint, with the project's architecture and review rules in the system
-prompt, and the rule-check findings passed in as context. Output is English,
-structured as Summary / Issues / Suggestions.
+- **File size** — every added/modified file is `stat`ed in the worktree, so text
+  and binary are measured alike. Anything at or above `LARGE_FILE_THRESHOLD_KB`
+  (default 500) is reported in its own **Large files** section pointing at the
+  COS convention. The earlier version parsed `git diff --stat`, which reports
+  bytes *only* for binary files — a 2 MB generated JSON passed silently.
+- **Archive and binary extensions** — `.tar.gz`, `.zip`, `.so`, `.pt`, `.onnx`,
+  `.whl` and similar, flagged regardless of size. Every real offender in these
+  repos is under 1 MB (a committed `.zip`, an x86_64 `.so` in an ARM64-only
+  project), so a size threshold alone misses all of them. `.gitignore` covers
+  only images, so this check is the only gate.
+- **Infrastructure** — every touched `Dockerfile*`, `requirements.txt`,
+  `pyproject.toml`, `build*.sh`, `driver.yaml`, `deploy/service.yml`, tiered by
+  blast radius:
+
+  | Path | Who depends on it |
+  |------|-------------------|
+  | `phanthymotus/deploy/ros-base/Dockerfile` | all drivers + agent-core + perception, **across both repos** |
+  | `phanthymotus-driver/dji/base/*` | the three DJI drones |
+  | `phanthymotus-driver/common/**` | every driver that imports it |
+  | one component's Dockerfile | that component |
+
+  Shared paths count as infrastructure whatever they are named — `common/` is
+  ordinary Python that every driver imports, so a filename test alone would miss
+  the highest-blast-radius changes.
+- **Possible secrets** — `.env`, `credentials`, `secret`, `.pem`, `.key`
+  (`*.example` and `*.sample` exempt).
+
+### The review loop
+
+An LLM with read-only tools over the PR's checkout, bounded by
+`REVIEW_MAX_ROUNDS` (20) and `REVIEW_TIMEOUT_SECONDS` (600).
+
+| Tool | Purpose |
+|------|---------|
+| `list_dir(path)` | entries with type and size |
+| `read_file(path, start_line, max_lines)` | line-numbered text |
+| `grep(pattern, path, glob)` | matches as `file:line: text` |
+| `file_diff(path)` | this PR's diff for one file |
+| `finish_review(summary, issues, suggestions)` | terminal |
+
+**The prompt no longer carries the diff.** It carries the file list, `--stat`,
+and the deterministic results; the loop reads what it needs. That structurally
+removes the old failure where a large PR built a prompt past the model's
+context, which `MAX_DIFF_LINES` was papering over.
+
+Modelled on agent-core's `subagent/agent.py` rather than its main `event/llm.py`
+loop, for reasons the main loop demonstrates by counter-example: it has no
+wall-clock timeout (500 rounds x a 120 s read timeout runs for hours), it calls
+`json.loads` on tool arguments unguarded so one malformed blob kills the turn,
+and it breaks silently at its round ceiling. Here the budget is bounded in both
+rounds and seconds, malformed arguments degrade to `{}` so the tool can report
+the missing parameter, tool failures come back as `[tool error] ...` content the
+model can correct, and exhaustion is reported explicitly — **a review that was
+cut short must not look like a review that found nothing**, so both the PR
+comment and the dashboard say so.
 
 `LLM_BASE_URL` accepts a bare host, a `/v1` root, or the full endpoint — `/v1`
 is added when missing. A gateway that serves its web UI at `/chat/completions`
-would otherwise answer 200 with HTML and the failure would read as a JSON
+would otherwise answer 200 with HTML, and the failure would read as a JSON
 parse error rather than a wrong URL.
 
-This is a single call, not an agent loop: the pipeline is deterministic, so
-there is nothing for a loop to decide. Diffs are truncated to
-`MAX_DIFF_LINES`. If the LLM is unconfigured or fails, the build result is
-still posted and the review section says so.
+### Rules, docs and reference implementations
+
+`agents/pr_review/rules/*.md` hold the review standards, so changing them is
+editing markdown. `common.md` always applies; `driver.md`, `core.md` and
+`perception.md` are added by detected component. `components.py` maps each
+component to its authoritative docs and a comparable existing implementation,
+both named in the prompt.
+
+The rules are written from what the repos actually document *and* actually do,
+which diverges more than once:
+
+- A driver's `dispatch()` must return a **plain dict**. This is the single
+  highest-value check because `README_dev.md` contradicts itself — line 246 bans
+  the pre-wrapped `[{"type": "text", ...}]` form while its own skeleton example
+  around line 453 does exactly that. Anyone copying the example ships a
+  double-encoded payload that looks like a rendering bug.
+- Driver ports must be verified against the other `driver.yaml` files, **not**
+  the table in `README.md`, which is already wrong. Four drivers really do
+  declare 15702 and two declare 15703.
+- `driver.md` also carries a **do not flag** list, so the loop does not fight
+  conformant code: `README_dev.md` forbids `network_mode`/`ipc`/`pid` in
+  `deploy/service.yml` but every existing driver sets them, and the doc's
+  `drivers/<provider>/<model>/` paths have no `drivers/` prefix in reality.
+
+For a new driver the reference is chosen by shape — `unitree/go1` for structure,
+`robotera/q5_bundle` for decomposition, `dji/mavic3e` for a native-SDK bridge,
+`pnpbotics/adam` for gRPC, `unitree/go2` for SLAM. `deep_robotics/lynx_m20` and
+`unitree/g1/device.py` are deliberately excluded as models.
+
+### Sandbox
+
+The loop reads a worktree built from an **untrusted PR**, so both file names and
+file contents are attacker-authored, and the review is posted to a **public** PR
+comment. Every path is resolved and checked against the worktree root. Because
+`Path.resolve()` follows symlinks, that also blocks the dangerous case: a PR
+adding `evil -> /proc/self/environ` (which holds `GITHUB_TOKEN`,
+`REGISTRY_PASSWORD` and `LLM_API_KEY`) and getting the agent to read it into
+public. Confinement also keeps `jobs.db`, `poller_state.json` and the bare
+clones out of reach, since they live one level up in `$DATA_DIR`. An absolute
+path is reinterpreted as repo-relative rather than refused, so it reads nothing
+outside. `.git/` is excluded, binaries are refused rather than returned as
+bytes, and every result is capped so one `read_file` cannot blow the context.
+
+**There is no shell or exec tool**, despite `ls`/`grep`/`cat`/`diff` being the
+requested capabilities — they are provided as fixed, argument-validated,
+read-only tools instead. Adding `exec` would add an execution path and no review
+capability.
+
+What this does *not* address, stated plainly: the agent runs `docker build` on
+Dockerfiles from untrusted PRs, so a malicious `RUN` executes on the build host.
+That is inherent to "build the PR" and independent of the review loop; it is
+where to look first if this ever needs hardening.
 
 ## Dashboard
 
@@ -453,7 +551,15 @@ agents/pr_review/
   git_workspace.py     Bare clones, worktrees, diffs
   build_detector.py    Changed files → build targets
   builder.py           Invokes the repos' build scripts, streams logs
-  reviewer.py          Rule checks + LLM review
+  reviewer.py          Deterministic checks (size, infra, secrets) + LLM helpers
+  review_agent.py      The review loop
+  tools.py             Sandboxed list_dir/read_file/grep/file_diff
+  components.py        Component -> rules, docs, reference implementations
+  rules/               Review standards as editable markdown
+    common.md            infrastructure tiers, file size, COS convention
+    driver.md            plugin contract, driver.yaml, renderer formats
+    core.md              agent-core subsystems and their failure modes
+    perception.md        the ASR audio contract
   comments.py          PR comment formatting
   web/
     index.html

@@ -80,6 +80,16 @@ class JobStore:
             ("stage_detail", "ALTER TABLE jobs ADD COLUMN stage_detail TEXT"),
             ("stage_started_at",
              "ALTER TABLE jobs ADD COLUMN stage_started_at REAL"),
+            ("large_files", "ALTER TABLE jobs ADD COLUMN large_files TEXT"),
+            ("infra_files", "ALTER TABLE jobs ADD COLUMN infra_files TEXT"),
+            ("shared_base_files",
+             "ALTER TABLE jobs ADD COLUMN shared_base_files TEXT"),
+            ("review_rounds",
+             "ALTER TABLE jobs ADD COLUMN review_rounds INTEGER"),
+            ("review_stopped_reason",
+             "ALTER TABLE jobs ADD COLUMN review_stopped_reason TEXT"),
+            ("review_tool_calls",
+             "ALTER TABLE jobs ADD COLUMN review_tool_calls INTEGER"),
         ):
             if column not in existing:
                 conn.execute(ddl)
@@ -132,8 +142,11 @@ class JobStore:
                   stage_started_at, attempt,
                   skip_build, build_only, force_targets,
                   review_text, findings, error, attempt_errors,
-                  created_at, started_at, finished_at
-                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                  created_at, started_at, finished_at,
+                  large_files, infra_files, shared_base_files,
+                  review_rounds, review_stopped_reason, review_tool_calls
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,
+                          ?,?,?,?,?,?)
                 """,
                 (
                     job.id,
@@ -159,6 +172,12 @@ class JobStore:
                     job.created_at.timestamp(),
                     job.started_at.timestamp() if job.started_at else None,
                     job.finished_at.timestamp() if job.finished_at else None,
+                    json.dumps(job.large_files),
+                    json.dumps(job.infra_files),
+                    json.dumps(job.shared_base_files),
+                    job.review_rounds,
+                    job.review_stopped_reason,
+                    job.review_tool_calls,
                 ),
             )
             conn.commit()
@@ -508,6 +527,17 @@ class JobStore:
             },
             "review_text": row["review_text"] or "",
             "findings": _load_json(row["findings"], []),
+            # _col, not row[...]: these columns are absent on rows written
+            # before the migration ran.
+            "large_files": _load_json(_col(row, "large_files", ""), []),
+            "infra_files": _load_json(_col(row, "infra_files", ""), []),
+            "shared_base_files": _load_json(
+                _col(row, "shared_base_files", ""), []),
+            "review": {
+                "rounds": _col(row, "review_rounds", 0),
+                "stopped_reason": _col(row, "review_stopped_reason", ""),
+                "tool_calls": _col(row, "review_tool_calls", 0),
+            },
             "error": row["error"] or "",
             "attempt_errors": _load_json(row["attempt_errors"], []),
         })
@@ -560,6 +590,12 @@ CREATE TABLE IF NOT EXISTS jobs (
   force_targets TEXT,
   review_text TEXT,
   findings TEXT,
+  large_files TEXT,
+  infra_files TEXT,
+  shared_base_files TEXT,
+  review_rounds INTEGER,
+  review_stopped_reason TEXT,
+  review_tool_calls INTEGER,
   error TEXT,
   attempt_errors TEXT,
   created_at REAL NOT NULL,
