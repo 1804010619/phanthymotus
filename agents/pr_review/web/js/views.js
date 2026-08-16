@@ -172,10 +172,27 @@ export function renderHistory(el, jobs) {
     </table>`;
 }
 
+/**
+ * A build's outcome pill.
+ *
+ * `success` is tri-state: null means the row is the placeholder the worker writes
+ * before a build starts, so the dashboard has a log pane to tail. Rendering that
+ * as "failed" showed a FAILED build beside a job that was building normally.
+ */
+function buildPill(b) {
+  if (b.success === null || b.success === undefined) return 'running';
+  return b.success ? 'ok' : 'fail';
+}
+
+function buildLabel(b) {
+  if (b.success === null || b.success === undefined) return 'building';
+  return b.success ? 'success' : 'failed';
+}
+
 function _buildSummary(results) {
   if (!results || !results.length) return '<span style="color:var(--text-dim)">—</span>';
   return results.map((b) =>
-    `<span class="pill ${b.success ? 'ok' : 'fail'}">${esc(targetLabel(b))}</span>`
+    `<span class="pill ${buildPill(b)}">${esc(targetLabel(b))}</span>`
   ).join(' ');
 }
 
@@ -194,7 +211,10 @@ export function renderDetail(el, job) {
   el.innerHTML = [
     _detailMeta(job),
     _detailBuilds(job),
+    _detailPRContext(job),
+    _detailReviewProcess(job),
     _detailReview(job),
+    _detailChangeAudit(job),
     _detailFindings(job),
     _detailErrors(job),
   ].join('');
@@ -221,6 +241,7 @@ function _detailMeta(j) {
       <div class="card-body">
         ${running ? `<div class="stage-banner">${stageCell(j)}</div>` : ''}
         <dl class="kv">
+          ${j.pr_title ? `<dt>Title</dt><dd class="plain">${esc(j.pr_title)}</dd>` : ''}
           <dt>Commit</dt><dd>${esc(j.head_sha || '—')}</dd>
           <dt>Branch</dt><dd>${esc(j.head_ref || '—')} → ${esc(j.base_ref || '—')}</dd>
           <dt>Requested by</dt><dd class="plain">${esc(j.requester)} (via ${esc(j.source)})</dd>
@@ -250,7 +271,7 @@ function _detailBuilds(j) {
   const rows = results.map((b) => `
     <tr>
       <td>${esc(targetLabel(b))}</td>
-      <td><span class="pill ${b.success ? 'ok' : 'fail'}">${b.success ? 'success' : 'failed'}</span></td>
+      <td><span class="pill ${buildPill(b)}">${esc(buildLabel(b))}</span></td>
       <td>${b.image_tag ? `
         <div class="copy-cell">
           <span class="mono">${esc(b.image_tag)}</span>
@@ -286,14 +307,379 @@ function _detailBuilds(j) {
 
 function _detailReview(j) {
   if (!j.review_text) return '';
+  const r = j.review || {};
+  // A review cut short must not look like a review that found nothing, so the
+  // stop reason is shown next to the text rather than only in the PR comment.
+  const meta = r.rounds
+    ? `<span class="card-meta">${r.rounds} rounds · ${r.tool_calls || 0} tool calls</span>`
+    : '';
+  const CUT = {
+    max_rounds: 'Cut short — round limit reached; may be incomplete.',
+    timeout: 'Cut short — time limit reached; may be incomplete.',
+    error: 'Ended on an error; may be incomplete.',
+  };
+  const warn = CUT[r.stopped_reason]
+    ? `<div class="finding"><span class="pill sev-warning">warning</span>
+         <div class="finding-msg">${esc(CUT[r.stopped_reason])}</div></div>`
+    : '';
   return `
     <div class="card">
-      <div class="card-header"><h2 class="card-title">Code review</h2></div>
+      <div class="card-header"><h2 class="card-title">Code review</h2>${meta}</div>
       <div class="card-body">
+        ${warn}
         <div class="review-body">${renderMarkdown(j.review_text)}</div>
       </div>
     </div>`;
 }
+
+function _detailChangeAudit(j) {
+  const big = j.large_files || [];
+  const infra = j.infra_files || [];
+  if (!big.length && !infra.length) return '';
+  const shared = new Set(j.shared_base_files || []);
+
+  const bigRows = big.map((e) => `
+    <div class="finding">
+      <span class="pill sev-error">${Math.round(e.bytes / 1024)}KB</span>
+      <div class="finding-file">${esc(e.file)}</div>
+    </div>`).join('');
+  const infraRows = infra.map((f) => `
+    <div class="finding">
+      <span class="pill sev-${shared.has(f) ? 'error' : 'warning'}">
+        ${shared.has(f) ? 'shared' : 'infra'}</span>
+      <div>
+        <div class="finding-file">${esc(f)}</div>
+        ${shared.has(f)
+          ? '<div class="finding-msg">Affects every component built on it, across both repositories.</div>'
+          : ''}
+      </div>
+    </div>`).join('');
+
+  return `
+    <div class="card">
+      <div class="card-header">
+        <h2 class="card-title">Change audit</h2>
+        <span class="card-meta">${big.length} large · ${infra.length} infra</span>
+      </div>
+      <div class="card-body">
+        ${big.length ? `<div class="finding-msg">Files over the size limit — these
+          belong in COS, fetched at build time.</div>${bigRows}` : ''}
+        ${infraRows}
+      </div>
+    </div>`;
+}
+
+/**
+ * What the PR said about itself — the context the reviewer was given.
+ *
+ * Shown so a reader can judge the review against the same information it had:
+ * a review that contradicts the author's claims is doing its job, and that is
+ * only visible with both side by side.
+ *
+ * The description is PR-authored, so it renders through renderMarkdown(), which
+ * escapes before substituting.
+ */
+function _detailPRContext(j) {
+  const body = (j.pr_body || '').trim();
+  const ctx = j.pr_context || {};
+  if (!body && !ctx.description_missing) return '';
+
+  const meta = [
+    body ? `${body.length} chars` : '',
+    ctx.comments_used ? `${ctx.comments_used} comments fed in` : '',
+    ctx.comments_dropped ? `${ctx.comments_dropped} omitted` : '',
+  ].filter(Boolean).join(' · ');
+
+  const warn = ctx.description_missing
+    ? `<div class="finding">
+         <span class="pill sev-warning">warning</span>
+         <div class="finding-msg">No usable description — empty or an unfilled
+           template. The reviewer was told to raise this.</div>
+       </div>`
+    : '';
+
+  return `
+    <div class="card">
+      <div class="card-header">
+        <h2 class="card-title">PR description</h2>
+        <span class="card-meta">${esc(meta)}</span>
+      </div>
+      <div class="card-body">
+        ${warn}
+        ${body ? `<div class="review-body">${renderMarkdown(body)}</div>` : ''}
+      </div>
+    </div>`;
+}
+
+function _detailReviewProcess(j) {
+  // Rendered while the review is still running too, so the card exists before
+  // there is any review text to show. Events arrive via appendTraceEvents().
+  const running = j.stage === 'generating review' || j.stage === 'running rule checks';
+  if (!j.has_review_trace && !running) return '';
+  const r = j.review || {};
+  const tools = r.tool_calls || 0;
+  const meta = r.rounds
+    ? `${r.rounds} round${r.rounds === 1 ? '' : 's'} · ` +
+      `${tools} tool call${tools === 1 ? '' : 's'}`
+    : 'running…';
+  return `
+    <div class="card">
+      <div class="card-header">
+        <h2 class="card-title">Review process</h2>
+        <span class="card-meta" data-trace-meta>${esc(meta)}</span>
+      </div>
+      <div class="card-body no-pad">
+        <div class="trace" data-trace-job="${esc(j.id)}"></div>
+      </div>
+    </div>`;
+}
+
+/**
+ * Append trace events to the process timeline.
+ *
+ * Incremental on purpose: re-rendering the whole timeline each poll would
+ * collapse any <details> the reader has open, which is exactly the pane they are
+ * reading. So rounds are found-or-created and rows appended.
+ *
+ * Everything here is built with createElement/textContent rather than an HTML
+ * string. Tool results are file contents from an untrusted PR — this is the one
+ * place they are shown verbatim, so there is no interpolation to get wrong.
+ */
+export function appendTraceEvents(container, events) {
+  for (const ev of events) {
+    switch (ev.kind) {
+      case 'setup':   container.appendChild(_traceSetup(ev)); break;
+      case 'round':   container.appendChild(_traceRound(ev)); break;
+      case 'tool':    _traceRoundBody(container, ev.round)
+                        .appendChild(ev.markdown ? _traceReview(ev) : _traceTool(ev));
+                      break;
+      case 'nudge':   _traceRoundBody(container, ev.round)
+                        .appendChild(_traceNote('warning',
+                          `Returned nothing (${ev.attempt}/${ev.limit}) — ${ev.reason || 'retrying'}`)); break;
+      case 'finish':  container.appendChild(_traceFinish(ev)); break;
+      // 'refusal' duplicates what the tool row already shows as [refused].
+      default: break;
+    }
+  }
+}
+
+function _traceBlock(summary, meta, open = false) {
+  const d = document.createElement('details');
+  d.className = 'trace-block';
+  if (open) d.open = true;
+  const s = document.createElement('summary');
+  s.className = 'trace-summary';
+  const title = document.createElement('span');
+  title.className = 'trace-title';
+  title.textContent = summary;
+  s.appendChild(title);
+  if (meta) {
+    const m = document.createElement('span');
+    m.className = 'trace-meta';
+    m.textContent = meta;
+    s.appendChild(m);
+  }
+  d.appendChild(s);
+  const body = document.createElement('div');
+  body.className = 'trace-body';
+  d.appendChild(body);
+  return d;
+}
+
+function _kv(body, label, value) {
+  if (value === undefined || value === null || value === '' ||
+      (Array.isArray(value) && !value.length)) return;
+  const row = document.createElement('div');
+  row.className = 'trace-kv';
+  const k = document.createElement('span');
+  k.className = 'trace-k';
+  k.textContent = label;
+  const v = document.createElement('span');
+  v.className = 'trace-v';
+  v.textContent = Array.isArray(value) ? value.join(', ') : String(value);
+  row.append(k, v);
+  body.appendChild(row);
+}
+
+function _traceSetup(ev) {
+  // Open by default: what the reviewer was told is the context for everything
+  // below it, and it is short.
+  const block = _traceBlock('Setup', ev.model || '', true);
+  const body = block.querySelector('.trace-body');
+  _kv(body, 'component', ev.component);
+  _kv(body, 'rules', `${(ev.rules || []).join(' + ')}  (${ev.rules_chars || 0} chars)`);
+  _kv(body, 'docs to read', ev.docs);
+  _kv(body, 'compare against', ev.references);
+  _kv(body, 'budget', `${ev.max_rounds} rounds / ${ev.timeout_seconds}s`);
+  _kv(body, 'changed files', ev.changed_files);
+  _kv(body, 'large files', ev.large_files);
+  _kv(body, 'infrastructure', ev.infra_files);
+  _kv(body, 'shared base', ev.shared_base_files);
+  return block;
+}
+
+function _traceRound(ev) {
+  const bits = [];
+  if (ev.elapsed !== undefined) bits.push(`${ev.elapsed}s`);
+  if (ev.prompt_tokens) {
+    // cached_tokens is the only visible signal that the stable-system-prompt
+    // design is actually getting prefix cache hits.
+    bits.push(ev.cached_tokens
+      ? `${_n(ev.prompt_tokens)} prompt (${_n(ev.cached_tokens)} cached)`
+      : `${_n(ev.prompt_tokens)} prompt`);
+  }
+  if (ev.completion_tokens) bits.push(`${_n(ev.completion_tokens)} out`);
+  if (ev.reasoning_tokens) bits.push(`${_n(ev.reasoning_tokens)} reasoning`);
+
+  const block = _traceBlock(`Round ${ev.round}`, bits.join(' · '), true);
+  block.dataset.traceRound = String(ev.round);
+  const body = block.querySelector('.trace-body');
+  if (ev.error) body.appendChild(_traceNote('error', ev.error));
+  if (ev.content) {
+    // The model narrating alongside its tool calls — the closest thing to
+    // visible reasoning this router returns.
+    const p = document.createElement('div');
+    p.className = 'trace-narration';
+    p.textContent = ev.content;
+    body.appendChild(p);
+  } else if (ev.tools?.length) {
+    // The header advertises N output tokens; without this there is nothing on
+    // screen to account for them. Those tokens *were* the tool calls, whose
+    // arguments each row shows under "called".
+    const p = document.createElement('div');
+    p.className = 'trace-narration muted';
+    p.textContent =
+      `No prose this round — the output was ${ev.tools.length} tool call` +
+      `${ev.tools.length === 1 ? '' : 's'}: ${ev.tools.join(', ')}`;
+    body.appendChild(p);
+  }
+  return block;
+}
+
+/** The body of round N, creating a placeholder block if it is not there yet. */
+function _traceRoundBody(container, round) {
+  const key = String(round ?? 0);
+  let block = container.querySelector(`[data-trace-round="${CSS.escape(key)}"]`);
+  if (!block) {
+    block = _traceBlock(`Round ${key}`, '', true);
+    block.dataset.traceRound = key;
+    container.appendChild(block);
+  }
+  return block.querySelector('.trace-body');
+}
+
+function _traceTool(ev) {
+  const row = document.createElement('details');
+  row.className = 'trace-tool';
+
+  const s = document.createElement('summary');
+  s.className = 'trace-tool-head';
+
+  const name = document.createElement('span');
+  name.className = 'trace-tool-name';
+  name.textContent = ev.name || '?';
+
+  const summary = document.createElement('span');
+  summary.className = 'trace-tool-arg';
+  summary.textContent = ev.summary || '';
+
+  s.append(name, summary);
+
+  if (ev.refused || ev.error) {
+    const pill = document.createElement('span');
+    pill.className = `pill ${ev.refused ? 'sev-warning' : 'sev-error'}`;
+    pill.textContent = ev.refused ? 'refused' : 'error';
+    s.appendChild(pill);
+  }
+  const size = document.createElement('span');
+  size.className = 'trace-tool-size';
+  size.textContent = [
+    ev.bytes !== undefined ? _bytes(ev.bytes) : '',
+    ev.ms ? `${ev.ms}ms` : '',
+  ].filter(Boolean).join(' · ');
+  s.appendChild(size);
+
+  row.appendChild(s);
+
+  // The literal call the model emitted. The summary line above is a readable
+  // rendering of it; this is the arguments verbatim, which is what the round's
+  // output tokens were actually spent on.
+  if (ev.args && Object.keys(ev.args).length) {
+    const call = document.createElement('pre');
+    call.className = 'trace-call';
+    call.textContent = `${ev.name}(${JSON.stringify(ev.args, null, 1)
+      .replace(/\n\s*/g, ' ')})`;
+    row.appendChild(call);
+  }
+
+  const pre = document.createElement('pre');
+  pre.className = 'trace-result';
+  pre.textContent = ev.result || '(no output)';
+  row.appendChild(pre);
+  return row;
+}
+
+/**
+ * The written review, as its own block rather than a tool row.
+ *
+ * This is what the loop was for, so it renders as markdown like the review card
+ * instead of being dumped into a <pre> the way tool output is. renderMarkdown()
+ * escapes before applying its patterns, which is what makes that safe.
+ */
+function _traceReview(ev) {
+  const block = _traceBlock('Review written', ev.summary || '', true);
+  block.classList.add('trace-review');
+  const body = block.querySelector('.trace-body');
+  const md = document.createElement('div');
+  md.className = 'review-body';
+  md.innerHTML = renderMarkdown(ev.result || '');
+  body.appendChild(md);
+  return block;
+}
+
+function _traceNote(sev, text) {
+  const d = document.createElement('div');
+  d.className = 'trace-note';
+  const pill = document.createElement('span');
+  pill.className = `pill sev-${sev}`;
+  pill.textContent = sev;
+  const msg = document.createElement('span');
+  msg.textContent = text;
+  d.append(pill, msg);
+  return d;
+}
+
+function _traceFinish(ev) {
+  const REASON = {
+    finished: 'Finished — review written',
+    max_rounds: 'Stopped: round limit reached — the review may be incomplete',
+    timeout: 'Stopped: time limit reached — the review may be incomplete',
+    error: 'Stopped on an error — the review may be incomplete',
+  };
+  const d = document.createElement('div');
+  d.className = `trace-finish ${ev.stopped_reason === 'finished' ? 'ok' : 'warn'}`;
+  const label = document.createElement('span');
+  label.textContent = REASON[ev.stopped_reason] || ev.stopped_reason || 'Finished';
+  d.appendChild(label);
+  const meta = document.createElement('span');
+  meta.className = 'trace-meta';
+  meta.textContent = [
+    ev.rounds ? `${ev.rounds} rounds` : '',
+    ev.tool_calls ? `${ev.tool_calls} tool calls` : '',
+    ev.t !== undefined ? `${ev.t}s total` : '',
+  ].filter(Boolean).join(' · ');
+  d.appendChild(meta);
+  if (ev.error) d.appendChild(_traceNote('error', ev.error));
+  return d;
+}
+
+const _n = (v) => Number(v).toLocaleString('en-US');
+
+function _bytes(n) {
+  if (n < 1024) return `${n} B`;
+  return `${(n / 1024).toFixed(1)} KB`;
+}
+
 
 function _detailFindings(j) {
   const findings = j.findings || [];

@@ -37,6 +37,11 @@ export function getLog(jobId, idx, offset = 0) {
   return _json(`/api/jobs/${encodeURIComponent(jobId)}/log/${idx}?${q}`);
 }
 
+export function getReviewTrace(jobId, offset = 0) {
+  const q = new URLSearchParams({ offset });
+  return _json(`/api/jobs/${encodeURIComponent(jobId)}/review-trace?${q}`);
+}
+
 // ── Escaping ─────────────────────────────────────────────────────────────────
 
 /** Escape for interpolation into innerHTML. */
@@ -61,13 +66,31 @@ export function renderMarkdown(src) {
   const lines = esc(src).split('\n');
   const out = [];
   let inList = false;
+  let table = [];
 
   const closeList = () => {
     if (inList) { out.push('</ul>'); inList = false; }
   };
+  // Pipe tables are common in PR descriptions here, and a real table parser is
+  // more machinery (and more escaping risk) than this needs. Consecutive pipe
+  // lines are emitted as a preformatted block instead: the columns line up, and
+  // nothing is reinterpreted as markup.
+  const closeTable = () => {
+    if (table.length) {
+      out.push(`<pre class="md-table">${table.join('\n')}</pre>`);
+      table = [];
+    }
+  };
 
   for (const raw of lines) {
     const line = raw.trimEnd();
+
+    if (/^\s*\|.*\|\s*$/.test(line)) {
+      closeList();
+      table.push(line.trim());
+      continue;
+    }
+    closeTable();
 
     const heading = line.match(/^#{1,6}\s+(.*)$/);
     if (heading) {
@@ -89,6 +112,7 @@ export function renderMarkdown(src) {
     out.push(`<p>${_inline(line)}</p>`);
   }
   closeList();
+  closeTable();
   return out.join('');
 }
 

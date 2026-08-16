@@ -31,6 +31,9 @@ logger = logging.getLogger(__name__)
 
 DB_FILENAME = "jobs.db"
 LOGS_DIRNAME = "logs"
+# Lives beside the build logs in the job's log directory, so prune removes it
+# with everything else and no retention code has to know about it.
+REVIEW_TRACE_FILENAME = "review.jsonl"
 
 
 class JobStore:
@@ -80,6 +83,19 @@ class JobStore:
             ("stage_detail", "ALTER TABLE jobs ADD COLUMN stage_detail TEXT"),
             ("stage_started_at",
              "ALTER TABLE jobs ADD COLUMN stage_started_at REAL"),
+            ("large_files", "ALTER TABLE jobs ADD COLUMN large_files TEXT"),
+            ("infra_files", "ALTER TABLE jobs ADD COLUMN infra_files TEXT"),
+            ("shared_base_files",
+             "ALTER TABLE jobs ADD COLUMN shared_base_files TEXT"),
+            ("review_rounds",
+             "ALTER TABLE jobs ADD COLUMN review_rounds INTEGER"),
+            ("review_stopped_reason",
+             "ALTER TABLE jobs ADD COLUMN review_stopped_reason TEXT"),
+            ("review_tool_calls",
+             "ALTER TABLE jobs ADD COLUMN review_tool_calls INTEGER"),
+            ("pr_title", "ALTER TABLE jobs ADD COLUMN pr_title TEXT"),
+            ("pr_body", "ALTER TABLE jobs ADD COLUMN pr_body TEXT"),
+            ("pr_context", "ALTER TABLE jobs ADD COLUMN pr_context TEXT"),
         ):
             if column not in existing:
                 conn.execute(ddl)
@@ -132,8 +148,12 @@ class JobStore:
                   stage_started_at, attempt,
                   skip_build, build_only, force_targets,
                   review_text, findings, error, attempt_errors,
-                  created_at, started_at, finished_at
-                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                  created_at, started_at, finished_at,
+                  large_files, infra_files, shared_base_files,
+                  review_rounds, review_stopped_reason, review_tool_calls,
+                  pr_title, pr_body, pr_context
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,
+                          ?,?,?,?,?,?,?,?,?)
                 """,
                 (
                     job.id,
@@ -159,6 +179,15 @@ class JobStore:
                     job.created_at.timestamp(),
                     job.started_at.timestamp() if job.started_at else None,
                     job.finished_at.timestamp() if job.finished_at else None,
+                    json.dumps(job.large_files),
+                    json.dumps(job.infra_files),
+                    json.dumps(job.shared_base_files),
+                    job.review_rounds,
+                    job.review_stopped_reason,
+                    job.review_tool_calls,
+                    job.pr_title,
+                    job.pr_body,
+                    json.dumps(job.pr_context),
                 ),
             )
             conn.commit()
@@ -190,7 +219,9 @@ class JobStore:
                     idx,
                     result.target.value,
                     result.driver_path,
-                    int(result.success),
+                    # NULL for an in-progress build — the column is already
+                    # nullable, so no migration is needed for the third state.
+                    None if result.success is None else int(result.success),
                     result.image_tag,
                     result.log_path,
                     result.container_name,
@@ -257,7 +288,7 @@ class JobStore:
                         "idx": row["idx"],
                         "target": row["target"],
                         "driver_path": row["driver_path"],
-                        "success": bool(row["success"]),
+                        "success": _tri(row["success"]),
                         "image_tag": row["image_tag"],
                     })
                 for j in jobs:
@@ -316,7 +347,7 @@ class JobStore:
                     "idx": r["idx"],
                     "target": r["target"],
                     "driver_path": r["driver_path"],
-                    "success": bool(r["success"]),
+                    "success": _tri(r["success"]),
                     "image_tag": r["image_tag"],
                     "has_log": bool(r["log_path"]) and Path(r["log_path"]).exists(),
                     "container_name": _col(r, "container_name"),
@@ -403,6 +434,68 @@ class JobStore:
             "size": size,
             "truncated": offset + len(chunk) < size,
         }
+
+    # ── Review trace ──────────────────────────────────────────────────────────
+
+    def review_trace_path(self, job_id: str) -> Path:
+        return self.log_dir_for(job_id) / REVIEW_TRACE_FILENAME
+
+    def has_review_trace(self, job_id: str) -> bool:
+        try:
+            return self.review_trace_path(job_id).is_file()
+        except OSError:
+            return False
+
+    async def read_review_trace(
+        self, job_id: str, offset: int = 0, max_bytes: int = 1024 * 1024
+    ) -> dict | None:
+        """Parsed trace events from `offset`, for incremental tailing.
+
+        Same offset contract as `read_log`, but the unit is a whole JSON line
+        rather than bytes: the returned `offset` never lands mid-line, so a poll
+        that catches the writer between `write()` and the newline re-reads that
+        line next tick instead of dropping the event.
+        """
+        return await asyncio.to_thread(
+            self._read_review_trace_sync, job_id, offset, max_bytes
+        )
+
+    def _read_review_trace_sync(
+        self, job_id: str, offset: int, max_bytes: int
+    ) -> dict | None:
+        path = self.review_trace_path(job_id)
+        if not path.is_file():
+            return None
+
+        size = path.stat().st_size
+        if offset < 0:
+            offset = 0
+        if offset >= size:
+            return {"events": [], "offset": size, "size": size}
+
+        with open(path, "rb") as f:
+            f.seek(offset)
+            chunk = f.read(max_bytes)
+
+        # Keep only whole lines. Anything after the last newline is a partial
+        # write, so leave the cursor before it.
+        end = chunk.rfind(b"\n")
+        if end < 0:
+            return {"events": [], "offset": offset, "size": size}
+        consumed = end + 1
+
+        events = []
+        for raw in chunk[:consumed].decode("utf-8", errors="replace").splitlines():
+            raw = raw.strip()
+            if not raw:
+                continue
+            try:
+                events.append(json.loads(raw))
+            except ValueError:
+                # One corrupt line must not blank the whole timeline.
+                logger.warning(f"Skipping malformed trace line in {job_id}")
+
+        return {"events": events, "offset": offset + consumed, "size": size}
 
     # ── Retention ─────────────────────────────────────────────────────────────
 
@@ -508,6 +601,20 @@ class JobStore:
             },
             "review_text": row["review_text"] or "",
             "findings": _load_json(row["findings"], []),
+            # _col, not row[...]: these columns are absent on rows written
+            # before the migration ran.
+            "large_files": _load_json(_col(row, "large_files", ""), []),
+            "infra_files": _load_json(_col(row, "infra_files", ""), []),
+            "shared_base_files": _load_json(
+                _col(row, "shared_base_files", ""), []),
+            "pr_title": _col(row, "pr_title", ""),
+            "pr_body": _col(row, "pr_body", ""),
+            "pr_context": _load_json(_col(row, "pr_context", ""), {}),
+            "review": {
+                "rounds": _col(row, "review_rounds", 0),
+                "stopped_reason": _col(row, "review_stopped_reason", ""),
+                "tool_calls": _col(row, "review_tool_calls", 0),
+            },
             "error": row["error"] or "",
             "attempt_errors": _load_json(row["attempt_errors"], []),
         })
@@ -515,6 +622,11 @@ class JobStore:
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
+
+
+def _tri(value) -> bool | None:
+    """A build's outcome: True, False, or None while it is still running."""
+    return None if value is None else bool(value)
 
 
 def _col(row: sqlite3.Row, name: str, default=""):
@@ -560,6 +672,15 @@ CREATE TABLE IF NOT EXISTS jobs (
   force_targets TEXT,
   review_text TEXT,
   findings TEXT,
+  large_files TEXT,
+  infra_files TEXT,
+  shared_base_files TEXT,
+  review_rounds INTEGER,
+  review_stopped_reason TEXT,
+  review_tool_calls INTEGER,
+  pr_title TEXT,
+  pr_body TEXT,
+  pr_context TEXT,
   error TEXT,
   attempt_errors TEXT,
   created_at REAL NOT NULL,

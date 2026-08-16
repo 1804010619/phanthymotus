@@ -39,6 +39,25 @@ class GitHubClient:
         resp.raise_for_status()
         return resp.json()
 
+    async def list_pr_comments(
+        self, repo: str, pr_number: int, per_page: int = 100
+    ) -> list[dict]:
+        """Conversation comments on one PR, oldest first.
+
+        The repo-wide `list_repo_comments` below is the poller's endpoint; this is
+        the per-PR one, used to give the reviewer the discussion as it stands when
+        the review runs.
+
+        Line-level review comments live at `/pulls/{n}/comments` and are
+        deliberately not fetched — same reason the trigger is not read there.
+        """
+        resp = await self._client.get(
+            f"/repos/{repo}/issues/{pr_number}/comments",
+            params={"per_page": per_page},
+        )
+        resp.raise_for_status()
+        return resp.json()
+
     async def list_repo_comments(
         self,
         repo: str,

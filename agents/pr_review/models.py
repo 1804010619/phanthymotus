@@ -105,7 +105,10 @@ class Stage(str, Enum):
 class BuildResult:
     target: BuildTarget
     driver_path: str | None  # e.g. "unitree/g1", only for DRIVER
-    success: bool
+    # None means "still building". The worker persists a placeholder row before
+    # a build starts so the dashboard has a log pane to tail; encoding that as
+    # False made an in-progress build render as FAILED.
+    success: bool | None
     image_tag: str  # full image ref when successful
     log_tail: str  # last N lines, for the PR comment
     log_path: str = ""  # full log on disk, for the dashboard
@@ -125,6 +128,15 @@ class ReviewJob:
     comment_id: int  # triggering comment
     requester: str  # GitHub username
     source: str = "webhook"  # "webhook" | "poll"
+    # The PR's own account of itself. Captured at trigger time off the get_pr
+    # response already being fetched, so it costs no extra API call and survives
+    # a retry without one.
+    pr_title: str = ""
+    pr_body: str = ""
+    # Summary of what the filter actually fed the reviewer: how many comments
+    # survived, how many were dropped, whether the description was usable. Kept
+    # on the job so the dashboard does not have to wait for the trace to load.
+    pr_context: dict = field(default_factory=dict)
 
     # Options parsed from the command
     skip_build: bool = False
@@ -146,6 +158,16 @@ class ReviewJob:
     # Rule-check findings as plain dicts, so they survive persistence and can
     # be rendered by the dashboard rather than only formatted into a comment.
     findings: list[dict] = field(default_factory=list)
+    # Deterministic pre-review results, kept so the dashboard and the comment
+    # render the same numbers the loop was told about.
+    large_files: list[dict] = field(default_factory=list)
+    infra_files: list[str] = field(default_factory=list)
+    shared_base_files: list[str] = field(default_factory=list)
+    # How the review loop ended. A review cut short must not look like a review
+    # that found nothing, so this is persisted rather than inferred.
+    review_rounds: int = 0
+    review_stopped_reason: str = ""
+    review_tool_calls: int = 0
     error: str = ""
     created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     started_at: datetime | None = None

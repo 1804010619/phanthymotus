@@ -36,7 +36,11 @@ from .models import (
     ReviewJob,
     Stage,
 )
-from .reviewer import llm_review, run_rule_checks
+from .components import build_context
+from .pr_context import PRContext, build_pr_context
+from .review_agent import PRFacts, ReviewAgent
+from .review_trace import ReviewTrace
+from .reviewer import infra_files, large_files, run_rule_checks
 from .store import JobStore
 
 logger = logging.getLogger(__name__)
@@ -250,7 +254,9 @@ async def _run_once(
         job.set_stage(Stage.RULE_CHECKS)
         await store.save_job(job)
         diff_stat = await workspace_mgr.get_diff_stat(worktree, base_ref)
-        findings = run_rule_checks(changed_files, diff_stat)
+        findings = run_rule_checks(
+            changed_files, diff_stat, worktree, config.large_file_threshold_kb
+        )
         # Kept on the job (not just formatted into the comment) so the
         # dashboard can render them and they survive a restart.
         job.findings = [
@@ -260,10 +266,56 @@ async def _run_once(
 
         job.set_stage(Stage.LLM_REVIEW, config.llm_model)
         await store.save_job(job)
-        diff = await workspace_mgr.get_diff(
-            worktree, base_ref, config.max_diff_lines
+
+        # The loop reads the worktree itself rather than being handed the diff:
+        # a large PR would otherwise build a prompt past the model's context,
+        # which is what max_diff_lines was papering over.
+        big = large_files(
+            changed_files, worktree, config.large_file_threshold_kb
         )
-        job.review_text = await llm_review(config, changed_files, diff, findings)
+        infra, shared = infra_files(changed_files)
+        job.large_files = [{"file": f, "bytes": n} for f, n in big]
+        job.infra_files = infra
+        job.shared_base_files = shared
+
+        # The PR's own account of itself. Fetched here rather than at trigger
+        # time so the reviewer sees the discussion as it stands when it runs —
+        # a job can sit in the queue behind a 20-minute build.
+        pr_ctx = await _build_pr_context(job, github_client, config)
+        job.pr_context = {
+            "description_missing": pr_ctx.description_missing,
+            "comments_used": len(pr_ctx.comments),
+            "comments_total": pr_ctx.comments_total,
+            "comments_dropped": pr_ctx.comments_dropped,
+        }
+
+        agent = ReviewAgent(
+            config,
+            worktree,
+            build_context(
+                job.repo_full_name, targets, driver_paths, changed_files
+            ),
+            PRFacts(
+                repo=job.repo_full_name,
+                pr_number=job.pr_number,
+                base_ref=base_ref,
+                changed_files=changed_files,
+                diff_stat=diff_stat,
+                large_files=big,
+                infra_files=infra,
+                shared_base_files=shared,
+                context=pr_ctx,
+            ),
+            # Records what the loop did, streamed to disk so the dashboard can
+            # follow a review in progress rather than only see the verdict.
+            trace=ReviewTrace(store.review_trace_path(job.id)),
+            on_round=_round_reporter(job, store, config.llm_model),
+        )
+        result = await agent.run()
+        job.review_text = result.markdown
+        job.review_rounds = result.rounds
+        job.review_stopped_reason = result.stopped_reason
+        job.review_tool_calls = result.tool_calls
 
         job.set_stage(Stage.POSTING)
         await store.save_job(job)
@@ -272,7 +324,7 @@ async def _run_once(
         await github_client.post_comment(
             job.repo_full_name,
             job.pr_number,
-            comments.format_review(findings, job.review_text),
+            comments.format_review(findings, job.review_text, job),
         )
 
     job.status = JobStatus.REVIEW_DONE
@@ -280,6 +332,50 @@ async def _run_once(
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
+
+
+async def _build_pr_context(
+    job: ReviewJob, github_client: GitHubClient, config: Config
+) -> PRContext:
+    """Title, description and discussion, filtered and bounded.
+
+    A failure here degrades the review rather than failing it: losing the
+    author's context is worse than nothing, but far better than losing the whole
+    review to one flaky API call.
+    """
+    raw_comments = []
+    try:
+        raw_comments = await github_client.list_pr_comments(
+            job.repo_full_name, job.pr_number
+        )
+    except Exception as e:
+        logger.warning(f"Job {job.id}: could not fetch PR discussion: {e}")
+
+    ctx = build_pr_context(
+        job.pr_title,
+        job.pr_body,
+        raw_comments,
+        max_chars=config.pr_context_max_chars,
+        max_comments=config.pr_context_max_comments,
+    )
+    logger.info(
+        f"Job {job.id}: PR context — description {len(ctx.description)} chars"
+        f"{' (MISSING)' if ctx.description_missing else ''}, "
+        f"{len(ctx.comments)} of {ctx.comments_total} comments"
+    )
+    return ctx
+
+
+def _round_reporter(job: ReviewJob, store: JobStore, model: str):
+    """Persist per-round progress, so the dashboard shows the review moving.
+
+    Without this the overview sits on a static "generating review" for the whole
+    loop, which is indistinguishable from a hang.
+    """
+    async def report(n: int, total: int):
+        job.set_stage(Stage.LLM_REVIEW, f"{model} · round {n}/{total}")
+        await store.save_job(job)
+    return report
 
 
 async def _execute_builds(
@@ -318,12 +414,15 @@ async def _execute_builds(
         # builds its log panes from build_results, so without this there is no
         # pane to tail until the build has already finished — which is exactly
         # when live tailing stops being useful.
+        #
+        # success=None, not False: this row means "building", and False rendered
+        # as a FAILED pill next to a job that was still running fine.
         await store.save_build_result(
             job.id, idx,
             BuildResult(
                 target=target,
                 driver_path=driver_path,
-                success=False,
+                success=None,
                 image_tag="",
                 log_tail="",
                 log_path=str(log_path),
