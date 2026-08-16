@@ -105,7 +105,10 @@ class Stage(str, Enum):
 class BuildResult:
     target: BuildTarget
     driver_path: str | None  # e.g. "unitree/g1", only for DRIVER
-    success: bool
+    # None means "still building". The worker persists a placeholder row before
+    # a build starts so the dashboard has a log pane to tail; encoding that as
+    # False made an in-progress build render as FAILED.
+    success: bool | None
     image_tag: str  # full image ref when successful
     log_tail: str  # last N lines, for the PR comment
     log_path: str = ""  # full log on disk, for the dashboard

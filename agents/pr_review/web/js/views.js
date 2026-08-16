@@ -172,10 +172,27 @@ export function renderHistory(el, jobs) {
     </table>`;
 }
 
+/**
+ * A build's outcome pill.
+ *
+ * `success` is tri-state: null means the row is the placeholder the worker writes
+ * before a build starts, so the dashboard has a log pane to tail. Rendering that
+ * as "failed" showed a FAILED build beside a job that was building normally.
+ */
+function buildPill(b) {
+  if (b.success === null || b.success === undefined) return 'running';
+  return b.success ? 'ok' : 'fail';
+}
+
+function buildLabel(b) {
+  if (b.success === null || b.success === undefined) return 'building';
+  return b.success ? 'success' : 'failed';
+}
+
 function _buildSummary(results) {
   if (!results || !results.length) return '<span style="color:var(--text-dim)">—</span>';
   return results.map((b) =>
-    `<span class="pill ${b.success ? 'ok' : 'fail'}">${esc(targetLabel(b))}</span>`
+    `<span class="pill ${buildPill(b)}">${esc(targetLabel(b))}</span>`
   ).join(' ');
 }
 
@@ -254,7 +271,7 @@ function _detailBuilds(j) {
   const rows = results.map((b) => `
     <tr>
       <td>${esc(targetLabel(b))}</td>
-      <td><span class="pill ${b.success ? 'ok' : 'fail'}">${b.success ? 'success' : 'failed'}</span></td>
+      <td><span class="pill ${buildPill(b)}">${esc(buildLabel(b))}</span></td>
       <td>${b.image_tag ? `
         <div class="copy-cell">
           <span class="mono">${esc(b.image_tag)}</span>
@@ -525,6 +542,16 @@ function _traceRound(ev) {
     p.className = 'trace-narration';
     p.textContent = ev.content;
     body.appendChild(p);
+  } else if (ev.tools?.length) {
+    // The header advertises N output tokens; without this there is nothing on
+    // screen to account for them. Those tokens *were* the tool calls, whose
+    // arguments each row shows under "called".
+    const p = document.createElement('div');
+    p.className = 'trace-narration muted';
+    p.textContent =
+      `No prose this round — the output was ${ev.tools.length} tool call` +
+      `${ev.tools.length === 1 ? '' : 's'}: ${ev.tools.join(', ')}`;
+    body.appendChild(p);
   }
   return block;
 }
@@ -573,6 +600,17 @@ function _traceTool(ev) {
   s.appendChild(size);
 
   row.appendChild(s);
+
+  // The literal call the model emitted. The summary line above is a readable
+  // rendering of it; this is the arguments verbatim, which is what the round's
+  // output tokens were actually spent on.
+  if (ev.args && Object.keys(ev.args).length) {
+    const call = document.createElement('pre');
+    call.className = 'trace-call';
+    call.textContent = `${ev.name}(${JSON.stringify(ev.args, null, 1)
+      .replace(/\n\s*/g, ' ')})`;
+    row.appendChild(call);
+  }
 
   const pre = document.createElement('pre');
   pre.className = 'trace-result';

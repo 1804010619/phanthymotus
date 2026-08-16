@@ -414,12 +414,15 @@ async def _execute_builds(
         # builds its log panes from build_results, so without this there is no
         # pane to tail until the build has already finished — which is exactly
         # when live tailing stops being useful.
+        #
+        # success=None, not False: this row means "building", and False rendered
+        # as a FAILED pill next to a job that was still running fine.
         await store.save_build_result(
             job.id, idx,
             BuildResult(
                 target=target,
                 driver_path=driver_path,
-                success=False,
+                success=None,
                 image_tag="",
                 log_tail="",
                 log_path=str(log_path),

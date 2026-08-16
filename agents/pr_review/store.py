@@ -219,7 +219,9 @@ class JobStore:
                     idx,
                     result.target.value,
                     result.driver_path,
-                    int(result.success),
+                    # NULL for an in-progress build — the column is already
+                    # nullable, so no migration is needed for the third state.
+                    None if result.success is None else int(result.success),
                     result.image_tag,
                     result.log_path,
                     result.container_name,
@@ -286,7 +288,7 @@ class JobStore:
                         "idx": row["idx"],
                         "target": row["target"],
                         "driver_path": row["driver_path"],
-                        "success": bool(row["success"]),
+                        "success": _tri(row["success"]),
                         "image_tag": row["image_tag"],
                     })
                 for j in jobs:
@@ -345,7 +347,7 @@ class JobStore:
                     "idx": r["idx"],
                     "target": r["target"],
                     "driver_path": r["driver_path"],
-                    "success": bool(r["success"]),
+                    "success": _tri(r["success"]),
                     "image_tag": r["image_tag"],
                     "has_log": bool(r["log_path"]) and Path(r["log_path"]).exists(),
                     "container_name": _col(r, "container_name"),
@@ -620,6 +622,11 @@ class JobStore:
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
+
+
+def _tri(value) -> bool | None:
+    """A build's outcome: True, False, or None while it is still running."""
+    return None if value is None else bool(value)
 
 
 def _col(row: sqlite3.Row, name: str, default=""):

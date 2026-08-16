@@ -364,6 +364,16 @@ details[open] > .trace-summary::before { content: '▾'; }
   white-space: pre-wrap; word-break: break-word;
 }
 
+/* The tool call the model emitted, verbatim, above its result. */
+.trace-call {
+  margin: 2px 0 0; padding: 6px 10px;
+  background: var(--blue-bg); color: var(--blue);
+  border-radius: var(--radius-xs);
+  font-family: var(--font-mono); font-size: 10.5px; line-height: 1.5;
+  white-space: pre-wrap; word-break: break-word;
+}
+.trace-narration.muted { color: var(--text-dim); font-style: italic; }
+
 /* Pipe tables from a PR description — aligned, and still just text. */
 .md-table {
   margin: 6px 0; padding: 8px 10px;
