@@ -10,6 +10,37 @@ const TERMINAL = new Set([
   'review_done', 'build_success', 'build_failed', 'timeout', 'error', 'cancelled',
 ]);
 
+// ── Shared cells ─────────────────────────────────────────────────────────────
+
+/**
+ * The commit cell.
+ *
+ * Shows the *build ref* — the worktree HEAD after the PR was merged onto base,
+ * which is the sha the build scripts shorten into `release.YYMMDD.<7hex>`. That
+ * makes the column the thing you can actually search a registry for. The PR head
+ * sha is not: it never names an image. Falls back to it for jobs recorded before
+ * the build ref was captured, and the tooltip carries all three ids in full.
+ */
+function commitCell(j) {
+  const shown = j.build_ref_sha || j.head_sha;
+  const lines = [
+    `PR head:      ${j.head_sha || '—'}`,
+    `build ref:    ${j.build_ref_sha || '—'}   (names the image tag)`,
+    `merge commit: ${j.merge_commit_sha || 'not merged yet'}`,
+  ].join('\n');
+  return `<td class="mono" title="${esc(lines)}">${esc(shortSha(shown))}</td>`;
+}
+
+/**
+ * Who the work belongs to: the PR's author, not whoever typed the trigger.
+ *
+ * Falls back to `requester` for rows written before the author was recorded —
+ * usually the same person, and better than a blank column.
+ */
+function byCell(j) {
+  return `<td>${esc(j.pr_author || j.requester || '—')}</td>`;
+}
+
 // ── Overview ─────────────────────────────────────────────────────────────────
 
 export function renderStats(el, s) {
@@ -54,10 +85,10 @@ export function renderActive(bodyEl, metaEl, s) {
           <tr class="clickable" data-job="${esc(j.id)}">
             <td class="mono">#${esc(j.pr_number)}</td>
             <td>${esc(shortRepo(j.repo))}</td>
-            <td class="mono">${esc(shortSha(j.head_sha))}</td>
+            ${commitCell(j)}
             <td>${stageCell(j)}</td>
             <td class="mono">${esc(j.attempt)}</td>
-            <td>${esc(j.requester)}</td>
+            ${byCell(j)}
             <td class="num">${esc(fmtDuration(j.elapsed))}</td>
           </tr>
         `).join('')}
@@ -154,7 +185,7 @@ export function renderHistory(el, jobs) {
           <tr class="clickable" data-job="${esc(j.id)}">
             <td class="mono">#${esc(j.pr_number)}</td>
             <td>${esc(shortRepo(j.repo))}</td>
-            <td class="mono">${esc(shortSha(j.head_sha))}</td>
+            ${commitCell(j)}
             <td>
               ${TERMINAL.has(j.status)
                 ? `<span class="pill ${esc(j.status)}">${esc(j.status)}</span>`
@@ -162,7 +193,7 @@ export function renderHistory(el, jobs) {
               ${j.attempt > 1 ? `<span class="pill">try ${esc(j.attempt)}</span>` : ''}
             </td>
             <td>${_buildSummary(j.build_results)}</td>
-            <td>${esc(j.requester)}</td>
+            ${byCell(j)}
             <td>${esc(j.source)}</td>
             <td class="num">${esc(fmtDuration(j.elapsed))}</td>
             <td class="num" title="${esc(fmtTime(j.created_at))}">${esc(fmtRelative(j.created_at))}</td>
@@ -242,9 +273,18 @@ function _detailMeta(j) {
         ${running ? `<div class="stage-banner">${stageCell(j)}</div>` : ''}
         <dl class="kv">
           ${j.pr_title ? `<dt>Title</dt><dd class="plain">${esc(j.pr_title)}</dd>` : ''}
-          <dt>Commit</dt><dd>${esc(j.head_sha || '—')}</dd>
+          <dt>PR head</dt><dd>${esc(j.head_sha || '—')}</dd>
+          <dt title="The sha the build scripts turn into release.YYMMDD.&lt;7hex&gt;">Build ref</dt>
+          <dd>${j.build_ref_sha
+            ? `${esc(j.build_ref_sha)} <span class="stage-detail">names the image tag</span>`
+            : '—'}</dd>
+          <dt>Merge commit</dt>
+          <dd>${j.merge_commit_sha
+            ? esc(j.merge_commit_sha)
+            : '<span style="color:var(--text-dim)">not merged yet</span>'}</dd>
           <dt>Branch</dt><dd>${esc(j.head_ref || '—')} → ${esc(j.base_ref || '—')}</dd>
-          <dt>Requested by</dt><dd class="plain">${esc(j.requester)} (via ${esc(j.source)})</dd>
+          <dt>PR author</dt><dd class="plain">${esc(j.pr_author || j.requester || '—')}</dd>
+          <dt>Triggered via</dt><dd class="plain">${esc(j.source || '—')}</dd>
           <dt>Mode</dt><dd class="plain">${esc(mode)}${
             (o.force_targets || []).length
               ? ` · forced: ${esc((o.force_targets || []).join(', '))}` : ''}</dd>

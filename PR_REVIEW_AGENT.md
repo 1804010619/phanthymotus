@@ -494,6 +494,37 @@ byte offset it last received. The pane only autoscrolls if you are already at th
 bottom, so tailing does not yank the view away while you read an error further
 up.
 
+### Three commits per job
+
+The dashboard's `Commit` column is deliberately **not** the PR head sha, because
+that sha never names an image. A job carries three ids:
+
+| Id | What it is | Where it comes from |
+|---|---|---|
+| `head_sha` | what the author pushed | the PR, at trigger time |
+| `build_ref_sha` | worktree HEAD after the PR is merged onto base | `git rev-parse HEAD` in the worktree |
+| `merge_commit_sha` | the commit on the base branch once merged | backfilled from the GitHub API |
+
+`build_ref_sha` is the one that matters for finding an image: reviews build a
+worktree that is *base + PR merged*, and `build.sh` / `build_core.sh` /
+`build_perception.sh` all tag from that worktree's HEAD —
+`TAG="release.${DATE}.${COMMIT}"` where `COMMIT` is its short sha. It is a local
+merge commit in a worktree that is deleted when the job ends, so it exists nowhere
+but the job record. (When the PR has not diverged from its base the merge
+fast-forwards and it equals `head_sha`.)
+
+`merge_commit_sha` is what you search for when tracing a release back to a
+change. The poller fills it in roughly every 5 minutes from
+`GET /repos/{repo}/pulls?state=closed` — one request per repo, since that endpoint
+carries `merge_commit_sha` and `merged_at` for every PR it lists. It is only
+recorded when `merged_at` is set: on an open PR that field holds a throwaway
+test-merge sha that changes whenever the base moves.
+
+Jobs are attributed to the **PR author**, not to whoever typed
+`/request_bot_review` — the trigger is often used by a reviewer or by whoever is
+operating the agent. The requester is still recorded, and is who the
+acknowledgment comment on the PR thanks.
+
 ### Persistence
 
 State lives on the host at `DATA_HOST_DIR` (default

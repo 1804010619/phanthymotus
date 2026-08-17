@@ -90,6 +90,36 @@ class GitHubClient:
         resp.raise_for_status()
         return resp.json()
 
+    async def list_pulls(
+        self,
+        repo: str,
+        state: str = "closed",
+        sort: str = "updated",
+        direction: str = "desc",
+        per_page: int = 100,
+    ) -> list[dict]:
+        """List a repo's PRs — one call, not one per PR.
+
+        Used to backfill merge commits: this endpoint carries `merge_commit_sha`
+        and `merged_at` for every entry, so the whole backlog is covered by a
+        single request per repo.
+
+        Caller beware: on an *open* PR, `merge_commit_sha` is GitHub's throwaway
+        test-merge sha and changes whenever the base moves. It is only the real
+        merge commit when `merged_at` is non-null.
+        """
+        resp = await self._client.get(
+            f"/repos/{repo}/pulls",
+            params={
+                "state": state,
+                "sort": sort,
+                "direction": direction,
+                "per_page": per_page,
+            },
+        )
+        resp.raise_for_status()
+        return resp.json()
+
     async def post_comment(self, repo: str, pr_number: int, body: str) -> int:
         """Post a comment on a PR. Returns the comment ID."""
         resp = await self._client.post(

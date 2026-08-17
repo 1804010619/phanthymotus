@@ -214,12 +214,20 @@ class GitWorkspaceManager:
         pr_number: int,
         head_sha: str,
         base_ref: str,
-    ) -> Path:
+    ) -> tuple[Path, str]:
         """Create an isolated worktree at `base_ref` with the PR merged in.
 
         `base_ref` is a plain branch name (e.g. "main"), not `origin/main`: this
         is a bare clone, where branches live at `refs/heads/*` and there are no
         remote-tracking refs for `origin/main` to resolve against.
+
+        Returns (worktree_path, build_ref_sha). The second value is the worktree
+        HEAD after the merge — the commit the build scripts turn into the image
+        tag (`release.YYMMDD.<7hex>`), which is what makes a published image
+        traceable back to a review. It is a *local* merge commit: this worktree
+        is thrown away, so it exists nowhere else and cannot be recovered later.
+        (When the PR has not diverged from base the merge fast-forwards and this
+        equals `head_sha`.)
 
         Raises MergeConflictError when the PR cannot be merged.
         """
@@ -268,7 +276,23 @@ class GitWorkspaceManager:
             )
 
         logger.info(f"Worktree ready: {wt_path} ({base_ref} + PR #{pr_number})")
-        return wt_path
+        return wt_path, await self._head_sha(wt_path)
+
+    async def _head_sha(self, worktree_path: Path) -> str:
+        """Worktree HEAD, or "" if it cannot be read.
+
+        Never fatal: this is recorded for traceability, and losing the id is not
+        a reason to fail a review that would otherwise have run.
+        """
+        rc, out = await self._run_git_status(
+            ["git", "rev-parse", "HEAD"],
+            cwd=str(worktree_path),
+            timeout=GIT_LOCAL_TIMEOUT,
+        )
+        if rc != 0:
+            logger.warning(f"Could not read build ref in {worktree_path}: {out.strip()}")
+            return ""
+        return out.strip()
 
     async def remove_worktree(self, repo_full_name: str, worktree_path: Path):
         """Remove a worktree after use."""

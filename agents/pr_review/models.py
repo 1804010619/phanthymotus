@@ -128,6 +128,10 @@ class ReviewJob:
     comment_id: int  # triggering comment
     requester: str  # GitHub username
     source: str = "webhook"  # "webhook" | "poll"
+    # Who opened the PR. Distinct from `requester`, who merely typed the trigger
+    # and is often a reviewer or the bot operator; the dashboard attributes work
+    # to the author, while the acknowledgment comment still thanks the requester.
+    pr_author: str = ""
     # The PR's own account of itself. Captured at trigger time off the get_pr
     # response already being fetched, so it costs no extra API call and survives
     # a retry without one.
@@ -173,6 +177,17 @@ class ReviewJob:
     started_at: datetime | None = None
     finished_at: datetime | None = None
     worktree_path: str = ""
+    # The three ids a released image has to be traceable through:
+    #
+    #   pr_head_sha     what the author pushed
+    #   build_ref_sha   worktree HEAD after the PR is merged onto base — the one
+    #                   the build scripts shorten into release.YYMMDD.<7hex>, so
+    #                   the only id that finds the published image
+    #   merge_commit_sha  the commit on the base branch once the PR is merged;
+    #                   backfilled by the poller, empty until then
+    build_ref_sha: str = ""
+    merge_commit_sha: str = ""
+    merged_at: str = ""  # ISO8601 from GitHub, alongside merge_commit_sha
     # Acknowledgment comment, edited in place through the job's lifetime.
     progress_comment_id: int | None = None
 
