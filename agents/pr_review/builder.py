@@ -194,10 +194,15 @@ async def _run_build(
 
     # start_new_session puts the child in its own process group so the whole
     # build tree (bash -> docker -> buildx) dies with it, not just bash.
+    #
+    # stdin is /dev/null because nothing here can answer a prompt: inheriting the
+    # agent's stdin would let a `read` in a build script block until the build
+    # timeout instead of failing immediately.
     proc = await asyncio.create_subprocess_exec(
         *cmd,
         cwd=cwd,
         env=env,
+        stdin=asyncio.subprocess.DEVNULL,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.STDOUT,
         start_new_session=True,
