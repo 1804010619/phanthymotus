@@ -186,10 +186,13 @@ async def _run_once(
     # 2. Create an isolated worktree with the PR merged onto the base
     job.set_stage(Stage.WORKTREE, f"{base_ref} + PR #{job.pr_number}")
     await store.save_job(job)
-    worktree = await workspace_mgr.create_worktree(
+    worktree, build_ref_sha = await workspace_mgr.create_worktree(
         job.repo_full_name, job.pr_number, job.pr_head_sha, base_ref
     )
     job.worktree_path = str(worktree)
+    # Recorded now because the worktree — and with it this commit — is removed
+    # when the job ends.
+    job.build_ref_sha = build_ref_sha
 
     # 3. Determine what changed
     job.set_stage(Stage.DETECTING)

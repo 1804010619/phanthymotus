@@ -101,6 +101,7 @@ async def create_job_from_comment(
         pr_base_ref=pr_info["base"]["ref"],
         pr_title=pr_info.get("title") or "",
         pr_body=pr_info.get("body") or "",
+        pr_author=(pr_info.get("user") or {}).get("login", ""),
         comment_id=comment_id,
         requester=requester,
         source=source,

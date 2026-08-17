@@ -127,6 +127,11 @@ def _summarize_active(job) -> dict:
         "repo": job.repo_full_name,
         "pr_number": job.pr_number,
         "head_sha": job.pr_head_sha,
+        "build_ref_sha": job.build_ref_sha,
+        # An in-flight PR is by definition not merged yet; sent so the shape
+        # matches a history row and the table needs no special case.
+        "merge_commit_sha": "",
+        "pr_author": job.pr_author,
         "requester": job.requester,
         "status": job.status.value,
         "stage": job.stage,

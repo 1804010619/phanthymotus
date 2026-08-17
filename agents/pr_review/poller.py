@@ -15,6 +15,7 @@ import asyncio
 import json
 import logging
 import re
+import time
 from collections import deque
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -38,6 +39,18 @@ PROCESSED_IDS_MAX = 1000
 
 # Pages of 100 comments to walk per repo per cycle.
 MAX_PAGES_PER_POLL = 5
+
+# How often to look for merge commits of PRs already reviewed. Much slower than
+# the trigger poll: nothing waits on a merge id.
+#
+# The pass is skipped when no reviewed PR is missing one. A PR that is still open
+# — or was closed without merging — never gets one, so it keeps the pass alive at
+# one request per repo per interval. That is the intended cost: it is also what
+# picks up a merge that happens weeks after the review.
+MERGE_BACKFILL_INTERVAL_SECONDS = 300
+
+# PRs per repo examined in one backfill pass (one request, newest-updated first).
+MERGE_BACKFILL_PER_PAGE = 100
 
 
 class Poller:
@@ -68,6 +81,11 @@ class Poller:
         self.last_poll_at: str | None = None
         self.last_error: str | None = None
         self.triggers_found = 0
+        # Merge-commit backfill. Monotonic, so a clock change cannot stall it;
+        # 0.0 means the first cycle runs one, which catches PRs merged while the
+        # agent was down.
+        self._last_backfill = 0.0
+        self.merge_commits_found = 0
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
@@ -121,6 +139,47 @@ class Poller:
         self.poll_count += 1
         self.last_poll_at = _now_iso()
         self._save_state()
+
+        # Piggybacks on the same loop rather than owning a task: it shares the
+        # repo list and the client, and runs far less often than it.
+        if time.monotonic() - self._last_backfill >= MERGE_BACKFILL_INTERVAL_SECONDS:
+            self._last_backfill = time.monotonic()
+            for repo in self._config.repos:
+                try:
+                    await self._backfill_merge_commits(repo)
+                except Exception as e:
+                    logger.warning(f"Merge backfill failed for {repo}: {e}")
+
+    async def _backfill_merge_commits(self, repo: str):
+        """Record the merge commit of PRs that have been reviewed and merged.
+
+        The reviewed commit and the commit that names the built image are both
+        local to a throwaway worktree; this is the id that survives on the base
+        branch, and the one to search for when tracing a release to a change.
+        """
+        pending = await self._store.prs_missing_merge_commit(repo)
+        if not pending:
+            return
+
+        pulls = await self._github.list_pulls(
+            repo, state="closed", per_page=MERGE_BACKFILL_PER_PAGE
+        )
+        found = 0
+        for pr in pulls:
+            number = pr.get("number")
+            if number not in pending:
+                continue
+            # Only a merged PR has a real merge commit. On an open one the field
+            # holds a throwaway test-merge sha that would be wrong to record.
+            merged_at = pr.get("merged_at")
+            sha = pr.get("merge_commit_sha") or ""
+            if not merged_at or not sha:
+                continue
+            if await self._store.set_merge_commit(repo, number, sha, merged_at):
+                found += 1
+                logger.info(
+                    f"Recorded merge commit for {repo}#{number}: {sha[:7]}")
+        self.merge_commits_found += found
 
     async def _poll_repo(self, repo: str):
         """Poll a single repo for new trigger comments."""
@@ -260,6 +319,7 @@ class Poller:
             "last_poll_at": self.last_poll_at,
             "last_error": self.last_error,
             "triggers_found": self.triggers_found,
+            "merge_commits_found": self.merge_commits_found,
             "watermarks": dict(self._last_checked),
         }
 

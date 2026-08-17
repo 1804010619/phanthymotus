@@ -96,6 +96,11 @@ class JobStore:
             ("pr_title", "ALTER TABLE jobs ADD COLUMN pr_title TEXT"),
             ("pr_body", "ALTER TABLE jobs ADD COLUMN pr_body TEXT"),
             ("pr_context", "ALTER TABLE jobs ADD COLUMN pr_context TEXT"),
+            ("pr_author", "ALTER TABLE jobs ADD COLUMN pr_author TEXT"),
+            ("build_ref_sha", "ALTER TABLE jobs ADD COLUMN build_ref_sha TEXT"),
+            ("merge_commit_sha",
+             "ALTER TABLE jobs ADD COLUMN merge_commit_sha TEXT"),
+            ("merged_at", "ALTER TABLE jobs ADD COLUMN merged_at TEXT"),
         ):
             if column not in existing:
                 conn.execute(ddl)
@@ -151,9 +156,10 @@ class JobStore:
                   created_at, started_at, finished_at,
                   large_files, infra_files, shared_base_files,
                   review_rounds, review_stopped_reason, review_tool_calls,
-                  pr_title, pr_body, pr_context
+                  pr_title, pr_body, pr_context,
+                  pr_author, build_ref_sha, merge_commit_sha, merged_at
                 ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,
-                          ?,?,?,?,?,?,?,?,?)
+                          ?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 (
                     job.id,
@@ -188,9 +194,72 @@ class JobStore:
                     job.pr_title,
                     job.pr_body,
                     json.dumps(job.pr_context),
+                    job.pr_author,
+                    job.build_ref_sha,
+                    job.merge_commit_sha,
+                    job.merged_at,
                 ),
             )
             conn.commit()
+        finally:
+            conn.close()
+
+    async def set_merge_commit(
+        self, repo: str, pr_number: int, sha: str, merged_at: str
+    ) -> int:
+        """Record a PR's merge commit on every job row for that PR.
+
+        Every row, because a PR can be reviewed several times and each run wants
+        the same id. Only rows where it is still empty, so this is idempotent and
+        a repeat pass costs one no-op UPDATE.
+        """
+        try:
+            return await asyncio.to_thread(
+                self._set_merge_commit_sync, repo, pr_number, sha, merged_at
+            )
+        except Exception as e:
+            logger.warning(
+                f"Failed to record merge commit for {repo}#{pr_number}: {e}")
+            return 0
+
+    def _set_merge_commit_sync(
+        self, repo: str, pr_number: int, sha: str, merged_at: str
+    ) -> int:
+        conn = self._connect()
+        try:
+            cursor = conn.execute(
+                """UPDATE jobs SET merge_commit_sha = ?, merged_at = ?
+                   WHERE repo = ? AND pr_number = ?
+                     AND (merge_commit_sha IS NULL OR merge_commit_sha = '')""",
+                (sha, merged_at, repo, pr_number),
+            )
+            conn.commit()
+            return cursor.rowcount or 0
+        finally:
+            conn.close()
+
+    async def prs_missing_merge_commit(self, repo: str) -> set[int]:
+        """PR numbers in this repo whose rows still have no merge commit.
+
+        The backfill asks first and skips the API call entirely when this is
+        empty, so a quiet agent makes no extra requests.
+        """
+        try:
+            return await asyncio.to_thread(self._prs_missing_merge_commit_sync, repo)
+        except Exception as e:
+            logger.warning(f"Failed to list PRs missing a merge commit: {e}")
+            return set()
+
+    def _prs_missing_merge_commit_sync(self, repo: str) -> set[int]:
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                """SELECT DISTINCT pr_number FROM jobs
+                   WHERE repo = ?
+                     AND (merge_commit_sha IS NULL OR merge_commit_sha = '')""",
+                (repo,),
+            ).fetchall()
+            return {r[0] for r in rows}
         finally:
             conn.close()
 
@@ -575,6 +644,12 @@ class JobStore:
             "pr_number": row["pr_number"],
             "head_sha": row["head_sha"],
             "head_ref": row["head_ref"],
+            # The commit that names the published image, and the one on the base
+            # branch after merge. _col: both are post-migration columns.
+            "build_ref_sha": _col(row, "build_ref_sha", ""),
+            "merge_commit_sha": _col(row, "merge_commit_sha", ""),
+            "merged_at": _col(row, "merged_at", ""),
+            "pr_author": _col(row, "pr_author", ""),
             "requester": row["requester"],
             "source": row["source"],
             "status": row["status"],
@@ -681,6 +756,10 @@ CREATE TABLE IF NOT EXISTS jobs (
   pr_title TEXT,
   pr_body TEXT,
   pr_context TEXT,
+  pr_author TEXT,
+  build_ref_sha TEXT,
+  merge_commit_sha TEXT,
+  merged_at TEXT,
   error TEXT,
   attempt_errors TEXT,
   created_at REAL NOT NULL,
