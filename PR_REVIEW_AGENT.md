@@ -649,12 +649,13 @@ repos are public; the token is used for the API, not for cloning.
 The container mounts the Docker socket, which is root-equivalent access to the
 host. Keep `.env` root-readable only — it holds registry and API credentials.
 
-`RESOURCE_CENTER_API_KEY` is intentionally left unset. The build scripts
-auto-register successful builds into the Resource Center image catalog, and
-their interactive "sync?" confirmation defaults to *yes* whenever it cannot
-read a TTY — which is always, in a container. Setting it here would silently
-publish every PR build, including unreviewed and unmerged code, into the
-catalog that production deployments draw from.
+`RESOURCE_CENTER_API_KEY` decides whether PR builds reach the image catalog.
+The build scripts register every successful build into the Resource Center, and
+their "sync?" confirmation only appears when there is a terminal to ask on —
+never, in a container. Setting the key here is therefore the opt-in: each PR
+build, including unreviewed and unmerged code, is published to the catalog that
+production deployments draw from. Leave it unset to keep the catalog to
+deliberate builds only.
 
 ## Monitoring
 
