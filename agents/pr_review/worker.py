@@ -29,12 +29,14 @@ from .config import Config
 from .git_workspace import GitWorkspaceManager
 from .github_client import GitHubClient
 from .models import (
+    DEFAULT_JP_VERSION,
     BuildResult,
     BuildTarget,
     JobStatus,
     ReviewError,
     ReviewJob,
     Stage,
+    build_label,
 )
 from .components import build_context
 from .pr_context import PRContext, build_pr_context
@@ -217,16 +219,19 @@ async def _run_once(
 
     # 4. Build
     if not job.skip_build and targets:
+        # The plan is resolved before the comment goes out so the comment names
+        # the exact images that will be built — including one line per JetPack
+        # version when perception is built for more than one.
+        plan = _build_plan(job, targets, driver_paths)
         await _report(
             job, github_client,
             comments.format_building(
-                job.requester, job.pr_head_sha, targets, driver_paths
+                job.requester, job.pr_head_sha,
+                [build_label(t, dp, v) for t, dp, v in plan],
             ),
         )
 
-        results = await _execute_builds(
-            job, targets, driver_paths, worktree, config, store
-        )
+        results = await _execute_builds(job, plan, worktree, config, store)
         job.build_results = results
         await store.save_job(job)
 
@@ -381,15 +386,37 @@ def _round_reporter(job: ReviewJob, store: JobStore, model: str):
     return report
 
 
-async def _execute_builds(
+def _build_plan(
     job: ReviewJob,
     targets: list[BuildTarget],
     driver_paths: list[str],
+) -> list[tuple[BuildTarget, str | None, str]]:
+    """Expand targets into the individual builds to run, in order.
+
+    Perception expands over the requested JetPack versions — one job can produce
+    two images — and defaults to a single build at `DEFAULT_JP_VERSION`. Core and
+    drivers have no variant.
+    """
+    plan: list[tuple[BuildTarget, str | None, str]] = []
+    for target in targets:
+        if target == BuildTarget.DRIVER:
+            plan.extend((target, dp, "") for dp in driver_paths)
+        elif target == BuildTarget.PERCEPTION:
+            versions = job.perception_variants or [DEFAULT_JP_VERSION]
+            plan.extend((target, None, v) for v in versions)
+        else:
+            plan.append((target, None, ""))
+    return plan
+
+
+async def _execute_builds(
+    job: ReviewJob,
+    plan: list[tuple[BuildTarget, str | None, str]],
     worktree: Path,
     config: Config,
     store: JobStore,
 ) -> list[BuildResult]:
-    """Build each detected target in sequence, persisting each result.
+    """Build each planned target in sequence, persisting each result.
 
     Each build streams to its own log file under the job's log directory, so the
     dashboard can tail an in-progress build and the full output outlives the
@@ -398,17 +425,10 @@ async def _execute_builds(
     log_dir = store.log_dir_for(job.id)
     log_dir.mkdir(parents=True, exist_ok=True)
 
-    plan: list[tuple[BuildTarget, str | None]] = []
-    for target in targets:
-        if target == BuildTarget.DRIVER:
-            plan.extend((target, dp) for dp in driver_paths)
-        else:
-            plan.append((target, None))
-
     results = []
-    for idx, (target, driver_path) in enumerate(plan):
-        label = driver_path or target.value
-        log_path = log_dir / log_filename(idx, target, driver_path)
+    for idx, (target, driver_path, variant) in enumerate(plan):
+        label = build_label(target, driver_path, variant)
+        log_path = log_dir / log_filename(idx, target, driver_path, variant)
 
         job.set_stage(Stage.BUILDING, f"{idx + 1}/{len(plan)} {label}")
         await store.save_job(job)
@@ -429,13 +449,14 @@ async def _execute_builds(
                 image_tag="",
                 log_tail="",
                 log_path=str(log_path),
+                variant=variant,
             ),
         )
 
         if target == BuildTarget.CORE:
             result = await build_core(worktree, config, log_path)
         elif target == BuildTarget.PERCEPTION:
-            result = await build_perception(worktree, config, log_path)
+            result = await build_perception(worktree, config, log_path, variant)
         else:
             result = await build_driver(worktree, driver_path, config, log_path)
 

@@ -287,7 +287,9 @@ function _detailMeta(j) {
           <dt>Triggered via</dt><dd class="plain">${esc(j.source || '—')}</dd>
           <dt>Mode</dt><dd class="plain">${esc(mode)}${
             (o.force_targets || []).length
-              ? ` · forced: ${esc((o.force_targets || []).join(', '))}` : ''}</dd>
+              ? ` · forced: ${esc((o.force_targets || []).join(', '))}` : ''}${
+            (o.perception_variants || []).length
+              ? ` · JetPack: ${esc((o.perception_variants || []).join(', '))}` : ''}</dd>
           <dt>Attempt</dt><dd>${esc(j.attempt)}</dd>
           <dt>Created</dt><dd>${esc(fmtTime(j.created_at))}</dd>
           <dt>Started</dt><dd>${esc(fmtTime(j.started_at))}</dd>

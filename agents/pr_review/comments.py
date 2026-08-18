@@ -5,7 +5,7 @@ Lives in its own module so both `trigger` (acknowledgment) and `worker`
 """
 
 from .builder import split_image_ref
-from .models import BuildResult, BuildTarget
+from .models import BuildResult
 from .reviewer import Finding
 
 # Marker prefixed to every bot comment, so bot comments are identifiable.
@@ -51,17 +51,22 @@ Request from @{requester} accepted — starting review.
 def format_building(
     requester: str,
     head_sha: str,
-    targets: list[BuildTarget],
-    driver_paths: list[str],
+    labels: list[str],
 ) -> str:
-    """Build-in-progress state."""
+    """Build-in-progress state.
+
+    Takes the resolved build plan rather than the targets, so a perception build
+    for two JetPack versions is announced as two builds — which is what will
+    happen, and how long it will take.
+    """
+    listed = ", ".join(f"`{n}`" for n in labels) if labels else "None"
     return f"""{BOT_MARKER}
 ## PR Review Agent
 
 | | |
 |---|---|
 | Commit | `{head_sha[:7]}` |
-| Build targets | {_target_list(targets, driver_paths)} |
+| Build targets | {listed} |
 | Status | Building... |
 
 Builds usually take 5–20 minutes. This comment will be updated when done.
@@ -72,7 +77,7 @@ def format_build_result(head_sha: str, results: list[BuildResult]) -> str:
     """Final build state — success or failure, with logs for failures."""
     rows = []
     for r in results:
-        name = r.driver_path or r.target.value
+        name = r.label()
         if r.success:
             _, tag = split_image_ref(r.image_tag)
             version = f"`{tag}`" if tag else "—"
@@ -108,13 +113,13 @@ Commit: `{head_sha[:7]}`
     if built:
         body += "\n### Images\n\n"
         for r in built:
-            name = r.driver_path or r.target.value
+            name = r.label()
             body += f"**{name}**\n```\n{r.image_tag}\n```\n"
         body += _deploy_help(built)
 
     missing_ref = [r for r in results if r.success and not r.image_tag]
     if missing_ref:
-        names = ", ".join(r.driver_path or r.target.value for r in missing_ref)
+        names = ", ".join(r.label() for r in missing_ref)
         body += (
             f"\n> Built successfully, but the image reference could not be read "
             f"from the build log for: {names}. Check the full log on the "
@@ -123,7 +128,7 @@ Commit: `{head_sha[:7]}`
 
     for r in results:
         if not r.success and r.log_tail:
-            name = r.driver_path or r.target.value
+            name = r.label()
             line_count = len(r.log_tail.splitlines())
             body += f"""
 <details><summary>{name} build log (last {line_count} lines)</summary>
@@ -158,7 +163,7 @@ def _deploy_help(built: list[BuildResult]) -> str:
 
     runnable = [r for r in built if r.container_name]
     for r in runnable:
-        name = r.driver_path or r.target.value
+        name = r.label()
         out += f"""
 **{name}**
 
@@ -174,7 +179,7 @@ Then `--logs`, `--shell`, `--down`. Starts container `{r.container_name}`, and
     # agent itself and updates in place rather than running as a second copy.
     web_only = [r for r in built if not r.container_name]
     if web_only:
-        names = ", ".join(r.driver_path or r.target.value for r in web_only)
+        names = ", ".join(r.label() for r in web_only)
         out += f"""
 **{names}** — deployed by updating through the web console, not by running a
 container: Agent Core pulls the image and hands over to a restart helper. Open
@@ -454,13 +459,3 @@ Commit: `{head_sha[:7]}`
 
 Push a fix and comment `/request_bot_review` again to retrigger.
 """
-
-
-def _target_list(targets: list[BuildTarget], driver_paths: list[str]) -> str:
-    names = []
-    for t in targets:
-        if t == BuildTarget.DRIVER:
-            names.extend(driver_paths)
-        else:
-            names.append(t.value)
-    return ", ".join(f"`{n}`" for n in names) if names else "None"

@@ -167,7 +167,10 @@ export function shortSha(sha) {
 
 /** Human label for a build target row. */
 export function targetLabel(br) {
-  return br.driver_path || br.target || 'build';
+  const name = br.driver_path || br.target || 'build';
+  // A job can hold two perception builds — without the variant they render as
+  // duplicates of each other.
+  return br.variant ? `${name} (jetson-jp${br.variant})` : name;
 }
 
 /** "owner/repo" -> "repo", which is what disambiguates in this UI. */

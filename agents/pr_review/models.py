@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
+import logging
+import re
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
+
+logger = logging.getLogger(__name__)
 
 
 # ── Errors ────────────────────────────────────────────────────────────────────
@@ -54,6 +58,17 @@ class BuildTarget(str, Enum):
     CORE = "core"
     PERCEPTION = "perception"
     DRIVER = "driver"
+
+
+# Perception is built for Jetson only — that is where it runs, so the script's
+# `cpu` default produced an image nobody deploys. What is selectable is the
+# JetPack version, which picks the base image and lands in the tag as
+# `release.YYMMDD.<sha>-jetson-jp<ver>`.
+#
+# These are the versions `deploy/build_perception.sh` accepts; it exits 1 on
+# anything else, so an unrecognised one must never reach it.
+SUPPORTED_JP_VERSIONS = ("5.11", "6.1")
+DEFAULT_JP_VERSION = "5.11"
 
 
 # Statuses from which a job will never advance. Plain strings, because the
@@ -116,6 +131,27 @@ class BuildResult:
     # target ships a parseable fragment, so it doubles as the signal that
     # deploy/run-pr-image.sh will work for this image.
     container_name: str = ""
+    # JetPack version for a perception build, "" for core and drivers. Part of
+    # the build's identity, not a detail of it: one job can produce two
+    # perception images, and only this tells them apart.
+    variant: str = ""
+
+    def label(self) -> str:
+        return build_label(self.target, self.driver_path, self.variant)
+
+
+def build_label(
+    target: BuildTarget, driver_path: str | None, variant: str = ""
+) -> str:
+    """Human name for one build: what the comment and the dashboard both show.
+
+    In one place because a job can now contain two builds of the same target,
+    and a label that omits the variant would render them as duplicates.
+    """
+    name = driver_path or target.value
+    if variant:
+        return f"{name} (jetson-jp{variant})"
+    return name
 
 
 @dataclass
@@ -146,6 +182,9 @@ class ReviewJob:
     skip_build: bool = False
     build_only: bool = False
     force_targets: list[str] = field(default_factory=list)  # e.g. ["core"]
+    # JetPack versions to build perception for, in the order requested. Empty
+    # means the default; two entries mean two images from one job.
+    perception_variants: list[str] = field(default_factory=list)
 
     # Runtime state
     id: str = field(default_factory=lambda: uuid.uuid4().hex[:12])
@@ -218,12 +257,18 @@ class ReviewJob:
 
 TRIGGER = "/request_bot_review"
 
+# A JetPack version token: `jetson-5.11`, `jetson-jp6.1`, `jp5.11`, or the bare
+# version. Only perception has variants, so no target prefix is required — and a
+# version on its own is taken as a request to build perception.
+JP_TOKEN_PATTERN = re.compile(r"^(?:jetson-)?(?:jp)?(\d+\.\d+)$", re.IGNORECASE)
+
 
 def parse_trigger_command(comment_body: str) -> dict | None:
     """Parse a `/request_bot_review` command out of a comment body.
 
-    Returns {"skip_build", "build_only", "force_targets"}, or None when the
-    comment does not contain the trigger.
+    Returns {"skip_build", "build_only", "force", "force_targets",
+    "perception_variants"}, or None when the comment does not contain the
+    trigger.
     """
     if not comment_body:
         return None
@@ -241,6 +286,7 @@ def parse_trigger_command(comment_body: str) -> dict | None:
             "build_only": False,
             "force": False,
             "force_targets": [],
+            "perception_variants": [],
         }
         for arg in args:
             token = arg.strip().strip("`,")
@@ -254,6 +300,24 @@ def parse_trigger_command(comment_body: str) -> dict | None:
                 result["force"] = True
             elif lowered in ("core", "perception"):
                 result["force_targets"].append(lowered)
+            elif JP_TOKEN_PATTERN.match(lowered):
+                version = JP_TOKEN_PATTERN.match(lowered).group(1)
+                if version not in SUPPORTED_JP_VERSIONS:
+                    # Dropped rather than passed through: the build script exits
+                    # 1 on an unknown version, which would fail the whole job.
+                    # The build-in-progress comment lists what will actually be
+                    # built, so the drop is visible on the PR.
+                    logger.warning(
+                        f"Ignoring unsupported JetPack version {token!r} "
+                        f"(supported: {', '.join(SUPPORTED_JP_VERSIONS)})"
+                    )
+                    continue
+                if version not in result["perception_variants"]:
+                    result["perception_variants"].append(version)
+                # Asking for a version is asking for perception: the token means
+                # nothing for any other target.
+                if "perception" not in result["force_targets"]:
+                    result["force_targets"].append("perception")
             elif "/" in token:
                 # A driver path such as unitree/g1
                 result["force_targets"].append(token)

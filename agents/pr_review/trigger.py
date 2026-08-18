@@ -108,6 +108,7 @@ async def create_job_from_comment(
         skip_build=trigger["skip_build"],
         build_only=trigger["build_only"],
         force_targets=trigger["force_targets"],
+        perception_variants=trigger["perception_variants"],
     )
 
     # Acknowledge with a comment immediately. With polling this matters — the
