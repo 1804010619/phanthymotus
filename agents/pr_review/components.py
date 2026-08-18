@@ -81,9 +81,10 @@ def build_context(
     if repo == "phanthymotus-driver":
         return _driver_context(driver_paths, changed_files)
 
-    # phanthymotus: core and perception can both appear in one PR.
+    # phanthymotus: core, perception and actucore can all appear in one PR.
     touches_core = any(f.startswith("agent-core/") for f in changed_files)
     touches_perc = any(f.startswith("perception/") for f in changed_files)
+    touches_actu = any(f.startswith("actucore/") for f in changed_files)
 
     names, docs, label = ["common.md"], [], []
     if touches_core:
@@ -95,6 +96,10 @@ def build_context(
         names.append("perception.md")
         label.append("perception")
         docs.append("perception/README.md")
+    if touches_actu:
+        names.append("actucore.md")
+        label.append("actucore")
+        docs.append("actucore/README.md")
 
     if not label:
         label = ["phanthymotus"]

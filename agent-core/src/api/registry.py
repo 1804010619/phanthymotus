@@ -15,6 +15,15 @@ router = fastapi.APIRouter(prefix='/registry', tags=['registry'])
 
 RESOURCE_CENTER_URL = os.environ.get('RESOURCE_CENTER_URL', 'https://motus.phanthy.com')
 
+# Service categories, in display order. A catalog item whose category is not in
+# this tuple is dropped — adding a new kind of service means adding it here.
+CATEGORIES = ('core', 'perception', 'actucore', 'driver')
+
+
+def empty_catalog() -> dict:
+    return {c: [] for c in CATEGORIES}
+
+
 # ── Simple in-memory cache ──────────────────────────────────────────────────
 
 _cache: dict = {'data': None, 'ts': 0.0}
@@ -42,13 +51,13 @@ def _build_catalog_sync() -> dict:
             payload = json.load(r)
     except Exception as e:
         print(f'[registry] resource-center fetch failed: {e}')
-        return {'core': [], 'driver': [], 'perception': [], 'inspection': []}
+        return empty_catalog()
 
     if not payload.get('ok') or not isinstance(payload.get('data'), list):
         print(f'[registry] unexpected response: {str(payload)[:200]}')
-        return {'core': [], 'driver': [], 'perception': [], 'inspection': []}
+        return empty_catalog()
 
-    result: dict = {'core': [], 'driver': [], 'perception': [], 'inspection': []}
+    result: dict = empty_catalog()
 
     for item in payload['data']:
         category = item.get('category', '')
@@ -91,27 +100,17 @@ def _build_catalog_sync() -> dict:
             'tags': tags,
         }
 
+        if category not in CATEGORIES:
+            print(f'[registry] unknown category {category!r} for {item.get("registryImage")}')
+            continue
+
+        entry['category'] = category
         if category == 'driver':
-            entry['category'] = 'driver'
             entry['provider'] = item.get('hardware_provider', '')
             entry['model'] = item.get('hardware_model', '')
-            result['driver'].append(entry)
-        elif category == 'core':
-            entry['category'] = 'core'
-            result['core'].append(entry)
-        elif category == 'perception':
-            entry['category'] = 'perception'
-            result['perception'].append(entry)
-        elif category == 'inspection':
-            entry['category'] = 'inspection'
-            result['inspection'].append(entry)
-        else:
-            print(f'[registry] unknown category {category!r} for {item.get("registryImage")}')
+        result[category].append(entry)
 
-    print(
-        f'[registry] catalog: core={len(result["core"])} driver={len(result["driver"])} '
-        f'perception={len(result["perception"])} inspection={len(result["inspection"])}'
-    )
+    print('[registry] catalog: ' + ' '.join(f'{c}={len(result[c])}' for c in CATEGORIES))
     return result
 
 
@@ -128,7 +127,7 @@ async def registry_catalog(refresh: bool = False):
     try:
         data = await loop.run_in_executor(None, _build_catalog_sync)
     except Exception as e:
-        return {'code': 500, 'message': str(e), 'data': {'core': [], 'hardware': [], 'perception': [], 'inspection': []}}
+        return {'code': 500, 'message': str(e), 'data': empty_catalog()}
 
     _cache['data'] = data
     _cache['ts'] = now

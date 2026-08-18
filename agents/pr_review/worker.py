@@ -17,6 +17,7 @@ from pathlib import Path
 from . import comments
 from .build_detector import detect_targets
 from .builder import (
+    build_actucore,
     build_core,
     build_driver,
     build_perception,
@@ -425,15 +426,15 @@ def _build_plan(
 ) -> list[tuple[BuildTarget, str | None, str]]:
     """Expand targets into the individual builds to run, in order.
 
-    Perception expands over the requested JetPack versions — one job can produce
-    two images — and defaults to a single build at `DEFAULT_JP_VERSION`. Core and
-    drivers have no variant.
+    Perception and actucore expand over the requested JetPack versions — one job
+    can produce two images — and default to a single build at
+    `DEFAULT_JP_VERSION`. Core and drivers have no variant.
     """
     plan: list[tuple[BuildTarget, str | None, str]] = []
     for target in targets:
         if target == BuildTarget.DRIVER:
             plan.extend((target, dp, "") for dp in driver_paths)
-        elif target == BuildTarget.PERCEPTION:
+        elif target in (BuildTarget.PERCEPTION, BuildTarget.ACTUCORE):
             versions = job.perception_variants or [DEFAULT_JP_VERSION]
             plan.extend((target, None, v) for v in versions)
         else:
@@ -489,6 +490,8 @@ async def _execute_builds(
             result = await build_core(worktree, config, log_path)
         elif target == BuildTarget.PERCEPTION:
             result = await build_perception(worktree, config, log_path, variant)
+        elif target == BuildTarget.ACTUCORE:
+            result = await build_actucore(worktree, config, log_path, variant)
         else:
             result = await build_driver(worktree, driver_path, config, log_path)
 
@@ -523,6 +526,8 @@ def _parse_forced_targets(
             targets.append(BuildTarget.CORE)
         elif t == "perception":
             targets.append(BuildTarget.PERCEPTION)
+        elif t == "actucore":
+            targets.append(BuildTarget.ACTUCORE)
         elif "/" in t:
             targets.append(BuildTarget.DRIVER)
             driver_paths.append(t)

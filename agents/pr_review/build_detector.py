@@ -62,8 +62,11 @@ def _detect_motus_targets(
             targets.add(BuildTarget.CORE)
         elif top == "perception":
             targets.add(BuildTarget.PERCEPTION)
+        elif top == "actucore":
+            targets.add(BuildTarget.ACTUCORE)
     # Deterministic order, so the build plan and its log indices are stable.
-    return [t for t in (BuildTarget.CORE, BuildTarget.PERCEPTION) if t in targets], []
+    order = (BuildTarget.CORE, BuildTarget.PERCEPTION, BuildTarget.ACTUCORE)
+    return [t for t in order if t in targets], []
 
 
 def _detect_driver_targets(

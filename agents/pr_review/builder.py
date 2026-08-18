@@ -125,6 +125,33 @@ async def build_perception(
     )
 
 
+async def build_actucore(
+    worktree: Path,
+    config: Config,
+    log_path: Path,
+    jp_version: str = DEFAULT_JP_VERSION,
+) -> BuildResult:
+    """Build the actucore image via deploy/build_actucore.sh.
+
+    Jetson-only by construction — execution models need the GPU, so the script
+    takes no `--variant`. `--jp-version` picks the base image and shows up in
+    the tag as `-jetson-jp<ver>`.
+    """
+    return await _build_with_script(
+        target=BuildTarget.ACTUCORE,
+        driver_path=None,
+        script=worktree / "deploy" / "build_actucore.sh",
+        args=[
+            "--mirror", config.mirror,
+            "--jp-version", jp_version,
+        ],
+        cwd=worktree,
+        config=config,
+        log_path=log_path,
+        variant=jp_version,
+    )
+
+
 async def build_driver(
     worktree: Path, driver_path: str, config: Config, log_path: Path
 ) -> BuildResult:
@@ -435,8 +462,9 @@ def container_name_from_service_yaml(yaml_text: str) -> str:
 def service_yaml_path(target: BuildTarget, driver_path: str | None) -> str | None:
     """Where a target's `deploy/service.yml` lives in the checkout, if it has one.
 
-    Drivers and perception both ship one and are deployed the same way (Agent
-    Core extracts it from the image and merges it into the host compose file).
+    Drivers, perception and actucore all ship one and are deployed the same way
+    (Agent Core extracts it from the image and merges it into the host compose
+    file).
 
     Core has none: it is the agent itself, updated in place through the web
     console via `POST /api/system/update`, which pulls the image and hands over
@@ -446,6 +474,8 @@ def service_yaml_path(target: BuildTarget, driver_path: str | None) -> str | Non
         return f"{driver_path}/deploy/service.yml"
     if target == BuildTarget.PERCEPTION:
         return "perception/deploy/service.yml"
+    if target == BuildTarget.ACTUCORE:
+        return "actucore/deploy/service.yml"
     return None
 
 
