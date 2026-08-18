@@ -25,6 +25,17 @@ plugins:
     speaker_id: 0
     speed: 1.0
 
+  # Optional VITS2 TensorRT TTS for JetPack 6.1. Build the image with
+  # ENABLE_VITS2_TRT=1 before enabling this plugin.
+  vits2_tts:
+    enabled: false
+    backend: trt
+    speaker_id: 0
+    speed: 1.0
+    model_dir: /models/vits2
+    warmup: true
+    max_chunk_tokens: 256
+
   htmsg:
     enabled: true
     namespace: ""       # auto-detect from hostname if empty

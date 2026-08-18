@@ -93,6 +93,11 @@ class PerceptionBundle:
             self._plugins.append(TTSPlugin(plugins_cfg["tts"], executor))
             log.info("TTSPlugin loaded")
 
+        if plugins_cfg.get("vits2_tts", {}).get("enabled", False):
+            from plugins.vits2_tts_trt import TTSPlugin as VITS2TTSPlugin
+            self._plugins.append(VITS2TTSPlugin(plugins_cfg["vits2_tts"], executor))
+            log.info("VITS2TTSPlugin loaded")
+
         if plugins_cfg.get("htmsg", {}).get("enabled", False):
             import re, socket
             namespace = plugins_cfg["htmsg"].get("namespace", "").strip()
