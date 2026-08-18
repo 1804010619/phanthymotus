@@ -498,6 +498,13 @@ export function appendTraceEvents(container, events) {
       case 'nudge':   _traceRoundBody(container, ev.round)
                         .appendChild(_traceNote('warning',
                           `Returned nothing (${ev.attempt}/${ev.limit}) — ${ev.reason || 'retrying'}`)); break;
+      // A retried round is otherwise indistinguishable from a slow model, which
+      // sends you debugging the wrong thing.
+      case 'llm_retry':
+                      _traceRoundBody(container, ev.round)
+                        .appendChild(_traceNote('warning',
+                          `LLM call failed (retry ${ev.attempt}/${ev.limit}, ` +
+                          `waiting ${ev.delay}s) — ${ev.error || 'transient error'}`)); break;
       case 'finish':  container.appendChild(_traceFinish(ev)); break;
       // 'refusal' duplicates what the tool row already shows as [refused].
       default: break;
@@ -546,7 +553,9 @@ function _kv(body, label, value) {
 function _traceSetup(ev) {
   // Open by default: what the reviewer was told is the context for everything
   // below it, and it is short.
-  const block = _traceBlock('Setup', ev.model || '', true);
+  const block = _traceBlock(
+    ev.attempt > 1 ? `Setup — review restarted (attempt ${ev.attempt})` : 'Setup',
+    ev.model || '', true);
   const body = block.querySelector('.trace-body');
   _kv(body, 'component', ev.component);
   _kv(body, 'rules', `${(ev.rules || []).join(' + ')}  (${ev.rules_chars || 0} chars)`);
@@ -601,7 +610,12 @@ function _traceRound(ev) {
 /** The body of round N, creating a placeholder block if it is not there yet. */
 function _traceRoundBody(container, round) {
   const key = String(round ?? 0);
-  let block = container.querySelector(`[data-trace-round="${CSS.escape(key)}"]`);
+  // The *last* block with this number, not the first: one trace file can hold
+  // more than one review of the same job — a restarted review, or a job-level
+  // retry — and each starts counting rounds at 1 again. Matching the first
+  // block would file the second review's round 1 under the first review's.
+  const all = container.querySelectorAll(`[data-trace-round="${CSS.escape(key)}"]`);
+  let block = all[all.length - 1];
   if (!block) {
     block = _traceBlock(`Round ${key}`, '', true);
     block.dataset.traceRound = key;

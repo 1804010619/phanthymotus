@@ -274,6 +274,30 @@ def _check_sensitive_files(changed_files: list[str]) -> list[Finding]:
 
 # ── LLM Review ─────────────────────────────────────────────────────────────────
 
+class TransientLLMError(RuntimeError):
+    """An LLM call that failed for a reason that may not recur.
+
+    Separated from a permanent failure because the two want opposite handling:
+    a bad key or a wrong model name will fail identically forever and should
+    surface immediately, while a gateway hiccup on round 9 of a review throws
+    away everything the reviewer had learned. Callers that can retry catch this;
+    callers that cannot still see a RuntimeError with the same message.
+    """
+
+
+# Statuses worth retrying. 5xx and above is the broad case, and it deliberately
+# covers non-standard codes: `router.phanthy.com` answers 666 with
+# `bad_response_status_code` wrapping an upstream `openai_error`, which is a
+# transient upstream fault wearing a status code no client would special-case.
+# 408/429 are the sub-500 ones that mean "try again", and 529 is Anthropic's
+# overloaded signal.
+RETRYABLE_STATUSES = frozenset({408, 425, 429, 529})
+
+
+def is_retryable_status(status: int) -> bool:
+    return status >= 500 or status in RETRYABLE_STATUSES
+
+
 def describe_http_failure(resp: "httpx.Response", endpoint: str) -> dict:
     """Parse a completion response, raising errors that say what happened.
 
@@ -292,9 +316,10 @@ def describe_http_failure(resp: "httpx.Response", endpoint: str) -> dict:
     snippet = resp.text[:200].replace("\n", " ").strip()
 
     if resp.status_code >= 400:
-        raise RuntimeError(
-            f"HTTP {resp.status_code} ({ctype}) from {endpoint}: {snippet}"
-        )
+        message = f"HTTP {resp.status_code} ({ctype}) from {endpoint}: {snippet}"
+        if is_retryable_status(resp.status_code):
+            raise TransientLLMError(message)
+        raise RuntimeError(message)
 
     try:
         data = json.loads(resp.text)

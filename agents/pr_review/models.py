@@ -39,6 +39,20 @@ class JobTimeoutError(ReviewError):
     retryable = True
 
 
+class EmptyReviewError(ReviewError):
+    """The reviewer failed and left nothing written behind.
+
+    Terminal on purpose. The review has already been re-tried in place — twice
+    over, once per model call and once over the whole loop — so a third pass
+    would only rebuild every image again to ask the same broken gateway the same
+    question. An error comment says what happened; the placeholder review this
+    replaces read as "the reviewer had no comments", which is worse than
+    silence.
+    """
+
+    retryable = False
+
+
 # ── Enums ─────────────────────────────────────────────────────────────────────
 
 

@@ -32,7 +32,8 @@ from .config import Config
 from .pr_context import PRContext
 from .review_trace import ReviewTrace
 from .reviewer import (
-    chat_completions_url, describe_http_failure, explain_empty_completion,
+    TransientLLMError, chat_completions_url, describe_http_failure,
+    explain_empty_completion,
 )
 
 logger = logging.getLogger(__name__)
@@ -44,6 +45,16 @@ MAX_TOOL_RESULT = 4000
 # Consecutive rounds returning neither text nor tool calls before giving up. One
 # is a transient; three in a row is a misconfiguration worth reporting.
 MAX_EMPTY_ROUNDS = 3
+
+# Backoff before re-trying a transient LLM failure, in seconds — so up to three
+# retries per round, 15s of waiting worst case, against a 600s review budget.
+#
+# Without this, one gateway blip ended the whole review: a 666 from the router on
+# round 9 discarded 45 tool calls of accumulated context and posted a partial
+# review, with 11 rounds of budget left. The retry is per *call* and does not
+# consume a round, because the round budget exists to bound how much the model
+# explores, not to absorb the gateway's bad minute.
+LLM_RETRY_DELAYS = (1.0, 4.0, 10.0)
 
 # The written review is the point of the log, so it gets a larger cap than a
 # tool result. Still bounded: review_trace trims per field as a backstop.
@@ -57,6 +68,11 @@ class ReviewResult:
     stopped_reason: str = "finished"   # finished | max_rounds | timeout | error
     tool_calls: int = 0
     error: str = ""
+    # True when `markdown` is the placeholder rather than anything the model
+    # wrote. Lets the caller tell "the reviewer stopped early but had findings"
+    # from "the reviewer produced nothing at all" — the second is worth another
+    # attempt, the first is worth posting.
+    empty: bool = False
 
     @property
     def complete(self) -> bool:
@@ -277,6 +293,7 @@ class ReviewAgent:
         facts: PRFacts,
         trace: ReviewTrace | None = None,
         on_round=None,
+        attempt: int = 1,
     ):
         self._cfg = config
         self._ctx = ctx
@@ -289,6 +306,10 @@ class ReviewAgent:
         # Called with (round, max_rounds) so the caller can surface progress;
         # a minute of "generating review" with no movement reads as a hang.
         self._on_round = on_round
+        # Which pass over the loop this is. Only traced — one trace file can
+        # hold two reviews of the same job, and without this the second one's
+        # rounds read as a continuation of the first.
+        self._attempt = attempt
 
     async def run(self) -> ReviewResult:
         if not self._cfg.llm_base_url or not self._cfg.llm_api_key:
@@ -331,7 +352,9 @@ class ReviewAgent:
 
                 started = time.monotonic()
                 try:
-                    assistant, usage = await self._call(client, messages)
+                    assistant, usage = await self._call_with_retry(
+                        client, messages, rnd
+                    )
                 except Exception as e:
                     # A failure mid-loop still yields whatever was learned; the
                     # partial review is more useful than nothing.
@@ -414,6 +437,9 @@ class ReviewAgent:
         pr = self._facts.context
         self._trace.event(
             "setup",
+            # None on the first pass, so nothing changes for the common case
+            # (the trace drops None fields).
+            attempt=self._attempt if self._attempt > 1 else None,
             component=self._ctx.name,
             rules=self._ctx.rule_files,
             rules_chars=len(self._ctx.rules),
@@ -458,6 +484,48 @@ class ReviewAgent:
             finish_reason=assistant.get("_finish_reason") or None,
             tools=[c["function"]["name"] for c in calls] or None,
         )
+
+    async def _call_with_retry(
+        self, client: httpx.AsyncClient, messages: list[dict], rnd: int
+    ) -> tuple[dict, dict]:
+        """One model call, re-trying the failures that a second try can fix.
+
+        Transient means the gateway or the network, not the request: a 5xx (or
+        the router's synthetic 666), a 429, a dropped connection, a read
+        timeout. A bad key or an unknown model fails identically forever, so
+        those propagate on the first attempt rather than sleeping 15s first.
+
+        Each retry is traced. A silent one would make a slow round look like a
+        slow model, which is the wrong thing to go debugging.
+        """
+        last: Exception | None = None
+        for i, delay in enumerate((*LLM_RETRY_DELAYS, None)):
+            try:
+                return await self._call(client, messages)
+            except (TransientLLMError, httpx.TransportError) as e:
+                last = e
+                if delay is None:
+                    break
+                # Never sleep past the review budget: the round loop's own
+                # deadline check would then report a timeout, hiding the fact
+                # that the gateway was the problem.
+                if time.monotonic() + delay > self._deadline:
+                    logger.warning(
+                        f"round {rnd}: no budget left to retry after {e}"
+                    )
+                    break
+                logger.warning(
+                    f"round {rnd}: transient LLM failure "
+                    f"({i + 1}/{len(LLM_RETRY_DELAYS)}), retrying in {delay}s: {e}"
+                )
+                self._trace.event(
+                    "llm_retry", round=rnd, attempt=i + 1,
+                    limit=len(LLM_RETRY_DELAYS), delay=delay,
+                    error=f"{type(e).__name__}: {e}",
+                )
+                await asyncio.sleep(delay)
+        assert last is not None
+        raise last
 
     async def _call(
         self, client: httpx.AsyncClient, messages: list[dict]
@@ -613,6 +681,7 @@ class ReviewAgent:
         ]
         if prose:
             return prose[-1]
+        result.empty = True
         return (
             "_The reviewer explored the change but did not produce a written "
             "review before its budget ran out._"
