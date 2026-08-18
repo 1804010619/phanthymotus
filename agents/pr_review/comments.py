@@ -11,6 +11,17 @@ from .reviewer import Finding
 # Marker prefixed to every bot comment, so bot comments are identifiable.
 BOT_MARKER = "<!-- pr-review-agent -->"
 
+# GitHub rejects an issue comment body over 65536 characters with a 422. That
+# would lose the entire failure report — the one comment the author most needs —
+# so failed build logs are budgeted against it rather than cut to a fixed line
+# count. The margin absorbs the surrounding table and the wrappers.
+GITHUB_COMMENT_LIMIT = 65536
+COMMENT_BUDGET = 60000
+# Below this a log fragment is too small to show the error with any context, so
+# many-failure jobs (a driver PR touching a dozen drivers) link to the dashboard
+# instead of padding the comment with a dozen unreadable snippets.
+MIN_USEFUL_LOG_CHARS = 1500
+
 MODE_LABELS = {
     (False, False): "Build + Review",
     (True, False): "Review only (build skipped)",
@@ -126,19 +137,24 @@ Commit: `{head_sha[:7]}`
             f"dashboard.\n"
         )
 
-    for r in results:
-        if not r.success and r.log_tail:
-            name = r.label()
-            line_count = len(r.log_tail.splitlines())
-            body += f"""
-<details><summary>{name} build log (last {line_count} lines)</summary>
-
-```
-{r.log_tail}
-```
-
-</details>
-"""
+    # Logs last, and sharing whatever the rest of the comment left over: the
+    # author reads the log to fix the build, so it gets the space, but the table
+    # and image refs above it must survive intact. Splitting the remainder
+    # equally keeps the total inside the limit by construction, rather than
+    # relying on the client's truncation backstop.
+    failed = [r for r in results if not r.success and r.log_tail]
+    if failed:
+        share = (COMMENT_BUDGET - len(body)) // len(failed)
+        if share >= MIN_USEFUL_LOG_CHARS:
+            for r in failed:
+                body += _log_details(r.label(), r.log_tail, share)
+        else:
+            names = ", ".join(f"`{r.label()}`" for r in failed)
+            body += (
+                f"\n> {len(failed)} builds failed — too many to include their "
+                f"logs here without cutting each to a few unreadable lines. "
+                f"Open the dashboard for the full log of each: {names}.\n"
+            )
 
     if not all_ok:
         body += (
@@ -146,6 +162,70 @@ Commit: `{head_sha[:7]}`
         )
 
     return body
+
+
+def _log_details(name: str, log_tail: str, budget: int) -> str:
+    """One collapsed build log, trimmed only if it cannot fit.
+
+    The whole tail goes in when there is room. Sending the author to the
+    dashboard for the actual error is friction at the moment they are most
+    blocked, and a truncated log is worse than none: it reads as though the
+    build stopped where the text stops.
+
+    When it does not fit, the *end* is kept — that is where the failure is — and
+    the omission is stated, with a pointer to the full log.
+    """
+    lines = log_tail.splitlines()
+    # `budget` also has to cover this wrapper and the summary line.
+    room = budget - 400
+    dropped = 0
+
+    if len(log_tail) > room:
+        kept: list[str] = []
+        total = 0
+        for line in reversed(lines):
+            total += len(line) + 1
+            if total > room and kept:
+                break
+            kept.append(line)
+        kept.reverse()
+        dropped = len(lines) - len(kept)
+        lines = kept
+
+    text = "\n".join(lines)
+    # A single line can be longer than the whole budget — a build step echoing a
+    # one-line JSON blob, or a progress bar written without newlines. Trimming by
+    # line cannot help there, so cut characters and keep the end.
+    cut_mid_line = len(text) > room
+    if cut_mid_line:
+        text = text[-room:]
+
+    where = "full log on the dashboard"
+    omitted = f"{dropped} earlier line{'' if dropped == 1 else 's'} omitted"
+    if dropped and cut_mid_line:
+        note = f"last {len(lines)} lines, cut mid-line — {omitted}; {where}"
+    elif dropped:
+        note = (
+            f"last {len(lines)} lines — {omitted} to stay under GitHub's "
+            f"comment limit; {where}"
+        )
+    elif cut_mid_line:
+        note = f"tail only — this log has no line breaks to cut on; {where}"
+    else:
+        note = f"complete log, {len(lines)} lines"
+
+    # A four-backtick fence, because build output can itself contain ``` — an
+    # npm or docker step echoing a README would otherwise close the block early
+    # and spill the rest of the log into the comment as markup.
+    return f"""
+<details><summary>{name} build log ({note})</summary>
+
+````
+{text}
+````
+
+</details>
+"""
 
 
 def _deploy_help(built: list[BuildResult]) -> str:

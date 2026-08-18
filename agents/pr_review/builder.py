@@ -49,14 +49,20 @@ REF_SHAPE_PATTERN = re.compile(
     r"([\w.\-]+(?::\d+)?(?:/[\w.\-]+)+:release\.\d{6}\.[0-9a-f]{7,40})"
 )
 
-LOG_TAIL_LINES = 80
+# How much of a failed build's log to carry to the PR comment. Generous on
+# purpose: a build failure is diagnosed from the log, and 80 lines routinely cut
+# off above the actual error — a failing `pip install` or `apt-get` prints
+# hundreds of lines after it. `comments.format_build_result` trims to whatever
+# GitHub's comment limit leaves, so these bounds only need to be larger than
+# that limit can hold; reading further would always be discarded.
+LOG_TAIL_LINES = 4000
 READ_CHUNK = 8192
 # Bytes read from each end of a large log when scanning for the image tag.
 # Covers "Image :" at the head and "Done. ..." at the tail without loading a
 # multi-megabyte docker build log into memory.
 SCAN_WINDOW = 256 * 1024
 # Bytes read from the end when building the tail for the PR comment.
-TAIL_WINDOW = 64 * 1024
+TAIL_WINDOW = 512 * 1024
 
 
 def _build_env(config: Config) -> dict[str, str]:

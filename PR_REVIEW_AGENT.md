@@ -104,6 +104,35 @@ Supported versions are **5.11** (default) and **6.1** — the two
 with separate logs, rows and image tags, labelled `perception (jetson-jp5.11)`
 and `perception (jetson-jp6.1)` in the PR comment and on the dashboard.
 
+### Failure logs in the comment
+
+When a build fails, its log goes into the comment in full — collapsed under a
+`<details>` — rather than as a fixed number of trailing lines. A failure is
+diagnosed from the log, and a short tail routinely cut off above the actual
+error: a failing `pip install` or `apt-get` prints hundreds of lines after it.
+
+The one hard limit is GitHub's: a comment body over **65536 characters** is
+rejected with a 422, which would lose the entire failure report. So the logs are
+budgeted against it instead of trimmed to a line count:
+
+- Everything above the logs (result table, image refs, deploy help) is composed
+  first, and the failed builds split what is left equally — so the comment fits
+  by construction, roughly 600–900 lines for a single failure.
+- A log that fits goes in whole, and the summary says `complete log, N lines`.
+- One that does not keeps its **end**, where the error is, and says how many
+  earlier lines were dropped. A truncated log with no such note is worse than
+  none: it reads as though the build stopped where the text stops.
+- Many failures at once (a driver PR touching a dozen drivers) would each get a
+  few unreadable lines, so past that point the comment links to the dashboard
+  instead.
+- `github_client._clamp_body` is a last-resort backstop for every other comment
+  the agent posts, LLM review text included — nothing should reach it, but a 422
+  costs the whole comment.
+
+Log blocks use a four-backtick fence: build output can itself contain ```` ``` ````
+and would otherwise close the block early and spill the rest into the comment as
+markup. The complete, untrimmed log is always on the dashboard.
+
 ### How each target is deployed
 
 The build-result comment tailors its instructions per target, because the three
