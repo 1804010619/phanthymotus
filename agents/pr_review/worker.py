@@ -32,6 +32,7 @@ from .models import (
     DEFAULT_JP_VERSION,
     BuildResult,
     BuildTarget,
+    EmptyReviewError,
     JobStatus,
     ReviewError,
     ReviewJob,
@@ -50,6 +51,12 @@ logger = logging.getLogger(__name__)
 # Marks a timeout reason string, so the final status can distinguish a lost
 # job from a hard error without threading an extra flag through the loop.
 TIMEOUT_PREFIX = "Job timed out"
+
+# How many times the review loop is started over when it comes back with
+# nothing written. Two, because the interesting failure is a gateway blip that
+# survived the per-call retries — an outage long enough to eat two whole loops
+# is not going to be fixed by a third.
+REVIEW_ATTEMPTS = 2
 
 
 # ── Entry point: retry wrapper ─────────────────────────────────────────────────
@@ -297,33 +304,58 @@ async def _run_once(
             "comments_dropped": pr_ctx.comments_dropped,
         }
 
-        agent = ReviewAgent(
-            config,
-            worktree,
-            build_context(
-                job.repo_full_name, targets, driver_paths, changed_files
-            ),
-            PRFacts(
-                repo=job.repo_full_name,
-                pr_number=job.pr_number,
-                base_ref=base_ref,
-                changed_files=changed_files,
-                diff_stat=diff_stat,
-                large_files=big,
-                infra_files=infra,
-                shared_base_files=shared,
-                context=pr_ctx,
-            ),
-            # Records what the loop did, streamed to disk so the dashboard can
-            # follow a review in progress rather than only see the verdict.
-            trace=ReviewTrace(store.review_trace_path(job.id)),
-            on_round=_round_reporter(job, store, config.llm_model),
-        )
-        result = await agent.run()
+        # Retried in place rather than by failing the job: the worktree is
+        # already here and the images are already built, so a second pass costs
+        # one review while a job-level retry would rebuild and re-publish every
+        # image to ask the same question again.
+        for review_attempt in range(1, REVIEW_ATTEMPTS + 1):
+            agent = ReviewAgent(
+                config,
+                worktree,
+                build_context(
+                    job.repo_full_name, targets, driver_paths, changed_files
+                ),
+                PRFacts(
+                    repo=job.repo_full_name,
+                    pr_number=job.pr_number,
+                    base_ref=base_ref,
+                    changed_files=changed_files,
+                    diff_stat=diff_stat,
+                    large_files=big,
+                    infra_files=infra,
+                    shared_base_files=shared,
+                    context=pr_ctx,
+                ),
+                # Records what the loop did, streamed to disk so the dashboard
+                # can follow a review in progress rather than only see the
+                # verdict.
+                trace=ReviewTrace(store.review_trace_path(job.id)),
+                on_round=_round_reporter(job, store, config.llm_model),
+                attempt=review_attempt,
+            )
+            result = await agent.run()
+            # Anything the model actually wrote is worth posting, even from a
+            # loop that ended badly — so only a wholly empty failure repeats.
+            if not (result.stopped_reason == "error" and result.empty):
+                break
+            if review_attempt < REVIEW_ATTEMPTS:
+                logger.warning(
+                    f"Job {job.id}: review produced nothing "
+                    f"({result.error or 'unknown error'}) — starting over "
+                    f"({review_attempt + 1}/{REVIEW_ATTEMPTS})"
+                )
+
         job.review_text = result.markdown
         job.review_rounds = result.rounds
         job.review_stopped_reason = result.stopped_reason
         job.review_tool_calls = result.tool_calls
+
+        if result.stopped_reason == "error" and result.empty:
+            await store.save_job(job)
+            raise EmptyReviewError(
+                f"the reviewer produced nothing after {REVIEW_ATTEMPTS} "
+                f"attempts: {result.error or 'unknown error'}"
+            )
 
         job.set_stage(Stage.POSTING)
         await store.save_job(job)

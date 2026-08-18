@@ -223,6 +223,7 @@ failures another attempt could plausibly fix:
 | Network / git / registry error | yes | Usually transient |
 | Merge conflict | no | Only the author can resolve it |
 | Build failure (non-zero exit) | no | A real result — rebuilding says the same thing |
+| Reviewer produced nothing | no | Already re-tried in place, twice over (below) |
 
 > **Sizing note.** Builds run sequentially, so a PR touching N drivers needs
 > roughly N × `BUILD_TIMEOUT_SECONDS`. With the defaults, three drivers can
@@ -233,6 +234,46 @@ When a job is cancelled or times out, the build subprocess is killed by process
 group — `bash`, `docker`, and `buildx` all die together. Without that, an
 orphaned `docker build` would keep holding CPU and build cache while the retry
 competed with it.
+
+### A failing LLM gateway is not a failing PR
+
+The LLM call has its own retries, at two levels, because neither the round
+budget nor the job retry was the right tool for a gateway hiccup.
+
+**Per call.** A transient failure sleeps and tries the same call again —
+`LLM_RETRY_DELAYS`, currently 1s / 4s / 10s, so three retries and 15s of waiting
+worst case. Transient means the gateway or the network, not the request: any
+status ≥ 500, plus 408 / 425 / 429 / 529, plus a dropped connection or a read
+timeout. Note the ≥ 500 test is deliberately broad rather than a list of known
+codes — `router.phanthy.com` answers **666** with `bad_response_status_code`
+wrapping an upstream `openai_error`, which is an ordinary transient fault wearing
+a status no client would special-case.
+
+A retry does **not** consume a round. The round budget bounds how much the model
+explores; it is not there to absorb the gateway's bad minute. Nor does a retry
+sleep past `REVIEW_TIMEOUT_SECONDS` — the loop would then report a timeout and
+hide the fact that the gateway was the problem.
+
+A permanent failure (401, 403, 404, an unknown model) propagates on the first
+attempt. It will fail identically forever, and sleeping 15s first only delays the
+error comment.
+
+**Per review.** If the loop still ends with nothing the model wrote — an error
+and only the placeholder text — the whole review is started over, up to
+`REVIEW_ATTEMPTS` (2). In place, not by failing the job: the worktree is already
+there and the images are already built, so a second pass costs one review, while
+a job-level retry would rebuild and re-publish every image to ask the same
+question again. Both passes appear in the trace; the dashboard labels the second
+"Setup — review restarted (attempt 2)".
+
+A review that stopped early but *said* something is posted as-is — partial
+findings beat silence. Only a wholly empty one repeats, and if the second pass is
+empty too the PR gets an error comment rather than a review reading "the reviewer
+had no comments".
+
+Why this exists: one 666 on round 9 of a 20-round review used to end the whole
+thing, discarding 45 tool calls of accumulated context and posting the
+placeholder, with 11 rounds of budget left and nothing retried anywhere.
 
 ## PR comment lifecycle
 
@@ -492,16 +533,19 @@ Events are appended to `logs/<job_id>/review.jsonl` as they happen and tailed by
 the same cursor mechanism as a build log, so a review in progress can be watched
 live — the card appears before any review text exists. Rounds are found-or-created
 and rows appended rather than the timeline being re-rendered, so a result pane you
-have open stays open.
+have open stays open. "Found" means the *last* block with that number: one trace
+file can hold two reviews of the same job (a restarted review, or a job retry),
+and each starts counting rounds at 1 again.
 
 | Event | Carries |
 |---|---|
-| `setup` | component, rule files + size, docs, references, budget, model, and the deterministic size/infra results |
+| `setup` | component, rule files + size, docs, references, budget, model, and the deterministic size/infra results — plus `attempt` when this is a restarted review |
 | `round` | round, elapsed, prompt / cached / completion / reasoning tokens, narration, `finish_reason`, tools requested |
 | `tool` | round, name, args, summary, result bytes, duration, the result text, `error` / `refused` flags |
 | `tool` (`finish_review`) | the **written review itself**, flagged `markdown` so the timeline renders it as a *Review written* block rather than a `<pre>` |
 | `refusal` | a sandbox-blocked read — visible, not silently absent |
 | `nudge` | an empty completion and why, so a stalled review is legible |
+| `llm_retry` | round, attempt, the backoff, and the error — so "round 9 retried twice and then passed" is visible instead of reading as a slow model |
 | `finish` | stopped reason, rounds, tool calls, error |
 
 A trace runs ~100 KB for a 30-call review. It lives in the job's log directory, so
