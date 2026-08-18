@@ -106,9 +106,9 @@ async def build_perception(
 ) -> BuildResult:
     """Build the perception image via deploy/build_perception.sh.
 
-    Always `--variant jetson`: perception runs on Jetson hardware, so the
-    script's `cpu` default built an image nobody deploys. `--jp-version` picks
-    the base image and shows up in the tag as `-jetson-jp<ver>`.
+    Jetson-only by construction — perception runs on Jetson hardware, so the
+    script takes no `--variant`. `--jp-version` picks the base image and shows
+    up in the tag as `-jetson-jp<ver>`.
     """
     return await _build_with_script(
         target=BuildTarget.PERCEPTION,
@@ -116,7 +116,6 @@ async def build_perception(
         script=worktree / "deploy" / "build_perception.sh",
         args=[
             "--mirror", config.mirror,
-            "--variant", "jetson",
             "--jp-version", jp_version,
         ],
         cwd=worktree,

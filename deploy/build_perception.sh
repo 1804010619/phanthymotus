@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
 # build_perception.sh — 构建 perception-stack（感知层）镜像并推送
 #
+# 只有 Jetson GPU 版：感知栈跑在 Jetson 上，之前的 cpu 变体产出的镜像没人部署，
+# 而且已经 build 不过了。
+#
 # Usage:
-#   ./build_perception.sh                                       # CPU 版（默认），交互选源
-#   ./build_perception.sh --variant jetson                      # Jetson GPU 版, JetPack 5.11
-#   ./build_perception.sh --variant jetson --jp-version 6.1     # Jetson GPU 版，JetPack 6.1
-#   ./build_perception.sh --variant jetson --mirror tuna
+#   ./build_perception.sh                          # JetPack 5.11（默认），交互选源
+#   ./build_perception.sh --jp-version 6.1         # JetPack 6.1
+#   ./build_perception.sh --mirror tuna
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -21,11 +23,9 @@ fi
 eval "$(parse_mirror_arg "$@")"
 
 # ── 解析参数 ─────────────────────────────────────────────────────────
-VARIANT="cpu"
 JP_VERSION="5.11"
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --variant) VARIANT="$2"; shift 2 ;;
         --jp-version) JP_VERSION="$2"; shift 2 ;;
         *) echo "Unknown option: $1"; exit 1 ;;
     esac
@@ -45,23 +45,10 @@ fi
 DATE="$(date +%y%m%d)"
 COMMIT="$(git -C "${REPO_ROOT}" rev-parse --short=7 HEAD)"
 
-# ── 根据 variant 选择 Dockerfile、context、tag ────────────────────────
-case "${VARIANT}" in
-    cpu)
-        DOCKERFILE="${REPO_ROOT}/perception/Dockerfile"
-        BUILD_CONTEXT="${REPO_ROOT}/perception"
-        TAG="release.${DATE}.${COMMIT}"
-        ;;
-    jetson)
-        DOCKERFILE="${REPO_ROOT}/perception/Dockerfile.jetson"
-        BUILD_CONTEXT="${REPO_ROOT}"
-        TAG="release.${DATE}.${COMMIT}-jetson-jp${JP_VERSION}"
-        ;;
-    *)
-        echo "Unknown variant: ${VARIANT}  (supported: cpu, jetson)"
-        exit 1
-        ;;
-esac
+# ── Jetson-only：感知栈跑在 Jetson 上，没有 CPU 变体 ──────────────────
+DOCKERFILE="${REPO_ROOT}/perception/Dockerfile.jetson"
+BUILD_CONTEXT="${REPO_ROOT}"
+TAG="release.${DATE}.${COMMIT}-jetson-jp${JP_VERSION}"
 
 BUILD_ARGS=""
 # ── 根据 jp_version 选择 base image  ────────────────────────
@@ -81,8 +68,8 @@ esac
 FULL_IMAGE="${REGISTRY}/${IMAGE_NAMESPACE}/perception:${TAG}"
 
 echo "============================================"
-echo "Building perception-stack image"
-echo "Variant: ${VARIANT}"
+echo "Building perception-stack image (Jetson only)"
+echo "Variant: jetson"
 echo "PyTorch for JetPack: JP${JP_VERSION}"
 echo "Image  : ${FULL_IMAGE}"
 echo "Arch   : ${ARCH} (native=${IS_ARM64})"
