@@ -32,6 +32,9 @@ RUN mkdir -p /opt/vits2/usr/local /opt/vits2/python && \
       CPPFLAGS="-I/opt/vits2/usr/local/include" \
       LDFLAGS="-L/opt/vits2/usr/local/lib" \
       LD_LIBRARY_PATH="/opt/vits2/usr/local/lib" \
+      CFLAGS="-O0 -g0" \
+      CXXFLAGS="-O0 -g0 -fno-var-tracking -fno-var-tracking-assignments" \
+      MAKEFLAGS="-j1" \
         pip3 install --no-cache-dir --no-binary pynini \
         --target=/opt/vits2/python -i "${PYPI_MIRROR}" pynini==2.1.6 && \
       test -e /opt/vits2/usr/local/lib/libfstfar.so; \
