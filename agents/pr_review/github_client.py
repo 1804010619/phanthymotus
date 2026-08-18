@@ -6,6 +6,27 @@ import httpx
 
 logger = logging.getLogger(__name__)
 
+# GitHub rejects a comment body over 65536 characters with a 422. Anything the
+# agent posts is derived from build output or LLM text, so a length nobody
+# planned for is always possible — and losing the whole comment to it is much
+# worse than losing its tail. `comments.py` budgets logs well under this; the
+# clamp is the backstop for everything else.
+COMMENT_BODY_LIMIT = 65536
+
+
+def _clamp_body(body: str) -> str:
+    """Keep a comment postable, saying so if anything had to go."""
+    if len(body) <= COMMENT_BODY_LIMIT:
+        return body
+    note = (
+        "\n\n> :warning: This comment was truncated to fit GitHub's 65536-"
+        "character limit. See the dashboard for the full output.\n"
+    )
+    logger.warning(
+        f"Comment body {len(body)} chars exceeds GitHub's limit — truncating"
+    )
+    return body[: COMMENT_BODY_LIMIT - len(note)] + note
+
 
 class GitHubClient:
     """Thin async wrapper around GitHub REST API."""
@@ -124,7 +145,7 @@ class GitHubClient:
         """Post a comment on a PR. Returns the comment ID."""
         resp = await self._client.post(
             f"/repos/{repo}/issues/{pr_number}/comments",
-            json={"body": body},
+            json={"body": _clamp_body(body)},
         )
         resp.raise_for_status()
         return resp.json()["id"]
@@ -133,7 +154,7 @@ class GitHubClient:
         """Edit an existing comment."""
         resp = await self._client.patch(
             f"/repos/{repo}/issues/comments/{comment_id}",
-            json={"body": body},
+            json={"body": _clamp_body(body)},
         )
         resp.raise_for_status()
 

@@ -15,7 +15,7 @@ import signal
 from pathlib import Path
 
 from .config import Config
-from .models import BuildResult, BuildTarget
+from .models import DEFAULT_JP_VERSION, BuildResult, BuildTarget, build_label
 
 logger = logging.getLogger(__name__)
 
@@ -49,14 +49,20 @@ REF_SHAPE_PATTERN = re.compile(
     r"([\w.\-]+(?::\d+)?(?:/[\w.\-]+)+:release\.\d{6}\.[0-9a-f]{7,40})"
 )
 
-LOG_TAIL_LINES = 80
+# How much of a failed build's log to carry to the PR comment. Generous on
+# purpose: a build failure is diagnosed from the log, and 80 lines routinely cut
+# off above the actual error — a failing `pip install` or `apt-get` prints
+# hundreds of lines after it. `comments.format_build_result` trims to whatever
+# GitHub's comment limit leaves, so these bounds only need to be larger than
+# that limit can hold; reading further would always be discarded.
+LOG_TAIL_LINES = 4000
 READ_CHUNK = 8192
 # Bytes read from each end of a large log when scanning for the image tag.
 # Covers "Image :" at the head and "Done. ..." at the tail without loading a
 # multi-megabyte docker build log into memory.
 SCAN_WINDOW = 256 * 1024
 # Bytes read from the end when building the tail for the PR comment.
-TAIL_WINDOW = 64 * 1024
+TAIL_WINDOW = 512 * 1024
 
 
 def _build_env(config: Config) -> dict[str, str]:
@@ -93,17 +99,30 @@ async def build_core(worktree: Path, config: Config, log_path: Path) -> BuildRes
 
 
 async def build_perception(
-    worktree: Path, config: Config, log_path: Path
+    worktree: Path,
+    config: Config,
+    log_path: Path,
+    jp_version: str = DEFAULT_JP_VERSION,
 ) -> BuildResult:
-    """Build the perception image via deploy/build_perception.sh."""
+    """Build the perception image via deploy/build_perception.sh.
+
+    Always `--variant jetson`: perception runs on Jetson hardware, so the
+    script's `cpu` default built an image nobody deploys. `--jp-version` picks
+    the base image and shows up in the tag as `-jetson-jp<ver>`.
+    """
     return await _build_with_script(
         target=BuildTarget.PERCEPTION,
         driver_path=None,
         script=worktree / "deploy" / "build_perception.sh",
-        args=["--mirror", config.mirror],
+        args=[
+            "--mirror", config.mirror,
+            "--variant", "jetson",
+            "--jp-version", jp_version,
+        ],
         cwd=worktree,
         config=config,
         log_path=log_path,
+        variant=jp_version,
     )
 
 
@@ -133,8 +152,9 @@ async def _build_with_script(
     config: Config,
     log_path: Path,
     env_overrides: dict[str, str] | None = None,
+    variant: str = "",
 ) -> BuildResult:
-    label = driver_path or target.value
+    label = build_label(target, driver_path, variant)
 
     if not script.exists():
         message = f"{script.name} not found in worktree"
@@ -146,6 +166,7 @@ async def _build_with_script(
             image_tag="",
             log_tail=message,
             log_path=str(log_path),
+            variant=variant,
         )
 
     env = _build_env(config)
@@ -168,6 +189,7 @@ async def _build_with_script(
         image_tag=_extract_image_tag(log_path),
         log_tail=_read_tail(log_path),
         log_path=str(log_path),
+        variant=variant,
     )
 
 
@@ -436,8 +458,16 @@ def read_service_yaml(worktree: Path, rel_path: str) -> str:
         return ""
 
 
-def log_filename(idx: int, target: BuildTarget, driver_path: str | None) -> str:
-    """Log filename for one build within a job: `{idx}-{safe-label}.log`."""
+def log_filename(
+    idx: int, target: BuildTarget, driver_path: str | None, variant: str = ""
+) -> str:
+    """Log filename for one build within a job: `{idx}-{safe-label}.log`.
+
+    The variant is part of the name so two perception builds in one job are
+    told apart by more than their index.
+    """
     label = driver_path or target.value
+    if variant:
+        label = f"{label}-jetson-jp{variant}"
     safe = re.sub(r"[^A-Za-z0-9._-]", "-", label)
     return f"{idx}-{safe}.log"

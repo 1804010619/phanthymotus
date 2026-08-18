@@ -101,6 +101,8 @@ class JobStore:
             ("merge_commit_sha",
              "ALTER TABLE jobs ADD COLUMN merge_commit_sha TEXT"),
             ("merged_at", "ALTER TABLE jobs ADD COLUMN merged_at TEXT"),
+            ("perception_variants",
+             "ALTER TABLE jobs ADD COLUMN perception_variants TEXT"),
         ):
             if column not in existing:
                 conn.execute(ddl)
@@ -118,6 +120,8 @@ class JobStore:
              "ALTER TABLE build_results ADD COLUMN run_command TEXT"),
             ("container_name",
              "ALTER TABLE build_results ADD COLUMN container_name TEXT"),
+            ("variant",
+             "ALTER TABLE build_results ADD COLUMN variant TEXT"),
         ):
             if column not in br_existing:
                 conn.execute(ddl)
@@ -157,9 +161,10 @@ class JobStore:
                   large_files, infra_files, shared_base_files,
                   review_rounds, review_stopped_reason, review_tool_calls,
                   pr_title, pr_body, pr_context,
-                  pr_author, build_ref_sha, merge_commit_sha, merged_at
+                  pr_author, build_ref_sha, merge_commit_sha, merged_at,
+                  perception_variants
                 ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,
-                          ?,?,?,?,?,?,?,?,?,?,?,?,?)
+                          ?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 (
                     job.id,
@@ -198,6 +203,7 @@ class JobStore:
                     job.build_ref_sha,
                     job.merge_commit_sha,
                     job.merged_at,
+                    json.dumps(job.perception_variants),
                 ),
             )
             conn.commit()
@@ -280,8 +286,8 @@ class JobStore:
                 INSERT OR REPLACE INTO build_results (
                   job_id, idx, target, driver_path,
                   success, image_tag, log_path,
-                  container_name, created_at
-                ) VALUES (?,?,?,?,?,?,?,?,?)
+                  container_name, created_at, variant
+                ) VALUES (?,?,?,?,?,?,?,?,?,?)
                 """,
                 (
                     job_id,
@@ -295,6 +301,7 @@ class JobStore:
                     result.log_path,
                     result.container_name,
                     time.time(),
+                    result.variant,
                 ),
             )
             conn.commit()
@@ -346,7 +353,8 @@ class JobStore:
                 ids = [j["id"] for j in jobs]
                 marks = ",".join("?" * len(ids))
                 br = conn.execute(
-                    f"""SELECT job_id, idx, target, driver_path, success, image_tag
+                    f"""SELECT job_id, idx, target, driver_path, success,
+                               image_tag, variant
                         FROM build_results WHERE job_id IN ({marks})
                         ORDER BY job_id, idx""",
                     ids,
@@ -359,6 +367,7 @@ class JobStore:
                         "driver_path": row["driver_path"],
                         "success": _tri(row["success"]),
                         "image_tag": row["image_tag"],
+                        "variant": _col(row, "variant", ""),
                     })
                 for j in jobs:
                     j["build_results"] = by_job.get(j["id"], [])
@@ -420,6 +429,7 @@ class JobStore:
                     "image_tag": r["image_tag"],
                     "has_log": bool(r["log_path"]) and Path(r["log_path"]).exists(),
                     "container_name": _col(r, "container_name"),
+                    "variant": _col(r, "variant", ""),
                 }
                 for r in br
             ]
@@ -673,6 +683,9 @@ class JobStore:
                 "skip_build": bool(row["skip_build"]),
                 "build_only": bool(row["build_only"]),
                 "force_targets": _load_json(row["force_targets"], []),
+                "perception_variants": _load_json(
+                    _col(row, "perception_variants", ""), []
+                ),
             },
             "review_text": row["review_text"] or "",
             "findings": _load_json(row["findings"], []),
@@ -745,6 +758,7 @@ CREATE TABLE IF NOT EXISTS jobs (
   skip_build INTEGER DEFAULT 0,
   build_only INTEGER DEFAULT 0,
   force_targets TEXT,
+  perception_variants TEXT,
   review_text TEXT,
   findings TEXT,
   large_files TEXT,
@@ -781,6 +795,7 @@ CREATE TABLE IF NOT EXISTS build_results (
   log_path TEXT,
   run_command TEXT,        -- legacy, unused (see _migrate)
   container_name TEXT,
+  variant TEXT,            -- JetPack version for perception, "" otherwise
   created_at REAL NOT NULL,
   UNIQUE(job_id, idx)
 );

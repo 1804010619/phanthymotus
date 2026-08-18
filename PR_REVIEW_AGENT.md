@@ -41,8 +41,16 @@ logic, so they can run simultaneously without double-triggering.
 | `/request_bot_review build-only` | Build only |
 | `/request_bot_review force` | Re-review a commit that was already reviewed |
 | `/request_bot_review core` | Force the `core` target |
-| `/request_bot_review perception` | Force the `perception` target |
+| `/request_bot_review perception` | Force `perception` (JetPack 5.11, the default) |
+| `/request_bot_review perception jetson-6.1` | Force `perception` on JetPack 6.1 |
+| `/request_bot_review perception jetson-5.11 jetson-6.1` | Both JetPack versions — two builds, two images |
 | `/request_bot_review unitree/g1` | Force a specific driver |
+
+A JetPack token implies the `perception` target, so `/request_bot_review
+jetson-6.1` is enough. `jetson-6.1`, `jetson-jp6.1`, `jp6.1` and `6.1` are all
+accepted; an unsupported version is ignored with a warning rather than passed
+to the build script, which would exit 1 on it. The "Building..." comment lists
+the builds that will actually run, versions included.
 
 The trigger must start a line, and it must be in the PR's **main conversation**
 box. Line-level review comments are a different GitHub event and are not seen.
@@ -56,7 +64,7 @@ Determined from `git diff --name-only origin/main...HEAD`.
 | Changed path | Target |
 |--------------|--------|
 | `agent-core/**` | `deploy/build_core.sh` |
-| `perception/**` | `deploy/build_perception.sh` |
+| `perception/**` | `deploy/build_perception.sh --variant jetson` |
 | `README*`, `docs/**`, `CODEOWNERS` | none — review only |
 
 **phanthymotus-driver**
@@ -74,6 +82,56 @@ newly added vendor: that is exactly what happened to PR #166 adding
 
 The agent invokes the repos' existing build scripts rather than reimplementing
 the build. Image tags, mirrors, and registry handling stay in one place.
+
+### Perception: Jetson only
+
+`build_perception.sh` defaults to `--variant cpu`, but perception runs on Jetson
+hardware, so that image is not worth building — and its tag
+(`release.YYMMDD.<sha>`) does not even say which variant it is. The agent
+therefore always passes `--variant jetson`; the CPU variant is unreachable from
+a PR comment by design.
+
+What *is* selectable is the JetPack version, which picks the base image
+(`jetson-base:jp511-torch` / `jp61-torch`) and lands in the tag:
+
+| Requested | Built as | Tag |
+|-----------|----------|-----|
+| default | `--variant jetson --jp-version 5.11` | `release.YYMMDD.<sha>-jetson-jp5.11` |
+| `jetson-6.1` | `--variant jetson --jp-version 6.1` | `release.YYMMDD.<sha>-jetson-jp6.1` |
+
+Supported versions are **5.11** (default) and **6.1** — the two
+`build_perception.sh` accepts. Asking for both produces two sequential builds
+with separate logs, rows and image tags, labelled `perception (jetson-jp5.11)`
+and `perception (jetson-jp6.1)` in the PR comment and on the dashboard.
+
+### Failure logs in the comment
+
+When a build fails, its log goes into the comment in full — collapsed under a
+`<details>` — rather than as a fixed number of trailing lines. A failure is
+diagnosed from the log, and a short tail routinely cut off above the actual
+error: a failing `pip install` or `apt-get` prints hundreds of lines after it.
+
+The one hard limit is GitHub's: a comment body over **65536 characters** is
+rejected with a 422, which would lose the entire failure report. So the logs are
+budgeted against it instead of trimmed to a line count:
+
+- Everything above the logs (result table, image refs, deploy help) is composed
+  first, and the failed builds split what is left equally — so the comment fits
+  by construction, roughly 600–900 lines for a single failure.
+- A log that fits goes in whole, and the summary says `complete log, N lines`.
+- One that does not keeps its **end**, where the error is, and says how many
+  earlier lines were dropped. A truncated log with no such note is worse than
+  none: it reads as though the build stopped where the text stops.
+- Many failures at once (a driver PR touching a dozen drivers) would each get a
+  few unreadable lines, so past that point the comment links to the dashboard
+  instead.
+- `github_client._clamp_body` is a last-resort backstop for every other comment
+  the agent posts, LLM review text included — nothing should reach it, but a 422
+  costs the whole comment.
+
+Log blocks use a four-backtick fence: build output can itself contain ```` ``` ````
+and would otherwise close the block early and spill the rest into the comment as
+markup. The complete, untrimmed log is always on the dashboard.
 
 ### How each target is deployed
 
