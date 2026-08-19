@@ -49,6 +49,7 @@ async function _ensureEdit() {
       _isEditor = true;
       _currentEditor = _sessionId;
       _updateEditorUI();
+      _showToast('已自动获取编辑权限');
       return true;
     }
     _currentEditor = data.editor || null;
