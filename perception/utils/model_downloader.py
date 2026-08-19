@@ -370,3 +370,69 @@ def _download_verified_bundle(
                 os.path.join(model_dir, filename),
             )
     log.info(f"[model_downloader] {name}: verified bundle ready at {model_dir}")
+
+
+# ── OCR (PP-OCRv6 small, TensorRT engines; one bundle per JetPack family) ──
+# The engines are built per TensorRT major and are not portable, so the
+# bundle is chosen from the TensorRT that is importable at runtime. Only the
+# base URL is provenance-specific: switching the distribution host (e.g. to
+# COS) means changing OCR_MODEL_BASE only.
+OCR_MODEL_BASE = os.environ.get(
+    "OCR_MODEL_BASE_URL",
+    "https://www.modelscope.cn/models/Flame4pd/"
+    "ppocrv6-small-edge-ocr/resolve/"
+    "0301e9299b3abe09c6a60796d7bed74c23fcc525",
+)
+_OCR_KEYS = {
+    "size": 74947,
+    "sha256": "b5f2bfe2bdd9448429e3e82b51c789775d9b42f2403d082b00662eb77e401c5d",
+}
+OCR_MODEL_BUNDLES = {
+    "jp61": {
+        "base_url": f"{OCR_MODEL_BASE}/tensorrt-jp6-trt10.4-orin-batch8-cls8",
+        "files": {
+            "det.engine": {
+                "size": 11194324,
+                "sha256": "3b36aae43b2cc4a1b1e2d74d846a1319b4b6f42fbc6d97747d8d72e12c74a1ef",
+            },
+            "rec.engine": {
+                "size": 23303292,
+                "sha256": "8149fa68d5418f2c0763b8c4e5088987cb679a407317c7510f88ab6de38dd641",
+            },
+            "cls.engine": {
+                "size": 1046484,
+                "sha256": "148a6895260d3b6b6f86e0c5787121fc1bba316f3427397f654421196c13cb77",
+            },
+            "keys.txt": _OCR_KEYS,
+        },
+    },
+    "jp511": {
+        "base_url": f"{OCR_MODEL_BASE}/tensorrt-jp511-trt8.5-orin-batch8-cls8",
+        "files": {
+            "det.engine": {
+                "size": 12334256,
+                "sha256": "1bb32a027e93b06d5319ac61e38bb3e447137b01465eacefa7a652f58130ebdf",
+            },
+            "rec.engine": {
+                "size": 19915466,
+                "sha256": "1e204f0469beba33d8590b29c06419cf1073d98d41243b5ee316d2f877340b61",
+            },
+            "cls.engine": {
+                "size": 1038858,
+                "sha256": "02c722e56e621b56a36678cc8aa124a31b41e9e3c9ca350b11e4de0d5bbd0a35",
+            },
+            "keys.txt": _OCR_KEYS,
+        },
+    },
+}
+
+
+def ensure_ocr_model(model_dir: str, family: str | None = None) -> dict[str, str]:
+    """Ensure the OCR TensorRT bundle matching the runtime TensorRT is present."""
+    model_dir = require_models_subpath(model_dir)
+    key = select_bundle_family(OCR_MODEL_BUNDLES, family)
+    entry = OCR_MODEL_BUNDLES[key]
+    log.info(f"[model_downloader] ocr: using {key} bundle")
+    return ensure_verified_bundle(
+        f"ocr/{key}", model_dir, entry["base_url"], entry["files"]
+    )
