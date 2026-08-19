@@ -3,14 +3,22 @@ ARG ROS_BASE_IMAGE=bj-warehouse.tencentcloudcr.com/phanthy-motus/ros-base:latest
 FROM ${ROS_BASE_IMAGE}
 ARG PYPI_MIRROR
 
-# Install ffmpeg + docker CLI + compose plugin (static binaries, avoid apt docker.io QEMU segfault)
+# Install ffmpeg + docker CLI + compose plugin (static binaries, avoid apt docker.io QEMU segfault).
+# --retry survives the transient TLS drops this network path has hit more than
+# once (curl exit 56 / HTTP2 stream errors) — retrying the whole RUN restarts
+# the ffmpeg apt install too, which is the expensive part.
+# The compose binary is proxied through ghfast.top (same GitHub mirror already
+# used in perception/Dockerfile.jetson) since GitHub's release CDN is the more
+# frequent offender than Tsinghua's mirror.
 RUN apt-get -o Acquire::AllowInsecureRepositories=true update && \
     apt-get install -y --no-install-recommends --allow-unauthenticated \
         python3-pip python3-dbus ffmpeg curl && \
-    curl -fsSL https://mirrors.tuna.tsinghua.edu.cn/docker-ce/linux/static/stable/aarch64/docker-27.5.1.tgz \
+    curl -fsSL --retry 3 --retry-delay 2 --retry-connrefused --retry-max-time 60 \
+        https://mirrors.tuna.tsinghua.edu.cn/docker-ce/linux/static/stable/aarch64/docker-27.5.1.tgz \
         | tar -xz --strip-components=1 -C /usr/local/bin/ docker/docker && \
     mkdir -p /usr/local/lib/docker/cli-plugins && \
-    curl -fsSL https://github.com/docker/compose/releases/download/v2.37.0/docker-compose-linux-aarch64 \
+    curl -fsSL --retry 3 --retry-delay 2 --retry-connrefused --retry-max-time 60 \
+        https://ghfast.top/https://github.com/docker/compose/releases/download/v2.37.0/docker-compose-linux-aarch64 \
         -o /usr/local/lib/docker/cli-plugins/docker-compose && \
     chmod +x /usr/local/lib/docker/cli-plugins/docker-compose && \
     rm -rf /var/lib/apt/lists/*
