@@ -876,8 +876,13 @@ html, body {
 .canvas-editor-bar .editor-label--active {
   color: var(--green);
 }
+.canvas-editor-bar.canvas-editor-bar--locked {
+  background: var(--red-bg);
+  border-color: var(--red);
+}
 .canvas-editor-bar .editor-label--locked {
-  color: var(--text-dim);
+  color: var(--red);
+  font-weight: 600;
 }
 .canvas-editor-bar .editor-btn {
   background: none;
