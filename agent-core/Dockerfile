@@ -7,14 +7,16 @@ ARG PYPI_MIRROR
 # --retry survives the transient TLS drops this network path has hit more than
 # once (curl exit 56 / HTTP2 stream errors) — retrying the whole RUN restarts
 # the ffmpeg apt install too, which is the expensive part.
-# The compose binary is proxied through ghfast.top (same GitHub mirror already
-# used in perception/Dockerfile.jetson) since GitHub's release CDN is the more
-# frequent offender than Tsinghua's mirror.
+# The docker CLI binary is mirrored to COS (same pattern unitree/g1 uses for
+# cyclonedds) rather than Tsinghua's mirror, which was the more frequent
+# offender. The compose plugin is proxied through ghfast.top (same GitHub
+# mirror already used in perception/Dockerfile.jetson).
+ARG DOCKER_CLI_URL=https://agi-phanthy-dev-1252788780.cos.ap-beijing.myqcloud.com/public/docker-27.5.1-aarch64.tgz
 RUN apt-get -o Acquire::AllowInsecureRepositories=true update && \
     apt-get install -y --no-install-recommends --allow-unauthenticated \
         python3-pip python3-dbus ffmpeg curl && \
     curl -fsSL --retry 3 --retry-delay 2 --retry-connrefused --retry-max-time 60 \
-        https://mirrors.tuna.tsinghua.edu.cn/docker-ce/linux/static/stable/aarch64/docker-27.5.1.tgz \
+        ${DOCKER_CLI_URL} \
         | tar -xz --strip-components=1 -C /usr/local/bin/ docker/docker && \
     mkdir -p /usr/local/lib/docker/cli-plugins && \
     curl -fsSL --retry 3 --retry-delay 2 --retry-connrefused --retry-max-time 60 \
