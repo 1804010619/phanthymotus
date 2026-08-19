@@ -26,9 +26,33 @@ RUN if ls /etc/apt/sources.list.d/*.list 1>/dev/null 2>&1; then \
     fi
 
 # ── System deps ────────────────────────────────────────────────────
+# `ldconfig` is shimmed around every apt install in this file. The libc-bin
+# post-install trigger runs it, and it segfaults under qemu-user when the image
+# is cross-built from x86 (build_common.sh takes the `buildx --platform
+# linux/arm64` path there):
+#
+#   Processing triggers for libc-bin (2.35-0ubuntu3.8) ...
+#   qemu: uncaught target signal 11 (Segmentation fault) - core dumped
+#   dpkg: error processing package libc-bin (--configure): ... exit status 139
+#   E: Sub-process /usr/bin/dpkg returned an error code (1)
+#
+# The packages themselves unpack and configure fine — only the trigger dies, so
+# the layer contents are correct while apt still exits 100. jp6.1 hits it
+# (jammy, glibc 2.35); jp5.11 does not (focal, glibc 2.31); native arm64 builds
+# never do, because nothing is emulated.
+#
+# So: shim it for the duration of the install, then restore the real one and run
+# it best-effort. Native builds still get a correct /etc/ld.so.cache; emulated
+# builds fall back to ld.so's default search path, which already covers the
+# /usr/lib/aarch64-linux-gnu these packages install into.
 RUN rm -f /etc/apt/sources.list.d/* && rm -rf /var/cache/apt/archives/* /var/lib/apt/lists/* && \
+    mv /usr/sbin/ldconfig /usr/sbin/ldconfig.real && \
+    printf '#!/bin/sh\nexit 0\n' > /usr/sbin/ldconfig && \
+    chmod +x /usr/sbin/ldconfig && \
     apt-get -o Acquire::AllowInsecureRepositories=true update && \
     apt-get install -y --no-install-recommends --allow-unauthenticated ffmpeg && \
+    mv -f /usr/sbin/ldconfig.real /usr/sbin/ldconfig && \
+    { ldconfig || echo '[build] ldconfig skipped — emulated build, using default search path'; } && \
     apt-get clean && rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*
 
 RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} colcon-common-extensions && \
@@ -80,7 +104,16 @@ ENV YOLO_CONFIG_DIR=/work
 RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} sherpa-onnx
 
 # ── phonemizer (multilingual IPA via espeak-ng for asr_kws mode) ──
-RUN apt-get update && apt-get install -y --no-install-recommends espeak-ng && \
+# ldconfig shimmed for the same reason as the ffmpeg step above — this is the
+# step that actually failed on `--jp-version 6.1`, because layers 1-11 were
+# cached and it was the first apt install to run.
+RUN mv /usr/sbin/ldconfig /usr/sbin/ldconfig.real && \
+    printf '#!/bin/sh\nexit 0\n' > /usr/sbin/ldconfig && \
+    chmod +x /usr/sbin/ldconfig && \
+    apt-get update && \
+    apt-get install -y --no-install-recommends espeak-ng && \
+    mv -f /usr/sbin/ldconfig.real /usr/sbin/ldconfig && \
+    { ldconfig || echo '[build] ldconfig skipped — emulated build, using default search path'; } && \
     rm -rf /var/lib/apt/lists/*
 RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} phonemizer
 
