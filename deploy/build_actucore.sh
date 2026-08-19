@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
-# build_perception.sh — 构建 perception-stack（感知层）镜像并推送
+# build_actucore.sh — 构建 actucore（执行模型层）镜像并推送
 #
-# 只有 Jetson GPU 版：感知栈跑在 Jetson 上，之前的 cpu 变体产出的镜像没人部署，
-# 而且已经 build 不过了。
+# 只有 Jetson GPU 版：执行模型（VLA / 抓取策略 / locomotion）都要 GPU，
+# 没有 CPU 变体。
 #
 # Usage:
-#   ./build_perception.sh                          # JetPack 5.11（默认），交互选源
-#   ./build_perception.sh --jp-version 6.1         # JetPack 6.1
-#   ./build_perception.sh --mirror tuna
+#   ./build_actucore.sh                          # JetPack 5.11（默认），交互选源
+#   ./build_actucore.sh --jp-version 6.1         # JetPack 6.1
+#   ./build_actucore.sh --mirror tuna
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -45,8 +45,8 @@ fi
 DATE="$(date +%y%m%d)"
 COMMIT="$(git -C "${REPO_ROOT}" rev-parse --short=7 HEAD)"
 
-# ── Jetson-only：感知栈跑在 Jetson 上，没有 CPU 变体 ──────────────────
-DOCKERFILE="${REPO_ROOT}/perception/Dockerfile.jetson"
+# ── Jetson-only：执行模型都要 GPU，没有 CPU 变体 ──────────────────────
+DOCKERFILE="${REPO_ROOT}/actucore/Dockerfile.jetson"
 BUILD_CONTEXT="${REPO_ROOT}"
 TAG="release.${DATE}.${COMMIT}-jetson-jp${JP_VERSION}"
 
@@ -65,11 +65,10 @@ case "${JP_VERSION}" in
         ;;
 esac
 
-FULL_IMAGE="${REGISTRY}/${IMAGE_NAMESPACE}/perception:${TAG}"
+FULL_IMAGE="${REGISTRY}/${IMAGE_NAMESPACE}/actucore:${TAG}"
 
 echo "============================================"
-echo "Building perception-stack image (Jetson only)"
-echo "Variant: jetson"
+echo "Building actucore image (Jetson only)"
 echo "PyTorch for JetPack: JP${JP_VERSION}"
 echo "Image  : ${FULL_IMAGE}"
 echo "Arch   : ${ARCH} (native=${IS_ARM64})"
@@ -117,11 +116,12 @@ if ${PUSH_ENABLED} && [ -n "${RESOURCE_CENTER_API_KEY:-}" ]; then
             -H "x-api-key: ${RESOURCE_CENTER_API_KEY}" \
             -d "{
                 \"imageRef\": \"${FULL_IMAGE}\",
-                \"registryImage\": \"perception\",
+                \"registryImage\": \"actucore\",
                 \"tag\": \"${TAG}\",
-                \"category\": \"perception\",
-                \"name\": \"Perception Stack\",
-                \"description\": \"语音感知套件 — ASR 语音识别 + TTS 语音合成 + VAD 静音检测 + 唤醒词检测\"
+                \"category\": \"actucore\",
+                \"name\": \"ActuCore\",
+                \"port\": 15730,
+                \"description\": \"执行模型层 — VLA 策略 / 导航 / 抓取 / locomotion / 全身控制，以 processor 卡片接入\"
             }")
 
         if [ "${HTTP_STATUS}" = "200" ] || [ "${HTTP_STATUS}" = "201" ]; then

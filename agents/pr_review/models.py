@@ -71,16 +71,18 @@ class JobStatus(str, Enum):
 class BuildTarget(str, Enum):
     CORE = "core"
     PERCEPTION = "perception"
+    ACTUCORE = "actucore"
     DRIVER = "driver"
 
 
-# Perception is built for Jetson only — that is where it runs, so the script's
-# `cpu` default produced an image nobody deploys. What is selectable is the
-# JetPack version, which picks the base image and lands in the tag as
+# Perception and actucore are built for Jetson only — that is where they run, so
+# neither script takes a `--variant`. What is selectable is the JetPack version,
+# which picks the base image and lands in the tag as
 # `release.YYMMDD.<sha>-jetson-jp<ver>`.
 #
-# These are the versions `deploy/build_perception.sh` accepts; it exits 1 on
-# anything else, so an unrecognised one must never reach it.
+# These are the versions `deploy/build_perception.sh` and
+# `deploy/build_actucore.sh` accept; they exit 1 on anything else, so an
+# unrecognised one must never reach them.
 SUPPORTED_JP_VERSIONS = ("5.11", "6.1")
 DEFAULT_JP_VERSION = "5.11"
 

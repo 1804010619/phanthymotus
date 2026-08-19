@@ -79,7 +79,9 @@ Required: `id`, `name`, `category: driver`, `hardware_provider`,
 Note `hardware_model` is what the image is named after — it does not have to
 match the directory (`robotera/q5_bundle` builds `robotera/q5`).
 
-**Port must be in 15700–15799 and actually free.** Verify by reading the other
+**Port must be in 15700–15799 and actually free.** The `1572x` and `1573x`
+decades are carved out for perception (15720/15721) and ActuCore (15730, with
+15731 reserved), so a driver must not land there. Verify by reading the other
 `driver.yaml` files, **not** the table in `README.md` — that table is already
 wrong: it lists four drivers on 15702 and two on 15703. The WebSocket port is
 conventionally the MCP port + 1.

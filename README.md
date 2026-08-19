@@ -54,7 +54,7 @@ The platform runs a single **sense → think → act** loop:
 
 - **Drivers (L1)** — One MCP server per device. Every tool declares a `type`, and the Agent Core treats each type differently: `sensor` (data streams), `actuator` (executable actions), `processor` (data transforms), `resource` (static assets such as URDF). Sensor and actuator tools normally live in the **same** driver process — the diagram splits them by direction of data flow, not by deployment.
 - **Perception (L2, ports 15720 / 15721)** — Turns raw streams into semantics: ASR, TTS, VLM captions, vision understanding, face recognition.
-- **ActuCore (L2)** — The execution-model side of the same layer: VLA policies, navigation, grasping, locomotion, whole-body control. These are integrated as `processor` MCP devices, so any model that takes a goal and emits motion commands plugs in the same way. ActuCore is a **position in the architecture**, not a component shipped in this repository — the models are chosen per robot.
+- **ActuCore (L2, port 15730)** — The execution-model side of the same layer, shipped in this repository as [`actucore/`](actucore/): VLA policies, navigation, grasping, locomotion, whole-body control. It is a card host, structurally identical to Perception — each execution model attaches as a `processor` card, so any model that takes a goal and emits motion commands plugs in the same way. **It currently ships no cards**; the models are chosen per robot. See [`actucore/README.md`](actucore/README.md) for the card contract.
 - **Agent Loop (L3, port 15678)** — FastAPI + `ros2_bridge.py`: event collector, layered L1–L4 prompt, tool dispatch, ACP barrier, history compaction, steering / interrupt, task store, subagent manager, skills, memory.
 - **Two bypass lanes** — The loop can call `sensor` tools directly, skipping perception; and it can drive `actuator` tools over MCP JSON-RPC directly, skipping ActuCore. Both are the common path for simple queries and one-shot commands.
 - **Web Dashboard** — Subscribes to every DDS topic on the bus via `/ws/bus/{topic}`, and to the agent's decision stream via `/ws/motus`.
@@ -145,11 +145,11 @@ All services run as Docker containers managed by a single `docker-compose.yml` a
 
 1. **Install**: The `install.sh` script pulls the Agent Core image, extracts the initial `docker-compose.yml` from the image, and starts the service
 2. **Add drivers**: When you deploy a driver via the Web Dashboard, Agent Core pulls the driver image, extracts its `deploy/service.yml` fragment, and merges it into the compose file
-3. **Unified orchestration**: All containers (core, drivers, perception) are managed by the same compose file with `docker compose up -d`
+3. **Unified orchestration**: All containers (core, drivers, perception, actucore) are managed by the same compose file with `docker compose up -d`
 
 ### Container privileges
 
-All driver and perception containers run with `privileged: true` and `/dev:/dev` mounted to access hardware devices (cameras, USB, GPIO). Network is set to `host` mode for ROS2 DDS communication.
+All driver, perception and actucore containers run with `privileged: true` and `/dev:/dev` mounted to access hardware devices (cameras, USB, GPIO). Network is set to `host` mode for ROS2 DDS communication.
 
 ```yaml
 # Example: how a deployed service looks in /opt/phanthy-motus/docker-compose.yml
@@ -182,6 +182,7 @@ services:
 | Agent Core | 15678 |
 | Perception MCP | 15720 |
 | Perception WebSocket | 15721 |
+| ActuCore MCP | 15730 |
 | PR Review Agent (optional) | 25000 |
 
 Hardware driver ports are documented in [phanthymotus-driver](https://github.com/4paradigm/phanthymotus-driver).
