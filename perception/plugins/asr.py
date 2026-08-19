@@ -301,7 +301,7 @@ TOOLS = [
                 "vad_threshold": {"type": "number", "description": "VAD speech threshold (0-1, higher = stricter)", "default": 0.5, "scope": "shared"},
                 "vad_silence_ms":{"type": "integer", "description": "Silence duration (ms) before sentence end", "default": 400, "scope": "shared"},
                 "vad_pre_roll_ms":{"type": "integer", "description": "Audio retained before detected speech (ms)", "default": 500, "scope": "shared"},
-                "save_vad_segments": {"type": "boolean", "description": "Save VAD segments as WAV to /opt/embodied/models/vad_segments/", "default": False, "scope": "shared"},
+                "save_vad_segments": {"type": "boolean", "description": "Save VAD segments as WAV to /opt/embodied/models/vad_segments/", "default": True, "scope": "shared"},
                 "max_saved_segments": {"type": "integer", "description": "Max saved VAD segments (oldest deleted when exceeded)", "default": 1000, "scope": "shared"},
             },
             "required": []
@@ -1299,8 +1299,12 @@ class ASRPlugin:
         self._vad_threshold = float(vad_cfg.get('threshold', SPEECH_THRESH))
         self._vad_silence_ms = int(vad_cfg.get('silence_ms', 400))
         self._kws_cfg      = plugin_cfg.get('kws', {})
-        self._save_vad_segments = False
-        self._max_saved_segments = 1000
+        # On by default: the saved segments are the only way to audit what the VAD
+        # actually handed the recogniser when a transcription looks wrong. Bounded
+        # by _max_saved_segments — see _enforce_retention(), which unlike the
+        # previous per-process counter actually prunes.
+        self._save_vad_segments = bool(plugin_cfg.get('save_vad_segments', True))
+        self._max_saved_segments = int(plugin_cfg.get('max_saved_segments', 1000))
         self._vad_pre_roll_ms = int(vad_cfg.get('pre_roll_ms', 500))
         self._nodes: dict[str, _ASRNode] = {}           # key = instance_id
         # main.py serves MCP over ThreadingHTTPServer, so start/stop/config can
