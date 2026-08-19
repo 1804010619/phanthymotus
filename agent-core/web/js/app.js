@@ -468,7 +468,7 @@ function _showLoginScreen() {
     loginEl.innerHTML = `
       <div class="login-card">
         <div class="login-brand">
-          <img class="login-logo" src="https://agi-phanthy-dev-1252788780.cos.ap-beijing.myqcloud.com/public/PhanthyMotus_Final_Refined_logo.png" alt="PhanthyMotus">
+          <img class="login-logo" src="https://agi-phanthy-dev-1252788780.cos.ap-beijing.myqcloud.com/public/embodied_logo.svg" alt="PhanthyMotus">
           <div class="login-brand-text">
             <span class="brand-name">Phanthy</span><span class="brand-name-accent">Motus</span>
           </div>
