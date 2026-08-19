@@ -90,7 +90,7 @@ export function renderSidebar(mcps, topicStatuses = {}) {
   // ActuCore section
   if (actucores.length) {
     _scroll.appendChild(_buildMergedSection(actucores, {
-      cls: 'sidebar-section-actucore', icon: '▶', iconCls: 'actucore', label: '执行',
+      cls: 'sidebar-section-actucore', icon: '❋', iconCls: 'actucore', label: '执行',
     }));
   }
 
