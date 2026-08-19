@@ -186,6 +186,54 @@ services:
 
 Hardware driver ports are documented in [phanthymotus-driver](https://github.com/4paradigm/phanthymotus-driver).
 
+## Container Logs
+
+Every container declares log rotation in its `deploy/service.yml` (or compose
+fragment): the `local` driver, `max-size: 10m`, `max-file: 3` — so ~30 MB per
+container, compressed. Agent Core injects that same policy as a default when a
+driver image's fragment omits it.
+
+### Do not truncate a live container's log file
+
+**`truncate -s 0` on `/var/lib/docker/containers/<id>/**/*.log` corrupts the
+log.** The file size is reset but the Docker daemon keeps its write offset, so
+the next write lands past the new end-of-file and the kernel fills the gap with
+NUL bytes. `docker logs` then fails outright:
+
+```
+Error grabbing logs: invalid character '\x00' looking for beginning of value   # json-file
+Error grabbing logs: error unmarshalling log entry: proto: illegal tag 0       # local
+```
+
+Once that happens the log is unreadable until the file is replaced. A
+`truncate_log.sh` helper used to live in `deploy/` and was removed for exactly
+this reason.
+
+### What to do instead
+
+| Goal | Command |
+|------|---------|
+| Read recent logs | `docker logs --tail 500 -f <container>` |
+| Reclaim log space now | `docker restart <container>` — the daemon reopens and rotates its writer cleanly |
+| Reclaim disk generally | `docker image prune -a --filter until=168h` (stale images usually dwarf logs) |
+| Check log size | `du -sh /var/lib/docker/containers/*/local-logs` |
+
+### Host baseline (recommended, not applied automatically)
+
+Containers started outside the compose/service.yml paths inherit the daemon
+default, which for `json-file` is unbounded. Set a floor in
+`/etc/docker/daemon.json` so nothing can escape rotation:
+
+```json
+{
+  "log-driver": "local",
+  "log-opts": { "max-size": "10m", "max-file": "3" }
+}
+```
+
+Applying this requires restarting the Docker daemon, which stops every container
+on the host — schedule it rather than doing it mid-session.
+
 ## Resource Center (Optional)
 
 The platform can optionally connect to a [Resource Center](https://motus.phanthy.com) for:

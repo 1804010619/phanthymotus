@@ -30,6 +30,12 @@ RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} \
 # Override base image RMW (some ros-base tags ship cyclonedds by default)
 ENV RMW_IMPLEMENTATION=rmw_fastrtps_cpp
 ENV ROS_DOMAIN_ID=42
+# One write per log line instead of 8 KB block flushes that can tear a Docker
+# log record mid-write.
+ENV PYTHONUNBUFFERED=1
+# ANSI colour codes are control bytes; in a non-tty container log they are
+# exactly the "garbage characters" that make `docker logs` unreadable.
+ENV RCUTILS_COLORIZED_OUTPUT=0
 
 WORKDIR /work
 COPY main.py    /work/main.py

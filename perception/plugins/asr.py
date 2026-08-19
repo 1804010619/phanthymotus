@@ -602,14 +602,27 @@ def _vad_worker(pcm_q: multiprocessing.Queue, result_q: multiprocessing.Queue,
                 backend: str, threshold: float, silence_ms: int,
                 kws_cfg: dict = None,
                 save_vad_segments: bool = False, max_saved_segments: int = 1000,
-                pre_roll_ms: int = 500):
+                pre_roll_ms: int = 500, log_level: int = logging.INFO):
     """Runs in a child process — sherpa-onnx ONNX VAD + optional KWS gate.
 
     Pipeline: Audio → VAD → (KWS gate) → utterance output
     - If kws_cfg is provided and enabled, only output utterances after keyword detected
     - Otherwise (kws disabled), output all utterances (backward compat)
     """
-    logging.basicConfig(level=logging.DEBUG, format='%(asctime)s [%(name)s] %(levelname)s %(message)s',
+    # A spawned child gets a fresh interpreter and does not inherit the parent's
+    # sys.stdout object, so the atomic writer has to be reinstalled here.
+    try:
+        from utils import logsafe
+        logsafe.install(check_fd=False)
+    except Exception:
+        pass
+
+    # This runs in a spawned child, which has no handlers of its own — so
+    # basicConfig is right here. The level comes from the parent rather than
+    # being hardcoded to DEBUG: this is the per-audio-frame path, and a child
+    # quietly logging at DEBUG while the parent is at INFO was the single
+    # largest log-volume amplifier in the stack.
+    logging.basicConfig(level=log_level, format='%(asctime)s [%(name)s] %(levelname)s %(message)s',
                         datefmt='%H:%M:%S')
     _log = logging.getLogger("asr.vad_worker")
 
@@ -1000,7 +1013,7 @@ class _ASRNode(Node):
             args=(self._pcm_queue, self._utterance_queue, self._vad_stop,
                   self._vad_backend, self._vad_threshold, self._vad_silence_ms,
                   self._kws_cfg, self._save_vad_segments, self._max_saved_segments,
-                  self._vad_pre_roll_ms),
+                  self._vad_pre_roll_ms, log.getEffectiveLevel()),
             daemon=True, name="vad_worker",
         )
         self._vad_proc.start()
