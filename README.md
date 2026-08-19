@@ -44,9 +44,58 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for building and running from source code
 
 ## Architecture
 
-![Architecture](docs/images/architecture.jpg)
+![Architecture](docs/images/architecture.png)
+
+> Editable source: [`docs/architecture.svg`](docs/architecture.svg) — re-export the PNG after changing it.
+
+The platform runs a single **sense → think → act** loop:
+
+`Hardware → Driver·Sensor → Perception → Agent Loop → ActuCore → Driver·Actuator → Hardware`
+
+- **Drivers (L1)** — One MCP server per device. Every tool declares a `type`, and the Agent Core treats each type differently: `sensor` (data streams), `actuator` (executable actions), `processor` (data transforms), `resource` (static assets such as URDF). Sensor and actuator tools normally live in the **same** driver process — the diagram splits them by direction of data flow, not by deployment.
+- **Perception (L2, ports 15720 / 15721)** — Turns raw streams into semantics: ASR, TTS, VLM captions, vision understanding, face recognition.
+- **ActuCore (L2)** — The execution-model side of the same layer: VLA policies, navigation, grasping, locomotion, whole-body control. These are integrated as `processor` MCP devices, so any model that takes a goal and emits motion commands plugs in the same way. ActuCore is a **position in the architecture**, not a component shipped in this repository — the models are chosen per robot.
+- **Agent Loop (L3, port 15678)** — FastAPI + `ros2_bridge.py`: event collector, layered L1–L4 prompt, tool dispatch, ACP barrier, history compaction, steering / interrupt, task store, subagent manager, skills, memory.
+- **Two bypass lanes** — The loop can call `sensor` tools directly, skipping perception; and it can drive `actuator` tools over MCP JSON-RPC directly, skipping ActuCore. Both are the common path for simple queries and one-shot commands.
+- **Web Dashboard** — Subscribes to every DDS topic on the bus via `/ws/bus/{topic}`, and to the agent's decision stream via `/ws/motus`.
 
 Hardware drivers are maintained in a separate repository: **[phanthymotus-driver](https://github.com/4paradigm/phanthymotus-driver)**.
+
+### Memory & Long-Running Agent Architecture
+
+The Agent Core is designed for **continuous operation over days or months**. The architecture separates real-time interaction from background intelligence:
+
+```
+┌─────────────────────────────────────────────────────┐
+│                   Main Agent Loop                     │
+│  • Only processes user interactions (ASR/message)    │
+│  • Lean history → stable prefix caching (~90% hit)   │
+│  • Uses memory_recall for on-demand context retrieval│
+└──────────────┬──────────────────────┬───────────────┘
+               │ spawn                │ memory_recall
+               ▼                      ▼
+┌──────────────────────┐   ┌──────────────────────────┐
+│   User Task Subagent │   │    Memory Store (SQLite)  │
+│  • Isolated context  │   │  • subagent_conclusions   │
+│  • Full tool access  │   │  • chat_history (FTS5)    │
+│  • Returns summary   │   │  • daily_summary          │
+└──────────────────────┘   └──────────────────────────┘
+               ▲
+┌──────────────────────┐
+│    BG Monitor Agent   │
+│  • Sensor analysis   │
+│  • Results → DB only │
+│  • urgent=true → push│
+└──────────────────────┘
+```
+
+**Key design principles:**
+
+- **Main agent stays lean** — only user interactions enter the conversation history. Background monitoring conclusions are stored in the memory database, not pushed to the main thread.
+- **Memory recall on demand** — `memory_recall` tool provides FTS-based retrieval from past conversations, subagent conclusions, and daily summaries. Both main agent and subagents can use it.
+- **Urgent interrupts only** — background subagents only interrupt the main agent for safety-critical alerts (battery critical, hardware faults). Routine reports go to the database silently.
+- **Daily auto-summary** — a scheduled subagent generates daily reports covering user interactions, task completion, anomalies, performance review, and skill discovery opportunities.
+- **Prefix caching optimized** — stable system prompt (L1 + L2-static) is frozen per turn; dynamic status is minimal and placed in user messages to maximize LLM prefix cache hits.
 
 ## Web Dashboard
 
@@ -133,6 +182,7 @@ services:
 | Agent Core | 15678 |
 | Perception MCP | 15720 |
 | Perception WebSocket | 15721 |
+| PR Review Agent (optional) | 25000 |
 
 Hardware driver ports are documented in [phanthymotus-driver](https://github.com/4paradigm/phanthymotus-driver).
 
@@ -145,9 +195,46 @@ The platform can optionally connect to a [Resource Center](https://motus.phanthy
 
 Configure via the `RESOURCE_CENTER_URL` environment variable.
 
+## System Hooks
+
+System hooks provide **instant, bypass-LLM actions** for time-critical responses. Drivers declare hook bindings via `x-hooks` in their MCP tool schema; Agent Core fires them directly on system events without waiting for LLM or ACP barrier.
+
+### Architecture
+
+```
+System Event (ASR arrives / LLM starts / error)
+  → Agent Core hooks.fire("on_thinking")
+  → call_tool_direct() to driver (bypasses barrier + ACP)
+  → Driver executes immediately (LED effect, interrupt, etc.)
+```
+
+### Available Hooks
+
+| Hook | Trigger | Example |
+|------|---------|---------|
+| `on_hearing` | Voice activity detected | LED blink blue |
+| `on_kws_wakeup` | Wake word detected | LED solid blue 2s |
+| `on_thinking` | LLM inference starts | LED rainbow breathe |
+| `on_error` | LLM failure | LED red flash 5s |
+| `on_interrupt_all` | User barge-in | Stop TTS + motion |
+
+### API
+
+```bash
+POST /api/hooks/fire  {"hook": "on_interrupt_all"}
+GET  /api/hooks       # list all registered hooks
+```
+
+See [phanthymotus-driver/README_dev.md](../phanthymotus-driver/README_dev.md) for driver implementation guide.
+
 ## Contributing
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for development setup, architecture details, and guidelines.
+
+Pull requests can be built and reviewed automatically by commenting
+`/request_bot_review` on the PR — see
+[PR_REVIEW_AGENT.md](PR_REVIEW_AGENT.md) for what it does, how to run it, and
+its dashboard.
 
 ## License
 

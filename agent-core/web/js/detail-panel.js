@@ -13,10 +13,11 @@ import { ImageRenderer }    from './renderers/image.js';
 import { AudioRenderer }    from './renderers/audio.js';
 import { LidarRenderer }    from './renderers/lidar.js';
 import { SkeletonRenderer } from './renderers/skeleton.js';
-import { CameraRenderer, DepthRenderer } from './renderers/camera.js';
+import { CameraRenderer, DepthRenderer, DepthZlibRenderer } from './renderers/camera.js';
 import { HTMSGRenderer }    from './renderers/htmsg.js';
+import { openDetailPanelMobile, closeDetailPanelMobile } from './mobile.js';
 
-const RENDERERS = [VideoRenderer, CameraRenderer, DepthRenderer, ImageRenderer, AudioRenderer, LidarRenderer, HTMSGRenderer, SkeletonRenderer, TextRenderer, ActivityRenderer];
+const RENDERERS = [VideoRenderer, CameraRenderer, DepthRenderer, DepthZlibRenderer, ImageRenderer, AudioRenderer, LidarRenderer, HTMSGRenderer, SkeletonRenderer, TextRenderer, ActivityRenderer];
 
 let _panel    = null;
 let _renderer = null;
@@ -31,6 +32,7 @@ export function showTopicDetail(topicPath, format) {
   _cleanup();
 
   _panel.classList.remove('hidden');
+  openDetailPanelMobile();
   document.getElementById('detail-title').textContent    = topicPath;
   document.getElementById('detail-subtitle').textContent = format ? `format: ${format}` : 'live stream';
 
@@ -76,6 +78,7 @@ export async function showNodeDetail(mcp) {
   _cleanup();
 
   _panel.classList.remove('hidden');
+  openDetailPanelMobile();
   document.getElementById('detail-title').textContent    = mcp.server_name || mcp.name;
   document.getElementById('detail-subtitle').textContent = mcp.url || '';
 
@@ -155,6 +158,7 @@ export async function showNodeDetail(mcp) {
 function _closePanel() {
   _cleanup();
   _panel.classList.add('hidden');
+  closeDetailPanelMobile();
 }
 
 function _cleanup() {
