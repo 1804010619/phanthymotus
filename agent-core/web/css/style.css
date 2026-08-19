@@ -385,6 +385,9 @@ html, body {
 .sidebar-section-icon.controller {
   color: var(--emerald);
 }
+.sidebar-section-icon.actucore {
+  color: var(--blue);
+}
 
 .sidebar-section-name {
   font-size: 10px;

@@ -90,7 +90,7 @@ export function renderSidebar(mcps, topicStatuses = {}) {
   // ActuCore section
   if (actucores.length) {
     _scroll.appendChild(_buildMergedSection(actucores, {
-      cls: 'sidebar-section-actucore', icon: '◆', label: '执行',
+      cls: 'sidebar-section-actucore', icon: '▶', iconCls: 'actucore', label: '执行',
     }));
   }
 
@@ -139,7 +139,7 @@ function _buildSection(mcp) {
  * grouped by tool type. Used for perception and actucore, which each may be
  * served by more than one container but read as a single layer in the sidebar.
  */
-function _buildMergedSection(mcps, { cls, icon, label }) {
+function _buildMergedSection(mcps, { cls, icon, iconCls = '', label }) {
   const section = document.createElement('div');
   section.className = `sidebar-section ${cls}`;
 
@@ -157,7 +157,7 @@ function _buildMergedSection(mcps, { cls, icon, label }) {
     }
   }
   header.innerHTML = `
-    <span class="sidebar-section-icon">${_esc(icon)}</span>
+    <span class="sidebar-section-icon ${_esc(iconCls)}">${_esc(icon)}</span>
     <span class="sidebar-section-name">${_esc(label)}</span>
     <span class="sidebar-section-count">${allTools.length}</span>
   `;
