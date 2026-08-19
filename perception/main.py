@@ -14,6 +14,12 @@ WebSocket ASR 端口: config.ws_port（默认 15721）
 
 from __future__ import annotations
 
+# First, before anything can write to stdout: make every log line one atomic,
+# control-character-free write, so concurrent writers cannot tear a Docker log
+# record. See utils/logsafe.py.
+from utils import logsafe
+logsafe.install()
+
 import asyncio
 import json
 import logging

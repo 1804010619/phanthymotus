@@ -39,6 +39,22 @@ def _save_manifest(drivers: list) -> None:
 
 # ── Docker helpers ─────────────────────────────────────────────────────────
 
+# Log rotation policy, kept here so the legacy `docker run` fallback below and
+# the `logging:` block every deploy/service.yml declares stay visibly the same
+# policy. Without the options the `local` driver falls back to its own defaults
+# (20m x 5 = 100 MB), i.e. 3.3x what we intend, silently and per container.
+LOG_MAX_SIZE = '10m'
+LOG_MAX_FILE = '3'
+
+
+def _log_config() -> dict:
+    """docker-py log_config for a container. Values must be strings."""
+    return {
+        'type': 'local',
+        'config': {'max-size': LOG_MAX_SIZE, 'max-file': LOG_MAX_FILE},
+    }
+
+
 def _docker():
     import docker
     return docker.from_env()
@@ -161,6 +177,12 @@ def _deploy_sync(driver: dict) -> dict:
 
     service_name = list(service_def.keys())[0]
     service_def[service_name]['image'] = target_image
+    # Default the rotation policy for images whose service.yml predates it (or
+    # comes from a third party). Declared blocks win — this only fills a gap.
+    service_def[service_name].setdefault('logging', {
+        'driver': 'local',
+        'options': {'max-size': LOG_MAX_SIZE, 'max-file': LOG_MAX_FILE},
+    })
 
     # Read existing compose (or create minimal)
     try:
@@ -275,7 +297,7 @@ def _deploy_sync_legacy(driver: dict) -> dict:
     if driver.get('volumes'):
         run_kwargs['volumes'] = driver['volumes']
 
-    run_kwargs['log_config'] = {'type': 'local'}
+    run_kwargs['log_config'] = _log_config()
 
     _log_deploy(driver['id'], f'[run] {name}')
     try:

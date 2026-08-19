@@ -1,3 +1,6 @@
+import logsafe
+logsafe.install()
+
 import contextlib
 import asyncio
 import json
