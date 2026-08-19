@@ -25,23 +25,25 @@ def empty_catalog() -> dict:
 
 
 # ── Simple in-memory cache ──────────────────────────────────────────────────
-
-_cache: dict = {'data': None, 'ts': 0.0}
+# Keyed by channel: without this, switching channels while a stale cache entry
+# from the previous channel is still within TTL would serve mismatched data to
+# any caller that doesn't pass refresh=true.
+_cache: dict[str, dict] = {}
 _CACHE_TTL = 300  # 5 minutes
+
+
+def _current_channel() -> str:
+    try:
+        import config as _cfg
+        return _cfg.main.get('core', {}).get('update_channel', 'ga')
+    except Exception:
+        return 'ga'
 
 
 # ── Catalog fetch ─────────────────────────────────────────────────────────
 
-def _build_catalog_sync() -> dict:
-    url = f'{RESOURCE_CENTER_URL}/api/images'
-
-    # Append channel parameter from config
-    try:
-        import config as _cfg
-        channel = _cfg.main.get('core', {}).get('update_channel', 'ga')
-    except Exception:
-        channel = 'ga'
-    url = f'{url}?channel={channel}'
+def _build_catalog_sync(channel: str) -> dict:
+    url = f'{RESOURCE_CENTER_URL}/api/images?channel={channel}'
 
     print(f'[registry] fetching catalog from resource-center: {url}')
 
@@ -118,17 +120,18 @@ def _build_catalog_sync() -> dict:
 
 @router.get('/catalog')
 async def registry_catalog(refresh: bool = False):
+    channel = _current_channel()
     now = time.time()
-    if not refresh and _cache['data'] and (now - _cache['ts']) < _CACHE_TTL:
-        return {'code': 200, 'data': _cache['data'], 'cached': True}
+    cached = _cache.get(channel)
+    if not refresh and cached and (now - cached['ts']) < _CACHE_TTL:
+        return {'code': 200, 'data': cached['data'], 'cached': True}
 
     import asyncio
     loop = asyncio.get_event_loop()
     try:
-        data = await loop.run_in_executor(None, _build_catalog_sync)
+        data = await loop.run_in_executor(None, _build_catalog_sync, channel)
     except Exception as e:
         return {'code': 500, 'message': str(e), 'data': empty_catalog()}
 
-    _cache['data'] = data
-    _cache['ts'] = now
+    _cache[channel] = {'data': data, 'ts': now}
     return {'code': 200, 'data': data, 'cached': False}

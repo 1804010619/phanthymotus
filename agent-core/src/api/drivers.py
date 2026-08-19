@@ -441,16 +441,16 @@ async def drivers_list():
 @router.post('/sync')
 async def drivers_sync():
     """Fetch registry catalog and upsert drivers in DB."""
-    from api.registry import _build_catalog_sync, _cache as _registry_cache
+    from api.registry import _build_catalog_sync, _current_channel, _cache as _registry_cache
+    channel = _current_channel()
     loop = asyncio.get_event_loop()
     try:
-        catalog = await loop.run_in_executor(None, _build_catalog_sync)
+        catalog = await loop.run_in_executor(None, _build_catalog_sync, channel)
     except Exception as e:
         return {'code': 500, 'message': str(e)}
 
     # Update registry cache with fresh data so next GET /registry/catalog is immediate
-    _registry_cache['data'] = catalog
-    _registry_cache['ts']   = __import__('time').time()
+    _registry_cache[channel] = {'data': catalog, 'ts': __import__('time').time()}
 
     manifest = _load_manifest()
     added, updated = _upsert_from_catalog(manifest, catalog)
