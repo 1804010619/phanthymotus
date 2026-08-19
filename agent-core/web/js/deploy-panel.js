@@ -9,7 +9,13 @@
 let _overlay  = null;
 let _polling  = null;
 
-let _catalog  = { core: [], driver: [], perception: [], inspection: [] };
+let _catalog  = { core: [], perception: [], actucore: [], driver: [] };
+
+// Fallback descriptions, used when resource-center didn't supply one
+const _CAT_DESC = {
+  perception: '语音感知套件 — ASR 语音识别 + TTS 语音合成 + VAD 静音检测 + 唤醒词检测',
+  actucore:   '执行模型层 — VLA 策略 / 导航 / 抓取 / locomotion / 全身控制',
+};
 let _statuses = {};   // driver_id → { running, status, running_image, image, last_deploy }
 let _logPolls = {};   // driver_id → intervalId
 let _currentChannel = 'ga'; // mirrors config.core.update_channel; kept in sync by _loadChannel/_onChannelChange
@@ -183,8 +189,9 @@ function _renderMyServices() {
   // Collect all items from catalog that have a status (i.e., deployed)
   const allItems = [
     ...(_catalog.core || []).map(it => ({ ...it, _cat: 'core' })),
-    ...(_catalog.driver || []).map(it => ({ ...it, _cat: 'driver' })),
     ...(_catalog.perception || []).map(it => ({ ...it, _cat: 'perception' })),
+    ...(_catalog.actucore || []).map(it => ({ ...it, _cat: 'actucore' })),
+    ...(_catalog.driver || []).map(it => ({ ...it, _cat: 'driver' })),
   ];
 
   // Only show items that have actually been deployed (not just synced from catalog)
@@ -384,10 +391,11 @@ function _svcRowHTML({ item, id, s, latestTag, currentTag, hasUpdate }) {
 function _renderMarketplace() {
   const q = (document.getElementById('marketplace-search')?.value || '').trim().toLowerCase();
 
-  // Merge driver + perception for marketplace (core is managed in My Services only)
+  // Merge perception + actucore + driver for marketplace (core is managed in My Services only)
   const allItems = [
-    ...(_catalog.driver || []).map(it => ({ ...it, _cat: 'driver' })),
     ...(_catalog.perception || []).map(it => ({ ...it, _cat: 'perception' })),
+    ...(_catalog.actucore || []).map(it => ({ ...it, _cat: 'actucore' })),
+    ...(_catalog.driver || []).map(it => ({ ...it, _cat: 'driver' })),
   ];
 
   // Build provider list for filter chips
@@ -476,7 +484,7 @@ function _mpCardHTML(item) {
   const isInstalled = s && (s.running || s.last_deploy);
   const tags = _channelTags(item);
   const imageBase = item.full_repo || item.image;
-  const desc = item.description || (cat === 'perception' ? '语音感知套件 — ASR 语音识别 + TTS 语音合成 + VAD 静音检测 + 唤醒词检测' : '');
+  const desc = item.description || _CAT_DESC[cat] || '';
   const fullName = item.name || label;
 
   const versionOpts = tags.map(t => {

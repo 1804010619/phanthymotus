@@ -36,12 +36,22 @@ Perception ships `deploy/service.yml`, so it deploys the same way drivers do:
 Agent Core extracts the fragment from the image and merges it into the host
 compose file.
 
-## Two Dockerfiles, different bases
+## One Dockerfile, Jetson only
 
-`Dockerfile` builds `FROM ros-base` for CPU; `Dockerfile.jetson` builds from a
-prebuilt Jetson torch image and downloads CLIP weights at build time. A change to
-one usually needs the same change in the other — flag it when only one moved.
+`Dockerfile.jetson` is the only one — it builds from a prebuilt Jetson torch
+image and downloads CLIP weights at build time. The CPU variant is gone: it
+produced an image nobody deployed and had stopped building, so
+`deploy/build_perception.sh` no longer takes `--variant`, only `--jp-version`
+(5.11 / 6.1). A PR that reintroduces a CPU path needs to say who deploys it.
+
+Build context is the **repo root**, so `COPY` paths inside the Dockerfile are
+`perception/…`. A `COPY` written relative to `perception/` will fail the build.
 
 Note `Dockerfile.jetson` hardcodes its registry rather than taking an `ARG`,
 unlike every other Dockerfile in the project. Worth mentioning if a PR touches
 that line anyway, not worth raising on its own.
+
+It also does **not** `COPY perception/deploy/ /deploy/`, so the image ships
+without the compose fragment and Agent Core silently falls back to the legacy
+`docker run` path. That is a real bug — `actucore/Dockerfile.jetson` has the
+correct `COPY`. Flag it if a PR is already editing the COPY block.

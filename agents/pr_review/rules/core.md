@@ -51,5 +51,6 @@ same directory to learn the local convention.
 
 ## Ports
 
-15678 for Agent Core. Perception is 15720/15721, drivers 15700–15799. A change
-that hardcodes a port somewhere new should use the existing config instead.
+15678 for Agent Core. Perception is 15720/15721, ActuCore 15730 (15731 reserved),
+drivers 15700–15799 minus those two decades. A change that hardcodes a port
+somewhere new should use the existing config instead.
