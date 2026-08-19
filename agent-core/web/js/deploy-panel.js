@@ -12,6 +12,7 @@ let _polling  = null;
 let _catalog  = { core: [], driver: [], perception: [], inspection: [] };
 let _statuses = {};   // driver_id → { running, status, running_image, image, last_deploy }
 let _logPolls = {};   // driver_id → intervalId
+let _currentChannel = 'ga'; // mirrors config.core.update_channel; kept in sync by _loadChannel/_onChannelChange
 
 // { driverId → { image } }
 let _pending = {};
@@ -48,6 +49,7 @@ async function _loadChannel() {
     const json = await res.json();
     const channel = json.data?.channel || 'ga';
     document.getElementById('deploy-channel-select').value = channel;
+    _currentChannel = channel;
   } catch { /* keep default */ }
 }
 
@@ -67,9 +69,28 @@ async function _onChannelChange(e) {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ channel }),
     });
+    _currentChannel = channel;
     await _loadCatalog(true);
     _render();
   } catch { /* ignore */ }
+}
+
+// Versions visible per channel. Release also shows ga (a stable fallback);
+// preview is deliberately NOT inclusive of release/ga — mixing in the far
+// more sparsely-published stable tags just buries the preview builds you're
+// there to see. Anything not in this map's active list is hidden, not merely
+// re-labelled — resource-center's own channel param already narrows what it
+// returns, this is the client's independent guarantee that the version list
+// never shows a build outside the selected channel.
+const _CHANNEL_TAGS = {
+  ga:      ['ga'],
+  release: ['release', 'ga'],
+  preview: ['preview'],
+};
+
+function _channelTags(item) {
+  const allowed = _CHANNEL_TAGS[_currentChannel] || _CHANNEL_TAGS.ga;
+  return (item.tags || []).filter(t => allowed.includes(t.channel));
 }
 
 // ── Tab switching ─────────────────────────────────────────────────────────
@@ -190,7 +211,7 @@ function _renderMyServices() {
   for (const item of deployed) {
     const id = _driverIdForItem(item, item._cat);
     const s  = _statuses[id] || {};
-    const tags = item.tags || [];
+    const tags = _channelTags(item);
     const latestTag = tags.length > 0 ? tags[0].tag : null;
     const currentTag = s.running_image?.includes(':') ? s.running_image.split(':').pop() : null;
     const hasUpdate = latestTag && currentTag && latestTag !== currentTag;
@@ -299,7 +320,7 @@ function _svcRowHTML({ item, id, s, latestTag, currentTag, hasUpdate }) {
   const isRunning = s.running || item._cat === 'core';
   const statusDot = isRunning ? 'running' : s.status === 'error' ? 'error' : 'stopped';
   const imageBase = item.full_repo || item.image;
-  const tags = item.tags || [];
+  const tags = _channelTags(item);
 
   let actions = '';
   // Version switcher (dropdown)
@@ -453,7 +474,7 @@ function _mpCardHTML(item) {
   const driverId = _driverIdForItem(item, cat);
   const s = _statuses[driverId];
   const isInstalled = s && (s.running || s.last_deploy);
-  const tags = item.tags || [];
+  const tags = _channelTags(item);
   const imageBase = item.full_repo || item.image;
   const desc = item.description || (cat === 'perception' ? '语音感知套件 — ASR 语音识别 + TTS 语音合成 + VAD 静音检测 + 唤醒词检测' : '');
   const fullName = item.name || label;
