@@ -1,5 +1,6 @@
 # ── Jetson GPU variant ──────────────────────────────────────────────
-# Base: jetson-base:jp511-torch (torch 2.0 + torchvision 0.15 with CUDA)
+# Base image is selected by JP_VERSION. TensorRT plans are downloaded only when
+# the runtime target matches the host TensorRT major version.
 #
 # Build context: repo root (phanthy-motus/) so we can access both
 # src/perception_stack/ and deploy/ros-base/audio_msgs/
@@ -11,7 +12,7 @@
 ARG PYPI_MIRROR=https://pypi.tuna.tsinghua.edu.cn/simple/
 ARG APT_MIRROR=mirrors.tuna.tsinghua.edu.cn
 ARG JP_VERSION=511
-ARG ENABLE_VITS2_TRT=0
+ARG ENABLE_VITS2_TRT=1
 
 FROM bj-warehouse.tencentcloudcr.com/phanthy-motus/jetson-base:jp${JP_VERSION}-torch AS vits2-builder
 ARG ENABLE_VITS2_TRT
@@ -37,6 +38,9 @@ RUN mkdir -p /opt/vits2/usr/local /opt/vits2/python && \
       MAKEFLAGS="-j1" \
         pip3 install --no-cache-dir --no-binary pynini \
         --target=/opt/vits2/python -i "${PYPI_MIRROR}" pynini==2.1.6 && \
+      LD_LIBRARY_PATH="/opt/vits2/usr/local/lib" \
+      PYTHONPATH=/opt/vits2/python python3 -c \
+        "import _pynini, _pywrapfst, pynini" && \
       test -e /opt/vits2/usr/local/lib/libfstfar.so; \
     fi
 
@@ -166,11 +170,10 @@ RUN mv /usr/sbin/ldconfig /usr/sbin/ldconfig.real && \
     rm -rf /var/lib/apt/lists/*
 RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} phonemizer
 
-# Optional VITS2 frontend and TensorRT runtime. JP6.1 is the first validated
-# target; the plugin remains disabled unless explicitly enabled in config.
+# VITS2 frontend dependencies. TensorRT plans stay outside the image and are
+# selected at runtime by the host TensorRT major version.
 COPY perception/plugins/vits2_tts_trt/requirements.jetson.txt /tmp/vits2-requirements.txt
 RUN if [ "${ENABLE_VITS2_TRT}" = "1" ]; then \
-      test "${JP_VERSION}" = "61" && \
       ldconfig && \
       PYTHONPATH=/opt/vits2/python pip3 install --no-cache-dir -i "${PYPI_MIRROR}" \
         -r /tmp/vits2-requirements.txt && \

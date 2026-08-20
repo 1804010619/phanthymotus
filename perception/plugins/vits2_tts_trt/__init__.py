@@ -1,4 +1,4 @@
-"""Optional VITS2 TensorRT TTS plugin.
+"""VITS2 TensorRT implementation used by the standard TTS plugin.
 
 Keep ROS imports lazy so the frontend/adapter can be reused by offline
 evaluation without requiring ``audio_msgs`` or ``rclpy``.

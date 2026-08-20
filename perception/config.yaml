@@ -21,18 +21,11 @@ plugins:
 
   tts:
     enabled: true
-    model_dir: /models/sherpa-onnx/tts
-    speaker_id: 0
-    speed: 1.0
-
-  # Optional VITS2 TensorRT TTS for JetPack 6.1. Build the image with
-  # ENABLE_VITS2_TRT=1 before enabling this plugin.
-  vits2_tts:
-    enabled: false
+    engine: vits2_trt
     backend: trt
+    model_dir: /models/vits2
     speaker_id: 0
     speed: 1.0
-    model_dir: /models/vits2
     warmup: true
     max_chunk_tokens: 256
 
