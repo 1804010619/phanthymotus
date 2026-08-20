@@ -24,10 +24,13 @@ let _cards      = [];   // [{ id, mcpId, toolName, driverName, x, y, el }]
 let _allMcps    = [];
 
 // ── Editor Lock ──────────────────────────────────────────────────────────────
-let _sessionId = localStorage.getItem('canvas_session_id');
+// sessionStorage (not localStorage) so each tab/window gets its own session_id —
+// otherwise all tabs of the same browser would share one id and be treated as
+// the same editor, letting them edit concurrently and silently clobber each other's autosave.
+let _sessionId = sessionStorage.getItem('canvas_session_id');
 if (!_sessionId) {
   _sessionId = 'sess-' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
-  localStorage.setItem('canvas_session_id', _sessionId);
+  sessionStorage.setItem('canvas_session_id', _sessionId);
 }
 let _isEditor = false;
 let _currentEditor = null;  // session_id of current editor (null = no one)
@@ -2020,7 +2023,7 @@ function _debouncedSave() {
 }
 
 async function _saveLayout() {
-  if (!(await _ensureEdit())) return;  // auto-reclaim if lock was lost, bail if occupied
+  if (!_isEditor) return;  // only the current editor may persist; system-triggered saves must not auto-claim
   const cards = _cards.map(c => ({
     id:         c.id,
     mcpId:      c.mcpId,
