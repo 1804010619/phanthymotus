@@ -2,7 +2,7 @@ mcp_port: 15720
 
 plugins:
   asr:
-    enabled: true
+    enabled: false
     asr_model: paraformer-zh-en   # paraformer-zh-en | zipformer-en | sensevoice-small
     model_dir: /models/sherpa-onnx/asr
     hw_provider: cpu
@@ -20,7 +20,7 @@ plugins:
         - "x iǎo f àn x iǎo f àn @小范小范"
 
   tts:
-    enabled: true
+    enabled: false
     model_dir: /models/sherpa-onnx/tts
     speaker_id: 0
     speed: 1.0
@@ -48,7 +48,7 @@ plugins:
     fps: 5
 
   ocr:
-    enabled: false
+    enabled: true
     provider: openai   # openai | qwen | tesseract | google
     url: ""            # API URL (empty = default endpoint)
     key: ""            # API Key
