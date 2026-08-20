@@ -188,6 +188,7 @@ COPY perception/main.py    /work/main.py
 COPY perception/plugins/   /work/plugins/
 COPY perception/utils/     /work/utils/
 COPY perception/config.yaml /work/config.yaml
+COPY perception/deploy/    /deploy/
 
 EXPOSE 15720
 EXPOSE 15721
