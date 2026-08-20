@@ -178,9 +178,19 @@ def _register_core_mcp(silent=False):
                     'audio_file': {'type': 'string', 'format': 'file', 'accept': 'audio/*', 'description': '音频文件'},
                 }, 'required': ['action', 'audio_file']},
                 'topic_out': [{'topic': '/remote_control/audio', 'format': 'audio/pcm-16k'}],
+            },
+            {
+                'name': 'remote_image',
+                'type': 'sensor',
+                'description': '远程图片 — 从浏览器上传图片文件，转换为 JPEG 发布到 DDS',
+                'inputSchema': {'type': 'object', 'properties': {
+                    'action': {'type': 'string', 'enum': ['send_image'], 'description': 'Action to perform'},
+                    'image_file': {'type': 'string', 'format': 'file', 'accept': 'image/*', 'description': '图片文件'},
+                }, 'required': ['action', 'image_file']},
+                'topic_out': [{'topic': '/remote_control/image', 'format': 'image/jpeg'}],
             }
         ],
-        'topic_out': [{'topic': '/decision_core', 'format': 'data/json'}, {'topic': '/remote_control/mic', 'format': 'audio/pcm-16k'}, {'topic': '/remote_control/message', 'format': 'data/json'}, {'topic': '/remote_control/audio', 'format': 'audio/pcm-16k'}],
+        'topic_out': [{'topic': '/decision_core', 'format': 'data/json'}, {'topic': '/remote_control/mic', 'format': 'audio/pcm-16k'}, {'topic': '/remote_control/message', 'format': 'data/json'}, {'topic': '/remote_control/audio', 'format': 'audio/pcm-16k'}, {'topic': '/remote_control/image', 'format': 'image/jpeg'}],
         'topic_in': [{'format': 'data/json'}],
     })
 
@@ -601,6 +611,69 @@ async def _remote_audio_upload(file: fastapi.UploadFile = fastapi.File()):
         return await publish_audio_file(tmp_path)
     finally:
         os.unlink(tmp_path)
+
+# ── Remote Image: convert file to JPEG and publish to ROS2 ─────────────────────
+_image_pub = None
+
+def _ensure_image_pub():
+    """Lazily create the ROS2 publisher for /remote_control/image."""
+    global _image_pub
+    if _image_pub is not None:
+        return _image_pub
+    try:
+        from sensor_msgs.msg import CompressedImage
+        import ros2_bridge
+        node = ros2_bridge._node_main
+        if node:
+            from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
+            qos = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT,
+                             history=HistoryPolicy.KEEP_LAST, depth=1,
+                             durability=DurabilityPolicy.VOLATILE)
+            _image_pub = node.create_publisher(CompressedImage, "/remote_control/image", qos)
+    except Exception:
+        pass
+    return _image_pub
+
+async def publish_image_file(file_path: str) -> dict:
+    """Re-encode arbitrary uploaded image to JPEG (if needed) and publish once to DDS."""
+    import os
+    import subprocess
+    pub = _ensure_image_pub()
+    if not pub:
+        return {'code': 500, 'message': 'ROS2 not available'}
+    if not os.path.isfile(file_path):
+        return {'code': 400, 'message': f'文件不存在: {file_path}'}
+
+    proc = subprocess.run(
+        ['ffmpeg', '-y', '-i', file_path, '-frames:v', '1', '-f', 'mjpeg', 'pipe:1'],
+        capture_output=True, timeout=30,
+    )
+    if proc.returncode != 0:
+        return {'code': 400, 'message': f'图片解码失败: {proc.stderr.decode(errors="replace")[:200]}'}
+    jpeg_bytes = proc.stdout
+    if not jpeg_bytes:
+        return {'code': 400, 'message': 'No image data after conversion'}
+
+    width = height = 0
+    try:
+        probe = subprocess.run(
+            ['ffprobe', '-v', 'error', '-select_streams', 'v:0',
+             '-show_entries', 'stream=width,height', '-of', 'csv=p=0', file_path],
+            capture_output=True, timeout=10,
+        )
+        if probe.returncode == 0:
+            w, h = probe.stdout.decode().strip().split(',')
+            width, height = int(w), int(h)
+    except Exception:
+        pass
+
+    from sensor_msgs.msg import CompressedImage
+    msg = CompressedImage()
+    msg.format = "jpeg"
+    msg.data = list(jpeg_bytes)
+    pub.publish(msg)
+
+    return {'code': 200, 'data': {'width': width, 'height': height, 'bytes': len(jpeg_bytes)}}
 
 # ── Mic WebSocket endpoint (receive browser PCM and publish to ROS2) ──────────
 _mic_pub = None

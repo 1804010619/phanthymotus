@@ -811,6 +811,21 @@ async def mcp_call_tool(mcp_id: str, req: MCPCallRequest):
             elif action == 'info':
                 return {'code': 200, 'data': {'state': 'running', 'topic_out': [{'topic': '/remote_control/audio', 'format': 'audio/pcm-16k'}]}}
             return {'code': 200, 'data': None}
+        if req.tool == 'remote_image':
+            action = req.arguments.get('action', 'start')
+            if action == 'start':
+                return {'code': 200, 'data': {'state': 'running'}}
+            elif action == 'stop':
+                return {'code': 200, 'data': {'state': 'idle'}}
+            elif action == 'send_image':
+                image_file = req.arguments.get('image_file', '')
+                if not image_file:
+                    return {'code': 400, 'message': '缺少 image_file 参数', 'data': None}
+                from start import publish_image_file
+                return await publish_image_file(image_file)
+            elif action == 'info':
+                return {'code': 200, 'data': {'state': 'running', 'topic_out': [{'topic': '/remote_control/image', 'format': 'image/jpeg'}]}}
+            return {'code': 200, 'data': None}
         return await _handle_agentcore_call(req)
 
     # ── Handle internal channel MCP ──
