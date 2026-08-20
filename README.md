@@ -44,7 +44,20 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for building and running from source code
 
 ## Architecture
 
-![Architecture](docs/images/architecture.jpg)
+![Architecture](docs/images/architecture.png)
+
+> Editable source: [`docs/architecture.svg`](docs/architecture.svg) — re-export the PNG after changing it.
+
+The platform runs a single **sense → think → act** loop:
+
+`Hardware → Driver·Sensor → Perception → Agent Loop → ActuCore → Driver·Actuator → Hardware`
+
+- **Drivers (L1)** — One MCP server per device. Every tool declares a `type`, and the Agent Core treats each type differently: `sensor` (data streams), `actuator` (executable actions), `processor` (data transforms), `resource` (static assets such as URDF). Sensor and actuator tools normally live in the **same** driver process — the diagram splits them by direction of data flow, not by deployment.
+- **Perception (L2, ports 15720 / 15721)** — Turns raw streams into semantics: ASR, TTS, VLM captions, vision understanding, face recognition.
+- **ActuCore (L2)** — The execution-model side of the same layer: VLA policies, navigation, grasping, locomotion, whole-body control. These are integrated as `processor` MCP devices, so any model that takes a goal and emits motion commands plugs in the same way. ActuCore is a **position in the architecture**, not a component shipped in this repository — the models are chosen per robot.
+- **Agent Loop (L3, port 15678)** — FastAPI + `ros2_bridge.py`: event collector, layered L1–L4 prompt, tool dispatch, ACP barrier, history compaction, steering / interrupt, task store, subagent manager, skills, memory.
+- **Two bypass lanes** — The loop can call `sensor` tools directly, skipping perception; and it can drive `actuator` tools over MCP JSON-RPC directly, skipping ActuCore. Both are the common path for simple queries and one-shot commands.
+- **Web Dashboard** — Subscribes to every DDS topic on the bus via `/ws/bus/{topic}`, and to the agent's decision stream via `/ws/motus`.
 
 Hardware drivers are maintained in a separate repository: **[phanthymotus-driver](https://github.com/4paradigm/phanthymotus-driver)**.
 
@@ -169,6 +182,7 @@ services:
 | Agent Core | 15678 |
 | Perception MCP | 15720 |
 | Perception WebSocket | 15721 |
+| PR Review Agent (optional) | 25000 |
 
 Hardware driver ports are documented in [phanthymotus-driver](https://github.com/4paradigm/phanthymotus-driver).
 
@@ -216,6 +230,11 @@ See [phanthymotus-driver/README_dev.md](../phanthymotus-driver/README_dev.md) fo
 ## Contributing
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for development setup, architecture details, and guidelines.
+
+Pull requests can be built and reviewed automatically by commenting
+`/request_bot_review` on the PR — see
+[PR_REVIEW_AGENT.md](PR_REVIEW_AGENT.md) for what it does, how to run it, and
+its dashboard.
 
 ## License
 
