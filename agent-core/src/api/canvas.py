@@ -101,17 +101,12 @@ async def save_layout(layout: CanvasLayout):
     _check_editor_expired()
 
     session_id = layout.session_id
-    if _editor_session and session_id != _editor_session:
+    if session_id != _editor_session:
         return fastapi.responses.JSONResponse(
             status_code=403, content={'code': 403, 'message': 'Not the current editor',
                                       'editor': _editor_session})
 
-    # Auto-claim if no editor (backward compat: first save becomes editor)
-    if not _editor_session and session_id:
-        _editor_session = session_id
-
-    if session_id == _editor_session:
-        _editor_last_seen = time.monotonic()
+    _editor_last_seen = time.monotonic()
 
     save_data = layout.dict()
     save_data.pop('session_id', None)

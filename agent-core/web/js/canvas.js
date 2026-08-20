@@ -24,22 +24,45 @@ let _cards      = [];   // [{ id, mcpId, toolName, driverName, x, y, el }]
 let _allMcps    = [];
 
 // ── Editor Lock ──────────────────────────────────────────────────────────────
-let _sessionId = localStorage.getItem('canvas_session_id');
+// sessionStorage (not localStorage) so each tab/window gets its own session_id —
+// otherwise all tabs of the same browser would share one id and be treated as
+// the same editor, letting them edit concurrently and silently clobber each other's autosave.
+let _sessionId = sessionStorage.getItem('canvas_session_id');
 if (!_sessionId) {
   _sessionId = 'sess-' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
-  localStorage.setItem('canvas_session_id', _sessionId);
+  sessionStorage.setItem('canvas_session_id', _sessionId);
 }
 let _isEditor = false;
 let _currentEditor = null;  // session_id of current editor (null = no one)
 
-/** Check if current session can modify. If not, show warning and return false. */
-function _canEdit() {
-  if (!_isEditor) {
-    const msg = _currentEditor ? '画布已被其他用户锁定，无法编辑' : '请先点击「编辑」进入编辑状态';
-    _showToast(msg);
+/**
+ * Ensure current session holds the edit lock, auto-claiming it if free.
+ * Returns true if editing may proceed, false if the canvas is occupied by
+ * another session (in which case a toast + locked UI state is shown).
+ */
+async function _ensureEdit() {
+  if (_isEditor) return true;
+  try {
+    const resp = await fetch('/api/canvas/claim-edit', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ session_id: _sessionId }),
+    });
+    const data = await resp.json();
+    if (resp.ok) {
+      _isEditor = true;
+      _currentEditor = _sessionId;
+      _updateEditorUI();
+      _showToast('已自动获取编辑权限');
+      return true;
+    }
+    _currentEditor = data.editor || null;
+    _updateEditorUI();
+    _showToast('画布正被其他用户编辑，请稍后重试');
+    return false;
+  } catch {
+    _showToast('无法获取编辑权限，请检查网络');
     return false;
   }
-  return true;
 }
 
 function _showToast(msg) {
@@ -63,14 +86,16 @@ let _projectRunning = false;
 
 export function isProjectRunning() { return _projectRunning; }
 export function redrawCanvas() { _redrawConnections(); }
-export function canEdit() { return _canEdit(); }
+export function ensureEdit() { return _ensureEdit(); }
+export function isEditor() { return _isEditor; }
 
 /**
  * Programmatically add a card to the canvas (used by mobile tap-to-add).
  * Returns true if added, false if rejected.
  */
-export function addCardFromSidebar({ mcpId, toolName, driverName, hasConfig, multiInstance }) {
+export async function addCardFromSidebar({ mcpId, toolName, driverName, hasConfig, multiInstance }) {
   if (_projectRunning) return false;
+  if (!(await _ensureEdit())) return false;
   if (hasConfig && !isToolConfigured(mcpId, toolName)) return false;
   if (!multiInstance) {
     const existing = _cards.find(c => c.mcpId === mcpId && c.toolName === toolName);
@@ -596,12 +621,12 @@ function _addCard(data, save = true) {
   if (save) _saveLayout();
 }
 
-function _removeCard(id) {
+async function _removeCard(id) {
   if (_projectRunning) {
     _logActivity('warn', '请停止智能控制后修改');
     return;
   }
-  if (!_canEdit()) return;
+  if (!(await _ensureEdit())) return;
   const idx = _cards.findIndex(c => c.id === id);
   if (idx === -1) return;
   _cards[idx].el.remove();
@@ -818,7 +843,7 @@ function _buildCardEl({ id, mcpId, toolName, driverName, x, y, topicIn: savedTop
     if (sensorExecBtn) {
       sensorExecBtn.addEventListener('click', async (e) => {
         e.stopPropagation();
-        if (!_canEdit()) return;
+        if (!(await _ensureEdit())) return;
         await _executeCard(el, mcpId, toolName, id);
       });
     }
@@ -953,8 +978,8 @@ function _buildCardEl({ id, mcpId, toolName, driverName, x, y, topicIn: savedTop
             field.style.display = paramKeys.includes(key) ? '' : 'none';
           });
         };
-        actionSelect.addEventListener('change', () => {
-          if (!_canEdit()) {
+        actionSelect.addEventListener('change', async () => {
+          if (!(await _ensureEdit())) {
             _applyActionParams();  // revert visual to match current state
             return;
           }
@@ -993,7 +1018,7 @@ function _buildCardEl({ id, mcpId, toolName, driverName, x, y, topicIn: savedTop
     if (execBtn) {
       execBtn.addEventListener('click', async (e) => {
         e.stopPropagation();
-        if (!_canEdit()) return;
+        if (!(await _ensureEdit())) return;
         await _executeCard(el, mcpId, toolName);
       });
     }
@@ -1205,7 +1230,7 @@ function _setupPortDrag() {
   });
 
   // Delegate pointerdown on out ports and executor ports
-  _viewport.addEventListener('pointerdown', (e) => {
+  _viewport.addEventListener('pointerdown', async (e) => {
     const outPort = e.target.closest('.canvas-port.out');
     const execPort = !outPort ? e.target.closest('.canvas-port.executor') : null;
     if (!outPort && !execPort) return;
@@ -1213,7 +1238,7 @@ function _setupPortDrag() {
       _logActivity('warn', '请停止智能控制后修改');
       return;
     }
-    if (!_canEdit()) return;
+    if (!(await _ensureEdit())) return;
     e.preventDefault();
     e.stopPropagation();
 
@@ -1324,13 +1349,13 @@ function _redrawConnections() {
     line.addEventListener('mouseenter', showBtn);
     line.addEventListener('mouseleave', hideBtn);
     delBtn.addEventListener('mouseleave', () => delBtn.classList.remove('visible'));
-    delBtn.addEventListener('click', (e) => {
+    delBtn.addEventListener('click', async (e) => {
       e.stopPropagation();
       if (_projectRunning) {
         _logActivity('warn', '请停止智能控制后修改');
         return;
       }
-      if (!_canEdit()) return;
+      if (!(await _ensureEdit())) return;
       _connections = _connections.filter(c => c.id !== conn.id);
       _resolveAllTopics();
       _autoStopOnDisconnect(conn.toCardId, conn.toPortIdx, conn.fromTopic);
@@ -1405,8 +1430,8 @@ function _redrawConnections() {
     line.addEventListener('mouseleave', hideBtn);
     delBtn.addEventListener('mouseleave', () => delBtn.classList.remove('visible'));
 
-    const removeExec = () => {
-      if (!_canEdit()) return;
+    const removeExec = async () => {
+      if (!(await _ensureEdit())) return;
       _execConnections = _execConnections.filter(c => c.id !== conn.id);
       _logActivity('executor', `解绑执行器: ${conn.toToolName || conn.toCardId}`);
       _redrawConnections();
@@ -1947,12 +1972,12 @@ function _makeDraggable(el, cardData) {
 
   let startClientX, startClientY, startWorldX, startWorldY, isDragging = false;
 
-  header.addEventListener('pointerdown', (e) => {
+  header.addEventListener('pointerdown', async (e) => {
     if (e.target.closest('.canvas-card-close')) return;
     if (e.target.closest('.canvas-card-info-btn')) return;
     if (e.target.closest('.canvas-card-instance-cfg-btn')) return;
     if (_projectRunning) return;
-    if (!_canEdit()) return;
+    if (!(await _ensureEdit())) return;
     e.preventDefault();
     e.stopPropagation();
 
@@ -1998,7 +2023,7 @@ function _debouncedSave() {
 }
 
 async function _saveLayout() {
-  if (!_isEditor) return;  // Only editor can save
+  if (!_isEditor) return;  // only the current editor may persist; system-triggered saves must not auto-claim
   const cards = _cards.map(c => ({
     id:         c.id,
     mcpId:      c.mcpId,
@@ -2051,44 +2076,28 @@ function _createEditorBar() {
 function _updateEditorUI() {
   let bar = document.getElementById('canvas-editor-bar');
   if (!bar) bar = _createEditorBar();
+  bar.classList.toggle('canvas-editor-bar--locked', !_isEditor && !!_currentEditor);
 
   if (_isEditor) {
     bar.innerHTML = `${_SVG_PEN}<span class="editor-label editor-label--active">编辑中</span><button class="editor-btn" id="canvas-release-btn">释放</button>`;
     bar.querySelector('#canvas-release-btn').onclick = _releaseEdit;
     _setCanvasReadonly(false);
   } else if (_currentEditor) {
-    bar.innerHTML = `${_SVG_LOCK}<span class="editor-label editor-label--locked">已锁定</span>`;
+    bar.innerHTML = `${_SVG_LOCK}<span class="editor-label editor-label--locked">画布被占用，无法编辑</span>`;
     _setCanvasReadonly(true);
   } else {
     bar.innerHTML = `${_SVG_PEN}<button class="editor-btn editor-btn--claim" id="canvas-claim-btn">编辑</button>`;
-    bar.querySelector('#canvas-claim-btn').onclick = _claimEdit;
+    bar.querySelector('#canvas-claim-btn').onclick = _ensureEdit;
     _setCanvasReadonly(true);
   }
 }
 
 function _setCanvasReadonly(readonly) {
   // Don't use pointer-events: none — it blocks all interaction including toast triggers.
-  // Instead, each action handler checks _canEdit() individually.
+  // Instead, each action handler calls _ensureEdit() individually.
   document.querySelectorAll('.sidebar-tool-item').forEach(el => {
     el.draggable = !readonly;
   });
-}
-
-async function _claimEdit() {
-  try {
-    const resp = await fetch('/api/canvas/claim-edit', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ session_id: _sessionId }),
-    });
-    const data = await resp.json();
-    if (resp.ok) {
-      _isEditor = true;
-      _currentEditor = _sessionId;
-    } else {
-      _currentEditor = data.editor || null;
-    }
-  } catch { /* silent */ }
-  _updateEditorUI();
 }
 
 async function _releaseEdit() {
@@ -2115,6 +2124,7 @@ async function _checkEditStatus() {
       // We lost editor status (timeout)
       _isEditor = false;
       _logActivity('warn', '编辑权已超时释放（60秒无操作）');
+      _showToast('编辑权已超时释放，请重新操作');
     }
     _updateEditorUI();
   } catch { /* silent */ }

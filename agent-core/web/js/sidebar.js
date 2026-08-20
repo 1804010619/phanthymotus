@@ -4,7 +4,7 @@
  * Tools with configSchema show config status and config button.
  */
 
-import { isProjectRunning, addCardFromSidebar, canEdit } from './canvas.js';
+import { isProjectRunning, addCardFromSidebar, ensureEdit, isEditor } from './canvas.js';
 import { isMobile, closeSidebarMobile } from './mobile.js';
 
 let _scroll = null;
@@ -267,10 +267,10 @@ function _buildChip(mcp, tool) {
   chip.innerHTML = `<span class="chip-name">${_esc(tool.name)}</span><button class="mobile-add-btn" title="添加到画布">+</button>${configBtnHtml}`;
 
   // Mobile add-to-canvas button
-  chip.querySelector('.mobile-add-btn').addEventListener('click', (e) => {
+  chip.querySelector('.mobile-add-btn').addEventListener('click', async (e) => {
     e.stopPropagation();
     e.preventDefault();
-    const added = addCardFromSidebar({
+    const added = await addCardFromSidebar({
       mcpId: mcp.id, toolName: tool.name,
       driverName: mcp.server_name || mcp.name || mcp.id,
       hasConfig: !!hasSharedFields,
@@ -294,8 +294,9 @@ function _buildChip(mcp, tool) {
     _showDetail(mcp, tool);
   });
 
+  chip.addEventListener('pointerdown', () => { ensureEdit(); });
   chip.addEventListener('dragstart', (e) => {
-    if (!canEdit()) { e.preventDefault(); return; }
+    if (!isEditor()) { e.preventDefault(); ensureEdit(); return; }
     chip.classList.add('dragging-source');
     e.dataTransfer.effectAllowed = 'copy';
     e.dataTransfer.setData('application/x-cap-card', JSON.stringify({
@@ -402,10 +403,10 @@ function _buildToolCard(mcp, tool) {
   });
 
   // Mobile add-to-canvas button
-  card.querySelector('.mobile-add-btn').addEventListener('click', (e) => {
+  card.querySelector('.mobile-add-btn').addEventListener('click', async (e) => {
     e.stopPropagation();
     e.preventDefault();
-    const added = addCardFromSidebar({
+    const added = await addCardFromSidebar({
       mcpId: mcp.id, toolName: tool.name,
       driverName: mcp.server_name || mcp.name || mcp.id,
       hasConfig: !!hasSharedFields,
@@ -423,8 +424,9 @@ function _buildToolCard(mcp, tool) {
   }
 
   // Drag (for canvas drop)
+  card.addEventListener('pointerdown', () => { ensureEdit(); });
   card.addEventListener('dragstart', (e) => {
-    if (!canEdit()) { e.preventDefault(); return; }
+    if (!isEditor()) { e.preventDefault(); ensureEdit(); return; }
     card.classList.add('dragging-source');
     e.dataTransfer.effectAllowed = 'copy';
     e.dataTransfer.setData('application/x-cap-card', JSON.stringify({
@@ -457,12 +459,12 @@ export function hasSharedRequired(configSchema) {
 
 // ── Tool config modal (shared fields only) ────────────────────────────────────
 
-function _openToolConfigModal(mcpId, toolName, configSchema) {
+async function _openToolConfigModal(mcpId, toolName, configSchema) {
   if (isProjectRunning()) {
     alert('Stop agent before modifying');
     return;
   }
-  if (!canEdit()) return;
+  if (!(await ensureEdit())) return;
   const overlay = document.getElementById('tool-config-overlay');
   const titleEl = document.getElementById('tool-config-title');
   const bodyEl  = document.getElementById('tool-config-body');
@@ -668,7 +670,7 @@ function _openToolConfigModal(mcpId, toolName, configSchema) {
   // Handlers
   const close = () => { overlay.classList.add('hidden'); };
   const save = async () => {
-    if (!canEdit()) return;
+    if (!(await ensureEdit())) return;
     const values = {};
     bodyEl.querySelectorAll('[data-key]').forEach(input => {
       const v = input.value.trim();
@@ -784,12 +786,12 @@ function _hideDetail() {
  * Open a config modal for a specific canvas card instance.
  * Only shows fields with scope === "instance".
  */
-export function openInstanceConfigModal(mcpId, toolName, instanceId, configSchema) {
+export async function openInstanceConfigModal(mcpId, toolName, instanceId, configSchema) {
   if (isProjectRunning()) {
     alert('Stop agent before modifying');
     return;
   }
-  if (!canEdit()) return;
+  if (!(await ensureEdit())) return;
   const overlay = document.getElementById('tool-config-overlay');
   const titleEl = document.getElementById('tool-config-title');
   const bodyEl  = document.getElementById('tool-config-body');
@@ -955,7 +957,7 @@ export function openInstanceConfigModal(mcpId, toolName, instanceId, configSchem
 
   const close = () => { overlay.classList.add('hidden'); };
   const save = async () => {
-    if (!canEdit()) return;
+    if (!(await ensureEdit())) return;
     const values = {};
     bodyEl.querySelectorAll('[data-key]').forEach(input => {
       const v = input.value.trim();
