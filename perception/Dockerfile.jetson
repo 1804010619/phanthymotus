@@ -1,6 +1,7 @@
 # ── Jetson GPU variant ──────────────────────────────────────────────
-# Base image is selected by JP_VERSION. TensorRT plans are downloaded only when
-# the runtime target matches the host TensorRT major version.
+# Base: jetson-base:jp511-torch (torch 2.0 + torchvision 0.15 with CUDA)
+# JP_VERSION selects the corresponding Jetson base; TensorRT plans are loaded
+# only when the runtime target matches the host TensorRT major version.
 #
 # Build context: repo root (phanthy-motus/) so we can access both
 # src/perception_stack/ and deploy/ros-base/audio_msgs/
