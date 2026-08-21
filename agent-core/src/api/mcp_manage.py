@@ -15,18 +15,48 @@ router = fastapi.APIRouter(prefix='/mcp', tags=['mcp'])
 _mcp_write_lock = asyncio.Lock()  # 防止并发 ping 的 read-modify-write race condition
 
 
-async def _notify_inspector(mcp_id: str, topics: list) -> None:
-    """Register topics with the embedded inspection module (process-internal call)."""
+async def _notify_inspector(mcp_id: str, topic_out: list, topic_in: list | None = None) -> None:
+    """Register topics with the embedded inspection module (process-internal call).
+
+    生产者（topic_out）与消费者（topic_in）分开登记：一个 topic 的数据格式由**发布方**
+    决定。消费者声明的 format 只是「我要吃什么」，不能拿它改写别人发布的总线格式 ——
+    否则 ocr 的 image/jpeg 输入会把 /decision_core 注册成图片总线，仪表盘按图片渲染、
+    DDS 订阅也会用错消息类型。
+    """
     from api.inspection import register_topic_internal
-    for t in topics:
-        topic     = t.get('topic', '')
-        fmt       = t.get('format', '')
-        if not topic:
-            continue
-        try:
-            await register_topic_internal(topic, fmt, mcp_id)
-        except Exception:
-            pass
+    for producer, topics in ((True, topic_out or []), (False, topic_in or [])):
+        for t in topics:
+            topic = t.get('topic', '')
+            fmt   = t.get('format', '')
+            if not topic:
+                continue
+            try:
+                await register_topic_internal(topic, fmt, mcp_id, producer=producer)
+            except Exception:
+                pass
+
+
+def _fmt_match(required: str, available: str) -> bool:
+    """数据格式是否兼容。与前端 setup.js 的 _fmtMatch 保持一致：精确相等，或 `audio/*` 前缀通配。"""
+    if not required or not available:
+        return False
+    if required == available:
+        return True
+    if required.endswith('/*'):
+        return available.startswith(required[:-1])
+    return False
+
+
+# 已经提示过「上游没有匹配格式」的 (mcp_id, format)，避免每次 ping 都刷日志
+_unmatched_logged: set = set()
+
+
+def _upstream_topic_for(fmt: str, upstream_out: list) -> str:
+    """在上游的 topic_out 里找格式匹配的那条 topic。"""
+    for t in upstream_out:
+        if t.get('topic') and _fmt_match(fmt, t.get('format', '')):
+            return t['topic']
+    return ''
 
 
 def _get_mcp_list() -> list:
@@ -406,9 +436,10 @@ async def _do_ping(mcp_id: str) -> dict:
         is_internal = transport == 'internal'
         # Register topics for internal MCPs (so inspection/monitoring works)
         if is_internal:
-            topics = target.get('topic_out', []) + target.get('topic_in', [])
-            if topics:
-                asyncio.create_task(_notify_inspector(mcp_id, topics))
+            t_out = target.get('topic_out', []) or []
+            t_in  = target.get('topic_in', []) or []
+            if t_out or t_in:
+                asyncio.create_task(_notify_inspector(mcp_id, t_out, t_in))
         return {
             'online':      is_internal and target.get('online', False),
             'tools':       target.get('tools', []),
@@ -455,17 +486,29 @@ async def _do_ping(mcp_id: str) -> dict:
     topic_in  = [dict(t) for t in caps.get('topic_in',  [])]
     topic_out = [dict(t) for t in caps.get('topic_out', [])]
 
-    upstream_topic = ''
+    upstream_out = []
     depends_on = target.get('depends_on', '')
     if depends_on:
         upstream = next((m for m in mcps if m.get('id') == depends_on), None)
-        upstream_topic = ((upstream or {}).get('topic_out') or [{}])[0].get('topic', '')
+        upstream_out = (upstream or {}).get('topic_out') or []
 
-    # Fill empty topic_in from upstream (depends_on relationship)
-    if upstream_topic:
-        for t in topic_in:
-            if not t.get('topic'):
-                t['topic'] = upstream_topic
+    # Fill empty topic_in from upstream — **按格式匹配**，不是无脑取 topic_out[0]。
+    # agentcore 的 topic_out[0] 是 /decision_core (data/json)，取 [0] 会把 ocr/vop 的
+    # image/jpeg 输入挂到决策总线上，进而把 /decision_core 注册成图片格式：仪表盘按图片
+    # 渲染，DDS 订阅也会拿 CompressedImage 去订阅 std_msgs/String。
+    # 匹配不到就留空 —— UI 上显示「未连接」是对的，硬塞一个格式不符的总线不是。
+    for t in topic_in:
+        if t.get('topic'):
+            continue
+        fmt = t.get('format', '')
+        picked = _upstream_topic_for(fmt, upstream_out)
+        if picked:
+            t['topic'] = picked
+        elif upstream_out and (mcp_id, fmt) not in _unmatched_logged:
+            _unmatched_logged.add((mcp_id, fmt))
+            avail = ', '.join(f'{x.get("topic", "?")}({x.get("format", "?")})' for x in upstream_out)
+            print(f'[mcp/ping] {mcp_id}: upstream {depends_on} has no {fmt!r} topic — '
+                  f'input left unbound (upstream offers: {avail})')
 
     # Log only when tools change (first ping or tool list updated)
     current_tool_names = [t.get('name', '') if isinstance(t, dict) else t for t in caps['tools']]
@@ -569,7 +612,7 @@ async def _do_ping(mcp_id: str) -> dict:
             hooks.register(mcp_id, tool.get('name', ''), x_hooks)
 
     # Notify inspection module about all topics from this device
-    asyncio.create_task(_notify_inspector(mcp_id, topic_out + topic_in))
+    asyncio.create_task(_notify_inspector(mcp_id, topic_out, topic_in))
 
     # Auto-restore saved configs when device comes online (first ping or after offline)
     if not was_online:
@@ -965,9 +1008,10 @@ async def mcp_call_tool(mcp_id: str, req: MCPCallRequest):
                             try:
                                 parsed = json.loads(item.get('text', ''))
                                 if isinstance(parsed, dict):
-                                    topics_to_reg = parsed.get('topic_out', []) + parsed.get('topic_in', [])
-                                    if any(t.get('topic') for t in topics_to_reg):
-                                        asyncio.create_task(_notify_inspector(mcp_id, topics_to_reg))
+                                    t_out = parsed.get('topic_out', []) or []
+                                    t_in  = parsed.get('topic_in', []) or []
+                                    if any(t.get('topic') for t in t_out + t_in):
+                                        asyncio.create_task(_notify_inspector(mcp_id, t_out, t_in))
                             except Exception:
                                 pass
                 return {'code': 200, 'data': result.get('content', result)}
