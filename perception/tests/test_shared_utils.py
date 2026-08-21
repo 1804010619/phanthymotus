@@ -583,3 +583,34 @@ def test_require_models_subpath():
     for bad in ("/etc/cron.d", "/models/../etc", "relative/dir", "/modelsevil"):
         with pytest.raises(ValueError):
             require_models_subpath(bad)
+
+
+def test_require_models_subpath_rejects_symlink_escape(tmp_path):
+    """A lexical check passes /models/link while link points outside the tree;
+    every later makedirs/open/replace would follow it as root."""
+    from utils.model_downloader import require_models_subpath
+
+    root = tmp_path / "models"
+    root.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+
+    # symlinked directory inside the tree
+    (root / "link").symlink_to(outside)
+    with pytest.raises(ValueError):
+        require_models_subpath(str(root / "link"), root=str(root))
+    # and a not-yet-created child under that symlink
+    with pytest.raises(ValueError):
+        require_models_subpath(str(root / "link" / "bundle"), root=str(root))
+
+    # a symlink that stays inside the tree is still allowed
+    (root / "inner").mkdir()
+    (root / "alias").symlink_to(root / "inner")
+    assert require_models_subpath(str(root / "alias"), root=str(root)) == str(
+        (root / "inner").resolve()
+    )
+
+    # plain paths, existing or not, keep working
+    assert require_models_subpath(str(root / "new" / "bundle"), root=str(root)) == str(
+        root.resolve() / "new" / "bundle"
+    )

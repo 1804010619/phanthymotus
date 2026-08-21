@@ -214,17 +214,36 @@ MODELS_ROOT = "/models"
 def require_models_subpath(path: str, root: str = MODELS_ROOT) -> str:
     """Validate that a caller-supplied model_dir stays inside the models tree.
 
-    model_dir is accepted over MCP config, and the downloader runs as root in
-    the container — an unchecked value would let a caller create or overwrite
-    files at arbitrary container paths. Returns the normalized absolute path.
+    model_dir is accepted over MCP config and the downloader runs as root in
+    the container, so an unchecked value would let a caller create or
+    overwrite files at arbitrary container paths.
+
+    A lexical check is not enough: ``/models/link`` passes it while ``link``
+    is a symlink pointing outside the tree, and every later makedirs/open/
+    os.replace would follow it. Resolve symlinks on both sides — for the
+    deepest component that exists, since the target directory is usually
+    created later — and compare the resolved paths. Returns the resolved
+    absolute path, which callers must use for all filesystem work.
     """
-    normalized = os.path.normpath(os.path.join("/", str(path)))
-    root_norm = os.path.normpath(root)
-    if normalized != root_norm and not normalized.startswith(root_norm + os.sep):
+    candidate = os.path.normpath(os.path.join("/", str(path)))
+    root_real = os.path.realpath(root)
+
+    # Resolve the longest existing prefix, then re-attach the missing tail:
+    # realpath() on a not-yet-created directory cannot detect a symlinked
+    # parent otherwise.
+    existing = candidate
+    tail: list[str] = []
+    while not os.path.exists(existing) and existing not in ("/", ""):
+        existing, name = os.path.split(existing)
+        tail.append(name)
+    resolved = os.path.join(os.path.realpath(existing), *reversed(tail))
+    resolved = os.path.normpath(resolved)
+
+    if resolved != root_real and not resolved.startswith(root_real + os.sep):
         raise ValueError(
-            f"model_dir must be under {root_norm}/: got {path!r}"
+            f"model_dir must resolve under {root_real}/: got {path!r}"
         )
-    return normalized
+    return resolved
 
 
 def select_bundle_family(bundles: dict, family: str | None = None) -> str:
