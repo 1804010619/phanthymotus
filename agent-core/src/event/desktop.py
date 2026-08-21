@@ -23,6 +23,11 @@ _MAX_OUTPUT = 51200  # 50 KB output cap
 
 _ALLOWED_DIRS = ['/work', '/tmp']
 
+# Read 直接返回给 LLM 的图片：超过此大小先用 ffmpeg 缩放重编码，避免 context 爆掉
+_IMAGE_EXT = {'.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp'}
+_IMAGE_INLINE_MAX = 1_500_000   # 1.5 MB
+_IMAGE_MAX_EDGE = 1280          # 缩放后最长边
+
 _BASH_BLOCKED = [
     'rm -rf /', 'rm -rf /*', 'mkfs', 'reboot', 'shutdown', 'poweroff',
     'dd if=', 'dd of=/dev',
@@ -63,6 +68,57 @@ def _truncate(text: str, max_bytes: int = _MAX_OUTPUT) -> str:
     encoded = text.encode('utf-8', errors='replace')[:max_bytes]
     truncated = encoded.decode('utf-8', errors='ignore')
     return truncated + f'\n\n... [output truncated at {max_bytes} bytes]'
+
+
+async def _read_image(p: pathlib.Path):
+    """把图片文件读成 OpenAI multi-modal 内容块。
+
+    返回值形如 [{'type':'text',...},{'type':'image_url','image_url':'data:...'}]，
+    与 mcp_client.call_tool 处理 MCP 图片结果的格式一致；event/llm.py::_trim 已能
+    处理 list 型 tool content（超出 max_images 时替换为占位符）。
+
+    大图先用 ffmpeg 缩放重编码为 JPEG（镜像内自带 ffmpeg，见 start.py::publish_image_file），
+    否则一张手机照片就能占满上下文。
+    """
+    import base64
+
+    raw = p.read_bytes()
+    mime = 'image/jpeg'
+    suffix = p.suffix.lower()
+    if suffix == '.png':
+        mime = 'image/png'
+    elif suffix == '.gif':
+        mime = 'image/gif'
+    elif suffix == '.webp':
+        mime = 'image/webp'
+    elif suffix == '.bmp':
+        mime = 'image/bmp'
+
+    note = ''
+    if len(raw) > _IMAGE_INLINE_MAX:
+        proc = await asyncio.create_subprocess_exec(
+            'ffmpeg', '-y', '-i', str(p), '-frames:v', '1',
+            '-vf', f'scale=\'min({_IMAGE_MAX_EDGE},iw)\':-2',
+            '-q:v', '4', '-f', 'mjpeg', 'pipe:1',
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            out, _err = await asyncio.wait_for(proc.communicate(), timeout=30)
+        except asyncio.TimeoutError:
+            proc.kill()
+            out = b''
+        if out:
+            note = f' (downscaled from {len(raw) / 1e6:.1f}MB for the model)'
+            raw, mime = out, 'image/jpeg'
+        else:
+            return (f'[{p} | {len(raw)} bytes] Image too large to inline and ffmpeg '
+                    f'downscaling failed. Use Bash + ffmpeg to shrink it first.')
+
+    b64 = base64.b64encode(raw).decode('ascii')
+    return [
+        {'type': 'text', 'text': f'[{p} | image | {len(raw)} bytes{note}]'},
+        {'type': 'image_url', 'image_url': f'data:{mime};base64,{b64}'},
+    ]
 
 
 # ── Tools class ──────────────────────────────────────────────────────────────────
@@ -199,7 +255,7 @@ class DesktopTools:
         offset: typing.Annotated[int, 'Line number to start reading from (1-indexed)'] = 1,
         limit: typing.Annotated[int, 'Maximum number of lines to return (default 200)'] = 200,
     ) -> str:
-        """Read file contents with line numbers. Supports reading specific line ranges for large files."""
+        """Read file contents with line numbers. Supports reading specific line ranges for large files. Images (jpg/png/gif/webp/bmp) are returned as viewable images — use this to look at photos received from messaging channels or captured by the robot."""
         p = _resolve_path(file_path)
 
         err = _check_path_allowed(p)
@@ -210,6 +266,10 @@ class DesktopTools:
             return f'Error: file not found: {p}'
         if not p.is_file():
             return f'Error: not a file: {p}'
+
+        # 图片 → 多模态内容（与 mcp_client 的图片返回格式一致，LLM 可直接“看到”）
+        if p.suffix.lower() in _IMAGE_EXT:
+            return await _read_image(p)
 
         # Check if binary
         try:

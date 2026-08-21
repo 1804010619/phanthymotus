@@ -830,64 +830,56 @@ async def mcp_call_tool(mcp_id: str, req: MCPCallRequest):
 
     # ── Handle internal channel MCP ──
     if mcp_id == 'channel':
+        from channel.manager import manager as channel_mgr
+
+        def _card_channel(tool: str, instance_id: str) -> str:
+            if not instance_id:
+                return ''
+            cfg = config.main.get(f'tool_config:channel:{tool}:{instance_id}', None)
+            return (cfg or {}).get('channel_id', '')
+
         if req.tool == 'channel_request':
             action = req.arguments.get('action', 'start')
+            instance_id = req.arguments.get('instance_id', '')
             if action == 'start':
-                # Self-check: verify channel adapter is connected (with retry wait)
-                from channel.manager import manager as channel_mgr
-                import asyncio
-                instance_id = req.arguments.get('instance_id', '')
-                channel_id = ''
-                if instance_id:
-                    cfg = config.main.get(f'tool_config:channel:channel_request:{instance_id}', None)
-                    if cfg:
-                        channel_id = cfg.get('channel_id', '')
-                if channel_id:
-                    # Wait up to 10s for adapter to connect
-                    for _ in range(20):  # 20 × 0.5s = 10s
-                        if channel_id in channel_mgr._adapters:
-                            adapter = channel_mgr._adapters[channel_id]
-                            if adapter.status() == 'connected':
-                                return {'code': 200, 'data': {'state': 'running', 'channel': channel_id}}
-                        await asyncio.sleep(0.5)
-                    return {'code': 200, 'data': {'state': 'error', 'message': f'channel {channel_id} adapter not connected (10s timeout)'}}
-                return {'code': 200, 'data': {'state': 'running'}}
+                # 自检：卡片必须选了一个存在且启用的 channel，且 adapter 真的连通。
+                # ensure_connected 会顺手把被 Stop 过的 adapter 拉起来（自愈）。
+                channel_id = _card_channel('channel_request', instance_id)
+                ok, reason = await channel_mgr.ensure_connected(channel_id)
+                if not ok:
+                    print(f'[channel_request] self-check failed: {reason}')
+                    return {'code': 200, 'data': {'state': 'error', 'message': reason}}
+                return {'code': 200, 'data': {'state': 'running', 'channel': channel_id}}
             elif action == 'stop':
                 return {'code': 200, 'data': {'state': 'idle'}}
             elif action == 'info':
-                channel_id = req.arguments.get('channel_id', '')
-                if not channel_id:
-                    instance_id = req.arguments.get('instance_id', '')
-                    if instance_id:
-                        cfg = config.main.get(f'tool_config:channel:channel_request:{instance_id}', None)
-                        if cfg:
-                            channel_id = cfg.get('channel_id', '')
+                channel_id = req.arguments.get('channel_id', '') or _card_channel(
+                    'channel_request', instance_id)
                 topic_id = channel_id.replace(' ', '_') if channel_id else ''
                 topic = f'/channel/request/{topic_id}' if topic_id else '/channel/request'
                 return {'code': 200, 'data': {'topic_out': [{'topic': topic, 'format': 'data/json'}]}}
             return {'code': 200, 'data': None}
         if req.tool == 'channel_reply':
             action = req.arguments.get('action', 'send')
+            instance_id = req.arguments.get('instance_id', '')
             if action == 'start':
-                # Self-check: send a greeting to verify channel is working
-                from channel.manager import manager as channel_mgr
-                try:
-                    import asyncio
-                    result = await channel_mgr.send_to_channel_any("我上线啦！我可以通过飞书与您交流。")
-                    if result:
-                        return {'code': 200, 'data': {'state': 'running', 'self_check': 'greeting sent'}}
-                    else:
-                        return {'code': 200, 'data': {'state': 'error', 'message': 'failed to send greeting — channel not connected'}}
-                except Exception as e:
-                    return {'code': 200, 'data': {'state': 'error', 'message': f'channel send failed: {e}'}}
+                # 自检：静默探测（校验配置 + adapter 健康），不给用户发问候消息。
+                # 旧实现发「我上线啦！」并用 `if result:` 判断，而返回值恒为非空字符串 —— 永远「通过」。
+                channel_id = _card_channel('channel_reply', instance_id)
+                ok, reason = await channel_mgr.ensure_connected(channel_id)
+                if not ok:
+                    print(f'[channel_reply] self-check failed: {reason}')
+                    return {'code': 200, 'data': {'state': 'error', 'message': reason}}
+                return {'code': 200, 'data': {'state': 'running', 'channel': channel_id}}
             elif action == 'stop':
                 return {'code': 200, 'data': {'state': 'idle'}}
             elif action == 'send':
                 text = req.arguments.get('text', '')
-                if not text:
-                    return {'code': 200, 'data': {'error': 'text is required'}}
-                from channel.manager import manager as channel_mgr
-                result = await channel_mgr.send_to_channel_any(text)
+                files = req.arguments.get('files', []) or []
+                if not text and not files:
+                    return {'code': 200, 'data': {'error': 'text or files is required'}}
+                result = await channel_mgr.send_reply(instance_id=instance_id,
+                                                     text=text, files=files)
                 return {'code': 200, 'data': {'result': result}}
             return {'code': 200, 'data': None}
         return {'code': 200, 'data': None}
