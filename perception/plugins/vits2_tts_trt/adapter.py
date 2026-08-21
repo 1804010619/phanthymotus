@@ -152,7 +152,6 @@ def _trt_adapter(cfg: dict) -> Vits2TensorRTAdapter:
 def _configure_frontend_paths(root: Path) -> None:
     """Point inference at the release-controlled frontend data."""
     os.environ.setdefault("NLTK_DATA", str(root / "nltk_data"))
-    os.environ.setdefault("EN_TN_CACHE_DIR", str(root / "tn_cache"))
     os.environ.setdefault("TN_CACHE_DIR", str(root / "tn_cache"))
     os.environ.setdefault("VITS2_FRONTEND_DATA_DIR", str(root / "frontend_data"))
 

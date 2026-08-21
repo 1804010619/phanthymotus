@@ -17,7 +17,8 @@ if NLTK_DATA_DIR not in nltk.data.path:
 
 from g2p_en import G2p
 
-EN_TN_CACHE_DIR = os.getenv("EN_TN_CACHE_DIR", os.path.join(project_root, "tn_cache"))
+from .wetext_compat import ensure_wetext_compat
+
 EN_TN_MODE = os.getenv("EN_TN_MODE", "auto").lower()
 
 _frontend_data_dir = os.getenv("VITS2_FRONTEND_DATA_DIR", "")
@@ -107,9 +108,9 @@ _abbreviations = [
 def get_normalizer():
     global _normalizer
     if _normalizer is None:
-        os.makedirs(EN_TN_CACHE_DIR, exist_ok=True)
-        from tn.english.normalizer import Normalizer as tn_normalizer
-        _normalizer = tn_normalizer(cache_dir=EN_TN_CACHE_DIR)
+        ensure_wetext_compat()
+        from wetext import Normalizer as tn_normalizer
+        _normalizer = tn_normalizer(lang="en", operator="tn")
     return _normalizer
 
 

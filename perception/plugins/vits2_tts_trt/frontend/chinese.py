@@ -9,7 +9,7 @@ from pypinyin import lazy_pinyin, Style, load_phrases_dict
 from .symbols import punctuation
 from .tone_sandhi import ToneSandhi
 
-from tn.chinese.normalizer import Normalizer as ZhNormalizer
+from .fst_tn import FstTextNormalizer
 
 from .heteronym import custom_dict, jieba_phrases
 
@@ -29,9 +29,8 @@ for phrase in jieba_phrases:
 
 current_file_path = os.path.dirname(__file__)
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-default_tn_cache_dir = os.path.join(project_root, "tn_cache")
-_TN_CACHE_DIR = os.getenv("TN_CACHE_DIR", default_tn_cache_dir)
-_normalizer = ZhNormalizer(cache_dir=_TN_CACHE_DIR)
+_TN_RELEASE_DIR = os.getenv("TN_CACHE_DIR", os.path.join(project_root, "tn_cache"))
+_normalizer = FstTextNormalizer(_TN_RELEASE_DIR)
 
 with open(
     os.path.join(current_file_path, "opencpop-strict.txt"), encoding="utf-8"

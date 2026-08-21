@@ -15,42 +15,10 @@ ARG APT_MIRROR=mirrors.tuna.tsinghua.edu.cn
 ARG JP_VERSION=511
 ARG ENABLE_VITS2_TRT=1
 
-FROM bj-warehouse.tencentcloudcr.com/phanthy-motus/jetson-base:jp${JP_VERSION}-torch AS vits2-builder
-ARG ENABLE_VITS2_TRT
-ARG PYPI_MIRROR
-ARG OPENFST_VERSION=1.8.3
-RUN mkdir -p /opt/vits2/usr/local /opt/vits2/python && \
-    if [ "${ENABLE_VITS2_TRT}" = "1" ]; then \
-      apt-get update && apt-get install -y --no-install-recommends \
-        autoconf automake build-essential ca-certificates curl libtool python3-dev && \
-      curl -fsSL "https://www.openfst.org/twiki/pub/FST/FstDownload/openfst-${OPENFST_VERSION}.tar.gz" \
-        -o /tmp/openfst.tar.gz && \
-      mkdir -p /tmp/openfst && \
-      tar -xzf /tmp/openfst.tar.gz -C /tmp/openfst --strip-components=1 && \
-      cd /tmp/openfst && \
-      CXXFLAGS="-O2 -g0" ./configure \
-        --prefix=/usr/local --enable-shared --disable-static --enable-grm && \
-      make -j1 && make install DESTDIR=/opt/vits2 && \
-      CPPFLAGS="-I/opt/vits2/usr/local/include" \
-      LDFLAGS="-L/opt/vits2/usr/local/lib" \
-      LD_LIBRARY_PATH="/opt/vits2/usr/local/lib" \
-      CFLAGS="-O0 -g0" \
-      CXXFLAGS="-O0 -g0 -fno-var-tracking -fno-var-tracking-assignments" \
-      MAKEFLAGS="-j1" \
-        pip3 install --no-cache-dir --no-binary pynini \
-        --target=/opt/vits2/python -i "${PYPI_MIRROR}" pynini==2.1.6 && \
-      LD_LIBRARY_PATH="/opt/vits2/usr/local/lib" \
-      PYTHONPATH=/opt/vits2/python python3 -c \
-        "import _pynini, _pywrapfst, pynini" && \
-      test -e /opt/vits2/usr/local/lib/libfstfar.so; \
-    fi
-
 FROM bj-warehouse.tencentcloudcr.com/phanthy-motus/jetson-base:jp${JP_VERSION}-torch
 ARG PYPI_MIRROR APT_MIRROR
 ARG ENABLE_VITS2_TRT
 ARG JP_VERSION
-COPY --from=vits2-builder /opt/vits2/usr/local/ /usr/local/
-COPY --from=vits2-builder /opt/vits2/python/ /opt/vits2/python/
 
 # ── APT mirror (conditional) ─────────────────────────────────────
 RUN if [ -n "${APT_MIRROR}" ]; then \
@@ -171,15 +139,13 @@ RUN mv /usr/sbin/ldconfig /usr/sbin/ldconfig.real && \
     rm -rf /var/lib/apt/lists/*
 RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} phonemizer
 
-# VITS2 frontend dependencies. TensorRT plans stay outside the image and are
-# selected at runtime by the host TensorRT major version.
+# VITS2 frontend dependencies.  The model release contains compiled TN FSTs;
+# the container executes them with WeText/kaldifst and does not build Pynini.
 COPY perception/plugins/vits2_tts_trt/requirements.jetson.txt /tmp/vits2-requirements.txt
 RUN if [ "${ENABLE_VITS2_TRT}" = "1" ]; then \
-      ldconfig && \
-      PYTHONPATH=/opt/vits2/python pip3 install --no-cache-dir -i "${PYPI_MIRROR}" \
+      pip3 install --no-cache-dir -i "${PYPI_MIRROR}" \
         -r /tmp/vits2-requirements.txt && \
-      PYTHONPATH=/opt/vits2/python python3 -c \
-        "import ctypes,numpy,pynini,tn; ctypes.CDLL('libfstfar.so')"; \
+      python3 -c "import kaldifst,numpy,onnxruntime"; \
     fi && rm -f /tmp/vits2-requirements.txt
 
 # ── Application code ───────────────────────────────────────────────
@@ -200,7 +166,6 @@ RUN find /ros_ws/install -name "site-packages" -type d > /usr/local/lib/python${
 # ROS2 shared libraries（audio_msgs .so 等）
 ENV LD_LIBRARY_PATH="/ros_ws/install/audio_msgs/lib:/opt/ros/humble/install/lib:${LD_LIBRARY_PATH}"
 ENV AMENT_PREFIX_PATH="/ros_ws/install/audio_msgs:/opt/ros/humble/install"
-ENV PYTHONPATH="/opt/vits2/python:${PYTHONPATH}"
 
 # One write per log line instead of 8 KB block flushes that can tear a Docker
 # log record mid-write.
