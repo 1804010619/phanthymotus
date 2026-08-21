@@ -146,6 +146,7 @@ class _Vits2TTSNode(Node):
 
     def stop(self):
         self.request_stop()
+        self._complete_discarded_actions()
         if self._worker_thread and self._worker_thread.is_alive():
             self._worker_thread.join(timeout=3)
         self.state = "idle"
@@ -157,15 +158,26 @@ class _Vits2TTSNode(Node):
 
     def interrupt(self) -> dict:
         """Cancel the active utterance and discard queued utterances."""
-        cleared = 0
+        self._interrupt_event.set()
+        cleared = self._complete_discarded_actions()
+        return {"status": "interrupted", "cleared": cleared}
+
+    def _complete_discarded_actions(self) -> int:
+        """Cancel queued MCP actions that will not reach the worker."""
+        discarded = []
         while True:
             try:
-                self._text_queue.get_nowait()
-                cleared += 1
+                item = self._text_queue.get_nowait()
             except queue.Empty:
                 break
-        self._interrupt_event.set()
-        return {"status": "interrupted", "cleared": cleared}
+            if isinstance(item, tuple):
+                text, action_id = item
+            else:
+                text, action_id = str(item), ""
+            discarded.append((text, action_id))
+        for text, action_id in discarded:
+            self._complete_action(action_id, text, 0, interrupted=True)
+        return len(discarded)
 
     def enqueue(self, text: str, action_id: str = ""):
         if self.state != "running":
@@ -201,13 +213,12 @@ class _Vits2TTSNode(Node):
         if not action_id:
             return
         try:
-            import ssl
             import urllib.request
+            from urllib.parse import urlparse
 
             agent_core_url = os.getenv("AGENT_CORE_URL", "https://localhost:15678")
-            context = ssl.create_default_context()
-            context.check_hostname = False
-            context.verify_mode = ssl.CERT_NONE
+            if urlparse(agent_core_url).scheme != "https":
+                raise ValueError("AGENT_CORE_URL must use HTTPS")
             payload = json.dumps(
                 {
                     "action_id": action_id,
@@ -221,7 +232,7 @@ class _Vits2TTSNode(Node):
                 headers={"Content-Type": "application/json"},
                 method="POST",
             )
-            urllib.request.urlopen(request, timeout=3, context=context)
+            urllib.request.urlopen(request, timeout=3)
         except Exception as exc:
             log.warning("[vits2_tts_trt] ACP completion callback failed: %s", exc)
 
@@ -276,6 +287,7 @@ class _Vits2TTSNode(Node):
                 text, action_id = str(item), ""
             if self._interrupt_event.is_set():
                 self._interrupt_event.clear()
+                self._publish_eof()
                 self._complete_action(action_id, text, 0, interrupted=True)
                 continue
             subscriber_gate_cancel = threading.Event()
@@ -301,6 +313,7 @@ class _Vits2TTSNode(Node):
             # TensorRT synthesis so the stronger BEST_EFFORT guard does not
             # become pure TTFT overhead.
             subscriber_gate_thread.start()
+            eof_published = False
             try:
                 task_started = time.monotonic()
                 first_published_at = None
@@ -396,6 +409,7 @@ class _Vits2TTSNode(Node):
                         subscriber_count,
                     )
                 self._publish_eof()
+                eof_published = True
                 self._complete_action(action_id, text, frames_sent, interrupted)
                 if interrupted:
                     log.info(
@@ -407,6 +421,8 @@ class _Vits2TTSNode(Node):
                 log.exception("[vits2_tts_trt] synthesis failed")
                 self._complete_action(action_id, text, 0, interrupted=True)
             finally:
+                if not eof_published:
+                    self._publish_eof()
                 subscriber_gate_cancel.set()
                 subscriber_gate_thread.join(timeout=0.1)
 
