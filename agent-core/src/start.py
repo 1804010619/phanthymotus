@@ -208,7 +208,12 @@ def _register_core_mcp(silent=False):
             {
                 'name': 'channel_request',
                 'type': 'sensor',
-                'description': 'Channel message input — receive messages from Telegram/Slack and other platforms',
+                'description': (
+                    'Inbound gateway for messaging platforms (Feishu / Telegram / Slack): delivers '
+                    'messages users send from a chat app — including image and file attachments — '
+                    'into the decision core. You never call this tool. The events it produces carry '
+                    'channel="channel:<platform>"; reply to those with channel_reply.'
+                ),
                 'inputSchema': {'type': 'object', 'properties': {}},
                 'configSchema': {
                     'type': 'object',
@@ -227,7 +232,17 @@ def _register_core_mcp(silent=False):
             {
                 'name': 'channel_reply',
                 'type': 'actuator',
-                'description': 'Reply to a message from a messaging platform (Feishu/Telegram/Slack). Can send text and/or files (images, videos, documents). ONLY use this tool when the triggering event has channel="channel:*". Never use for local_mic/remote_mic/remote_web events — those should be answered via TTS/speaker on the robot body.',
+                'description': (
+                    'Send a reply to a user on a messaging platform (Feishu / Telegram / Slack). '
+                    'This is the ONLY way those users receive anything from you — text left in '
+                    '`content` reaches nobody. When the triggering event\'s channel attribute starts '
+                    'with "channel:" (for example channel="channel:feishu"), any reply must go through '
+                    'this tool, and only to that channel. Whether the event warrants a response at all '
+                    'is a separate judgement — see the response rules; when it does not, just finish. '
+                    'Send text, and/or attach files (images, video, documents) through `files` — paths '
+                    'must be under /work or /tmp. Do not use it for on-body channels '
+                    '(local_mic / remote_mic / remote_web); answer those with the robot\'s own output tools.'
+                ),
                 'inputSchema': {
                     'type': 'object',
                     'properties': {
