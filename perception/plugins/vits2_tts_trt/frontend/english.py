@@ -5,12 +5,10 @@ import inflect
 import numpy as np
 
 from .symbols import punctuation, symbols
+from .release_paths import frontend_data_dir, nltk_data_dir
 
-current_file_path = os.path.dirname(__file__)
-project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-
-# Configure the bundled NLTK data path before importing g2p_en.
-NLTK_DATA_DIR = os.getenv("NLTK_DATA", os.path.join(project_root, "nltk_data"))
+# Configure the verified release NLTK data path before importing g2p_en.
+NLTK_DATA_DIR = str(nltk_data_dir())
 import nltk
 if NLTK_DATA_DIR not in nltk.data.path:
     nltk.data.path.insert(0, NLTK_DATA_DIR)
@@ -21,19 +19,9 @@ from .wetext_compat import ensure_wetext_compat
 
 EN_TN_MODE = os.getenv("EN_TN_MODE", "auto").lower()
 
-_frontend_data_dir = os.getenv("VITS2_FRONTEND_DATA_DIR", "")
-CMU_DICT_PATH = os.getenv(
-    "VITS2_CMU_DICT_PATH",
-    os.path.join(_frontend_data_dir, "cmudict.rep")
-    if _frontend_data_dir
-    else os.path.join(current_file_path, "cmudict.rep"),
-)
-CACHE_PATH = os.getenv(
-    "VITS2_CMU_CACHE_PATH",
-    os.path.join(_frontend_data_dir, "cmudict_cache.pickle")
-    if _frontend_data_dir
-    else os.path.join(current_file_path, "cmudict_cache.pickle"),
-)
+_frontend_data_dir = frontend_data_dir()
+CMU_DICT_PATH = str(_frontend_data_dir / "cmudict.rep")
+CACHE_PATH = str(_frontend_data_dir / "cmudict_cache.pickle")
 _g2p = G2p()
 _normalizer = None
 

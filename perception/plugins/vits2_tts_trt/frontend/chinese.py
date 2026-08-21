@@ -12,13 +12,13 @@ from .tone_sandhi import ToneSandhi
 from .fst_tn import FstTextNormalizer
 
 from .heteronym import custom_dict, jieba_phrases
+from .release_paths import frontend_data_dir, tn_cache_dir
 
 
 def _load_phrase_pinyin_data():
-    data_dir = os.getenv("VITS2_FRONTEND_DATA_DIR", os.path.dirname(__file__))
-    di_path = os.path.join(data_dir, "phrase_pinyin_data", "di.py")
-    if os.path.isfile(di_path):
-        runpy.run_path(di_path)["load"]()
+    di_path = frontend_data_dir() / "phrase_pinyin_data" / "di.py"
+    if di_path.is_file():
+        runpy.run_path(str(di_path))["load"]()
 
 
 _load_phrase_pinyin_data()
@@ -28,9 +28,7 @@ for phrase in jieba_phrases:
     jieba.add_word(phrase)
 
 current_file_path = os.path.dirname(__file__)
-project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-_TN_RELEASE_DIR = os.getenv("TN_CACHE_DIR", os.path.join(project_root, "tn_cache"))
-_normalizer = FstTextNormalizer(_TN_RELEASE_DIR)
+_normalizer = FstTextNormalizer(tn_cache_dir())
 
 with open(
     os.path.join(current_file_path, "opencpop-strict.txt"), encoding="utf-8"

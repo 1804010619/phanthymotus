@@ -18,7 +18,8 @@ docker build \
 The image installs the WeText/Kaldifst runtime. Chinese text normalization
 executes checksum-verified FST files from the model release and does not
 compile OpenFST or Pynini on the device. Model files are not embedded in the
-image.
+image. Frontend asset locations are derived from the verified model directory;
+deployment environment variables do not override release assets.
 
 ## Configure
 
