@@ -28,6 +28,10 @@ from .adapter import (
 log = logging.getLogger(__name__)
 
 
+# End-of-utterance marker used by the public TTS audio protocol.
+AUDIO_EOF_MAGIC = b"\x01\x00\xff\xff\x01\x00\xff\xff"
+
+
 def _ensure_release(model_dir: str) -> None:
     """Install and verify the immutable TensorRT runtime release."""
     from utils.model_downloader import ensure_model
@@ -75,12 +79,21 @@ TOOLS = [
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["start", "stop", "speak", "info", "config"],
+                    "enum": [
+                        "start",
+                        "stop",
+                        "speak",
+                        "info",
+                        "config",
+                        "interrupt",
+                    ],
                 },
                 "input_topic": {"type": "string"},
                 "text": {"type": "string"},
             },
             "required": ["action"],
+            "x-completion": {"actions": ["speak"], "timeout": 60},
+            "x-hooks": {"on_interrupt_speak": {"action": "interrupt"}},
         },
         "configSchema": {
             "type": "object",
@@ -111,6 +124,7 @@ class _Vits2TTSNode(Node):
         self._text_queue = queue.Queue()
         self._worker_thread = None
         self._stop_event = threading.Event()
+        self._interrupt_event = threading.Event()
         self._pub = self.create_publisher(AudioChunk, self._output_topic, _LOW_LAT_QOS)
         self._sub = (
             self.create_subscription(
@@ -124,6 +138,7 @@ class _Vits2TTSNode(Node):
         if self.state == "running":
             return self.status()
         self._stop_event.clear()
+        self._interrupt_event.clear()
         self._worker_thread = threading.Thread(target=self._worker, daemon=True)
         self._worker_thread.start()
         self.state = "running"
@@ -139,6 +154,18 @@ class _Vits2TTSNode(Node):
     def request_stop(self):
         """Request worker shutdown without waiting for thread termination."""
         self._stop_event.set()
+
+    def interrupt(self) -> dict:
+        """Cancel the active utterance and discard queued utterances."""
+        cleared = 0
+        while True:
+            try:
+                self._text_queue.get_nowait()
+                cleared += 1
+            except queue.Empty:
+                break
+        self._interrupt_event.set()
+        return {"status": "interrupted", "cleared": cleared}
 
     def enqueue(self, text: str):
         if self.state != "running":
@@ -162,6 +189,13 @@ class _Vits2TTSNode(Node):
         message.data = list(pcm)
         self._pub.publish(message)
 
+    def _publish_eof(self):
+        """Publish the protocol end-of-utterance marker."""
+        self._publish(AUDIO_EOF_MAGIC)
+
+    def _utterance_cancelled(self) -> bool:
+        return self._stop_event.is_set() or self._interrupt_event.is_set()
+
     def _wait_for_audio_subscriber(
         self, cancel_event: Optional[threading.Event] = None
     ) -> tuple[float, float, int]:
@@ -169,7 +203,7 @@ class _Vits2TTSNode(Node):
         started = time.monotonic()
         deadline = started + (SUBSCRIBER_WAIT_MS + SUBSCRIBER_SETTLE_MS) / 1000.0
         matched_at = None
-        while not self._stop_event.is_set() and not (
+        while not self._utterance_cancelled() and not (
             cancel_event and cancel_event.is_set()
         ):
             now = time.monotonic()
@@ -193,6 +227,8 @@ class _Vits2TTSNode(Node):
             time.sleep(SUBSCRIBER_POLL_MS / 1000.0)
         if cancel_event and cancel_event.is_set():
             raise RuntimeError("subscriber wait cancelled")
+        if self._interrupt_event.is_set():
+            raise RuntimeError("TTS interrupted while waiting for an audio subscriber")
         raise RuntimeError("TTS stopped while waiting for an audio subscriber")
 
     def _worker(self):
@@ -201,6 +237,9 @@ class _Vits2TTSNode(Node):
             try:
                 text = self._text_queue.get(timeout=1)
             except queue.Empty:
+                continue
+            if self._interrupt_event.is_set():
+                self._interrupt_event.clear()
                 continue
             subscriber_gate_cancel = threading.Event()
             subscriber_gate_done = threading.Event()
@@ -236,18 +275,20 @@ class _Vits2TTSNode(Node):
                 subscriber_settle_seconds = None
                 subscriber_count = 0
 
-                def publish_frame(frame: bytes) -> None:
+                def publish_frame(frame: bytes) -> bool:
                     nonlocal started, frames_sent, first_published_at, total_bytes
                     nonlocal subscriber_wait_seconds, subscriber_settle_seconds
                     nonlocal subscriber_count
+                    if self._utterance_cancelled():
+                        return False
                     now = time.monotonic()
                     if started is None:
                         while not subscriber_gate_done.wait(timeout=0.05):
-                            if self._stop_event.is_set():
-                                raise RuntimeError(
-                                    "TTS stopped while waiting for an audio subscriber"
-                                )
+                            if self._utterance_cancelled():
+                                return False
                         if "error" in subscriber_gate_result:
+                            if self._utterance_cancelled():
+                                return False
                             raise subscriber_gate_result["error"]
                         (
                             subscriber_wait_seconds,
@@ -266,23 +307,34 @@ class _Vits2TTSNode(Node):
                         delay = target - now
                         if delay > 0:
                             time.sleep(delay)
+                    if self._utterance_cancelled():
+                        return False
                     self._publish(frame)
                     if first_published_at is None:
                         first_published_at = time.monotonic()
                     total_bytes += len(frame)
                     frames_sent += 1
+                    return True
 
+                interrupted = False
                 for pcm in self._adapter.synthesize_stream(text):
-                    if self._stop_event.is_set():
+                    if self._utterance_cancelled():
+                        interrupted = True
                         break
                     buffer.extend(pcm)
                     while len(buffer) >= CHUNK_BYTES:
                         frame = bytes(buffer[:CHUNK_BYTES])
                         del buffer[:CHUNK_BYTES]
-                        publish_frame(frame)
+                        if not publish_frame(frame):
+                            interrupted = True
+                            break
+                    if interrupted:
+                        break
 
-                if buffer and not self._stop_event.is_set():
-                    publish_frame(bytes(buffer))
+                if buffer and not self._utterance_cancelled():
+                    if not publish_frame(bytes(buffer)):
+                        interrupted = True
+                interrupted = interrupted or self._interrupt_event.is_set()
                 if total_bytes:
                     finished_at = time.monotonic()
                     audio_seconds = total_bytes / (SAMPLE_RATE * 2)
@@ -306,6 +358,13 @@ class _Vits2TTSNode(Node):
                         (subscriber_settle_seconds or 0.0) * 1000.0,
                         subscriber_count,
                     )
+                self._publish_eof()
+                if interrupted:
+                    log.info(
+                        "[vits2_tts_trt] utterance interrupted after %d frames",
+                        frames_sent,
+                    )
+                self._interrupt_event.clear()
             except Exception:
                 log.exception("[vits2_tts_trt] synthesis failed")
             finally:
