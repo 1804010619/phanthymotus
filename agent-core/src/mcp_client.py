@@ -452,6 +452,18 @@ async def call_tool(full_name: str, args: dict) -> str:
     texts  = [c.get('text', '') for c in content_items if c.get('type') == 'text']
 
     if images:
+        # 与 Read 读图同一个开关。关闭时按**失败**返回，不要返回「成功但没有图像」——
+        # 模型会把成功结果当成「我拿到了这张图」，然后凭 mime 和字节数编出画面内容。
+        from event.desktop import vision_input_enabled
+        if not vision_input_enabled():
+            lines = list(texts)
+            for img in images:
+                mime = img.get('mimeType', 'image/jpeg')
+                approx = len(img.get('data', '')) * 3 // 4
+                lines.append(
+                    f'Error: cannot parse image contents — this model does not accept '
+                    f'image input. Image: [{mime} | {approx} bytes]')
+            return '\n'.join(lines)
         parts_list = []
         for img in images:
             data   = img.get('data', '')
