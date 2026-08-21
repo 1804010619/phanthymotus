@@ -32,7 +32,6 @@ class LLMErrorKind:
     AUTH            = 'auth'             # 401/403
     TIMEOUT         = 'timeout'          # 超时
     CONNECTION      = 'connection'       # 网络连接失败
-    NO_VISION       = 'no_vision'        # 400：该模型不接受图片输入
     UNKNOWN         = 'unknown'
 
 
@@ -74,14 +73,6 @@ def _classify_error(e: Exception) -> tuple[str, float | None]:
     )):
         return LLMErrorKind.SERVER_ERROR, 1.0
 
-    # 纯文本模型收到了图片（工具结果里的截图/收到的图片附件）。原样重试没有意义，
-    # 但也不该让一张图打断整轮对话 —— 调用方剥掉图片再试一次。
-    if status == 400 and any(kw in body_msg for kw in (
-        'do not support image', 'not support image', 'image input',
-        "'param': 'image_url'", 'image_url',
-    )):
-        return LLMErrorKind.NO_VISION, None
-
     # 上下文溢出：从错误消息推断
     if any(kw in body_msg for kw in (
         'context length', 'context_length', 'too many tokens',
@@ -90,39 +81,6 @@ def _classify_error(e: Exception) -> tuple[str, float | None]:
         return LLMErrorKind.CONTEXT_OVERFLOW, None
 
     return LLMErrorKind.UNKNOWN, None
-
-
-_IMAGE_PLACEHOLDER = ('[图片内容已省略：当前模型不支持图片输入。文件本身仍然可用——'
-                      '可以原样回传、转存或放进文档，按用户的实际需求处理]')
-
-
-def _strip_images(message_list: list[dict]) -> tuple[list[dict], int]:
-    """把多模态消息里的图片块换成占位文字，返回 (新消息列表, 剥掉的图片数)。
-
-    纯文本模型遇到图片会 400。这里不做任何图片专属策略，只做通用的「模型拒绝这类
-    内容 → 去掉这类内容再试一次」：整轮报错的话，用户连沉默之外什么都得不到。
-    文字部分（含文件路径）保留 —— 看不到图像内容不等于这个文件没用。
-    """
-    out = []
-    removed = 0
-    for msg in message_list:
-        content = msg.get('content')
-        if not isinstance(content, list):
-            out.append(msg)
-            continue
-        texts = []
-        here = 0
-        for part in content:
-            if not isinstance(part, dict):
-                continue
-            if part.get('type') == 'image_url':
-                here += 1
-            elif part.get('type') == 'text' and part.get('text'):
-                texts.append(part['text'])
-        removed += here
-        parts = texts + ([_IMAGE_PLACEHOLDER] if here else [])
-        out.append({**msg, 'content': '\n'.join(parts) or '(空)'})
-    return out, removed
 
 
 # ── Client ────────────────────────────────────────────────────────────────────
@@ -345,16 +303,6 @@ class Client():
                 # 上下文溢出：不重试，由调用方处理（需要压缩历史）
                 print(f'[llm] context overflow — caller should compress history')
                 raise error
-
-            if kind == LLMErrorKind.NO_VISION:
-                stripped, n = _strip_images(message_list)
-                if n and attempt < max_retries:
-                    # 重新绑定闭包变量 —— _go 在调用时才读 message_list
-                    message_list = stripped
-                    print(f'[llm] model does not accept image input — stripped {n} image(s) '
-                          f'and retrying (configure a vision-capable model to analyse images)')
-                    continue
-                print('[llm] model does not accept image input and no image found to strip')
 
             # UNKNOWN：不重试
             break
