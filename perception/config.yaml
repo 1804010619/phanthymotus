@@ -48,7 +48,7 @@ plugins:
     fps: 5
 
   ocr:
-    enabled: false
+    enabled: true
     provider: rapidocr
     model_dir: /models/ocr/ppocrv6-small-trt
     device_id: 0
