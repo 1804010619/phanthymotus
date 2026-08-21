@@ -13,7 +13,7 @@ import json
 import time
 
 import config
-from channel.adapter import ChannelAdapter, InboundMessage, OutboundMessage
+from channel.adapter import ChannelAdapter, InboundMessage, OutboundMessage, PartialSendError
 from channel import acl
 
 
@@ -519,23 +519,30 @@ class ChannelManager:
             if file_errors:
                 result += '\nSome files were NOT sent:\n' + '\n'.join(file_errors)
             return result
+        except PartialSendError as e:
+            # 部分成功：必须让 LLM 知道哪部分已经到了，否则它会把文本重发一遍
+            print(f'[channel] {channel_id} partial send: {e}')
+            result = f'部分发送成功（目标 {channel_id}）：\n{e}'
+            if file_errors:
+                result += '\n其它未通过校验的文件：\n' + '\n'.join(file_errors)
+            await self._push_error(f'[channel] {channel_id} partial send: {e}')
+            return result
         except Exception as e:
             error_msg = str(e)
-            if '99991672' in error_msg or 'Permission denied' in error_msg or 'Access denied' in error_msg:
-                result = (
-                    f'Error: Permission denied when sending message.\n'
-                    f'Cause: The bot lacks "im:message:send_as_bot" permission.\n'
-                    f'Solution: Grant the permission in Feishu Developer Console, '
-                    f'then publish a new app version.'
-                )
-            elif 'not initialized' in error_msg or 'not running' in error_msg:
+            # 平台自己的报错通常已经写明缺哪个权限、给了授权链接 —— 原文透传，
+            # 不要用猜的原因盖掉它（曾经把「缺上传权限」说成「缺 im:message:send_as_bot」，
+            # LLM 就照着这句错话跟用户解释）。
+            if 'not initialized' in error_msg or 'not running' in error_msg:
                 result = (
                     f'Error: Channel adapter is not connected.\n'
                     f'Cause: The WebSocket connection may have dropped silently.\n'
                     f'Solution: Go to Settings → Channels and click Restart.'
                 )
             else:
-                result = f'Error sending reply: {error_msg}'
+                result = f'Error sending reply to {channel_id}: {error_msg}'
+            if file_errors:
+                result += '\nAlso rejected before sending:\n' + '\n'.join(file_errors)
+            print(f'[channel] send failed ({channel_id}→{chat_id}): {error_msg}')
             await self._push_error(result)
             return result
 

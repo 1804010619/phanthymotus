@@ -10,8 +10,9 @@ Config: {app_id, app_secret, domain?}
 
 Required Feishu permissions:
 - im:message                — 接收消息
-- im:message:send_as_bot    — 以机器人身份发消息
-- im:resource               — 上传/下载图片与文件（收发附件必需）
+- im:message:send_as_bot    — 以机器人身份发消息（只发文本时够了）
+- im:resource               — 上传/下载图片与文件（收发附件必需；仅发送也可用
+                              im:resource:upload。缺它时文本能发出去、附件一律 99991672）
 - im:chat:readonly          — 列出会话（可选）
 
 Event subscription:
@@ -29,7 +30,7 @@ import aiohttp
 
 from channel.adapter import (
     Attachment, ChannelAdapter, InboundMessage, OnMessageCallback, OutboundMessage,
-    KIND_AUDIO, KIND_FILE, KIND_IMAGE, KIND_VIDEO,
+    PartialSendError, KIND_AUDIO, KIND_FILE, KIND_IMAGE, KIND_VIDEO,
 )
 
 # Common Feishu error codes and actionable messages
@@ -323,8 +324,21 @@ class FeishuAdapter(ChannelAdapter):
             for chunk in _chunks(msg.text, _TEXT_CHUNK):
                 await self._send_raw(msg.chat_id, 'text', {'text': chunk})
 
+        if not files:
+            return
+
+        # 逐个附件独立汇报成败：一个文件失败不该让上层以为整条消息（含已送达的文本）失败
+        sent = ['文本'] if msg.text else []
+        failures = []
         for att in files:
-            await self._send_attachment(msg.chat_id, att)
+            try:
+                await self._send_attachment(msg.chat_id, att)
+                sent.append(att.name or att.path)
+            except Exception as e:
+                print(f'[feishu] send attachment failed ({att.name or att.path}): {e}')
+                failures.append(f'- {att.name or att.path}: {e}')
+        if failures:
+            raise PartialSendError(sent, failures)
 
     async def _send_raw(self, chat_id: str, msg_type: str, content: dict) -> None:
         await self._request(
@@ -360,7 +374,7 @@ class FeishuAdapter(ChannelAdapter):
         form.add_field('image_type', 'message')
         form.add_field('image', payload, filename=os.path.basename(path),
                        content_type='application/octet-stream')
-        data = await self._request('POST', '/open-apis/im/v1/images', data=form)
+        data = await self._upload('/open-apis/im/v1/images', form)
         return data.get('image_key', '')
 
     async def _upload_file(self, path: str, name: str = '') -> str:
@@ -374,8 +388,24 @@ class FeishuAdapter(ChannelAdapter):
         form.add_field('file_name', fname)
         form.add_field('file', payload, filename=fname,
                        content_type='application/octet-stream')
-        data = await self._request('POST', '/open-apis/im/v1/files', data=form)
+        data = await self._upload('/open-apis/im/v1/files', form)
         return data.get('file_key', '')
+
+    async def _upload(self, path: str, form: 'aiohttp.FormData') -> dict:
+        """上传资源。缺权限是这里最常见的失败，且与「发消息」的权限是两码事 ——
+        只有 im:message:send_as_bot 时文本照发、附件全 99991672，所以要说清是上传权限。"""
+        try:
+            return await self._request('POST', path, data=form)
+        except FeishuError as e:
+            if e.code == 99991672:
+                raise FeishuError(
+                    e.code, e.msg,
+                    '上传资源需要 im:resource（或 im:resource:upload）权限，与发送文本的 '
+                    'im:message:send_as_bot 是两个权限。在飞书开发者后台开通后**发布新版本**：'
+                    f'https://open.feishu.cn/app/{self.config.get("app_id", "")}/auth'
+                    '?q=im:resource:upload,im:resource'
+                ) from None
+            raise
 
     # ── 接收 ─────────────────────────────────────────────────────────────────
 

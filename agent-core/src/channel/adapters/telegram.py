@@ -13,7 +13,7 @@ import asyncio
 
 from channel.adapter import (
     Attachment, ChannelAdapter, InboundMessage, OnMessageCallback, OutboundMessage,
-    KIND_AUDIO, KIND_FILE, KIND_IMAGE, KIND_VIDEO,
+    PartialSendError, KIND_AUDIO, KIND_FILE, KIND_IMAGE, KIND_VIDEO,
 )
 
 _TEXT_CHUNK = 4000  # Telegram 单条上限 4096
@@ -148,18 +148,31 @@ class TelegramAdapter(ChannelAdapter):
             for chunk in _chunks(msg.text, _TEXT_CHUNK):
                 await bot.send_message(chat_id=chat_id, text=chunk)
 
+        if not files:
+            return
+
+        # 逐个附件汇报成败：附件失败不该让上层以为已送达的文本也失败了
+        sent = ['文本'] if msg.text else []
+        failures = []
         for att in files:
-            with open(att.path, 'rb') as f:
-                payload = f.read()
-            if att.kind == KIND_IMAGE:
-                await bot.send_photo(chat_id=chat_id, photo=payload, caption=att.caption or '')
-            elif att.kind == KIND_VIDEO:
-                await bot.send_video(chat_id=chat_id, video=payload, caption=att.caption or '')
-            elif att.kind == KIND_AUDIO:
-                await bot.send_audio(chat_id=chat_id, audio=payload, caption=att.caption or '')
-            else:
-                await bot.send_document(chat_id=chat_id, document=payload,
-                                        filename=att.name or None, caption=att.caption or '')
+            try:
+                with open(att.path, 'rb') as f:
+                    payload = f.read()
+                if att.kind == KIND_IMAGE:
+                    await bot.send_photo(chat_id=chat_id, photo=payload, caption=att.caption or '')
+                elif att.kind == KIND_VIDEO:
+                    await bot.send_video(chat_id=chat_id, video=payload, caption=att.caption or '')
+                elif att.kind == KIND_AUDIO:
+                    await bot.send_audio(chat_id=chat_id, audio=payload, caption=att.caption or '')
+                else:
+                    await bot.send_document(chat_id=chat_id, document=payload,
+                                            filename=att.name or None, caption=att.caption or '')
+                sent.append(att.name or att.path)
+            except Exception as e:
+                print(f'[telegram] send attachment failed ({att.name or att.path}): {e}')
+                failures.append(f'- {att.name or att.path}: {e}')
+        if failures:
+            raise PartialSendError(sent, failures)
 
     # ── 接收 ─────────────────────────────────────────────────────────────────
 

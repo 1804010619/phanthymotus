@@ -15,7 +15,7 @@ import os
 
 from channel.adapter import (
     Attachment, ChannelAdapter, InboundMessage, OnMessageCallback, OutboundMessage,
-    KIND_AUDIO, KIND_FILE, KIND_IMAGE, KIND_VIDEO,
+    PartialSendError, KIND_AUDIO, KIND_FILE, KIND_IMAGE, KIND_VIDEO,
 )
 
 
@@ -151,13 +151,26 @@ class SlackAdapter(ChannelAdapter):
         if msg.text:
             await self._client.chat_postMessage(channel=msg.chat_id, text=msg.text)
 
+        if not files:
+            return
+
+        # 逐个附件汇报成败：附件失败不该让上层以为已送达的文本也失败了
+        sent = ['文本'] if msg.text else []
+        failures = []
         for att in files:
-            await self._client.files_upload_v2(
-                channel=msg.chat_id,
-                file=att.path,
-                filename=att.name or os.path.basename(att.path),
-                initial_comment=att.caption or '',
-            )
+            try:
+                await self._client.files_upload_v2(
+                    channel=msg.chat_id,
+                    file=att.path,
+                    filename=att.name or os.path.basename(att.path),
+                    initial_comment=att.caption or '',
+                )
+                sent.append(att.name or att.path)
+            except Exception as e:
+                print(f'[slack] send attachment failed ({att.name or att.path}): {e}')
+                failures.append(f'- {att.name or att.path}: {e}')
+        if failures:
+            raise PartialSendError(sent, failures)
 
     # ── 接收 ─────────────────────────────────────────────────────────────────
 

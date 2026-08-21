@@ -76,6 +76,25 @@ class OutboundMessage:
 OnMessageCallback = Callable[[InboundMessage], Awaitable[None]]
 
 
+class PartialSendError(RuntimeError):
+    """一条出站消息里，部分内容发出去了、部分失败了。
+
+    文本与每个附件在平台侧是**独立的**几次调用（飞书要先上传再发一条 image/file 消息）。
+    如果附件失败就整体抛异常，上层只看到「失败」，LLM 会把已经送达的文本重发一遍
+    —— 用户那边收到两条一样的话。带上 sent 让上层能如实回报「文本已达、文件没成功」。
+    """
+
+    def __init__(self, sent: list[str], failures: list[str]):
+        self.sent = sent
+        self.failures = failures
+        parts = []
+        if sent:
+            parts.append('已发送：' + '、'.join(sent) + '（不要重发这部分）')
+        if failures:
+            parts.append('失败：\n' + '\n'.join(failures))
+        super().__init__('\n'.join(parts))
+
+
 class ChannelAdapter(ABC):
     """消息平台适配器基类。"""
 
