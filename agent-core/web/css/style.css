@@ -2361,6 +2361,61 @@ html, body {
   font-size: 10px;
   color: var(--text-dim);
 }
+/* 版本所需的加速器架构（JetPack 5 / 6）；agnostic 的版本不挂徽标 */
+.mp-version-arch {
+  font-size: 10px;
+  font-weight: 500;
+  color: var(--accent);
+  background: var(--accent-dim);
+  border-radius: 3px;
+  padding: 2px 6px;
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
+/* ── 本机架构提示 ─────────────────────────────────────────────────────────
+   驱动市场的列表按本机架构过滤过，跟官网看到的不一样。不解释的话用户只会以为
+   某个组件消失了，所以把本机架构和被隐藏的数量摊开讲清楚。 */
+.mp-host-hint {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 16px;
+  padding: 8px 12px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg-secondary);
+  font-size: 11px;
+}
+.mp-host-hint-label {
+  color: var(--text-dim);
+  flex-shrink: 0;
+}
+.mp-host-hint-arch {
+  font-weight: 600;
+  color: var(--accent);
+  background: var(--accent-dim);
+  border-radius: 3px;
+  padding: 2px 8px;
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+.mp-host-hint-note {
+  color: var(--text-muted);
+  line-height: 1.5;
+}
+.mp-host-hint-warn {
+  border-color: var(--yellow);
+  background: var(--yellow-bg);
+}
+.mp-host-hint-warn .mp-host-hint-label,
+.mp-host-hint-warn .mp-host-hint-note { color: var(--yellow); }
+.mp-host-hint-warn .mp-host-hint-arch {
+  color: var(--yellow);
+  background: transparent;
+  border: 1px solid var(--yellow);
+}
 
 /* ── Driver detail (in-pane view) ────────────────────────────────────────── */
 .mp-detail {
