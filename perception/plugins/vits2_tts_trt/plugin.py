@@ -167,10 +167,10 @@ class _Vits2TTSNode(Node):
         self._interrupt_event.set()
         return {"status": "interrupted", "cleared": cleared}
 
-    def enqueue(self, text: str):
+    def enqueue(self, text: str, action_id: str = ""):
         if self.state != "running":
             raise RuntimeError("TTS not running; call start first")
-        self._text_queue.put(text)
+        self._text_queue.put((text, action_id))
 
     def _text_callback(self, message: String):
         if self.state != "running":
@@ -180,7 +180,7 @@ class _Vits2TTSNode(Node):
         except Exception:
             text = message.data.strip()
         if text:
-            self._text_queue.put(text)
+            self._text_queue.put((text, ""))
 
     def _publish(self, pcm: bytes):
         message = AudioChunk()
@@ -192,6 +192,38 @@ class _Vits2TTSNode(Node):
     def _publish_eof(self):
         """Publish the protocol end-of-utterance marker."""
         self._publish(AUDIO_EOF_MAGIC)
+
+    @staticmethod
+    def _complete_action(
+        action_id: str, text: str, frames_sent: int, interrupted: bool
+    ) -> None:
+        """Notify Agent Core that an MCP speak action has terminated."""
+        if not action_id:
+            return
+        try:
+            import ssl
+            import urllib.request
+
+            agent_core_url = os.getenv("AGENT_CORE_URL", "https://localhost:15678")
+            context = ssl.create_default_context()
+            context.check_hostname = False
+            context.verify_mode = ssl.CERT_NONE
+            payload = json.dumps(
+                {
+                    "action_id": action_id,
+                    "status": "cancelled" if interrupted else "completed",
+                    "result": {"text": text[:100], "frames": frames_sent},
+                }
+            ).encode()
+            request = urllib.request.Request(
+                f"{agent_core_url}/api/acp/complete",
+                data=payload,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            urllib.request.urlopen(request, timeout=3, context=context)
+        except Exception as exc:
+            log.warning("[vits2_tts_trt] ACP completion callback failed: %s", exc)
 
     def _utterance_cancelled(self) -> bool:
         return self._stop_event.is_set() or self._interrupt_event.is_set()
@@ -235,11 +267,16 @@ class _Vits2TTSNode(Node):
         frame_interval = FRAME_INTERVAL_MS / 1000.0
         while not self._stop_event.is_set():
             try:
-                text = self._text_queue.get(timeout=1)
+                item = self._text_queue.get(timeout=1)
             except queue.Empty:
                 continue
+            if isinstance(item, tuple):
+                text, action_id = item
+            else:
+                text, action_id = str(item), ""
             if self._interrupt_event.is_set():
                 self._interrupt_event.clear()
+                self._complete_action(action_id, text, 0, interrupted=True)
                 continue
             subscriber_gate_cancel = threading.Event()
             subscriber_gate_done = threading.Event()
@@ -359,6 +396,7 @@ class _Vits2TTSNode(Node):
                         subscriber_count,
                     )
                 self._publish_eof()
+                self._complete_action(action_id, text, frames_sent, interrupted)
                 if interrupted:
                     log.info(
                         "[vits2_tts_trt] utterance interrupted after %d frames",
@@ -367,6 +405,7 @@ class _Vits2TTSNode(Node):
                 self._interrupt_event.clear()
             except Exception:
                 log.exception("[vits2_tts_trt] synthesis failed")
+                self._complete_action(action_id, text, 0, interrupted=True)
             finally:
                 subscriber_gate_cancel.set()
                 subscriber_gate_thread.join(timeout=0.1)
@@ -603,11 +642,14 @@ class TTSPlugin:
             text = args.get("text", "").strip()
             if not text:
                 raise ValueError("text is required")
+            import uuid
+
+            action_id = f"speak-{uuid.uuid4().hex[:8]}"
             with self._nodes_lock:
                 node = next((n for n in self._nodes.values() if n.state == "running"), None)
             if node is not None:
-                node.enqueue(text)
-                return {"status": "queued", "chars": len(text)}
+                node.enqueue(text, action_id=action_id)
+                return {"status": "queued", "action_id": action_id, "text": text}
             key = instance_id or "_default"
             marker = self._reserve_start(key)
             if marker is None:
@@ -632,8 +674,8 @@ class TTSPlugin:
                         node.start()
             finally:
                 self._finish_start(key, marker)
-            node.enqueue(text)
-            return {"status": "queued", "chars": len(text)}
+            node.enqueue(text, action_id=action_id)
+            return {"status": "queued", "action_id": action_id, "text": text}
 
         if action == "config":
             if "speaker_id" in args:
@@ -654,6 +696,18 @@ class TTSPlugin:
                 self._dispose_node(node, key)
             self._load_error = None
             return {"status": "configured"}
+
+        if action == "interrupt":
+            with self._nodes_lock:
+                if instance_id:
+                    targets = [self._nodes[instance_id]] if instance_id in self._nodes else []
+                else:
+                    targets = [node for node in self._nodes.values() if node.state == "running"]
+            cleared = 0
+            for node in targets:
+                result = node.interrupt()
+                cleared += result.get("cleared", 0)
+            return {"status": "interrupted", "nodes": len(targets), "cleared": cleared}
 
         return None
 

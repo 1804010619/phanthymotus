@@ -27,6 +27,10 @@ deployment environment variables do not override release assets.
 there is no separate `vits2_tts` tool. Set `engine: sherpa_onnx` only when an
 existing Sherpa model deployment is intentionally selected.
 
+`speak` retains the standard action-completion contract: it returns a
+`speak-*` action identifier, supports `interrupt`, and publishes the existing
+end-of-utterance marker when an utterance terminates.
+
 The first `start` or `speak` call downloads the pinned ModelScope release into `model_dir`, verifies file sizes and SHA256 checksums, and loads the TensorRT engines. `info` and tool discovery do not access the network. A complete verified model directory is reused without network access.
 
 The published release provides TensorRT 8 engines for JetPack 5.1.1 and
