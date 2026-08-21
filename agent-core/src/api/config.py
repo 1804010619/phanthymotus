@@ -281,6 +281,19 @@ async def _do_start_project():
             return topics[0], []
         return '', []
 
+    # 先确保 channel adapters 已连接（被 Stop 过 / 上次启动失败的在此拉起）。
+    # 必须在卡片启动之前：channel 卡片的自检要求 adapter 真的连通，
+    # 放在最后会让自检先失败触发整体回滚，永远走不到这里。
+    from channel.manager import manager as channel_mgr, _get_channel_configs
+    channel_mgr.sync_from_canvas()
+    for ch_cfg in _get_channel_configs():
+        ch_id = ch_cfg.get('id', '')
+        if ch_cfg.get('enabled') and ch_id not in channel_mgr._adapters:
+            try:
+                await channel_mgr.restart_adapter(ch_id, retries=1)
+            except Exception as e:
+                print(f'[start-project] channel {ch_id} restart failed: {e}')
+
     # Phase 1: start sources (no input_topic needed) and collect their topic_out
     for card in sources:
         await _start_and_resolve(card)
@@ -301,17 +314,6 @@ async def _do_start_project():
     core = config.main.get('core', {})
     core['project_running'] = True
     config.main['core'] = core
-
-    # 确保 channel adapters 已连接（restart 断开的 adapter）
-    from channel.manager import manager as channel_mgr, _get_channel_configs
-    channel_mgr.sync_from_canvas()
-    for ch_cfg in _get_channel_configs():
-        ch_id = ch_cfg.get('id', '')
-        if ch_cfg.get('enabled') and ch_id not in channel_mgr._adapters:
-            try:
-                await channel_mgr.restart_adapter(ch_id)
-            except Exception as e:
-                print(f'[start-project] channel {ch_id} restart failed: {e}')
 
     # 广播启动完成
     await push_event({'type': 'project_start_done', 'payload': {'has_error': False}})

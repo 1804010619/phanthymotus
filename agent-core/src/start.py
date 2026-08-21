@@ -227,14 +227,28 @@ def _register_core_mcp(silent=False):
             {
                 'name': 'channel_reply',
                 'type': 'actuator',
-                'description': 'Reply to a message from a messaging platform (Feishu/Telegram/Slack). ONLY use this tool when the triggering event has channel="channel:*". Never use for local_mic/remote_mic/remote_web events — those should be answered via TTS/speaker on the robot body.',
+                'description': 'Reply to a message from a messaging platform (Feishu/Telegram/Slack). Can send text and/or files (images, videos, documents). ONLY use this tool when the triggering event has channel="channel:*". Never use for local_mic/remote_mic/remote_web events — those should be answered via TTS/speaker on the robot body.',
                 'inputSchema': {
                     'type': 'object',
                     'properties': {
                         'action': {'type': 'string', 'enum': ['send'], 'description': 'Action'},
                         'text': {'type': 'string', 'description': 'Reply text to send to the user'},
+                        'files': {
+                            'type': 'array',
+                            'description': ('Optional files to send. Each item is {"path": "<absolute path inside the container>", '
+                                            '"caption": "<optional>"}. Paths must be under /work or /tmp (e.g. camera snapshots '
+                                            'or files received earlier at /work/resource/channel_files/...). Images ≤10MB, other files ≤30MB on Feishu.'),
+                            'items': {
+                                'type': 'object',
+                                'properties': {
+                                    'path': {'type': 'string', 'description': 'Absolute path of the file to send'},
+                                    'caption': {'type': 'string', 'description': 'Optional caption sent with the file'},
+                                },
+                                'required': ['path'],
+                            },
+                        },
                     },
-                    'required': ['action', 'text'],
+                    'required': ['action'],
                 },
                 'configSchema': {
                     'type': 'object',

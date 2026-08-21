@@ -6203,6 +6203,14 @@ html, body {
   background: rgba(239, 68, 68, 0.1);
   color: #ef4444;
 }
+.channel-item-error {
+  margin-top: 6px;
+  font-size: 0.7rem;
+  line-height: 1.4;
+  color: #ef4444;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
 .channel-item-actions {
   display: flex;
   gap: 6px;

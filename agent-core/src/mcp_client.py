@@ -545,20 +545,16 @@ async def _dispatch_internal(mcp_id: str, tool_name: str, args: dict) -> str:
     if tool_name == 'channel_reply':
         action = args.get('action', '')
         if action == 'send':
-            text = args.get('text', '')
-            if not text:
-                return 'Error: "text" field is required.'
+            text = args.get('text', '') or ''
+            files = args.get('files', []) or []
+            if not text and not files:
+                return 'Error: provide "text" and/or "files".'
             from channel.manager import manager as channel_mgr
-            channels_with_context = list(channel_mgr._get_last_context().keys())
-            if not channels_with_context:
-                return (
-                    'Error: No active conversation context. '
-                    'A user must send a message to the bot first before it can reply. '
-                    'Ask the user to send a message in Feishu/Telegram/Slack.'
-                )
-            channel_id = channels_with_context[-1]
-            return await channel_mgr.send_to_channel(channel_id, text)
-        return f'Error: Unknown action "{action}". Use action="send" with a "text" field.'
+            # instance_id 由 llm.py 从画布绑定注入（_bound_instance_ids），
+            # 用它解析卡片上选的 channel —— 卡片配置必须真正决定回复去向
+            return await channel_mgr.send_reply(
+                instance_id=args.get('instance_id', ''), text=text, files=files)
+        return f'Error: Unknown action "{action}". Use action="send" with "text" and/or "files".'
 
     # Default: return info for other internal tools
     return json.dumps({'status': 'ok', 'tool': tool_name})

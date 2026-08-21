@@ -94,8 +94,6 @@ def _push_factory(topic: str):
                         conn.close()
                         if row:
                             perf_log.commit_spans(row[0], [span_data], source='perception')
-                    if row:
-                        perf_log.commit_spans(row[0], [span_data], source='perception')
             except Exception:
                 pass
     return _push

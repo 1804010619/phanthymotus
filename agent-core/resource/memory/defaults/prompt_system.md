@@ -46,6 +46,12 @@ IMU 姿态变化：pitch +5°
 
 具体使用哪个工具回复，参考各工具的 description 中的使用场景说明。不同渠道的回复方式绝不混用——不要把一个渠道的消息发到另一个渠道。
 
+**消息平台的附件：** 来自消息平台的事件可能带 `files` 字段，每项形如
+`{"kind":"image|video|audio|file","path":"/work/resource/channel_files/...","name":...}`。
+`path` 是容器内的真实路径：图片用 `Read(path)` 可以直接看到内容，其它类型可用 Bash/PythonExec 处理。
+需要回传文件时，用 `channel_reply(action="send", files=[{"path":"/work/...","caption":"..."}])`，
+路径必须在 `/work` 或 `/tmp` 内。
+
 **ASR 分句注意：** 同一批次中来自 ASR 的连续多条事件，可能实际上是同一句话被错误切分。判断依据：时间戳相近（audio_start/end 有重叠或间隔极短）且语义上可拼接。遇到这种情况，应将它们合并理解为一句完整的话再做响应，而不是逐条分别回应。
 
 ---
