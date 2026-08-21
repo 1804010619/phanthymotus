@@ -130,11 +130,15 @@ class _Vits2TTSNode(Node):
         return self.status()
 
     def stop(self):
-        self._stop_event.set()
+        self.request_stop()
         if self._worker_thread and self._worker_thread.is_alive():
             self._worker_thread.join(timeout=3)
         self.state = "idle"
         return {"state": "idle"}
+
+    def request_stop(self):
+        """Request worker shutdown without waiting for thread termination."""
+        self._stop_event.set()
 
     def enqueue(self, text: str):
         if self.state != "running":
@@ -329,6 +333,9 @@ class TTSPlugin:
         self._cfg = dict(plugin_cfg)
         self._executor = executor
         self._nodes = {}
+        # Serializes instance lifecycle state across concurrent MCP requests.
+        self._nodes_lock = threading.RLock()
+        self._starting = {}
         self._adapter = None
         self._model_name = "vits2"
         self._load_error = None
@@ -371,18 +378,42 @@ class TTSPlugin:
     def get_tools(self):
         return TOOLS
 
-    def _remove_node(self, key):
-        node = self._nodes.pop(key)
-        node.stop()
-        self._executor.remove_node(node)
-        node.destroy_node()
+    def _dispose_node(self, node, key):
+        """Release a node after its caller has removed it from _nodes."""
+        try:
+            node.request_stop()
+            node.stop()
+        except Exception:
+            log.exception("[vits2_tts_trt] node stop failed: %s", key)
+        try:
+            self._executor.remove_node(node)
+        except Exception:
+            log.exception("[vits2_tts_trt] node removal failed: %s", key)
+        try:
+            node.destroy_node()
+        except Exception:
+            log.exception("[vits2_tts_trt] node destroy failed: %s", key)
 
-    def _create_node(self, key, input_topic):
+    def _create_node(self, key, input_topic, adapter):
         suffix = key.replace("/", "_").replace("-", "_")
-        node = _Vits2TTSNode(input_topic or None, self._adapter, suffix)
+        node = _Vits2TTSNode(input_topic or None, adapter, suffix)
         self._executor.add_node(node)
         self._nodes[key] = node
         return node
+
+    def _reserve_start(self, key):
+        """Reserve an instance while model initialization executes outside the lock."""
+        with self._nodes_lock:
+            if key in self._starting:
+                return None
+            marker = threading.Event()
+            self._starting[key] = marker
+            return marker
+
+    def _finish_start(self, key, marker):
+        with self._nodes_lock:
+            if self._starting.get(key) is marker:
+                del self._starting[key]
 
     def dispatch(self, name: str, args: dict):
         action = args.get("action") if name == "tts" else name
@@ -397,12 +428,16 @@ class TTSPlugin:
                     "state": "error",
                     "desc": self._load_error,
                 }
-            if instance_id and instance_id in self._nodes:
+            with self._nodes_lock:
+                node = self._nodes.get(instance_id) if instance_id else None
+                nodes = list(self._nodes.values())
+                loading = bool(self._starting)
+            if instance_id and node is not None:
                 return {
                     "name": "VITS2 TTS",
                     "manufacture": "Embodied",
                     "model": self._model_name,
-                    **self._nodes[instance_id].status(),
+                    **node.status(),
                     "desc": "VITS2 TensorRT text-to-speech",
                 }
             input_topic = args.get("input_topic", "")
@@ -427,16 +462,16 @@ class TTSPlugin:
                 }
             state = (
                 "running"
-                if any(node.state == "running" for node in self._nodes.values())
-                else "idle"
+                if any(node.state == "running" for node in nodes)
+                else "loading" if loading else "idle"
             )
             topics_in = [
                 {"topic": node._input_topic, "format": "data/json", "desc": ""}
-                for node in self._nodes.values()
+                for node in nodes
             ]
             topics_out = [
                 {"topic": node._output_topic, "format": "audio/pcm-16k", "desc": ""}
-                for node in self._nodes.values()
+                for node in nodes
             ]
             if not topics_out:
                 output_topic = (
@@ -461,40 +496,83 @@ class TTSPlugin:
             }
 
         if action == "start":
-            try:
-                self._ensure_adapter()
-            except RuntimeError:
-                return {"state": "error", "message": self._load_error}
             input_topic = args.get("input_topic") or ""
             key = instance_id or input_topic or "_default"
-            if key in self._nodes and input_topic != self._nodes[key]._input_topic:
-                self._remove_node(key)
-            node = self._nodes.get(key) or self._create_node(key, input_topic)
-            return node.start()
+            marker = self._reserve_start(key)
+            if marker is None:
+                return {"state": "loading", "message": "TTS start is already in progress"}
+            try:
+                adapter = self._ensure_adapter()
+            except RuntimeError:
+                self._finish_start(key, marker)
+                return {"state": "error", "message": self._load_error}
+            old_node = None
+            try:
+                with self._nodes_lock:
+                    if marker.is_set():
+                        return {"state": "idle"}
+                    node = self._nodes.get(key)
+                    if node is not None and input_topic != node._input_topic:
+                        old_node = self._nodes.pop(key)
+                        node = None
+                    if node is not None:
+                        return node.start()
+                if old_node is not None:
+                    self._dispose_node(old_node, key)
+                with self._nodes_lock:
+                    if marker.is_set():
+                        return {"state": "idle"}
+                    node = self._create_node(key, input_topic, adapter)
+                    return node.start()
+            finally:
+                self._finish_start(key, marker)
 
         if action == "stop":
-            if instance_id and instance_id in self._nodes:
-                self._remove_node(instance_id)
-            elif not instance_id:
-                for key in list(self._nodes):
-                    self._remove_node(key)
+            with self._nodes_lock:
+                keys = [instance_id] if instance_id else list(self._nodes)
+                markers = [self._starting[key] for key in keys if key in self._starting]
+                if not instance_id:
+                    markers = list(self._starting.values())
+                nodes = [(key, self._nodes.pop(key)) for key in keys if key in self._nodes]
+            for marker in markers:
+                marker.set()
+            for key, node in nodes:
+                self._dispose_node(node, key)
             return {"state": "idle"}
 
         if action == "speak":
-            try:
-                self._ensure_adapter()
-            except RuntimeError:
-                return {"state": "error", "message": self._load_error}
             text = args.get("text", "").strip()
             if not text:
                 raise ValueError("text is required")
-            node = next((n for n in self._nodes.values() if n.state == "running"), None)
-            if node is None:
-                key = instance_id or "_default"
-                node = self._nodes.get(key) or self._create_node(
-                    key, args.get("input_topic") or ""
-                )
-                node.start()
+            with self._nodes_lock:
+                node = next((n for n in self._nodes.values() if n.state == "running"), None)
+            if node is not None:
+                node.enqueue(text)
+                return {"status": "queued", "chars": len(text)}
+            key = instance_id or "_default"
+            marker = self._reserve_start(key)
+            if marker is None:
+                return {"status": "loading", "message": "TTS start is already in progress"}
+            try:
+                adapter = self._ensure_adapter()
+            except RuntimeError:
+                self._finish_start(key, marker)
+                return {"state": "error", "message": self._load_error}
+            try:
+                with self._nodes_lock:
+                    if marker.is_set():
+                        return {"state": "idle"}
+                    node = next(
+                        (n for n in self._nodes.values() if n.state == "running"),
+                        None,
+                    )
+                    if node is None:
+                        node = self._create_node(
+                            key, args.get("input_topic") or "", adapter
+                        )
+                        node.start()
+            finally:
+                self._finish_start(key, marker)
             node.enqueue(text)
             return {"status": "queued", "chars": len(text)}
 
@@ -505,10 +583,16 @@ class TTSPlugin:
                 self._cfg["speed"] = float(args["speed"])
             if int(self._cfg.get("speaker_id", 0)) != 0:
                 raise ValueError("The VITS2 model supports only speaker_id=0")
+            with self._nodes_lock:
+                markers = list(self._starting.values())
+                nodes = list(self._nodes.items())
+                self._nodes.clear()
+            for marker in markers:
+                marker.set()
             if self._adapter is not None:
                 self._adapter.set_speed(float(self._cfg.get("speed", 1.0)))
-            for key in list(self._nodes):
-                self._remove_node(key)
+            for key, node in nodes:
+                self._dispose_node(node, key)
             self._load_error = None
             return {"status": "configured"}
 

@@ -145,7 +145,7 @@ COPY perception/plugins/vits2_tts_trt/requirements.jetson.txt /tmp/vits2-require
 RUN if [ "${ENABLE_VITS2_TRT}" = "1" ]; then \
       pip3 install --no-cache-dir -i "${PYPI_MIRROR}" \
         -r /tmp/vits2-requirements.txt && \
-      python3 -c "import kaldifst,numpy,onnxruntime"; \
+      python3 -c "import kaldifst,numpy"; \
     fi && rm -f /tmp/vits2-requirements.txt
 
 # ── Application code ───────────────────────────────────────────────

@@ -15,8 +15,10 @@ docker build \
   -t phanthymotus-perception:vits2-jp61 .
 ```
 
-The default builder stage compiles OpenFST 1.8.3 and Pynini 2.1.6 for the
-selected JetPack image. Model files are not embedded in the image.
+The image installs the WeText/Kaldifst runtime. Chinese text normalization
+executes checksum-verified FST files from the model release and does not
+compile OpenFST or Pynini on the device. Model files are not embedded in the
+image.
 
 ## Configure
 
@@ -26,7 +28,6 @@ existing Sherpa model deployment is intentionally selected.
 
 The first `start` or `speak` call downloads the pinned ModelScope release into `model_dir`, verifies file sizes and SHA256 checksums, and loads the TensorRT engines. `info` and tool discovery do not access the network. A complete verified model directory is reused without network access.
 
-The published release currently supports TensorRT 10 on Jetson Orin. The image
-can be built on JetPack 5.1.1, but a JP511 engine release must be published
-before JP511 can synthesize. TensorRT plans are not portable across incompatible
-TensorRT versions or GPU architectures.
+The published release provides TensorRT 8 engines for JetPack 5.1.1 and
+TensorRT 10 engines for JetPack 6.1. TensorRT plans are not portable across
+incompatible TensorRT versions or GPU architectures.
