@@ -256,6 +256,12 @@ def _deploy_sync_legacy(driver: dict) -> dict:
         restart_policy={'Name': 'unless-stopped'},
     )
 
+    # Second consumer of the `-jetson` tag suffix, alongside hostarch.py /
+    # resource-center's lib/arch.ts — but a different question: does this image want
+    # the nvidia runtime? Keep it even though the catalog is now arch-filtered:
+    # POST /api/drivers/{id}/deploy still accepts an arbitrary image, so the UI being
+    # unable to pick a mismatched one is not a guarantee. If tags ever stop carrying
+    # `-jetson`, this silently falls back to privileged without the nvidia runtime.
     if '-jetson' in target_image:
         # Only use nvidia runtime if available on host
         try:
@@ -463,7 +469,9 @@ async def drivers_list():
 @router.post('/sync')
 async def drivers_sync():
     """Fetch registry catalog and upsert drivers in DB."""
-    from api.registry import _build_catalog_sync, _current_channel, _cache as _registry_cache
+    from api.registry import (
+        _build_catalog_sync, _current_channel, cache_key, _cache as _registry_cache,
+    )
     channel = _current_channel()
     loop = asyncio.get_event_loop()
     try:
@@ -471,8 +479,9 @@ async def drivers_sync():
     except Exception as e:
         return {'code': 500, 'message': str(e)}
 
-    # Update registry cache with fresh data so next GET /registry/catalog is immediate
-    _registry_cache[channel] = {'data': catalog, 'ts': __import__('time').time()}
+    # Update registry cache with fresh data so next GET /registry/catalog is immediate.
+    # Must use cache_key(): the key includes the host arch facets, not just the channel.
+    _registry_cache[cache_key(channel)] = {'data': catalog, 'ts': __import__('time').time()}
 
     manifest = _load_manifest()
     added, updated = _upsert_from_catalog(manifest, catalog)

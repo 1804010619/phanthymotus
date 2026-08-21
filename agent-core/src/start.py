@@ -302,6 +302,11 @@ async def lifespan(app):
     loop = asyncio.get_event_loop()
     await loop.run_in_executor(None, _check_dds)
 
+    # 探测宿主架构（用于向 resource-center 过滤镜像目录）。只是预热 memo 并把值写进
+    # 日志 —— 「为什么这个组件不显示在驱动市场」全靠这一行排查。
+    import hostarch
+    print(f'[startup] host facets: acc_arch={hostarch.acc_arch()} cpu_arch={hostarch.cpu_arch()}')
+
     # 启动 ROS2 bridge（用于 DDS topic 订阅）
     import ros2_bridge
     _ros2_loop = asyncio.get_running_loop()
