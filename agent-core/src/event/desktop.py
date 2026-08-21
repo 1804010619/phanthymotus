@@ -70,6 +70,45 @@ def _truncate(text: str, max_bytes: int = _MAX_OUTPUT) -> str:
     return truncated + f'\n\n... [output truncated at {max_bytes} bytes]'
 
 
+def vision_input_enabled() -> bool:
+    """主模型是否接受图片输入（decision_core 配置项 vision_input，默认关）。
+
+    默认关是因为「发出去才知道不支持」的代价不小：一张手机照片是 ~420KB base64，
+    换来的是一个 400 和一轮失败。开关由人显式打开，不做能力自动推断。
+    """
+    return bool(config.main.get('event', {}).get('llm', {}).get('vision_input', False))
+
+
+def _image_unavailable(p: pathlib.Path, mime: str, size: int, origin: str = '') -> str:
+    """模型不接受图片输入时，图片读取按**失败**返回。
+
+    这里刻意用 `Error:` 而不是「成功但内容为空」：实测过三种成功形态的返回
+    （解释性占位 / 纯客观说明行 / 文件信息行），模型都把「成功读取」当成「我拿到了这张图」，
+    然后凭文件名编出斜拉桥、灯光秀、猫。唯一一次如实回答，恰恰是那一轮直接失败、
+    工具结果压根不存在的时候。文件信息照旧附上 —— 转发、存档、放进文档都还用得到。
+    """
+    return (f'Error: cannot parse image contents — this model does not accept image input. '
+            f'File: [{origin}{p} | {mime} | {size} bytes]')
+
+
+def _image_origin(p: pathlib.Path) -> str:
+    """入站附件目录里的文件是用户发来的，标注出来；其它（如相机截图）不标注。"""
+    try:
+        from channel import store as _store
+        if _store.is_inbound_media(p):
+            return 'user-uploaded image | '
+    except Exception:
+        pass
+    return ''
+
+
+def _image_mime(p: pathlib.Path) -> str:
+    return {
+        '.png': 'image/png', '.gif': 'image/gif',
+        '.webp': 'image/webp', '.bmp': 'image/bmp',
+    }.get(p.suffix.lower(), 'image/jpeg')
+
+
 async def _read_image(p: pathlib.Path):
     """把图片文件读成 OpenAI multi-modal 内容块。
 
@@ -83,16 +122,7 @@ async def _read_image(p: pathlib.Path):
     import base64
 
     raw = p.read_bytes()
-    mime = 'image/jpeg'
-    suffix = p.suffix.lower()
-    if suffix == '.png':
-        mime = 'image/png'
-    elif suffix == '.gif':
-        mime = 'image/gif'
-    elif suffix == '.webp':
-        mime = 'image/webp'
-    elif suffix == '.bmp':
-        mime = 'image/bmp'
+    mime = _image_mime(p)
 
     note = ''
     if len(raw) > _IMAGE_INLINE_MAX:
@@ -116,16 +146,8 @@ async def _read_image(p: pathlib.Path):
 
     b64 = base64.b64encode(raw).decode('ascii')
     # 说明行体现来源：入站附件目录里的文件是**用户发来的**，不是机器人自己取得的图像。
-    # 后者（例如相机截图）保持原格式。
-    origin = ''
-    try:
-        from channel import store as _store
-        if _store.is_inbound_media(p):
-            origin = 'user-uploaded image | '
-    except Exception:
-        pass
     return [
-        {'type': 'text', 'text': f'[{origin}{p} | {mime} | {len(raw)} bytes{note}]'},
+        {'type': 'text', 'text': f'[{_image_origin(p)}{p} | {mime} | {len(raw)} bytes{note}]'},
         {'type': 'image_url', 'image_url': f'data:{mime};base64,{b64}'},
     ]
 
@@ -276,9 +298,11 @@ class DesktopTools:
         if not p.is_file():
             return f'Error: not a file: {p}'
 
-        # 图片 → 多模态内容（与 mcp_client 的图片返回格式一致，LLM 可直接“看到”）
+        # 图片：开关打开才把图像内联给模型（多模态）；否则按读取失败返回
         if p.suffix.lower() in _IMAGE_EXT:
-            return await _read_image(p)
+            if vision_input_enabled():
+                return await _read_image(p)
+            return _image_unavailable(p, _image_mime(p), p.stat().st_size, _image_origin(p))
 
         # Check if binary
         try:

@@ -740,6 +740,7 @@ async def _handle_agentcore_call(req: MCPCallRequest):
             'topic_in': topic_in_list,
             'topic_out': [{'topic': '/decision_core', 'format': 'data/json'}],
             'trigger_interval_ms': trigger_interval_ms,
+            'vision_input': bool(llm_cfg.get('vision_input', False)),
         }}
 
     elif action == 'config':
@@ -761,6 +762,14 @@ async def _handle_agentcore_call(req: MCPCallRequest):
             event_cfg = config.main.get('event', {})
             llm_cfg = event_cfg.get('llm', {})
             llm_cfg['trigger_interval_ms'] = int(trigger_interval)
+            event_cfg['llm'] = llm_cfg
+            config.main['event'] = event_cfg
+        # 图片输入开关：模型不支持时把图像内容内联进请求，只会换来一个 400 和一轮失败
+        vision_input = req.arguments.get('vision_input')
+        if vision_input is not None:
+            event_cfg = config.main.get('event', {})
+            llm_cfg = event_cfg.get('llm', {})
+            llm_cfg['vision_input'] = bool(vision_input)
             event_cfg['llm'] = llm_cfg
             config.main['event'] = event_cfg
         # Save search config to desktop_tools.search
