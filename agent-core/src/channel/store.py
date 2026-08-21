@@ -54,6 +54,19 @@ def dir_for(channel_id: str) -> pathlib.Path:
     return d
 
 
+def is_inbound_media(path: str | pathlib.Path) -> bool:
+    """该路径是否为用户从消息平台发来的附件（本模块落盘的文件）。
+
+    这个目录下的文件只有一个来源：channel adapter 下载的入站附件。工具在把文件内容
+    交给 LLM 时用它标注来源 —— 「用户上传的图」和「机器人自己截的图」不是一回事。
+    """
+    try:
+        root = str(_ROOT.resolve())
+        return str(pathlib.Path(path).resolve()).startswith(root + os.sep)
+    except OSError:
+        return False
+
+
 def save_bytes(channel_id: str, data: bytes, *, kind: str, name: str = '',
                mime: str = '', fallback_ext: str = '') -> Attachment:
     """把入站媒体写入持久化目录，返回带绝对路径的 Attachment。"""

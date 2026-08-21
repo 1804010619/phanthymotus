@@ -115,8 +115,17 @@ async def _read_image(p: pathlib.Path):
                     f'downscaling failed. Use Bash + ffmpeg to shrink it first.')
 
     b64 = base64.b64encode(raw).decode('ascii')
+    # 说明行体现来源：入站附件目录里的文件是**用户发来的**，不是机器人自己取得的图像。
+    # 后者（例如相机截图）保持原格式。
+    origin = ''
+    try:
+        from channel import store as _store
+        if _store.is_inbound_media(p):
+            origin = 'user-uploaded image | '
+    except Exception:
+        pass
     return [
-        {'type': 'text', 'text': f'[{p} | image | {len(raw)} bytes{note}]'},
+        {'type': 'text', 'text': f'[{origin}{p} | {mime} | {len(raw)} bytes{note}]'},
         {'type': 'image_url', 'image_url': f'data:{mime};base64,{b64}'},
     ]
 
