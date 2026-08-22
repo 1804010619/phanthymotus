@@ -130,7 +130,74 @@ async def _do_start_project():
     """
     from api.mcp_manage import mcp_call_tool, MCPCallRequest
     from api.motus_stream import push_event
+    import asyncio as _asyncio
     import json as _json
+
+    LOADING_POLL_S = 3
+    LOADING_TIMEOUT_S = 900
+
+    def _tool_state(result) -> tuple[str | None, str]:
+        """Pull (state, message) out of an MCP call result of either shape."""
+        if result.get('code') != 200:
+            return None, str(result.get('message') or '')[:200]
+        payload = result.get('data')
+        if isinstance(payload, list) and payload:
+            try:
+                payload = _json.loads(payload[0].get('text', '{}'))
+            except Exception:
+                payload = {}
+        elif isinstance(payload, str):
+            try:
+                payload = _json.loads(payload)
+            except Exception:
+                payload = {}
+        if not isinstance(payload, dict):
+            return None, ''
+        return payload.get('state'), str(
+            payload.get('error') or payload.get('message') or payload.get('desc') or ''
+        )[:200]
+
+    async def _settle_loading_item(mcp_id: str, tool_name: str, card_id: str) -> None:
+        """Poll a card that started into `loading` and report its real outcome.
+
+        Runs detached: a 60 MB model download must not hold up the other cards,
+        and the operator must not be told 已就绪 before the tool can do its job.
+        """
+        deadline = time.time() + LOADING_TIMEOUT_S
+        while time.time() < deadline:
+            await _asyncio.sleep(LOADING_POLL_S)
+            try:
+                info = await mcp_call_tool(mcp_id, MCPCallRequest(
+                    tool=tool_name, arguments={'action': 'info', 'instance_id': card_id},
+                ))
+            except Exception as error:
+                print(f'[start-project] {tool_name} info during load failed: {error}')
+                continue
+            state, message = _tool_state(info)
+            if state == 'loading' or state is None:
+                continue
+            if state == 'idle':
+                # The start was cancelled or the project stopped while the model
+                # was loading. Saying "ready" here would claim a card that is
+                # deliberately not running, so report it as cancelled — which
+                # also releases the frontend's wait on this item.
+                print(f'[start-project] {tool_name} ({mcp_id}) load abandoned (idle)')
+                await push_event({'type': 'project_start_item', 'payload': {
+                    'tool': tool_name, 'mcp_id': mcp_id, 'status': 'cancelled',
+                    'message': '启动已取消',
+                }})
+                return
+            status = 'error' if state == 'error' else 'ready'
+            print(f'[start-project] {tool_name} ({mcp_id}) settled: {state}')
+            await push_event({'type': 'project_start_item', 'payload': {
+                'tool': tool_name, 'mcp_id': mcp_id, 'status': status,
+                'message': message if status == 'error' else '',
+            }})
+            return
+        await push_event({'type': 'project_start_item', 'payload': {
+            'tool': tool_name, 'mcp_id': mcp_id, 'status': 'error',
+            'message': f'模型加载超过 {LOADING_TIMEOUT_S // 60} 分钟仍未就绪',
+        }})
 
     layout = config.main.get('canvas_layout', {})
     cards = layout.get('cards', [])
@@ -200,6 +267,23 @@ async def _do_start_project():
                         'tool': tool_name, 'mcp_id': mcp_id, 'status': 'error', 'message': tool_message,
                     }})
                     errors.append(tool_name)
+                elif tool_state == 'loading':
+                    # The tool accepted the start but is not usable yet — it is
+                    # fetching or building a model (perception TTS/OCR do this;
+                    # a cold VITS2 release is a 60 MB download plus a TensorRT
+                    # warmup). Reporting "已就绪" here is how the operator ended
+                    # up with a card that claimed ready ~25 s before it could
+                    # speak. Keep it visibly starting and let a watcher settle
+                    # it, so the rest of the pipeline is not held up either.
+                    message = tool_message or '模型加载中，就绪后自动开始'
+                    print(f'[start-project] {tool_name} ({mcp_id}) loading: {message}')
+                    await push_event({'type': 'project_start_item', 'payload': {
+                        'tool': tool_name, 'mcp_id': mcp_id, 'status': 'loading',
+                        'message': message,
+                    }})
+                    _asyncio.create_task(
+                        _settle_loading_item(mcp_id, tool_name, card_id)
+                    )
                 else:
                     print(f'[start-project] started {tool_name} ({mcp_id})')
                     await push_event({'type': 'project_start_item', 'payload': {

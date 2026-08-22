@@ -1565,6 +1565,18 @@ async function _startProject() {
   // Subscribe to startup progress events
   let modal = null;
   let itemIndex = {};  // tool_name -> index in modal
+  // Cards that accepted start but are still loading a model (perception TTS/OCR
+  // fetch and warm one up). The backend settles them with a later ready/error
+  // event, so the subscription has to outlive project_start_done — otherwise
+  // the modal would sit at "启动中..." forever, or worse, close claiming success.
+  const loading = new Set();
+  let sequenceDone = false;
+
+  function _finishIfSettled() {
+    if (!sequenceDone || loading.size > 0) return;
+    if (modal) modal.startCountdown(15);
+    offMotusEvent(_onEvent);
+  }
 
   function _onEvent(event) {
     const p = event.payload || {};
@@ -1573,17 +1585,27 @@ async function _startProject() {
       const items = cards.map(c => ({ card: { toolName: c.tool, mcpId: c.mcp_id } }));
       modal = _showStartupModal(items);
       cards.forEach((c, i) => { itemIndex[`${c.mcp_id}:${c.tool}`] = i; });
-    } else if (event.type === 'project_start_item' && modal) {
-      const idx = itemIndex[`${p.mcp_id}:${p.tool}`];
-      if (idx !== undefined) {
+    } else if (event.type === 'project_start_item') {
+      const key = `${p.mcp_id}:${p.tool}`;
+      const idx = itemIndex[key];
+      // Anything other than 'loading' is terminal for the wait: ready, error,
+      // cancelled, or a status added later.
+      if (p.status === 'loading') loading.add(key);
+      else loading.delete(key);
+      if (modal && idx !== undefined) {
         modal.updateItem(idx, p.status, p.message || '');
       }
+      _finishIfSettled();
     } else if (event.type === 'project_start_done') {
-      if (modal && !p.has_error) {
-        // Show countdown close button, auto-close after 15s
-        modal.startCountdown(15);
+      sequenceDone = true;
+      if (p.has_error) {
+        offMotusEvent(_onEvent);
+        return;
       }
-      offMotusEvent(_onEvent);
+      if (modal && loading.size > 0) {
+        modal.setWaiting(loading.size);
+      }
+      _finishIfSettled();
     }
   }
 
@@ -1742,7 +1764,10 @@ function _showStartupModal(items) {
   });
   document.body.appendChild(overlay);
 
-  const STATUS_TEXT = { starting: '启动中...', ready: '已就绪', error: '启动失败' };
+  const STATUS_TEXT = {
+    starting: '启动中...', loading: '模型加载中...', ready: '已就绪',
+    error: '启动失败', cancelled: '已取消',
+  };
   function updateItem(i, state, msg) {
     dots[i].className = 'startup-dot ' + state;
     statuses[i].textContent = msg || STATUS_TEXT[state] || '';
@@ -1753,6 +1778,13 @@ function _showStartupModal(items) {
   }
 
   let _countdownTimer = null;
+  function setWaiting(count) {
+    // Every card was accepted, but some are still fetching or warming a model.
+    // Say so instead of auto-closing on a success the operator does not have yet.
+    const title = modal.querySelector('.modal-title');
+    if (title) title.textContent = `等待模型加载（${count}）`;
+  }
+
   function startCountdown(seconds) {
     const footer = modal.querySelector('.startup-modal-footer');
     const title = modal.querySelector('.modal-title');
@@ -1778,7 +1810,7 @@ function _showStartupModal(items) {
     // Actually stop the project when user cancels during startup
     _stopProject();
   });
-  return { modal, updateItem, close, startCountdown };
+  return { modal, updateItem, close, startCountdown, setWaiting };
 }
 
 /**

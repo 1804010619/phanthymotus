@@ -5493,6 +5493,13 @@ html, body {
 }
 .startup-dot.ready { background: #22c55e; opacity: 1; }
 .startup-dot.error { background: #ef4444; opacity: 1; }
+/* Accepted the start, but still fetching or warming a model — the same pulse as
+   starting, in amber, so "not usable yet" never reads as ready. */
+.startup-dot.loading {
+  background: #f59e0b;
+  opacity: 1;
+  animation: pulse-dot 1s infinite;
+}
 @keyframes pulse-dot {
   0%, 100% { opacity: 1; }
   50% { opacity: 0.35; }
