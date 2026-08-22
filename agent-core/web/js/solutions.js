@@ -601,9 +601,11 @@ async function _loadSavePanel() {
   panel.innerHTML = `<div class="skill-empty">加载中…</div>`;
 
   if (!isRcLoggedIn()) {
+    // 与技能 modal 的「我的技能」未登录态用同一套 .skill-rc-login 结构，
+    // 两处提示看起来才是一件事
     panel.innerHTML = `
-      <div class="skill-empty">
-        发布解决方案需要先登录 Resource Center。
+      <div class="skill-rc-login">
+        <p class="skill-rc-login-hint">发布解决方案需要先登录 Resource Center</p>
         <button class="skill-btn skill-btn-primary" id="sol-goto-login">去「我的」登录</button>
       </div>`;
     panel.querySelector('#sol-goto-login').addEventListener('click', () => showAccount());

@@ -4243,11 +4243,6 @@ html, body {
   line-height: 1.8;
   padding: 40px 24px;
 }
-/* 空态里的按钮独占一行并居中，别和说明文字挤在一起 */
-.skill-empty .skill-btn {
-  display: block;
-  margin: 18px auto 0;
-}
 .skill-empty.hidden { display: none; }
 
 .skill-card {
