@@ -2695,6 +2695,12 @@ html, body {
   overflow: hidden;
   box-shadow: var(--shadow-lg);
 }
+/* .modal-body 没有基础样式，是有意的：history 那种左右分栏的 body 需要
+   padding:0 + overflow:hidden，由内层面板各自滚动。代价是每个新弹窗都必须自己声明
+   padding 和 overflow-y —— 漏了的表现是：内容贴着弹窗边框（标题却是缩进的，看起来
+   就是"挤在一起"），且因为上面 .modal 是 max-height + overflow:hidden，超出的内容会
+   被直接裁掉而不是滚动。这个坑已经踩过三次（account / solution-load 都是事后才修），
+   加新弹窗时记得写。刻意不声明的只有 .history-body。 */
 .modal-header {
   display: flex;
   align-items: center;
@@ -6857,9 +6863,7 @@ html, body {
   display: flex;
   flex-direction: column;
 }
-/* .modal-body 没有基础 padding（见 .account-modal-body 上方那段说明），不自己声明的话
-   内容会贴着弹窗边框，而标题却是缩进的 —— 看起来就是"挤在一起"。overflow-y 同样必须
-   自己声明：.modal 是 max-height + overflow:hidden，驱动多的时候底部会被直接裁掉。 */
+/* padding + overflow-y 必须自己声明，原因见 .modal 上方那段注释 */
 .solution-load-modal .modal-body {
   padding: 18px 24px 22px;
   overflow-y: auto;
@@ -7176,9 +7180,7 @@ html, body {
 .topbar-account-badge.hidden { display: none; }
 
 .account-modal { width: 480px; }
-/* 必须自己声明滚动：.modal 是 max-height:88vh + overflow:hidden，body 不滚动的话
-   超出的内容会被直接裁掉（表现为最后一行文字被切、看不到下边距）。
-   .skill-modal-body / .reset-modal .modal-body 也都是各自声明的。 */
+/* padding + overflow-y 必须自己声明，原因见 .modal 上方那段注释 */
 .account-modal-body {
   padding: 18px 24px 26px;
   overflow-y: auto;
