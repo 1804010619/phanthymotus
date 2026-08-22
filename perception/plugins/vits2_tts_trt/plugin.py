@@ -32,11 +32,11 @@ log = logging.getLogger(__name__)
 AUDIO_EOF_MAGIC = b"\x01\x00\xff\xff\x01\x00\xff\xff"
 
 
-def _ensure_release(model_dir: str) -> None:
-    """Install and verify the immutable TensorRT runtime release."""
-    from utils.model_downloader import ensure_model
+def _ensure_release(model_dir: str) -> str:
+    """Install the release and return the engine dir for this TensorRT."""
+    from utils.model_downloader import ensure_vits2_model
 
-    ensure_model("vits2", model_dir)
+    return ensure_vits2_model(model_dir)
 FRAME_INTERVAL_MS = int(os.getenv("MIX_VITS_FRAME_INTERVAL_MS", "70"))
 if not 0 <= FRAME_INTERVAL_MS <= 1000:
     raise ValueError("MIX_VITS_FRAME_INTERVAL_MS must be between zero and 1000")
@@ -468,8 +468,9 @@ class TTSPlugin:
                 return self._adapter
             model_dir = self._cfg.get("model_dir", "/models/vits2")
             try:
-                _ensure_release(model_dir)
-                adapter = build_adapter(self._cfg)
+                cfg = dict(self._cfg)
+                cfg["engine_dir"] = _ensure_release(model_dir)
+                adapter = build_adapter(cfg)
                 if self._cfg.get("warmup", True):
                     started = time.monotonic()
                     warmup_bytes = adapter.warmup()

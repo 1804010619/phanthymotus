@@ -11,9 +11,6 @@ import tarfile
 import tempfile
 import time
 import zipfile
-import json
-import shutil
-from pathlib import Path
 from urllib.error import URLError
 from urllib.parse import quote
 from urllib.request import urlopen, urlretrieve
@@ -93,11 +90,6 @@ MODELS = {
         "check_file": "gtcrn_simple.onnx",
         "single_file": True,
     },
-    # Manifest-based release; handled by ensure_vits2_model below.
-    "vits2": {
-        "manifest": True,
-        "check_file": ".release_manifest.json",
-    },
 }
 
 
@@ -106,9 +98,6 @@ def ensure_model(name: str, model_dir: str) -> None:
     info = MODELS.get(name)
     if not info:
         raise ValueError(f"Unknown model name: {name}")
-    if info.get("manifest"):
-        ensure_vits2_model(model_dir)
-        return
 
     check_path = os.path.join(model_dir, info["check_file"])
     if os.path.exists(check_path):
@@ -334,6 +323,24 @@ def _bundle_matches(model_dir: str, files: dict) -> bool:
     )
 
 
+def _check_bundle_relpath(filename: str) -> None:
+    """Reject a bundle key that would escape model_dir or break the URL join.
+
+    Keys are relative paths, not bare filenames: the VITS2 release ships
+    ``engines/jp61/flow.plan`` and ``nltk_data/taggers/...`` and its consumers
+    expect that layout on disk. A key is only allowed to descend — no absolute
+    path, no ``..``, no empty or ``.`` segment, no backslash (which is a plain
+    character in a POSIX name but a separator once it reaches a URL).
+    """
+    if not filename or filename != filename.strip():
+        raise ValueError(f"Invalid model filename: {filename!r}")
+    if filename.startswith("/") or "\\" in filename:
+        raise ValueError(f"Invalid model filename: {filename!r}")
+    parts = filename.split("/")
+    if any(part in ("", ".", "..") for part in parts):
+        raise ValueError(f"Invalid model filename: {filename!r}")
+
+
 def _verify_pinned_file(path: str, metadata: dict) -> None:
     actual_size = os.path.getsize(path)
     if actual_size != metadata["size"]:
@@ -354,6 +361,45 @@ def _verify_pinned_file(path: str, metadata: dict) -> None:
         )
 
 
+def _fetch_pinned_file(
+    name: str, url: str, destination: str, metadata: dict, label: str = ""
+) -> None:
+    """Download one URL to destination, verifying its pinned size and SHA256.
+
+    Retries three times with a short backoff, leaving no partial file behind:
+    a truncated download fails _verify_pinned_file, which is caught here, so a
+    flaky link costs a retry rather than a corrupt model.
+    """
+    label = label or os.path.basename(destination)
+    last_error = None
+    for attempt in range(1, 4):
+        try:
+            log.info(
+                f"[model_downloader] {name}: downloading {label} "
+                f"(attempt {attempt}/3)"
+            )
+            with urlopen(url, timeout=120) as response, open(destination, "wb") as output:
+                while True:
+                    chunk = response.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    output.write(chunk)
+                output.flush()
+                os.fsync(output.fileno())
+            _verify_pinned_file(destination, metadata)
+            os.chmod(destination, 0o644)
+            return
+        except (URLError, TimeoutError, OSError, ValueError) as error:
+            last_error = error
+            if os.path.exists(destination):
+                os.unlink(destination)
+            if attempt < 3:
+                time.sleep(3)
+    raise RuntimeError(
+        f"[model_downloader] {name}: failed to download {label}"
+    ) from last_error
+
+
 def _download_verified_bundle(
     name: str, base_url: str, model_dir: str, files: dict
 ) -> None:
@@ -362,45 +408,20 @@ def _download_verified_bundle(
     staging_prefix = f".{name.replace('/', '_')}-"
     with tempfile.TemporaryDirectory(prefix=staging_prefix, dir=model_dir) as staging:
         for filename, metadata in files.items():
-            if os.path.basename(filename) != filename:
-                raise ValueError(f"Invalid model filename: {filename}")
-            url = f"{base_url.rstrip('/')}/{filename}"
+            _check_bundle_relpath(filename)
+            url = "/".join(
+                [base_url.rstrip("/")] + [quote(part) for part in filename.split("/")]
+            )
             destination = os.path.join(staging, filename)
-            last_error = None
-            for attempt in range(1, 4):
-                try:
-                    log.info(
-                        f"[model_downloader] {name}: downloading {filename} "
-                        f"(attempt {attempt}/3)"
-                    )
-                    with urlopen(url, timeout=120) as response, open(destination, "wb") as output:
-                        while True:
-                            chunk = response.read(1024 * 1024)
-                            if not chunk:
-                                break
-                            output.write(chunk)
-                        output.flush()
-                        os.fsync(output.fileno())
-                    _verify_pinned_file(destination, metadata)
-                    os.chmod(destination, 0o644)
-                    break
-                except (URLError, TimeoutError, OSError, ValueError) as error:
-                    last_error = error
-                    if os.path.exists(destination):
-                        os.unlink(destination)
-                    if attempt < 3:
-                        time.sleep(3)
-            else:
-                raise RuntimeError(
-                    f"[model_downloader] {name}: failed to download {filename}"
-                ) from last_error
+            os.makedirs(os.path.dirname(destination), exist_ok=True)
+            _fetch_pinned_file(name, url, destination, metadata, label=filename)
 
         for filename in files:
-            os.replace(
-                os.path.join(staging, filename),
-                os.path.join(model_dir, filename),
-            )
+            final = os.path.join(model_dir, filename)
+            os.makedirs(os.path.dirname(final), exist_ok=True)
+            os.replace(os.path.join(staging, filename), final)
     log.info(f"[model_downloader] {name}: verified bundle ready at {model_dir}")
+
 
 
 # ── OCR (PP-OCRv6 small, TensorRT engines; one bundle per JetPack family) ──
@@ -469,187 +490,140 @@ def ensure_ocr_model(model_dir: str, family: str | None = None) -> dict[str, str
     )
 
 
-# VITS2 uses a file-level manifest rather than the archive format above.
-VITS2_MODEL_ID = "Starlight777/VITS2-ZH-EN-Male-16k"
-VITS2_MODEL_REVISION = "14954122c4baf4e80b44436c4b2b167e38db4103"
-VITS2_MANIFEST_SHA256 = "2a8537b3abe7faffa81b20120136745e14e6f6d9e1599271f873e4d9192ab0f8"
-VITS2_BASE_URL = f"https://www.modelscope.cn/models/{VITS2_MODEL_ID}/resolve"
-VITS2_LOCAL_MANIFEST = ".release_manifest.json"
+def ensure_verified_archive(name: str, model_dir: str, url: str, entry: dict) -> None:
+    """Ensure a size/SHA256-pinned archive has been unpacked into model_dir.
 
+    The bundle helper above fetches one URL per file, which is right for a
+    handful of engines. A release that also carries its frontend data (VITS2
+    ships ~30 files, most of them small NLTK corpora) is cheaper as a single
+    compressed download, so this variant pins the archive instead: one size +
+    SHA256 covers every member, and 154 MB of engines and FSTs travel as 60 MB.
 
-def _sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as stream:
-        for block in iter(lambda: stream.read(1024 * 1024), b""):
-            digest.update(block)
-    return digest.hexdigest()
+    A ``.<name>.installed`` marker holding the archive's SHA256 records what is
+    unpacked, so a warm start costs one small read instead of re-hashing every
+    engine. Delete the marker (or the directory) to force a reinstall.
+    """
+    flat = name.replace("/", "_")
+    marker = os.path.join(model_dir, f".{flat}.installed")
+    if _archive_installed(marker, entry["sha256"]):
+        log.info(f"[model_downloader] {name}: verified archive already at {model_dir}")
+        return
 
-
-def _vits2_runtime_target() -> tuple[str, int]:
-    try:
-        import tensorrt
-    except ModuleNotFoundError as exc:
-        raise RuntimeError("TensorRT is required for the VITS2 TTS runtime") from exc
-
-    version = str(tensorrt.__version__)
-    try:
-        major = int(version.split(".", 1)[0])
-    except ValueError as exc:
-        raise RuntimeError(f"Unrecognized TensorRT version: {version}") from exc
-
-    targets = {8: "jp511", 10: "jp61"}
-    target = targets.get(major)
-    if target is None:
-        raise RuntimeError(
-            f"No VITS2 runtime target is defined for TensorRT {version}"
-        )
-    return target, major
-
-
-def _vits2_runtime_path(remote_path: str, target_name: str) -> str:
-    prefix = f"engines/{target_name}/"
-    return "engines/" + remote_path[len(prefix):] if remote_path.startswith(prefix) else remote_path
-
-
-def _manifest_runtime_target(manifest: dict, target_name: str) -> dict | None:
-    targets = manifest.get("runtime_targets")
-    if isinstance(targets, dict):
-        target = targets.get(target_name)
-        return target if isinstance(target, dict) else None
-    if isinstance(targets, list):
-        for target in targets:
-            if isinstance(target, dict) and target.get("name") == target_name:
-                return target
-        return None
-    target = manifest.get("runtime_target")
-    return target if isinstance(target, dict) else None
-
-
-def _load_vits2_manifest(path: Path, target_name: str, tensorrt_major: int) -> dict:
-    if _sha256_file(path) != VITS2_MANIFEST_SHA256:
-        raise RuntimeError("VITS2 release manifest SHA256 mismatch")
-    manifest = json.loads(path.read_text(encoding="utf-8"))
-    if manifest.get("schema_version") != 1 or manifest.get("model_id") != VITS2_MODEL_ID:
-        raise RuntimeError("Unsupported VITS2 release manifest")
-    target = _manifest_runtime_target(manifest, target_name)
-    if target is None:
-        raise RuntimeError(
-            f"The VITS2 release has no runtime target for {target_name}/"
-            f"TensorRT {tensorrt_major}"
-        )
-    if target.get("name") != target_name or target.get("tensorrt_major") != tensorrt_major:
-        raise RuntimeError(
-            f"The VITS2 release target does not match {target_name}/"
-            f"TensorRT {tensorrt_major}"
-        )
-    return manifest
-
-
-def _vits2_entry_target(entry: dict) -> str | None:
-    target = entry.get("runtime_target")
-    if isinstance(target, str):
-        return target
-    path = entry.get("path", "")
-    for target_name in ("jp511", "jp61"):
-        if path.startswith(f"engines/{target_name}/"):
-            return target_name
-    return None
-
-
-def _vits2_required_files(manifest: dict, target_name: str) -> list[dict]:
-    files = [
-        entry for entry in manifest.get("files", [])
-        if entry.get("runtime_required")
-        and _vits2_entry_target(entry) in (None, target_name)
-    ]
-    if not files:
-        raise RuntimeError("VITS2 release manifest has no runtime files")
-    return files
-
-
-def _vits2_complete(model_dir: Path, target_name: str, tensorrt_major: int) -> bool:
-    manifest_path = model_dir / VITS2_LOCAL_MANIFEST
-    if not manifest_path.is_file():
-        return False
-    try:
-        manifest = _load_vits2_manifest(manifest_path, target_name, tensorrt_major)
-        for entry in _vits2_required_files(manifest, target_name):
-            path = model_dir / _vits2_runtime_path(entry["path"], target_name)
-            if (not path.is_file() or path.stat().st_size != int(entry["bytes"])
-                    or _sha256_file(path) != entry["sha256"]):
-                return False
-    except (KeyError, OSError, TypeError, ValueError, RuntimeError, json.JSONDecodeError):
-        return False
-    return True
-
-
-def _vits2_file_url(base_url: str, revision: str, path: str) -> str:
-    encoded = "/".join(quote(part, safe="") for part in path.split("/"))
-    return f"{base_url.rstrip('/')}/{quote(revision, safe='')}/{encoded}"
-
-
-def _download_verified(url: str, destination: Path, expected_bytes: int, expected_sha256: str) -> None:
-    digest = hashlib.sha256()
-    size = 0
-    with urlopen(url, timeout=120) as response, destination.open("wb") as output:
-        while True:
-            block = response.read(1024 * 1024)
-            if not block:
-                break
-            output.write(block)
-            digest.update(block)
-            size += len(block)
-    if (expected_bytes >= 0 and size != expected_bytes) or digest.hexdigest() != expected_sha256:
-        raise RuntimeError(f"VITS2 release file verification failed: {destination.name}")
-
-
-def ensure_vits2_model(model_dir: str) -> None:
-    """Install a complete verified VITS2 TensorRT release on first use."""
-    target_name, tensorrt_major = _vits2_runtime_target()
-    target = Path(model_dir).resolve()
-    target.parent.mkdir(parents=True, exist_ok=True)
-    lock_path = target.parent / f".{target.name}.download.lock"
-    with lock_path.open("a+") as lock_file:
+    os.makedirs(model_dir, exist_ok=True)
+    # Same rationale as ensure_verified_bundle: instances share /models, so a
+    # cold multi-instance launch must fetch one copy, not one per process.
+    lock_path = os.path.join(model_dir, f".{flat}.lock")
+    with open(lock_path, "a+b") as lock_file:
         if fcntl is not None:
-            fcntl.flock(lock_file, fcntl.LOCK_EX)
-        if _vits2_complete(target, target_name, tensorrt_major):
-            log.info("[model_downloader] vits2: verified release at %s", target)
-            return
-        revision = os.getenv("VITS2_MODEL_REVISION", VITS2_MODEL_REVISION).strip()
-        if not revision or revision == "REPLACE_WITH_MODELSCOPE_COMMIT":
-            raise RuntimeError("VITS2 ModelScope revision is not configured")
-        base_url = os.getenv("VITS2_MODEL_BASE_URL", VITS2_BASE_URL).strip()
-        if not base_url:
-            raise RuntimeError("VITS2 model base URL is empty")
-
-        staging = Path(tempfile.mkdtemp(prefix=f".{target.name}.staging-", dir=target.parent))
-        backup = target.parent / f".{target.name}.previous"
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
         try:
-            manifest_path = staging / VITS2_LOCAL_MANIFEST
-            _download_verified(_vits2_file_url(base_url, revision, "release_manifest.json"),
-                               manifest_path, -1, VITS2_MANIFEST_SHA256)
-            manifest = _load_vits2_manifest(
-                manifest_path, target_name, tensorrt_major
-            )
-            for entry in _vits2_required_files(manifest, target_name):
-                destination = staging / _vits2_runtime_path(entry["path"], target_name)
-                destination.parent.mkdir(parents=True, exist_ok=True)
-                _download_verified(_vits2_file_url(base_url, revision, entry["path"]),
-                                   destination, int(entry["bytes"]), entry["sha256"])
-            if not _vits2_complete(staging, target_name, tensorrt_major):
-                raise RuntimeError("Downloaded VITS2 release is incomplete")
-            if backup.exists():
-                shutil.rmtree(backup)
-            if target.exists():
-                target.rename(backup)
-            staging.rename(target)
-            if backup.exists():
-                shutil.rmtree(backup)
-            log.info("[model_downloader] vits2: installed verified release at %s", target)
-        except Exception:
-            if not target.exists() and backup.exists():
-                backup.rename(target)
-            raise
+            if _archive_installed(marker, entry["sha256"]):
+                log.info(f"[model_downloader] {name}: installed by another instance")
+                return
+            with tempfile.TemporaryDirectory(prefix=f".{flat}-", dir=model_dir) as staging:
+                archive = os.path.join(staging, os.path.basename(url))
+                _fetch_pinned_file(name, url, archive, entry)
+                payload = os.path.join(staging, "payload")
+                os.makedirs(payload)
+                _extract_verified_tar(archive, payload)
+                os.unlink(archive)
+                _merge_tree(payload, model_dir)
+            # Written last: until the marker exists the install is incomplete
+            # and the next call redoes it, so a crash mid-extract cannot leave
+            # a half-unpacked release looking ready.
+            tmp_marker = f"{marker}.tmp"
+            with open(tmp_marker, "w") as handle:
+                handle.write(entry["sha256"])
+            os.replace(tmp_marker, marker)
+            log.info(f"[model_downloader] {name}: unpacked verified archive to {model_dir}")
         finally:
-            if staging.exists():
-                shutil.rmtree(staging)
+            if fcntl is not None:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
+def _archive_installed(marker: str, sha256: str) -> bool:
+    """Return whether the marker records this exact archive as unpacked."""
+    try:
+        with open(marker) as handle:
+            return handle.read().strip() == sha256
+    except OSError:
+        return False
+
+
+def _extract_verified_tar(archive: str, destination: str) -> None:
+    """Extract a tar archive, refusing anything that could escape destination.
+
+    tarfile's ``filter="data"`` would cover this, but it only exists from
+    Python 3.12 and the jp511 image is on 3.8 — so the member checks are
+    explicit: regular files and directories only, relative paths only, no
+    symlink or device entries.
+    """
+    with tarfile.open(archive, "r:*") as handle:
+        members = handle.getmembers()
+        if not members:
+            raise RuntimeError(f"Empty archive: {archive}")
+        for member in members:
+            if not (member.isfile() or member.isdir()):
+                raise ValueError(f"Unsupported archive entry: {member.name}")
+            _check_bundle_relpath(member.name)
+        handle.extractall(destination, members=members)
+
+
+def _merge_tree(source: str, destination: str) -> None:
+    """Move every file under source into destination, creating parents."""
+    for root, _, files in os.walk(source):
+        for filename in files:
+            src = os.path.join(root, filename)
+            final = os.path.join(destination, os.path.relpath(src, source))
+            os.makedirs(os.path.dirname(final), exist_ok=True)
+            os.replace(src, final)
+
+
+# ── VITS2 TTS (ZH/EN VITS2 16 kHz, TensorRT engines; one archive per JetPack) ──
+# TensorRT plans are not portable across TensorRT majors, so the archive is
+# chosen from the TensorRT that is importable at runtime, never from a build
+# argument — same rule as OCR above.
+#
+# Each archive carries the frontend the engines need, unpacked to the layout
+# frontend/release_paths.py expects: engines/<family>/*.plan, config.json,
+# frontend_data/, tn_cache/ (compiled WeText TN FSTs) and nltk_data/ (cmudict +
+# perceptron tagger — shipped precisely so the container never has to call
+# nltk.download() at runtime). Upstream is
+# modelscope.cn/models/Starlight777/VITS2-ZH-EN-Male-16k at revision
+# 14954122c4baf4e80b44436c4b2b167e38db4103; the runtime-required files of that
+# revision were repacked per family and mirrored to COS, so devices pull one
+# 60 MB file from the same host as every other model here. The fp32 ONNX graphs
+# the plans were built from are not included — they are build inputs, not
+# runtime files.
+VITS2_MODEL_BASE = os.environ.get("VITS2_MODEL_BASE_URL", COS_BASE)
+VITS2_MODEL_ARCHIVES = {
+    "jp61": {
+        "archive": "vits2-zh-en-male-16k-tensorrt-jp61-trt10.4-orin.tar.gz",
+        "size": 61834952,
+        "sha256": "f04ab439588cd3106ccd245f64af548199ba888d31627827c07ac28368225805",
+    },
+    "jp511": {
+        "archive": "vits2-zh-en-male-16k-tensorrt-jp511-trt8.5-orin.tar.gz",
+        "size": 62994881,
+        "sha256": "01ffce0516f1a68f3fcedce6ff9caff784f428a1d09da2d760fcba599116e8c7",
+    },
+}
+
+
+def ensure_vits2_model(model_dir: str, family: str | None = None) -> str:
+    """Ensure the VITS2 release matching the runtime TensorRT is installed.
+
+    Returns the engine directory for this runtime, which is what the adapter
+    hands to TensorRT — the caller never has to work out the family itself.
+    """
+    model_dir = require_models_subpath(model_dir)
+    key = select_bundle_family(VITS2_MODEL_ARCHIVES, family)
+    entry = VITS2_MODEL_ARCHIVES[key]
+    log.info(f"[model_downloader] vits2: using {key} archive")
+    ensure_verified_archive(
+        f"vits2/{key}",
+        model_dir,
+        f"{VITS2_MODEL_BASE.rstrip('/')}/{entry['archive']}",
+        entry,
+    )
+    return os.path.join(model_dir, "engines", key)

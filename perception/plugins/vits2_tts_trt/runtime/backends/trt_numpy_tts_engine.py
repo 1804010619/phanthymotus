@@ -12,9 +12,7 @@ import numpy as np
 from .trt_cuda_session import CudaRuntime, TensorRTCudaSession
 
 
-APP_DIR = Path(__file__).resolve().parent.parent
 DEFAULT_MAX_ENGINE_BYTES = 64 * 1024 * 1024
-
 
 def _profile_max(manifest, name, fallback):
     profile = str(manifest.get("profiles", {}).get(name, ""))
@@ -76,10 +74,11 @@ def _soft_clip_and_pcm(audio, sample_rate):
 
 
 class TensorRTNumpyTTSEngine:
-    def __init__(self, config_path: str, engine_dir: str | None = None, replica_id: int = 0):
-        self.engine_dir = Path(
-            engine_dir or os.getenv("MIX_VITS_TRT_ENGINE_DIR", APP_DIR / "engines")
-        )
+    def __init__(self, config_path: str, engine_dir: str, replica_id: int = 0):
+        # engine_dir is the family directory of the installed release
+        # (engines/jp61 or engines/jp511). No env fallback: plans are not
+        # portable across TensorRT majors.
+        self.engine_dir = Path(engine_dir)
         manifest_path = self.engine_dir / "manifest.json"
         if not manifest_path.is_file():
             raise FileNotFoundError(f"TensorRT manifest not found: {manifest_path}")

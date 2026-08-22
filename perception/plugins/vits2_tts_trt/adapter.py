@@ -11,24 +11,42 @@ from pathlib import Path
 from .runtime.backends.trt_numpy_tts_engine import TensorRTNumpyTTSEngine
 
 
+log = logging.getLogger(__name__)
+
+
+def _env_int(name: str, default: int, low: int, high: int, even: bool = False) -> int:
+    """Read a bounded int from the environment, falling back on bad input.
+
+    Same reasoning as plugin._env_int: this module is imported while the plugin
+    list is built, so a bad tuning variable must not abort the whole perception
+    process.
+    """
+    raw = os.getenv(name)
+    if raw is None or raw.strip() == "":
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        log.warning("[vits2_tts_trt] %s=%r is not an integer; using %d", name, raw, default)
+        return default
+    if not low <= value <= high or (even and value % 2):
+        log.warning("[vits2_tts_trt] %s=%d is unusable; using %d", name, value, default)
+        return default
+    return value
+
+
 SAMPLE_RATE = 16000
-CHUNK_BYTES = int(os.getenv("MIX_VITS_CHUNK_BYTES", "3200"))
+# PCM frame size on the wire. Must stay even (16-bit samples) and match what
+# the Speaker side expects; 3200 bytes is 100 ms at 16 kHz mono.
+CHUNK_BYTES = _env_int("MIX_VITS_CHUNK_BYTES", 3200, 2, 1 << 20, even=True)
 PCM_FRAME_MS = CHUNK_BYTES * 1000.0 / (SAMPLE_RATE * 2)
-MAX_CHUNK_TOKENS = int(os.getenv("MIX_VITS_MAX_TEXT_TOKENS", "256"))
-CHUNK_PAUSE_MS = int(os.getenv("MIX_VITS_CHUNK_PAUSE_MS", "0"))
-MODEL_CONFIG = os.getenv("MIX_VITS_CONFIG_PATH", "/models/vits2/config.json")
-ENGINE_DIR = os.getenv("MIX_VITS_TRT_ENGINE_DIR", "/models/vits2/engines")
+MAX_CHUNK_TOKENS = _env_int("MIX_VITS_MAX_TEXT_TOKENS", 256, 1, 4096)
+CHUNK_PAUSE_MS = _env_int("MIX_VITS_CHUNK_PAUSE_MS", 0, 0, 1000)
 WARMUP_CASES = (
     "你好，语音服务已经准备好了。",
     "今天可以使用平板电脑查看消息。",
     "The device is ready for a short test."
 )
-log = logging.getLogger(__name__)
-
-if CHUNK_BYTES <= 0 or CHUNK_BYTES % 2:
-    raise ValueError("MIX_VITS_CHUNK_BYTES must be a positive even number")
-if not 0 <= CHUNK_PAUSE_MS <= 1000:
-    raise ValueError("MIX_VITS_CHUNK_PAUSE_MS must be between 0 and 1000")
 
 class TTSAdapter(ABC):
     @abstractmethod
@@ -51,10 +69,16 @@ class Vits2TensorRTAdapter(TTSAdapter):
         speed: float = 1.0,
         *,
         engine=None,
-        model_config: str = MODEL_CONFIG,
-        engine_dir: str = ENGINE_DIR,
+        model_config: str = "",
+        engine_dir: str = "",
         max_chunk_tokens: int | None = None,
     ):
+        # Both paths come from the installed release (see
+        # utils.model_downloader.ensure_vits2_model), never from an env default:
+        # engines are per JetPack family, so a hardcoded fallback would happily
+        # hand TensorRT 10 a plan built by TensorRT 8.
+        if engine is None and not (model_config and engine_dir):
+            raise ValueError("model_config and engine_dir are required")
         self._lock = threading.Lock()
         self.set_speed(speed)
         self._engine = engine or TensorRTNumpyTTSEngine(model_config, engine_dir)
@@ -144,7 +168,7 @@ def _trt_adapter(cfg: dict) -> Vits2TensorRTAdapter:
     return Vits2TensorRTAdapter(
         speed=float(cfg.get("speed", 1.0)),
         model_config=str(root / "config.json"),
-        engine_dir=str(root / "engines"),
+        engine_dir=cfg["engine_dir"],
         max_chunk_tokens=int(cfg.get("max_chunk_tokens", MAX_CHUNK_TOKENS)),
     )
 
