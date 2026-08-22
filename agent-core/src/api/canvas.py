@@ -35,6 +35,55 @@ def _check_editor_expired():
         _editor_last_seen = 0.0
 
 
+def current_editor() -> Optional[str]:
+    """Session id currently holding the edit lock, or None.
+
+    Used by api/solutions.py: applying a solution rewrites canvas_layout behind
+    the lock's back, so it has to refuse while someone is editing — their next
+    autosave would otherwise clobber the freshly loaded layout.
+    """
+    _check_editor_expired()
+    return _editor_session
+
+
+def apply_tool_config(mcp_id: str, tool_name: str, body: Any,
+                      instance_id: str = '') -> None:
+    """Push a saved config down to the MCP plugin (fire-and-forget).
+
+    Shared by the tool-config endpoints below and by api/solutions.py when a
+    solution is applied, so both paths send the exact same `action: config`
+    call shape.
+    """
+    from api.mcp_manage import mcp_call_tool, MCPCallRequest
+
+    args = dict(body) if isinstance(body, dict) else {}
+    if instance_id:
+        args['instance_id'] = instance_id
+
+    async def _apply():
+        try:
+            req = MCPCallRequest(tool=tool_name, arguments={'action': 'config', **args})
+            await mcp_call_tool(mcp_id, req)
+        except Exception:
+            pass
+
+    try:
+        asyncio.create_task(_apply())
+    except RuntimeError:
+        # No running loop (called from a sync context outside a request). The
+        # config row is already persisted, and mcp_manage._restore_saved_configs
+        # re-sends it when the device next comes online — so skipping the live
+        # push here degrades timing, not correctness.
+        pass
+
+
+def tool_config_key(mcp_id: str, tool_name: str, instance_id: str = '') -> str:
+    """ConfigDB key for a tool config row."""
+    key = f'{_TOOL_CONFIG_PREFIX}{mcp_id}:{tool_name}'
+    return f'{key}:{instance_id}' if instance_id else key
+
+
+
 class CanvasLayout(BaseModel):
     cards:           list  = []
     connections:     list  = []
@@ -119,13 +168,12 @@ async def save_layout(layout: CanvasLayout):
 @router.get('/tool-config/{mcp_id}/{tool_name}')
 async def get_tool_config(mcp_id: str, tool_name: str):
     """Get saved config for a tool."""
-    data = config.main.get(f'{_TOOL_CONFIG_PREFIX}{mcp_id}:{tool_name}', None)
+    data = config.main.get(tool_config_key(mcp_id, tool_name), None)
     return {'code': 200, 'data': data}
 
 
-@router.get('/tool-configs')
-async def get_all_tool_configs():
-    """Batch-get all tool configs."""
+def all_tool_configs() -> dict:
+    """Every saved tool config, keyed by "mcp_id:tool_name[:instance_id]"."""
     result = {}
     try:
         conn = config._get_conn()
@@ -138,24 +186,38 @@ async def get_all_tool_configs():
             result[tool_key] = json.loads(value)
     except Exception:
         pass
-    return {'code': 200, 'data': result}
+    return result
+
+
+def delete_all_tool_configs() -> int:
+    """Drop every saved tool config. Returns the number of rows removed.
+
+    Only used when a solution replaces the whole canvas: the incoming cards
+    bring their own configs, and leftovers would keep pushing stale settings
+    (old topics, old device paths) to plugins that the new canvas reuses.
+    """
+    try:
+        conn = config._get_conn()
+        cur = conn.execute("DELETE FROM config WHERE key LIKE ?",
+                           (f'{_TOOL_CONFIG_PREFIX}%',))
+        conn.commit()
+        return cur.rowcount or 0
+    except Exception:
+        return 0
+
+
+@router.get('/tool-configs')
+async def get_all_tool_configs():
+    """Batch-get all tool configs."""
+    return {'code': 200, 'data': all_tool_configs()}
+
 
 
 @router.put('/tool-config/{mcp_id}/{tool_name}')
 async def save_tool_config(mcp_id: str, tool_name: str, body: Any = fastapi.Body(...)):
     """Save config for a tool and apply it to the MCP plugin."""
-    config.main[f'{_TOOL_CONFIG_PREFIX}{mcp_id}:{tool_name}'] = body
-
-    # Apply config to the MCP plugin (fire-and-forget, don't block response)
-    from api.mcp_manage import mcp_call_tool, MCPCallRequest
-    async def _apply():
-        try:
-            req = MCPCallRequest(tool=tool_name, arguments={'action': 'config', **body})
-            await mcp_call_tool(mcp_id, req)
-        except Exception:
-            pass
-    asyncio.create_task(_apply())
-
+    config.main[tool_config_key(mcp_id, tool_name)] = body
+    apply_tool_config(mcp_id, tool_name, body)
     return {'code': 200}
 
 
@@ -165,7 +227,7 @@ async def delete_tool_config(mcp_id: str, tool_name: str):
     try:
         conn = config._get_conn()
         conn.execute("DELETE FROM config WHERE key = ?",
-                     (f'{_TOOL_CONFIG_PREFIX}{mcp_id}:{tool_name}',))
+                     (tool_config_key(mcp_id, tool_name),))
         conn.commit()
     except Exception:
         pass
@@ -177,24 +239,15 @@ async def delete_tool_config(mcp_id: str, tool_name: str):
 @router.get('/tool-config/{mcp_id}/{tool_name}/{instance_id}')
 async def get_instance_config(mcp_id: str, tool_name: str, instance_id: str):
     """Get saved config for a specific tool instance."""
-    data = config.main.get(f'{_TOOL_CONFIG_PREFIX}{mcp_id}:{tool_name}:{instance_id}', None)
+    data = config.main.get(tool_config_key(mcp_id, tool_name, instance_id), None)
     return {'code': 200, 'data': data}
 
 
 @router.put('/tool-config/{mcp_id}/{tool_name}/{instance_id}')
 async def save_instance_config(mcp_id: str, tool_name: str, instance_id: str, body: Any = fastapi.Body(...)):
     """Save config for a specific tool instance and apply it."""
-    config.main[f'{_TOOL_CONFIG_PREFIX}{mcp_id}:{tool_name}:{instance_id}'] = body
-
-    # Apply instance config to the MCP plugin (fire-and-forget)
-    from api.mcp_manage import mcp_call_tool, MCPCallRequest
-    async def _apply():
-        try:
-            req = MCPCallRequest(tool=tool_name, arguments={'action': 'config', 'instance_id': instance_id, **body})
-            await mcp_call_tool(mcp_id, req)
-        except Exception:
-            pass
-    asyncio.create_task(_apply())
+    config.main[tool_config_key(mcp_id, tool_name, instance_id)] = body
+    apply_tool_config(mcp_id, tool_name, body, instance_id)
     return {'code': 200}
 
 
@@ -204,7 +257,7 @@ async def delete_instance_config(mcp_id: str, tool_name: str, instance_id: str):
     try:
         conn = config._get_conn()
         conn.execute("DELETE FROM config WHERE key = ?",
-                     (f'{_TOOL_CONFIG_PREFIX}{mcp_id}:{tool_name}:{instance_id}',))
+                     (tool_config_key(mcp_id, tool_name, instance_id),))
         conn.commit()
     except Exception:
         pass
