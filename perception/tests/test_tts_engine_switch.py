@@ -82,14 +82,19 @@ def _fake_engines(monkeypatch):
     """Replace both real engines with fakes; sherpa's is deliberately slow."""
     engines = _Engines()
 
-    def build(self, engine):
-        cfg = dict(self._cfg)
-        cfg["engine"] = engine
-        # sherpa-onnx really does fetch its Matcha model in __init__.
-        delay = 0.3 if engine == "sherpa_onnx" else 0.0
-        return _FakeEngine(engine, cfg, self._executor, engines.add, delay=delay)
-
-    monkeypatch.setattr(tts.TTSPlugin, "_build", build)
+    # Patch the two engine constructors, not TTSPlugin._build: the facade's own
+    # per-engine model_dir selection and post-construction health check live in
+    # _build, and stubbing it out would skip exactly what these tests check.
+    # sherpa-onnx really does fetch its Matcha model in __init__, hence the delay.
+    monkeypatch.setattr(
+        tts, "SherpaOnnxTTSPlugin",
+        lambda cfg, executor: _FakeEngine("sherpa_onnx", cfg, executor,
+                                          engines.add, delay=0.3),
+    )
+    monkeypatch.setattr(
+        tts.TTSPlugin, "_build_vits2",
+        lambda self, cfg: _FakeEngine("vits2_trt", cfg, self._executor, engines.add),
+    )
     return engines
 
 
@@ -198,10 +203,10 @@ def test_unknown_engine_is_refused_without_touching_the_live_one(_fake_engines):
 
 
 def test_engine_build_failure_is_reported_not_raised(monkeypatch):
-    def boom(self, engine):
+    def boom(self, cfg):
         raise RuntimeError("no TensorRT here")
 
-    monkeypatch.setattr(tts.TTSPlugin, "_build", boom)
+    monkeypatch.setattr(tts.TTSPlugin, "_build_vits2", boom)
     plugin = _plugin()          # must not raise: main.py keeps the tool listed
     info = plugin.dispatch("tts", {"action": "info"})
     assert info["state"] == "error"
@@ -239,3 +244,65 @@ def test_concurrent_switches_leave_exactly_one_engine_live(_fake_engines):
     for name, impl in _fake_engines.impls.items():
         if name != live:
             assert impl.stopped is True, f"{name} left running"
+
+
+# ── per-engine model_dir (device regression) ─────────────────────────────────
+
+def test_each_engine_gets_its_own_model_dir(_fake_engines):
+    """config.yaml carries one model_dir, written for the engine it declares.
+
+    Handing /models/vits2 to sherpa-onnx made it download its Matcha model into
+    the VITS2 directory and then load the vocoder from there — which is what
+    "I picked sherpa_onnx and it downloaded the VITS2 model" looked like.
+    """
+    plugin = tts.TTSPlugin(
+        {"engine": "vits2_trt", "model_dir": "/models/vits2"}, _FakeExecutor()
+    )
+    assert _fake_engines["vits2_trt"].cfg["model_dir"] == "/models/vits2"
+
+    plugin.dispatch("tts", {"action": "config", "tts_engine": "sherpa_onnx"})
+    assert _wait_until(lambda: "sherpa_onnx" in _fake_engines)
+    assert (_fake_engines["sherpa_onnx"].cfg["model_dir"]
+            == tts.ENGINE_MODEL_DIRS["sherpa_onnx"])
+
+
+def test_configured_model_dir_follows_the_configured_engine(_fake_engines):
+    """A sherpa-configured deployment keeps its own path, and VITS2 gets its own."""
+    plugin = tts.TTSPlugin(
+        {"engine": "sherpa_onnx", "model_dir": "/models/custom/sherpa"},
+        _FakeExecutor(),
+    )
+    assert _wait_until(lambda: "sherpa_onnx" in _fake_engines)
+    assert _fake_engines["sherpa_onnx"].cfg["model_dir"] == "/models/custom/sherpa"
+
+    plugin.dispatch("tts", {"action": "config", "tts_engine": "vits2_trt"})
+    assert _wait_until(lambda: "vits2_trt" in _fake_engines)
+    assert (_fake_engines["vits2_trt"].cfg["model_dir"]
+            == tts.ENGINE_MODEL_DIRS["vits2_trt"])
+
+
+def test_engine_that_reports_error_after_construction_is_not_installed(monkeypatch):
+    """sherpa swallows its own model-load failure and reports it through info.
+
+    Installing such an object made the facade claim ready, so start and speak
+    "succeeded" against a model that never loaded.
+    """
+    class _BrokenEngine:
+        def dispatch(self, name, args):
+            if args.get("action") == "info":
+                return {"state": "error", "error": "Protobuf parsing failed"}
+            return {"state": "running"}
+
+        def synthesize_raw(self, text):
+            raise RuntimeError("no model")
+
+    monkeypatch.setattr(tts, "SherpaOnnxTTSPlugin",
+                        lambda cfg, executor: _BrokenEngine())
+    plugin = tts.TTSPlugin({"engine": "sherpa_onnx"}, _FakeExecutor())
+
+    info = plugin.dispatch("tts", {"action": "info"})
+    assert info["state"] == "error"
+    assert "Protobuf parsing failed" in info["error"]
+    # And no action may claim success against it.
+    assert plugin.dispatch("tts", {"action": "start"})["state"] == "error"
+    assert plugin.dispatch("tts", {"action": "speak", "text": "hi"})["state"] == "error"

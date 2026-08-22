@@ -725,6 +725,12 @@ class SherpaOnnxTTSPlugin:
 
 DEFAULT_TTS_ENGINE = "vits2_trt"
 TTS_ENGINES = ("vits2_trt", "sherpa_onnx")
+# Where each engine keeps its own model files. Used for any engine other than
+# the one config.yaml was written for; see TTSPlugin._model_dir_for.
+ENGINE_MODEL_DIRS = {
+    "vits2_trt": "/models/vits2",
+    "sherpa_onnx": "/models/sherpa-onnx/tts",
+}
 
 
 class TTSPlugin:
@@ -751,6 +757,14 @@ class TTSPlugin:
         engine = self._select_engine(self._cfg.get("engine")
                                      or self._cfg.get("tts_engine"))
         self._engine = engine
+        # model_dir is per engine: sherpa-onnx wants its Matcha/vocoder pair,
+        # VITS2 wants its TensorRT release. config.yaml carries one model_dir,
+        # written for the engine it also declares — handing that same path to the
+        # other engine made sherpa download its models into /models/vits2 and
+        # then try to load them from there. So the configured path applies only
+        # to the configured engine; every other engine gets its own default.
+        self._configured_engine = engine
+        self._configured_model_dir = self._cfg.get("model_dir") or ""
         # Built inline at startup so info/start are immediately truthful, and so
         # a misconfigured engine shows up in the boot log rather than on the
         # first utterance. Runtime switches take the background path below.
@@ -770,14 +784,33 @@ class TTSPlugin:
             raise ValueError(f"Unsupported TTS engine: {engine}")
         return engine
 
+    def _model_dir_for(self, engine: str) -> str:
+        if engine == self._configured_engine and self._configured_model_dir:
+            return self._configured_model_dir
+        return ENGINE_MODEL_DIRS[engine]
+
     def _build(self, engine: str):
         cfg = dict(self._cfg)
         cfg["engine"] = engine
-        if engine == "vits2_trt":
-            from plugins.vits2_tts import Vits2TTSPlugin
+        cfg["model_dir"] = self._model_dir_for(engine)
+        impl = (self._build_vits2(cfg) if engine == "vits2_trt"
+                else SherpaOnnxTTSPlugin(cfg, self._executor))
+        # An implementation may swallow its own model-load failure and come back
+        # as an object that reports error through info (sherpa does exactly
+        # that). Installing it would make the facade claim ready and let a start
+        # or a speak "succeed" against a model that never loaded, so ask it.
+        state = impl.dispatch("tts", {"action": "info"}) or {}
+        if state.get("state") == "error":
+            raise RuntimeError(
+                state.get("error") or state.get("desc")
+                or f"engine {engine} reported an error after construction"
+            )
+        return impl
 
-            return Vits2TTSPlugin(cfg, self._executor)
-        return SherpaOnnxTTSPlugin(cfg, self._executor)
+    def _build_vits2(self, cfg: dict):
+        from plugins.vits2_tts import Vits2TTSPlugin
+
+        return Vits2TTSPlugin(cfg, self._executor)
 
     def _build_async(self, engine: str) -> None:
         """Build an engine off the request thread; the old one is already gone."""

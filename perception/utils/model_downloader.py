@@ -94,7 +94,16 @@ MODELS = {
 
 
 def ensure_model(name: str, model_dir: str) -> None:
-    """Ensure model files exist in model_dir. Download from COS if missing."""
+    """Ensure model files exist in model_dir. Download from COS if missing.
+
+    Serialized per (model_dir, name) with a file lock, and every download lands
+    through a temporary file in the destination directory: the check_file must
+    not exist until the model behind it is complete. Writing the final name
+    directly meant a second caller saw check_file the moment the transfer
+    started and loaded a partial model — observed as
+    "Load model from .../vocos-16khz-univ.onnx failed: Protobuf parsing failed"
+    while the log still showed that file at 30%.
+    """
     info = MODELS.get(name)
     if not info:
         raise ValueError(f"Unknown model name: {name}")
@@ -104,15 +113,40 @@ def ensure_model(name: str, model_dir: str) -> None:
         log.info(f"[model_downloader] {name}: already exists at {model_dir}")
         return
 
-    url = info["url"]
     os.makedirs(model_dir, exist_ok=True)
+    lock_path = os.path.join(model_dir, f".{name}.lock")
+    with open(lock_path, "a+b") as lock_file:
+        if fcntl is not None:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            if os.path.exists(check_path):
+                log.info(f"[model_downloader] {name}: fetched by another instance")
+                return
+            _download_model(name, info, model_dir, check_path)
+        finally:
+            if fcntl is not None:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
+def _download_model(name: str, info: dict, model_dir: str, check_path: str) -> None:
+    """Fetch one legacy model into model_dir. Caller holds the per-model lock."""
+    url = info["url"]
     log.info(f"[model_downloader] {name}: downloading from {url} ...")
 
     if info.get("single_file"):
-        # Direct file download (not an archive)
-        dest = os.path.join(model_dir, info["check_file"])
-        urlretrieve(url, dest, reporthook=_progress_hook(name))
-        log.info(f"[model_downloader] {name}: done.")
+        # Direct file download (not an archive). Staged in the destination
+        # directory so the rename is atomic (same filesystem).
+        with tempfile.NamedTemporaryFile(dir=model_dir, suffix=".part",
+                                         delete=False) as tmp:
+            tmp_path = tmp.name
+        try:
+            urlretrieve(url, tmp_path, reporthook=_progress_hook(name))
+            os.chmod(tmp_path, 0o644)
+            os.replace(tmp_path, check_path)
+            log.info(f"[model_downloader] {name}: done.")
+        finally:
+            if os.path.exists(tmp_path):
+                os.unlink(tmp_path)
         return
 
     # Determine suffix from URL
@@ -128,10 +162,19 @@ def ensure_model(name: str, model_dir: str) -> None:
         urlretrieve(url, tmp_path, reporthook=_progress_hook(name))
         log.info(f"[model_downloader] {name}: extracting to {model_dir} ...")
 
-        if suffix == ".zip":
-            _extract_zip(tmp_path, model_dir)
-        else:
-            _extract_tar(tmp_path, model_dir)
+        # Extract beside the destination, then move the files in, so a partly
+        # extracted archive never publishes check_file either.
+        with tempfile.TemporaryDirectory(prefix=f".{name}-", dir=model_dir) as staging:
+            if suffix == ".zip":
+                _extract_zip(tmp_path, staging)
+            else:
+                _extract_tar(tmp_path, staging)
+            if not os.path.exists(os.path.join(staging, info["check_file"])):
+                raise RuntimeError(
+                    f"[model_downloader] {name}: download completed but "
+                    f"{info['check_file']} not found in the archive"
+                )
+            _merge_tree(staging, model_dir)
 
         log.info(f"[model_downloader] {name}: done.")
     finally:
