@@ -1021,7 +1021,7 @@ async def apply(request: fastapi.Request, req: LoadRequest):
 def _apply_canvas(canvas: dict, mapping: dict) -> dict:
     """写画布布局与卡片配置。"""
     from api.canvas import (apply_tool_config, delete_all_tool_configs,
-                            tool_config_key)
+                            notify_layout_changed, tool_config_key)
 
     cards = []
     for card in canvas.get('cards') or []:
@@ -1057,6 +1057,8 @@ def _apply_canvas(canvas: dict, mapping: dict) -> dict:
         'execConnections': exec_connections,
         'transform':       canvas.get('transform') or {},
     }
+    # 绕过编辑锁直接改写了布局，所有开着画布的客户端都得重新拉一次
+    notify_layout_changed()
 
     # 卡片配置：先清空旧的，再写包体里的
     removed = delete_all_tool_configs()

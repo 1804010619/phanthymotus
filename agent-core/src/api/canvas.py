@@ -21,18 +21,112 @@ router = fastapi.APIRouter(prefix='/canvas', tags=['canvas'])
 _TOOL_CONFIG_PREFIX = 'tool_config:'
 
 # ── Editor Lock State (in-memory, resets on restart) ─────────────────────────
+#
+# The lock's lifetime is tied to the holder's /ws/motus connection, not to a
+# browser unload handler: beforeunload/pagehide never fire on a killed process,
+# a reclaimed mobile tab or a crashed page, and sendBeacon may be dropped — so a
+# closed tab used to hold the canvas hostage until the TTL expired. api/motus_stream
+# reports connect/disconnect here; a disconnect releases the lock after a short
+# grace period, and a *live* connection means the lock never times out (an editor
+# staring at the canvas without touching it is not idle).
 
 _editor_session: Optional[str] = None   # session_id of current editor
 _editor_last_seen: float = 0.0          # monotonic timestamp of last activity
-_EDITOR_TIMEOUT = 60.0                  # seconds before auto-release
+_EDITOR_TIMEOUT = 60.0                  # TTL fallback for sessions with no live WS
+
+_live_sessions: dict[str, int] = {}     # session_id → open /ws/motus count
+_DISCONNECT_GRACE = 8.0                 # seconds to tolerate a WS reconnect flap
+
+_layout_rev = 0                         # bumped on every canvas_layout write
+
+
+def _broadcast(event: dict) -> None:
+    """Fire-and-forget push to /ws/motus clients.
+
+    Local import breaks the cycle (motus_stream is imported by everything);
+    tolerating "no running loop" mirrors apply_tool_config below — a missed
+    broadcast degrades cross-tab freshness, not correctness, since clients also
+    poll /canvas/edit-status.
+    """
+    from api.motus_stream import push_event
+
+    try:
+        asyncio.create_task(push_event(event))
+    except RuntimeError:
+        pass
+
+
+def _broadcast_editor(reason: str) -> None:
+    """Tell every client who holds the lock now (None = free)."""
+    _broadcast({'type': 'canvas_editor',
+                'payload': {'editor': _editor_session, 'reason': reason}})
+
+
+def notify_layout_changed(session_id: str = '') -> None:
+    """Tell every client the saved layout changed, so readers can reload.
+
+    `session_id` is the writer — clients use it to ignore the echo of their own
+    save. Also called by api/solutions.py, which rewrites canvas_layout directly.
+    """
+    global _layout_rev
+    _layout_rev += 1
+    _broadcast({'type': 'canvas_layout',
+                'payload': {'editor': session_id, 'rev': _layout_rev}})
 
 
 def _check_editor_expired():
-    """Release editor if inactive for too long."""
+    """Release the lock if its holder is gone.
+
+    A session with a live /ws/motus never expires; the TTL only covers holders we
+    have no connection for (WS never established, or an old client).
+    """
     global _editor_session, _editor_last_seen
-    if _editor_session and (time.monotonic() - _editor_last_seen) > _EDITOR_TIMEOUT:
+    if not _editor_session or _live_sessions.get(_editor_session):
+        return
+    if (time.monotonic() - _editor_last_seen) > _EDITOR_TIMEOUT:
         _editor_session = None
         _editor_last_seen = 0.0
+        _broadcast_editor('timeout')
+
+
+def session_connected(session_id: str) -> None:
+    """A /ws/motus connection opened for this session."""
+    if not session_id:
+        return
+    _live_sessions[session_id] = _live_sessions.get(session_id, 0) + 1
+
+
+def session_disconnected(session_id: str) -> None:
+    """A /ws/motus connection closed; release the lock if nothing reconnects.
+
+    Refcounted because one page may hold several connections and a reconnect can
+    overlap the old socket's teardown — decrementing to zero is the only reliable
+    "this session is gone" signal.
+    """
+    if not session_id:
+        return
+    remaining = _live_sessions.get(session_id, 0) - 1
+    if remaining > 0:
+        _live_sessions[session_id] = remaining
+        return
+    _live_sessions.pop(session_id, None)
+    try:
+        asyncio.create_task(_grace_release(session_id))
+    except RuntimeError:
+        pass
+
+
+async def _grace_release(session_id: str) -> None:
+    """Release `session_id`'s lock unless it reconnects within the grace period."""
+    global _editor_session, _editor_last_seen
+    await asyncio.sleep(_DISCONNECT_GRACE)
+    if _live_sessions.get(session_id):
+        return                          # reconnected — keep editing
+    if _editor_session != session_id:
+        return
+    _editor_session = None
+    _editor_last_seen = 0.0
+    _broadcast_editor('disconnect')
 
 
 def current_editor() -> Optional[str]:
@@ -112,24 +206,50 @@ async def claim_edit(body: dict = fastapi.Body(...)):
 
     _editor_session = session_id
     _editor_last_seen = time.monotonic()
+    _broadcast_editor('claim')
     return {'code': 200, 'editor': session_id}
 
 
 @router.post('/release-edit')
-async def release_edit(body: dict = fastapi.Body(...)):
-    """Release edit permission."""
+async def release_edit(request: fastapi.Request):
+    """Release edit permission.
+
+    Body is parsed by hand rather than via Body(...) because the page-close path
+    uses navigator.sendBeacon, which sends Content-Type: text/plain — FastAPI only
+    JSON-decodes an `application/*json` body, so a declared dict param 422'd and
+    the lock was never released.
+    """
     global _editor_session, _editor_last_seen
-    session_id = body.get('session_id', '')
-    if _editor_session == session_id:
-        _editor_session = None
-        _editor_last_seen = 0.0
+    _check_editor_expired()
+
+    try:
+        body = json.loads(await request.body() or b'{}')
+    except (ValueError, TypeError):
+        body = {}
+    session_id = body.get('session_id', '') if isinstance(body, dict) else ''
+
+    if not session_id or _editor_session != session_id:
+        return fastapi.responses.JSONResponse(
+            status_code=409, content={'code': 409, 'message': 'Not the current editor',
+                                      'editor': _editor_session})
+
+    _editor_session = None
+    _editor_last_seen = 0.0
+    _broadcast_editor('release')
     return {'code': 200}
 
 
 @router.get('/edit-status')
-async def edit_status():
-    """Check who is currently editing."""
+async def edit_status(session_id: str = ''):
+    """Check who is currently editing.
+
+    Passing your own session_id also refreshes the TTL — the frontend's 10s poll
+    thus acts as a heartbeat while the /ws/motus connection is down.
+    """
+    global _editor_last_seen
     _check_editor_expired()
+    if session_id and session_id == _editor_session:
+        _editor_last_seen = time.monotonic()
     return {'code': 200, 'editor': _editor_session}
 
 
@@ -140,7 +260,7 @@ async def get_layout():
     """Return the saved canvas layout + current editor info."""
     _check_editor_expired()
     data = config.main.get('canvas_layout', {'cards': []})
-    return {'code': 200, 'data': data, 'editor': _editor_session}
+    return {'code': 200, 'data': data, 'editor': _editor_session, 'rev': _layout_rev}
 
 
 @router.post('/layout')
@@ -160,6 +280,7 @@ async def save_layout(layout: CanvasLayout):
     save_data = layout.dict()
     save_data.pop('session_id', None)
     config.main['canvas_layout'] = save_data
+    notify_layout_changed(session_id or '')
     return {'code': 200}
 
 
