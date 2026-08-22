@@ -1,3 +1,4 @@
+import logging
 import os
 import re
 import runpy
@@ -13,6 +14,8 @@ from .fst_tn import FstTextNormalizer
 
 from .heteronym import custom_dict, jieba_phrases
 from .release_paths import frontend_data_dir, tn_cache_dir
+
+log = logging.getLogger(__name__)
 
 
 def _load_phrase_pinyin_data():
@@ -122,7 +125,45 @@ def replace_punctuation(text):
     return replaced_text
 
 
+_WHITESPACE_RE = re.compile(r"\s+")
+
+
+def zh_speakable(text: str) -> bool:
+    """Return whether the Chinese path can voice every character of ``text``.
+
+    Whitespace is ignored — it carries no sound. Everything else must survive
+    replace_punctuation(), because whatever that drops would be silently
+    missing from the audio.
+    """
+    stripped = _WHITESPACE_RE.sub("", text)
+    return len(replace_punctuation(stripped)) == len(stripped)
+
+
 def g2p(text):
+    # Whitespace is dropped up front, and only whitespace.
+    #
+    # This function is handed slices of text normalized either by
+    # text_normalize() (which already removed everything it cannot voice) or by
+    # mix_normalize(), which ends with the *English* cleaner and therefore keeps
+    # spaces. pypinyin collapses a run of non-Chinese characters into a single
+    # element, so "  　　事件出圈," produced fewer word2ph entries than
+    # it has characters and tripped the assert below — an AssertionError while
+    # merely counting a chunk's tokens, which is how a long paragraph failed to
+    # synthesize at all rather than losing one space.
+    #
+    # Anything else unvoiceable is left in place on purpose: it must not vanish
+    # without a trace, so it is reported and the caller (see
+    # cleaner.g2p_normalized_text_mix) routes such chunks to the mixed frontend,
+    # which can still pronounce digits, latin and symbols.
+    text = _WHITESPACE_RE.sub("", text)
+    cleaned = replace_punctuation(text)
+    if len(cleaned) != len(text):
+        dropped = "".join(sorted(set(text) - set(cleaned)))
+        log.warning(
+            "[vits2_tts_trt] chinese g2p cannot voice %r; those characters are "
+            "not in the audio", dropped,
+        )
+        text = cleaned
     pattern = r"(?<=[{0}])\s*".format("".join(punctuation))
     sentences = [i for i in re.split(pattern, text) if i.strip() != ""]
     phones, tones, word2ph = _g2p(sentences)

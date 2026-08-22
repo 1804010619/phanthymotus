@@ -24,7 +24,12 @@ def g2p_normalized_text_mix(norm_text):
     """Convert already-normalized MIX text to phones without running TN again."""
     has_zh = any("\u4e00" <= c <= "\u9fff" for c in norm_text)
     has_en = any(("a" <= c.lower() <= "z") for c in norm_text)
-    if has_zh and not has_en:
+    # "No latin letters" is not the same as "the Chinese frontend can say all of
+    # it": mix_normalize() ends with the English cleaner, so a chunk can still
+    # carry digits or symbols that the Chinese cleaner would strip \u2014 silently
+    # dropping them from the audio. Those chunks go to the mixed frontend, which
+    # pronounces digits and symbols instead of deleting them.
+    if has_zh and not has_en and chinese.zh_speakable(norm_text):
         phones, tones, word2ph = chinese.g2p(norm_text)
         return phones, tones, ["ZH"] * len(phones), word2ph
     if has_en and not has_zh:

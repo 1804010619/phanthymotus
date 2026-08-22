@@ -22,12 +22,15 @@ Returns:
   word2ph : List[int]  — phoneme count per input position (char/word)
 """
 
+import logging
 import os
 import re
 
 from g2p_en import G2p
 from .symbols import punctuation
 from .english import eng_dict, refine_ph, post_replace_ph, arpa
+
+log = logging.getLogger(__name__)
 
 current_file_path = os.path.dirname(__file__)
 with open(os.path.join(current_file_path, "opencpop-strict.txt"), encoding="utf-8") as _f:
@@ -172,6 +175,7 @@ def _non_zh_token_to_phones(token: str):
     tones: list = []
     langs: list = []
 
+    unvoiced = []
     for match in _NON_ZH_PIECE_RE.finditer(token):
         piece = match.group(0)
         if _EN_TOKEN_RE.fullmatch(piece):
@@ -181,10 +185,21 @@ def _non_zh_token_to_phones(token: str):
                 phones.extend(ph_list)
                 tones.extend(tone_list)
                 langs.extend(["EN"] * len(ph_list))
+            else:
+                unvoiced.append(piece)
         elif piece in _PUNCT_SET:
             phones.append(piece)
             tones.append(0)
             langs.append("ZH")
+        else:
+            unvoiced.append(piece)
+    if unvoiced:
+        # Say so rather than let it disappear: a character with no phones is a
+        # word the listener never hears, and until now that happened silently.
+        log.warning(
+            "[vits2_tts_trt] no pronunciation for %r; not in the audio",
+            "".join(unvoiced),
+        )
 
     return phones, tones, langs
 
