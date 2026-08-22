@@ -153,13 +153,29 @@ RUN mv /usr/sbin/ldconfig /usr/sbin/ldconfig.real && \
     rm -rf /var/lib/apt/lists/*
 RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} phonemizer
 
-# VITS2 frontend dependencies.  The model release contains compiled TN FSTs;
-# the container executes them with WeText/kaldifst and does not build Pynini.
+# ── VITS2 TTS frontend deps ───────────────────────────────────────
+# The model release contains compiled TN FSTs; the container executes them with
+# WeText/kaldifst and does not build Pynini.
+#
+# numpy is NOT pinned in the requirements file: the OCR layer above already
+# pins it to whatever each JetPack's torch/cv2 stack ships, and a second pin
+# here would silently downgrade it (jp61 1.26.4 → 1.24.4, jp511 1.24.4 →
+# 1.23.5), breaking the numpy C-ABI those wheels were built against. The same
+# NUMPY_VERSION is re-stated on this pip invocation, and asserted afterwards,
+# so a transitive requirement of wetext/g2p-en/nltk cannot move it either.
 COPY perception/plugins/vits2_tts_trt/requirements.jetson.txt /tmp/vits2-requirements.txt
 RUN if [ "${ENABLE_VITS2_TRT}" = "1" ]; then \
+      if [ "${JP_VERSION}" = "61" ]; then NUMPY_VERSION=1.26.4; else NUMPY_VERSION=1.24.4; fi; \
       pip3 install --no-cache-dir -i "${PYPI_MIRROR}" \
-        -r /tmp/vits2-requirements.txt && \
-      python3 -c "import kaldifst,numpy"; \
+        "numpy==${NUMPY_VERSION}" -r /tmp/vits2-requirements.txt && \
+      python3 -c "import kaldifst, numpy; assert numpy.__version__ == '${NUMPY_VERSION}', numpy.__version__"; \
+    fi && rm -f /tmp/vits2-requirements.txt
+COPY perception/plugins/vits2_tts_trt/requirements.jetson.txt /tmp/vits2-requirements.txt
+RUN if [ "${ENABLE_VITS2_TRT}" = "1" ]; then \
+      if [ "${JP_VERSION}" = "61" ]; then NUMPY_VERSION=1.26.4; else NUMPY_VERSION=1.24.4; fi; \
+      pip3 install --no-cache-dir -i "${PYPI_MIRROR}" \
+        "numpy==${NUMPY_VERSION}" -r /tmp/vits2-requirements.txt && \
+      python3 -c "import kaldifst, numpy; assert numpy.__version__ == '${NUMPY_VERSION}', numpy.__version__"; \
     fi && rm -f /tmp/vits2-requirements.txt
 
 # ── Application code ───────────────────────────────────────────────
