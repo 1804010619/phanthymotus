@@ -90,6 +90,14 @@ export function ensureEdit() { return _ensureEdit(); }
 export function isEditor() { return _isEditor; }
 
 /**
+ * Discard the in-memory canvas and re-read it from the server.
+ * Used after a solution is loaded — the backend rewrote canvas_layout directly,
+ * so what's on screen is stale.
+ */
+export function reloadFromServer() { return _reloadLayout(); }
+
+
+/**
  * Programmatically add a card to the canvas (used by mobile tap-to-add).
  * Returns true if added, false if rejected.
  */

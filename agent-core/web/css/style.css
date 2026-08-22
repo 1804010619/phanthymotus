@@ -6842,3 +6842,257 @@ html, body {
   white-space: nowrap;
 }
 
+
+/* ══════════════════════════════════════════════════════════════════════════
+   Solutions — 解决方案（左上角入口 + 当前方案 / 市场 / 保存）
+   复用 .skill-* 的 modal / card / button 语言，这里只加方案特有的部件。
+   ══════════════════════════════════════════════════════════════════════════ */
+
+.solution-entry-btn {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-left: 10px;
+  padding: 5px 10px;
+  max-width: 260px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-card);
+  color: var(--text-muted);
+  font-size: 12px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: border-color .15s, color .15s, background .15s;
+}
+.solution-entry-btn:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+  background: var(--accent-dim);
+}
+.solution-entry-label { white-space: nowrap; }
+.solution-entry-badge {
+  max-width: 110px;
+  padding: 1px 6px;
+  border-radius: 999px;
+  background: var(--accent-dim);
+  color: var(--accent);
+  font-size: 10px;
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.solution-entry-badge.hidden { display: none; }
+
+.solution-modal { width: 680px; }
+.solution-load-modal {
+  width: 620px;
+  max-width: 95vw;
+  max-height: 85vh;
+  display: flex;
+  flex-direction: column;
+}
+
+.solution-section-label {
+  margin: 16px 0 8px;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: .1em;
+  text-transform: uppercase;
+  color: var(--text-dim);
+}
+.solution-section-label:first-child { margin-top: 0; }
+.solution-warn { color: var(--yellow); }
+
+.solution-pills {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+}
+.solution-pill {
+  padding: 2px 8px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--bg-input);
+  font-size: 11px;
+  color: var(--text-muted);
+}
+.solution-pill-sm { font-size: 10px; padding: 1px 6px; }
+.solution-pill-driver {
+  border-color: var(--accent-glow);
+  background: var(--accent-dim);
+  color: var(--accent);
+  font-size: 10px;
+  padding: 1px 6px;
+}
+
+/* ── 当前方案 ── */
+
+.solution-current-card {
+  padding: 16px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-card);
+}
+.solution-current-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+.solution-current-name {
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--text);
+}
+.solution-current-meta {
+  margin-top: 2px;
+  font-size: 11px;
+  color: var(--text-dim);
+}
+
+.solution-driver-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.solution-driver-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-input);
+  font-size: 12px;
+}
+.solution-driver-row-warn  { border-color: var(--yellow); background: var(--yellow-bg); }
+.solution-driver-row-error { border-color: var(--red);    background: var(--red-bg); }
+.solution-driver-name { font-weight: 500; color: var(--text); }
+.solution-driver-image {
+  margin-left: auto;
+  font-family: var(--font-mono, monospace);
+  font-size: 10px;
+  color: var(--text-dim);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.solution-driver-ok   { color: var(--green);  font-weight: 700; }
+.solution-driver-warn { color: var(--yellow); font-weight: 700; }
+.solution-driver-err  { color: var(--red);    font-weight: 700; }
+
+.solution-needs-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+}
+.solution-need-item {
+  padding: 3px 8px;
+  border: 1px solid var(--yellow);
+  border-radius: var(--radius);
+  background: var(--yellow-bg);
+  font-family: var(--font-mono, monospace);
+  font-size: 11px;
+  color: var(--yellow);
+  cursor: pointer;
+}
+.solution-need-item:hover { filter: brightness(.97); }
+.solution-need-item-static { cursor: default; }
+
+/* ── 市场 ── */
+
+.solution-market-bar {
+  display: flex;
+  gap: 8px;
+}
+.solution-market-bar select {
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-input);
+  font-size: 13px;
+  color: var(--text);
+  outline: none;
+}
+.solution-market-card .skill-card-header { align-items: center; }
+.solution-market-card .solution-pills { margin-top: 8px; }
+
+/* ── 载入确认 ── */
+
+.solution-load-error {
+  margin: 10px 0;
+  padding: 10px 12px;
+  border: 1px solid var(--red);
+  border-radius: var(--radius);
+  background: var(--red-bg);
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--red);
+}
+.solution-load-error code {
+  font-family: var(--font-mono, monospace);
+  font-size: 11px;
+}
+.solution-overwrite-list {
+  margin: 0;
+  padding-left: 18px;
+  font-size: 12px;
+  line-height: 1.8;
+  color: var(--text-muted);
+}
+
+/* ── 保存 / 打包 ── */
+
+.solution-save-form { padding-bottom: 8px; }
+.solution-check-group {
+  margin-top: 14px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-card);
+}
+.solution-check-group-title {
+  margin-bottom: 6px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text);
+}
+.solution-check {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 4px 0;
+  font-size: 12px;
+  color: var(--text-muted);
+  cursor: pointer;
+}
+.solution-check input { margin-top: 2px; }
+.solution-check em {
+  font-style: normal;
+  color: var(--text-dim);
+  font-size: 11px;
+}
+.solution-check code {
+  font-family: var(--font-mono, monospace);
+  font-size: 11px;
+  color: var(--text-muted);
+}
+.solution-check-locked,
+.solution-check-disabled { cursor: default; opacity: .75; }
+.solution-hint {
+  margin: 4px 0;
+  font-size: 11px;
+  line-height: 1.7;
+  color: var(--text-dim);
+}
+.solution-hint code {
+  font-family: var(--font-mono, monospace);
+  color: var(--text-muted);
+}
+
+/* 中等宽度下 topbar 挤，入口收成纯图标（角标保留，用户还需要知道载入了什么） */
+@media (max-width: 1100px) {
+  .solution-entry-label { display: none; }
+  .solution-entry-badge { max-width: 72px; }
+}

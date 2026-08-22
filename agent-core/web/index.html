@@ -23,6 +23,11 @@
         <div class="brand-name-row"><span class="brand-name">Phanthy</span><span class="brand-name-accent">Motus</span></div>
         <span class="brand-tagline">Robot Agent OS</span>
       </div>
+      <button class="solution-entry-btn" id="btn-solutions" title="解决方案">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="m12 2 9 5-9 5-9-5 9-5"/><path d="m3 12 9 5 9-5"/><path d="m3 17 9 5 9-5"/></svg>
+        <span class="solution-entry-label">解决方案</span>
+        <span class="solution-entry-badge hidden" id="solution-entry-badge"></span>
+      </button>
     </div>
     <!-- Mode toggle: 配置 / 监控 -->
     <div class="mode-toggle-group" id="mode-toggle-group">
@@ -504,6 +509,51 @@
           <button type="submit" class="skill-btn skill-btn-primary" id="skill-form-submit-btn">保存</button>
         </div>
       </form>
+    </div>
+  </div>
+</div>
+
+<!-- Solution Modal (载入 / 市场 / 保存) -->
+<div class="modal-overlay hidden" id="solution-overlay">
+  <div class="modal skill-modal solution-modal">
+    <div class="modal-header">
+      <span class="modal-title">解决方案</span>
+      <div class="skill-rc-login-status" id="solution-rc-login-status"></div>
+      <button class="btn-icon" id="solution-close">✕</button>
+    </div>
+    <div class="skill-tabs">
+      <button class="skill-tab active" data-tab="current">当前方案</button>
+      <button class="skill-tab" data-tab="market">方案市场</button>
+      <button class="skill-tab" data-tab="save">保存当前方案</button>
+    </div>
+    <div class="modal-body skill-modal-body">
+      <div class="skill-panel active" data-panel="current" id="solution-current-panel"></div>
+
+      <div class="skill-panel" data-panel="market" id="solution-market-panel">
+        <div class="skill-search-bar solution-market-bar">
+          <input type="text" id="solution-search" placeholder="搜索解决方案…" autocomplete="off" spellcheck="false">
+          <select id="solution-industry-filter"></select>
+        </div>
+        <div class="skill-list" id="solution-market-list"></div>
+        <div class="skill-empty hidden" id="solution-market-empty">未找到解决方案</div>
+      </div>
+
+      <div class="skill-panel" data-panel="save" id="solution-save-panel"></div>
+    </div>
+  </div>
+</div>
+
+<!-- Solution Load Confirm Modal (缺失驱动 + 覆盖提示) -->
+<div class="modal-overlay hidden" id="solution-load-overlay">
+  <div class="modal solution-load-modal">
+    <div class="modal-header">
+      <span class="modal-title" id="solution-load-title">载入解决方案</span>
+      <button class="btn-icon" id="solution-load-close">✕</button>
+    </div>
+    <div class="modal-body" id="solution-load-body"></div>
+    <div class="skill-form-footer">
+      <button type="button" class="skill-btn" id="solution-load-cancel">取消</button>
+      <button type="button" class="skill-btn skill-btn-primary" id="solution-load-confirm">确认载入</button>
     </div>
   </div>
 </div>

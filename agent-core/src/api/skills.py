@@ -25,6 +25,86 @@ def _get_rc_url() -> str:
     return 'https://motus.phanthy.com'
 
 
+async def fetch_rc_skill(slug: str, rc_token: str | None = None) -> dict:
+    """从 Resource Center 拉取技能定义。
+
+    返回 {'ok': True, 'data': {...}} 或 {'ok': False, 'error': '...'}。
+    rc_token 用于让作者取到自己尚未上架的技能。
+    """
+    rc_url = _get_rc_url()
+    headers = {}
+    if rc_token:
+        headers['Authorization'] = f'Bearer {rc_token}'
+    try:
+        import httpx
+        async with httpx.AsyncClient(timeout=10) as http:
+            resp = await http.get(f'{rc_url}/api/skills/{slug}', headers=headers)
+            if resp.status_code != 200:
+                return {'ok': False,
+                        'error': f'技能 "{slug}" 未在 Resource Center 找到 (HTTP {resp.status_code})'}
+            data = resp.json()
+            if not data.get('ok'):
+                return {'ok': False, 'error': data.get('error', '获取失败')}
+            return {'ok': True, 'data': data['data']}
+    except ImportError:
+        # httpx 未安装时 fallback 到 urllib
+        import urllib.request, json as _json
+        try:
+            req = urllib.request.Request(f'{rc_url}/api/skills/{slug}')
+            for k, v in headers.items():
+                req.add_header(k, v)
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                data = _json.loads(resp.read())
+                if not data.get('ok'):
+                    return {'ok': False, 'error': data.get('error', '获取失败')}
+                return {'ok': True, 'data': data['data']}
+        except Exception as e:
+            return {'ok': False, 'error': f'无法连接 Resource Center: {e}'}
+    except Exception as e:
+        return {'ok': False, 'error': f'无法连接 Resource Center: {e}'}
+
+
+async def install_from_rc(slug: str, rc_token: str | None = None) -> dict:
+    """安装一个 RC 技能到本地 ConfigDB。
+
+    返回 {'ok': True, 'data': {...}} / {'ok': False, 'error': ...}。
+    已安装时视为成功并回 already=True —— 载入解决方案时会批量调用，
+    重复安装不该让整包失败。
+    """
+    installed = _skills_mod.installed_skills()
+    if any(s['slug'] == slug for s in installed):
+        return {'ok': True, 'already': True, 'data': {'slug': slug}}
+
+    fetched = await fetch_rc_skill(slug, rc_token)
+    if not fetched.get('ok'):
+        return fetched
+    skill_data = fetched['data']
+
+    import datetime
+    new_skill = {
+        'slug': skill_data['slug'],
+        'name': skill_data['name'],
+        'description': skill_data.get('description', ''),
+        'icon': skill_data.get('icon'),
+        'oneLiner': skill_data['oneLiner'],
+        'instruction': skill_data['instruction'],
+        'category': skill_data.get('category', ''),
+        'version': skill_data.get('version', '1.0.0'),
+        'requiredTools': skill_data.get('requiredTools', []),
+        'configSchema': skill_data.get('configSchema'),
+        'author': (skill_data.get('author') or {}).get('name', ''),
+        'installedAt': datetime.datetime.now().isoformat(),
+        'active': True,
+    }
+
+    skills_cfg = config.main.get('skills', {'installed': []})
+    skills_cfg['installed'].append(new_skill)
+    config.main['skills'] = skills_cfg
+
+    return {'ok': True, 'already': False, 'data': {'slug': slug, 'name': new_skill['name']}}
+
+
+
 @router.get('')
 async def list_skills():
     """列出已安装技能及其激活状态。"""
@@ -54,68 +134,17 @@ async def install_skill(request: fastapi.Request, body: dict = fastapi.Body(...)
     if not slug:
         return {'code': 422, 'error': 'slug is required'}
 
-    # 检查是否已安装
+    # 检查是否已安装（install_from_rc 对已安装是幂等的，这里保留显式 409
+    # 是因为手动安装时用户需要知道"已经装过了"）
     installed = _skills_mod.installed_skills()
     if any(s['slug'] == slug for s in installed):
         return {'code': 409, 'error': f'技能 "{slug}" 已安装'}
 
-    # 从 Resource Center 获取技能定义
-    rc_url = _get_rc_url()
-    headers = {}
     # 传递 RC token 以允许作者安装自己的未发布技能
-    rc_token = request.headers.get('x-rc-token')
-    if rc_token:
-        headers['Authorization'] = f'Bearer {rc_token}'
-    try:
-        import httpx
-        async with httpx.AsyncClient(timeout=10) as http:
-            resp = await http.get(f'{rc_url}/api/skills/{slug}', headers=headers)
-            if resp.status_code != 200:
-                return {'code': 404, 'error': f'技能 "{slug}" 未在 Resource Center 找到 (HTTP {resp.status_code})'}
-            data = resp.json()
-            if not data.get('ok'):
-                return {'code': 404, 'error': data.get('error', '获取失败')}
-    except ImportError:
-        # httpx 未安装时 fallback 到 urllib
-        import urllib.request, json as _json
-        try:
-            req = urllib.request.Request(f'{rc_url}/api/skills/{slug}')
-            for k, v in headers.items():
-                req.add_header(k, v)
-            with urllib.request.urlopen(req, timeout=10) as resp:
-                data = _json.loads(resp.read())
-                if not data.get('ok'):
-                    return {'code': 404, 'error': data.get('error', '获取失败')}
-        except Exception as e:
-            return {'code': 502, 'error': f'无法连接 Resource Center: {e}'}
-    except Exception as e:
-        return {'code': 502, 'error': f'无法连接 Resource Center: {e}'}
-
-    skill_data = data['data']
-
-    # 存储到 ConfigDB
-    import datetime
-    new_skill = {
-        'slug': skill_data['slug'],
-        'name': skill_data['name'],
-        'description': skill_data.get('description', ''),
-        'icon': skill_data.get('icon'),
-        'oneLiner': skill_data['oneLiner'],
-        'instruction': skill_data['instruction'],
-        'category': skill_data.get('category', ''),
-        'version': skill_data.get('version', '1.0.0'),
-        'requiredTools': skill_data.get('requiredTools', []),
-        'configSchema': skill_data.get('configSchema'),
-        'author': skill_data.get('author', {}).get('name', ''),
-        'installedAt': datetime.datetime.now().isoformat(),
-        'active': True,
-    }
-
-    skills_cfg = config.main.get('skills', {'installed': []})
-    skills_cfg['installed'].append(new_skill)
-    config.main['skills'] = skills_cfg
-
-    return {'code': 200, 'data': {'slug': slug, 'name': new_skill['name']}}
+    result = await install_from_rc(slug, request.headers.get('x-rc-token'))
+    if not result.get('ok'):
+        return {'code': 404, 'error': result.get('error', '安装失败')}
+    return {'code': 200, 'data': result['data']}
 
 
 @router.post('/uninstall')

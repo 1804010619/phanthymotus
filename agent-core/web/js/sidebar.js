@@ -284,7 +284,7 @@ function _buildChip(mcp, tool) {
     chip.querySelector('.chip-config-btn').addEventListener('click', (e) => {
       e.stopPropagation();
       e.preventDefault();
-      _openToolConfigModal(mcp.id, tool.name, configSchema);
+      openToolConfigModal(mcp.id, tool.name, configSchema);
     });
   }
 
@@ -419,7 +419,7 @@ function _buildToolCard(mcp, tool) {
   if (hasSharedFields) {
     card.querySelector('.tool-card-config-btn').addEventListener('click', (e) => {
       e.stopPropagation();
-      _openToolConfigModal(mcp.id, tool.name, configSchema);
+      openToolConfigModal(mcp.id, tool.name, configSchema);
     });
   }
 
@@ -459,7 +459,7 @@ export function hasSharedRequired(configSchema) {
 
 // ── Tool config modal (shared fields only) ────────────────────────────────────
 
-async function _openToolConfigModal(mcpId, toolName, configSchema) {
+export async function openToolConfigModal(mcpId, toolName, configSchema) {
   if (isProjectRunning()) {
     alert('Stop agent before modifying');
     return;
