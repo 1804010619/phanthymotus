@@ -36,8 +36,9 @@ deviceRef 指向 devices[]，devices 用 MCP initialize 返回的 server_name
 
 敏感字段脱敏是"声明式"的：卡片自己在 configSchema 的属性上标
 `"x-sensitive": true`（或沿用已有的 `"format": "password"`），打包时把值清空
-并把路径记进 redactedFields。未声明的字段不会被自动清空 —— 打包接口会把
-候选清单给前端，作者可以通过 extraRedact 手工追加。
+并把路径记进 redactedFields。反过来，固定的出厂密码这类"要打码但不是秘密"的
+字段可以标 `"x-sensitive": false` 显式豁免。未声明的字段不会被自动清空 ——
+打包接口会把候选清单给前端，作者可以通过 extraRedact 手工追加。
 
 同样会被清空的是"本机专属"字段（`format: channel-select` /
 `audio-input-device`）：它们存的是本机 channel id 或声卡设备名，换机器不是
@@ -148,16 +149,28 @@ def _tool_schema(mcp: dict, tool_name: str) -> dict:
 def _sensitive_props(config_schema: dict) -> set:
     """schema 里声明为敏感的属性名。
 
-    `x-sensitive` 是本文件引入的声明（见模块注释），`format: password` 是
-    driver 侧早就在用的写法（web/js/sidebar.js 用它渲染 password input），
-    两者都算敏感 —— 否则已有驱动的密钥字段会原样进包体。
+    判定顺序：
+      1. `x-sensitive: true`  → 敏感（本文件引入的显式声明）
+      2. `x-sensitive: false` → 不敏感，即使 format 是 password。给"输入框要打码
+         但值本身不是秘密"的字段用，例如固定的出厂密码 —— 清掉只会让载入方
+         被迫重新敲一遍同一个默认值。
+      3. `format: password`   → 敏感（driver 侧早就在用的写法，见
+         web/js/sidebar.js 用它渲染 password input）
+
+    第 3 条是安全默认：没表态的密码框一律当秘密，否则已有驱动的密钥字段会
+    原样进包体。要豁免就按第 2 条显式写出来。
     """
     props = (config_schema or {}).get('properties') or {}
     out = set()
     for name, spec in props.items():
         if not isinstance(spec, dict):
             continue
-        if spec.get('x-sensitive') is True or spec.get('format') == 'password':
+        declared = spec.get('x-sensitive')
+        if declared is True:
+            out.add(name)
+        elif declared is False:
+            continue
+        elif spec.get('format') == 'password':
             out.add(name)
     return out
 
