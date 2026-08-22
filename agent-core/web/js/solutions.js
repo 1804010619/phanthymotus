@@ -645,7 +645,8 @@ async function _loadSavePanel() {
   }
 
   const sensitive = (data.configFields || []).filter(f => f.sensitive);
-  const others    = (data.configFields || []).filter(f => !f.sensitive);
+  const localOnly = (data.configFields || []).filter(f => f.localOnly && !f.sensitive);
+  const others    = (data.configFields || []).filter(f => !f.sensitive && !f.localOnly);
 
   panel.innerHTML = `
     <div class="solution-save-form">
@@ -694,14 +695,21 @@ async function _loadSavePanel() {
       </div>
 
       <div class="solution-check-group">
-        <div class="solution-check-group-title">敏感字段脱敏</div>
+        <div class="solution-check-group-title">打包时会清空的字段</div>
         ${sensitive.length ? `
-          <div class="solution-hint">以下字段由卡片声明为敏感，打包时一定会被清空：</div>
+          <div class="solution-hint">以下字段由卡片声明为敏感，一定会被清空：</div>
           ${sensitive.map(f => `
             <label class="solution-check solution-check-locked">
               <input type="checkbox" checked disabled>
               <span><code>${_esc(f.path)}</code></span>
             </label>`).join('')}` : `<div class="solution-hint">卡片没有声明任何敏感字段</div>`}
+        ${localOnly.length ? `
+          <div class="solution-hint">以下字段只对本机有效（渠道 / 声卡设备），载入方需要重选：</div>
+          ${localOnly.map(f => `
+            <label class="solution-check solution-check-locked">
+              <input type="checkbox" checked disabled>
+              <span><code>${_esc(f.path)}</code></span>
+            </label>`).join('')}` : ''}
         ${others.length ? `
           <div class="solution-hint">如果下面还有不该外传的值，勾选它一并清空：</div>
           ${others.map(f => `

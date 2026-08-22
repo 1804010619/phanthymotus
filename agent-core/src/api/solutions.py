@@ -38,6 +38,10 @@ deviceRef 指向 devices[]，devices 用 MCP initialize 返回的 server_name
 `"x-sensitive": true`（或沿用已有的 `"format": "password"`），打包时把值清空
 并把路径记进 redactedFields。未声明的字段不会被自动清空 —— 打包接口会把
 候选清单给前端，作者可以通过 extraRedact 手工追加。
+
+同样会被清空的是"本机专属"字段（`format: channel-select` /
+`audio-input-device`）：它们存的是本机 channel id 或声卡设备名，换机器不是
+泄密而是根本指不到东西，载入方必须重选。
 """
 
 import os
@@ -158,6 +162,24 @@ def _sensitive_props(config_schema: dict) -> set:
     return out
 
 
+# 值只在本机有意义的字段格式：channel-select 存的是本机 channel_configs 里的
+# id，audio-input-device 存的是本机声卡的设备名/序号。带到另一台机器上不是
+# 泄密，而是根本指不到东西，所以同样清空并让载入方重选。
+_LOCAL_ONLY_FORMATS = ('channel-select', 'audio-input-device')
+
+
+def _local_only_props(config_schema: dict) -> set:
+    """schema 里"值只对本机有效"的属性名。"""
+    props = (config_schema or {}).get('properties') or {}
+    return {name for name, spec in props.items()
+            if isinstance(spec, dict) and spec.get('format') in _LOCAL_ONLY_FORMATS}
+
+
+def _must_clear_props(config_schema: dict) -> tuple[set, set]:
+    """(敏感字段, 本机专属字段) —— 两类都必须在打包时清空。"""
+    return _sensitive_props(config_schema), _local_only_props(config_schema)
+
+
 def _port_from_url(url: str) -> Optional[int]:
     try:
         from urllib.parse import urlparse
@@ -258,7 +280,7 @@ def _config_field_paths(ref_of: dict) -> list:
         ref = ref_of.get(mcp_id)
         if not ref or not isinstance(value, dict):
             continue
-        sensitive = _sensitive_props(_tool_schema(mcps.get(mcp_id, {}), tool_name))
+        sensitive, local_only = _must_clear_props(_tool_schema(mcps.get(mcp_id, {}), tool_name))
         pkey = f'{ref}:{tool_name}:{instance_id}' if instance_id else f'{ref}:{tool_name}'
         for prop in value:
             out.append({
@@ -267,6 +289,7 @@ def _config_field_paths(ref_of: dict) -> list:
                 'prop':       prop,
                 'instanceId': instance_id,
                 'sensitive':  prop in sensitive,
+                'localOnly':  prop in local_only,
             })
     return sorted(out, key=lambda x: x['path'])
 
@@ -325,11 +348,11 @@ def _pack_canvas(ref_of: dict, extra_redact: set) -> tuple[dict, list]:
             tool_configs[pkey] = value
             continue
 
-        sensitive = _sensitive_props(_tool_schema(mcps.get(mcp_id, {}), tool_name))
+        sensitive, local_only = _must_clear_props(_tool_schema(mcps.get(mcp_id, {}), tool_name))
         packed = {}
         for prop, val in value.items():
             path = f'{pkey}:{prop}'
-            if prop in sensitive or path in extra_redact:
+            if prop in sensitive or prop in local_only or path in extra_redact:
                 packed[prop] = '' if isinstance(val, str) or val is None else type(val)()
                 redacted.append(path)
             else:
@@ -480,10 +503,15 @@ def _resolve_devices(devices: list) -> dict:
         driver_id = dev.get('driverId', '')
         port = dev.get('port')
 
-        # 1) 已注册 MCP：优先按 server_name（稳定），退化到端口
+        # 1) 已注册 MCP：优先按 server_name（稳定），退化到端口，再退化到 name。
+        #    name 兜底是给 agentcore / channel 这种内部伪设备用的：它们 url 为空、
+        #    没有端口也没有 manifest 条目，一旦 server_name 对不上就会被误判成
+        #    "本机缺驱动"，而实际上每台机器启动时都会注册它们。
         mcp = next((m for m in mcps if server_name and m.get('server_name') == server_name), None)
         if not mcp and port:
             mcp = next((m for m in mcps if _port_from_url(m.get('url', '')) == port), None)
+        if not mcp and dev.get('name'):
+            mcp = next((m for m in mcps if m.get('name') == dev['name']), None)
         if mcp:
             mapping[dev.get('ref')] = mcp.get('id')
             entry = _driver_entry_for(mcp)
