@@ -13,6 +13,7 @@
 import { openInstanceConfigModal, openToolConfigModal } from './sidebar.js';
 import { reloadFromServer } from './canvas.js';
 import { isRcLoggedIn, rcHeaders, rcFetch, showAccount, refreshAccount } from './account.js';
+import { sessionId } from './session.js';
 
 // 与 resource-center/lib/solution.ts 的 INDUSTRIES 保持一致
 const INDUSTRIES = [
@@ -265,7 +266,9 @@ async function _loadMarket() {
 
 // ── 载入流程：preflight → 缺驱动一键安装 → 覆盖确认 → apply ────────────────
 
-function _sessionId() { return sessionStorage.getItem('canvas_session_id') || ''; }
+// 与画布共用同一个 per-tab session id（见 session.js），否则 preflight 会把自己
+// 持有的编辑锁误判成"别人正在编辑"
+function _sessionId() { return sessionId(); }
 
 async function _preflight(slug) {
   const res = await fetch('/api/solutions/preflight', {
