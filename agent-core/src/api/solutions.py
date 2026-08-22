@@ -486,7 +486,10 @@ def _resolve_devices(devices: list) -> dict:
             mcp = next((m for m in mcps if _port_from_url(m.get('url', '')) == port), None)
         if mcp:
             mapping[dev.get('ref')] = mcp.get('id')
-            matched.append({**dev, 'mcpId': mcp.get('id'), 'mcpName': mcp.get('name', '')})
+            entry = _driver_entry_for(mcp)
+            matched.append({**dev, 'mcpId': mcp.get('id'), 'mcpName': mcp.get('name', ''),
+                            'localDriverId': entry.get('id', ''),
+                            'localImage': entry.get('image', '')})
             continue
 
         # 2) 驱动清单里有：只是没部署 / 没注册
@@ -501,6 +504,76 @@ def _resolve_devices(devices: list) -> dict:
 
     return {'mapping': mapping, 'matched': matched,
             'installable': installable, 'missing': missing}
+
+
+# ── 版本对齐 ────────────────────────────────────────────────────────────────
+
+def _image_tag(image_ref: str) -> str:
+    """镜像 ref 的 tag 部分（没有 tag 则返回空串）。"""
+    if not image_ref or ':' not in image_ref:
+        return ''
+    repo, tag = image_ref.rsplit(':', 1)
+    return '' if '/' in tag else tag     # 端口号形如 host:5000/img，不是 tag
+
+
+def _align_image_for(dev: dict) -> str:
+    """把方案记录的 tag 套到本机的镜像仓库上。
+
+    只换 tag、保留本机 repo：包体可能来自另一个 registry（作者的私有仓库），
+    照搬整个 ref 会拉不到镜像；而"对齐版本"要的本来也只是 tag 一致。
+    """
+    package_tag = _image_tag(dev.get('image', ''))
+    local_image = dev.get('localImage', '')
+    if not package_tag or not local_image:
+        return ''
+    local_repo = local_image.rsplit(':', 1)[0] if _image_tag(local_image) else local_image
+    return f'{local_repo}:{package_tag}'
+
+
+async def _augment_versions(resolved: dict) -> None:
+    """给 matched / installable 的设备补上版本对齐信息（原地修改）。
+
+    只在 preflight 里调用：要问 Docker 当前跑的是哪个镜像，比较慢，而 apply
+    只需要 ref → mcpId 的映射。
+    """
+    import asyncio as _asyncio
+    from api.drivers import _get_status_sync, _load_manifest
+
+    manifest = {d.get('id'): d for d in _load_manifest()}
+    loop = _asyncio.get_event_loop()
+
+    for dev in resolved['matched'] + resolved['installable']:
+        dev['packageImage'] = dev.get('image', '')
+        dev['packageTag'] = _image_tag(dev.get('image', ''))
+        dev['alignImage'] = _align_image_for(dev)
+        dev['runningImage'] = ''
+        dev['runningTag'] = ''
+        dev['aligned'] = None            # None = 问不到（没有 Docker / 容器没起）
+
+        driver_id = dev.get('localDriverId') or ''
+        if not driver_id:
+            continue
+        entry = manifest.get(driver_id, {})
+        try:
+            status = await loop.run_in_executor(
+                None, _get_status_sync, driver_id, entry.get('container_name', ''))
+        except Exception:
+            continue
+        running = status.get('running_image', '') or ''
+        dev['runningImage'] = running
+        dev['runningTag'] = _image_tag(running)
+        if dev['alignImage'] and running:
+            dev['aligned'] = (running == dev['alignImage'])
+
+
+def _misaligned(resolved: dict) -> list:
+    """需要重新部署才能对上方案记录版本的设备。
+
+    `aligned is None`（问不到 Docker 状态）不算不一致 —— 那种情况下拒绝载入
+    只会让没有 Docker socket 的部署方式完全用不了这个开关。
+    """
+    return [d for d in resolved['matched'] + resolved['installable']
+            if d.get('aligned') is False]
 
 
 def _overwrite_summary(includes: list) -> dict:
@@ -669,6 +742,8 @@ class LoadRequest(BaseModel):
     includes: list[str] = []            # 与 payload 搭配使用
     confirm: bool = False
     session_id: str = ''                # 画布编辑锁的持有者（前端传自己的）
+    align_versions: bool = False        # 要求所有相关容器与包体记录的 tag 一致
+    ref: str = ''                       # /align-device 用：要对齐哪个设备
 
 
 async def _load_solution(req: LoadRequest, token: Optional[str]) -> dict:
@@ -704,6 +779,7 @@ async def preflight(request: fastapi.Request, req: LoadRequest):
 
     includes = solution.get('includes') or []
     devices = _resolve_devices(payload.get('devices') or [])
+    await _augment_versions(devices)
 
     return {'code': 200, 'data': {
         'solution': {
@@ -718,6 +794,9 @@ async def preflight(request: fastapi.Request, req: LoadRequest):
         },
         'devices':   devices,
         'canLoad':   not devices['missing'] and not devices['installable'],
+        # 版本不一致不阻止载入 —— 只有用户勾了"对齐版本"才需要先重新部署
+        'misaligned':  _misaligned(devices),
+        'selfVersion': _core_version(),
         'overwrite': _overwrite_summary(includes),
         'canvasEditor': _canvas_editor_conflict(req.session_id),
     }}
@@ -734,6 +813,45 @@ def _canvas_editor_conflict(session_id: str) -> Optional[str]:
     if editor and editor != session_id:
         return editor
     return None
+
+
+@router.post('/align-device')
+async def align_device(request: fastapi.Request, req: LoadRequest):
+    """把某个设备的容器重新部署到方案记录的 tag（"对齐版本"逐个设备执行）。
+
+    走 api/drivers.py 的 deploy 而不是另写一套：那边已经处理了 service.yml
+    合并、日志轮转策略与旧容器清理。这里只负责决定"部署哪个镜像 ref"。
+    前端逐个调用并轮询 preflight，因为拉镜像慢，需要给用户进度。
+    """
+    loaded = await _load_solution(req, _get_rc_token(request))
+    if not loaded.get('ok'):
+        return {'code': loaded['status'], 'error': loaded['error']}
+
+    payload = loaded['solution'].get('payload') or {}
+    resolved = _resolve_devices(payload.get('devices') or [])
+    await _augment_versions(resolved)
+
+    dev = next((d for d in resolved['matched'] + resolved['installable']
+                if d.get('ref') == req.ref), None)
+    if not dev:
+        return {'code': 404, 'error': f'包体里没有 ref={req.ref} 的设备，或本机没有对应驱动'}
+
+    align_image = dev.get('alignImage') or ''
+    driver_id = dev.get('localDriverId') or ''
+    if not driver_id:
+        return {'code': 422, 'error': f'{dev.get("name") or dev.get("serverName")} 在本机驱动清单里没有对应条目'}
+    if not align_image:
+        return {'code': 422,
+                'error': f'{dev.get("name") or dev.get("serverName")} 没有可对齐的版本：'
+                         f'包体未记录镜像 tag'}
+
+    from api.drivers import driver_deploy
+    result = await driver_deploy(driver_id, {'image': align_image})
+    if result.get('code') != 200:
+        return {'code': 500, 'error': result.get('message', '部署失败'),
+                'driverId': driver_id, 'image': align_image}
+    return {'code': 200, 'data': {'driverId': driver_id, 'image': align_image,
+                                  'deploy': result.get('data')}}
 
 
 # ── 端点：载入 ──────────────────────────────────────────────────────────────
@@ -768,6 +886,16 @@ async def apply(request: fastapi.Request, req: LoadRequest):
                 'error': '所需驱动尚未就绪，请先安装并启动这些驱动',
                 'devices': resolved}
 
+    # 勾了"对齐版本"就在这里再核一遍：前端是逐个设备部署的，中间任何一个失败
+    # 都不该让方案以混合版本落地。没勾则完全不看版本（打包时只记录、不判断）。
+    if req.align_versions:
+        await _augment_versions(resolved)
+        misaligned = _misaligned(resolved)
+        if misaligned:
+            return {'code': 409,
+                    'error': '以下容器的版本还没对齐到方案记录的 tag，请先完成对齐',
+                    'misaligned': misaligned}
+
     applied: dict = {}
 
     # 1) 画布 —— deviceRef 换回本机 mcpId
@@ -799,6 +927,7 @@ async def apply(request: fastapi.Request, req: LoadRequest):
         'coreVersion': solution.get('coreVersion') or payload.get('coreVersion', ''),
         'needsConfig': needs_config,
         'appliedAt':   int(time.time()),
+        'versionAligned': bool(req.align_versions),
         'devices':     payload.get('devices') or [],
     }
 

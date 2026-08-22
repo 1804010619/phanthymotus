@@ -7096,3 +7096,21 @@ html, body {
   .solution-entry-label { display: none; }
   .solution-entry-badge { max-width: 72px; }
 }
+
+/* 载入弹窗里的容器版本格挡：本机 tag → 方案 tag */
+.solution-ver {
+  padding: 1px 6px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-input);
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+.solution-ver-diff {
+  border-color: var(--yellow);
+  background: var(--yellow-bg);
+  color: var(--yellow);
+}
+.solution-ver-unknown { color: var(--text-dim); }

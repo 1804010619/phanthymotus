@@ -40,6 +40,7 @@ let _overlay, _closeBtn, _tabs, _panels;
 let _marketCache = [];
 let _packable = null;
 let _loadTarget = null;   // 待载入的方案 {slug, name, ...}
+let _alignVersions = false;  // 载入时是否把相关容器对齐到方案记录的 tag
 
 // ── RC 登录态（与 skills.js 共用 localStorage 里的 rc_token）───────────────
 
@@ -151,6 +152,7 @@ async function _loadCurrent() {
             ${current.slug ? _esc(current.slug) + ' · ' : ''}v${_esc(current.version || '')}
             ${industry ? ' · ' + _esc(industry) : ''}
             ${current.appliedAt ? ' · 载入于 ' + new Date(current.appliedAt * 1000).toLocaleString() : ''}
+            ${current.versionAligned ? ' · 已对齐容器版本' : ''}
           </div>
         </div>
         <button class="skill-btn skill-btn-sm" id="solution-clear-current" title="只清除标记，不改动已载入的配置">清除标记</button>
@@ -290,6 +292,7 @@ async function _preflight(slug) {
 }
 
 async function _startLoad(slug) {
+  _alignVersions = false;   // 每次重新进入载入流程都从"不对齐"开始
   const body = document.getElementById('solution-load-body');
   document.getElementById('solution-load-overlay').classList.remove('hidden');
   body.innerHTML = `<div class="skill-empty">检查中…</div>`;
@@ -332,6 +335,7 @@ function _renderLoadModal(data) {
       <span class="solution-driver-ok">✓</span>
       <span class="solution-driver-name">${_esc(d.name || d.serverName)}</span>
       <span class="solution-pill solution-pill-sm">${_esc(d.category || '')}</span>
+      ${_versionCell(d)}
       <span class="solution-driver-image">已就绪 · ${_esc(d.mcpName || d.mcpId || '')}</span>
     </div>`).join('');
   html += installable.map(d => `
@@ -339,6 +343,7 @@ function _renderLoadModal(data) {
       <span class="solution-driver-warn">!</span>
       <span class="solution-driver-name">${_esc(d.name || d.serverName)}</span>
       <span class="solution-pill solution-pill-sm">${_esc(d.category || '')}</span>
+      ${_versionCell(d)}
       <span class="solution-driver-image">${_esc(d.localImage || d.image || '')}</span>
       <button class="skill-btn skill-btn-sm skill-btn-primary" data-install="${_esc(d.localDriverId)}">一键安装</button>
     </div>`).join('');
@@ -350,6 +355,32 @@ function _renderLoadModal(data) {
       <span class="solution-driver-image">本机没有此驱动：${_esc(d.registryImage || d.serverName)}</span>
     </div>`).join('');
   html += `</div>`;
+
+  // 版本对齐：默认不对齐（打包只记录版本，不做判断），勾上则把相关容器
+  // 重新部署到方案记录的 tag。Agent Core 自身不在此列 —— 它就是正在处理这次
+  // 请求的容器，重启会让载入半路断掉，只能提示用户手动升级。
+  const misaligned = data.misaligned || [];
+  const alignable = [...matched, ...installable].filter(d => d.alignImage);
+  html += `<div class="solution-section-label">容器版本</div>`;
+  html += `<label class="solution-check" id="solution-align-wrap">
+      <input type="checkbox" id="solution-align-versions" ${alignable.length ? '' : 'disabled'}>
+      <span>对齐方案记录的容器版本${alignable.length ? '' : '（方案未记录可用的镜像 tag）'}</span>
+    </label>`;
+  if (misaligned.length) {
+    html += `<div class="solution-hint solution-warn">
+      勾选后会先把这些容器重新部署到方案记录的 tag，再载入：
+      ${misaligned.map(d => `<code>${_esc(d.name || d.serverName)} ${_esc(d.runningTag || '未知')} → ${_esc(d.packageTag)}</code>`).join('、')}
+    </div>`;
+  } else if (alignable.length) {
+    html += `<div class="solution-hint">当前各容器版本已与方案记录一致（或无法读取 Docker 状态）。</div>`;
+  }
+  if (sol.coreVersion && data.selfVersion && sol.coreVersion !== data.selfVersion) {
+    html += `<div class="solution-hint solution-warn">
+      方案打包自 Agent Core <code>${_esc(sol.coreVersion)}</code>，本机是
+      <code>${_esc(data.selfVersion)}</code>。Agent Core 自身不会自动对齐
+      （重启会中断本次载入），需要时请到「设置 → 部署」手动升级。
+    </div>`;
+  }
 
   if (missing.length) {
     html += `<div class="solution-load-error">
@@ -403,9 +434,29 @@ function _renderLoadModal(data) {
     });
   }
 
+  // 勾选状态要跨重渲染保留：装完一个驱动就会重新 preflight + 重画，
+  // 用户不该因此丢掉刚勾上的"对齐版本"。
+  const alignBox = body.querySelector('#solution-align-versions');
+  if (alignBox) {
+    alignBox.checked = _alignVersions && !alignBox.disabled;
+    alignBox.addEventListener('change', () => { _alignVersions = alignBox.checked; });
+  }
+
   const ready = !missing.length && !installable.length && !data.canvasEditor;
   confirmBtn.classList.toggle('hidden', !ready);
   confirmBtn.disabled = !ready;
+}
+
+/** 版本格挡：本机在跑的 tag vs 方案记录的 tag。 */
+function _versionCell(d) {
+  if (!d.packageTag) return '';
+  if (d.aligned === false) {
+    return `<span class="solution-ver solution-ver-diff" title="本机 ${_esc(d.runningTag || '未知')} → 方案 ${_esc(d.packageTag)}">${_esc(d.runningTag || '未知')} → ${_esc(d.packageTag)}</span>`;
+  }
+  if (d.aligned === true) {
+    return `<span class="solution-ver">${_esc(d.packageTag)}</span>`;
+  }
+  return `<span class="solution-ver solution-ver-unknown" title="读不到容器状态">方案 ${_esc(d.packageTag)}</span>`;
 }
 
 /** 部署一个已在驱动清单里、但还没跑起来的驱动，然后等它自注册成 MCP。 */
@@ -454,12 +505,25 @@ async function _confirmLoad() {
   const confirmBtn = document.getElementById('solution-load-confirm');
   const body = document.getElementById('solution-load-body');
   confirmBtn.disabled = true;
-  confirmBtn.textContent = '载入中…';
 
   try {
+    if (_alignVersions) {
+      confirmBtn.textContent = '对齐版本中…';
+      const ok = await _alignAllVersions(confirmBtn);
+      if (!ok) {
+        confirmBtn.disabled = false;
+        confirmBtn.textContent = '确认载入';
+        return;
+      }
+    }
+
+    confirmBtn.textContent = '载入中…';
     const res = await fetch('/api/solutions/apply', {
       method: 'POST', headers: _rcHeaders(),
-      body: JSON.stringify({ slug: _loadTarget.slug, confirm: true, session_id: _sessionId() }),
+      body: JSON.stringify({
+        slug: _loadTarget.slug, confirm: true, session_id: _sessionId(),
+        align_versions: _alignVersions,
+      }),
     });
     const json = await res.json();
     if (json.code !== 200) {
@@ -475,6 +539,7 @@ async function _confirmLoad() {
     _syncEntryBadge();
     _tabs[0].click();
     let msg = '解决方案已载入。';
+    if (_alignVersions) msg += '\n相关容器已对齐到方案记录的版本。';
     if (needs.length) msg += `\n有 ${needs.length} 个脱敏字段需要补填，见「当前方案」。`;
     if (failed.length) msg += `\n以下技能安装失败：${failed.map(f => f.slug).join('、')}`;
     alert(msg);
@@ -483,6 +548,62 @@ async function _confirmLoad() {
     confirmBtn.textContent = '确认载入';
     alert(`载入失败：${e.message}`);
   }
+}
+
+/**
+ * 逐个把版本不一致的容器重新部署到方案记录的 tag。
+ *
+ * 一个个来而不是并发：拉镜像很吃带宽和磁盘，几个驱动同时 pull 在机器人这种
+ * 硬件上容易把自己拖死。每部署完一个都重新 preflight，一是拿到最新的对齐
+ * 状态，二是确认容器真的重新注册上来了。
+ */
+async function _alignAllVersions(statusBtn) {
+  let pending = (_loadTarget.misaligned || []).map(d => d.ref);
+  const total = pending.length;
+  if (!total) return true;
+
+  for (let done = 0; done < total; done++) {
+    const ref = pending[0];
+    const dev = (_loadTarget.misaligned || []).find(d => d.ref === ref) || {};
+    const label = dev.name || dev.serverName || ref;
+    statusBtn.textContent = `对齐 ${label}（${done + 1}/${total}）…`;
+
+    let json;
+    try {
+      const res = await fetch('/api/solutions/align-device', {
+        method: 'POST', headers: _rcHeaders(),
+        body: JSON.stringify({ slug: _loadTarget.slug, ref }),
+      });
+      json = await res.json();
+    } catch (e) {
+      alert(`对齐 ${label} 失败：${e.message}`);
+      return false;
+    }
+    if (json.code !== 200) {
+      alert(`对齐 ${label} 失败：${json.error || '未知错误'}`);
+      return false;
+    }
+
+    // 等容器重新起来并注册；轮询 preflight 直到这个 ref 不再出现在 misaligned
+    let settled = false;
+    for (let i = 0; i < 40; i++) {          // 最多约 2 分钟
+      await new Promise(r => setTimeout(r, 3000));
+      const pf = await _preflight(_loadTarget.slug);
+      if (pf.code !== 200) continue;
+      _loadTarget = { slug: _loadTarget.slug, ...pf.data };
+      const still = (pf.data.misaligned || []).some(d => d.ref === ref);
+      const notReady = (pf.data.devices.installable || []).some(d => d.ref === ref);
+      if (!still && !notReady) { settled = true; break; }
+    }
+    if (!settled) {
+      _renderLoadModal(_loadTarget);
+      alert(`${label} 已按方案版本重新部署，但还没恢复上线。请到「设置 → 部署」看容器日志。`);
+      return false;
+    }
+    pending = (_loadTarget.misaligned || []).map(d => d.ref);
+    if (!pending.length) break;
+  }
+  return true;
 }
 
 function _closeLoadModal() {
