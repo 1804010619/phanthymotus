@@ -1,38 +1,75 @@
 # VITS2 TensorRT TTS
 
-Chinese-English VITS2 speech synthesis for Jetson Orin. It is the default
-implementation of the standard `tts` plugin, not a second MCP plugin.
+Chinese-English VITS2 speech synthesis (16 kHz, single speaker) for Jetson
+Orin. It is one implementation of the standard `tts` plugin, not a second MCP
+plugin — `plugins/tts.py` owns the tool contract and picks the engine.
 
 ## Build
 
-The Dockerfile keeps the upstream JetPack 5.1.1 default. Build for JetPack 6.1
-explicitly when using the currently published TensorRT 10 model release:
+`ENABLE_VITS2_TRT` defaults to 1, so both JetPack lines build with the VITS2
+frontend installed:
 
 ```bash
-docker build \
-  --build-arg JP_VERSION=61 \
-  -f perception/Dockerfile.jetson \
-  -t phanthymotus-perception:vits2-jp61 .
+cd phanthymotus/deploy
+./build_perception.sh --jp-version 6.1     # TensorRT 10
+./build_perception.sh --jp-version 5.11    # TensorRT 8
 ```
 
-The image installs the WeText/Kaldifst runtime. Chinese text normalization
-executes checksum-verified FST files from the model release and does not
-compile OpenFST or Pynini on the device. Model files are not embedded in the
-image. Frontend asset locations are derived from the verified model directory;
-deployment environment variables do not override release assets.
+The image installs the WeText/Kaldifst runtime; Chinese text normalization
+executes the pre-compiled FSTs shipped in the model release, so neither
+OpenFST nor Pynini is built on the device. Model files are not embedded in the
+image.
+
+numpy is pinned once, in `Dockerfile.jetson`, to the version each JetPack's
+torch/cv2/rapidocr stack was built against (jp61 1.26.4, jp511 1.24.4) and that
+same pin is passed to this package's install — `requirements.jetson.txt`
+deliberately does not list numpy. See the comment there before adding a
+dependency that wants a different one.
 
 ## Configure
 
-`plugins.tts.engine` defaults to `vits2_trt`. The MCP tool name remains `tts`;
-there is no separate `vits2_tts` tool. Set `engine: sherpa_onnx` only when an
-existing Sherpa model deployment is intentionally selected.
+The engine is a `configSchema` field, so it is visible and switchable in the
+device panel:
 
-`speak` retains the standard action-completion contract: it returns a
-`speak-*` action identifier, supports `interrupt`, and publishes the existing
-end-of-utterance marker when an utterance terminates.
+```yaml
+plugins:
+  tts:
+    enabled: true
+    engine: vits2_trt      # or sherpa_onnx; also settable via action=config
+    backend: trt           # VITS2 requires trt
+    model_dir: /models/vits2
+    speed: 1.0
+    warmup: true
+```
 
-The first `start` or `speak` call downloads the pinned ModelScope release into `model_dir`, verifies file sizes and SHA256 checksums, and loads the TensorRT engines. `info` and tool discovery do not access the network. A complete verified model directory is reused without network access.
+`action=config` with `tts_engine` switches engines at runtime: the outgoing
+engine's nodes are disposed first (two live publishers on one audio topic is
+the duplicate-audio failure mode), then the incoming one is built in the
+background. `speaker_id` must stay 0 — the model has one voice.
 
-The published release provides TensorRT 8 engines for JetPack 5.1.1 and
-TensorRT 10 engines for JetPack 6.1. TensorRT plans are not portable across
-incompatible TensorRT versions or GPU architectures.
+`speak` keeps the standard action-completion contract: a `speak-*` action id,
+`interrupt` support, and the end-of-utterance marker on every terminated
+utterance, including one abandoned before it reached a node.
+
+## Model release
+
+`utils.model_downloader.ensure_vits2_model()` installs one archive per JetPack
+family (~60 MB) from COS, pinned by size and SHA256, using the same lock /
+staging / retry path as the other verified models. It returns the engine
+directory for the TensorRT that is actually importable, so `engines/jp61` and
+`engines/jp511` can never be confused — TensorRT plans are not portable across
+TensorRT majors or GPU architectures.
+
+The archive unpacks to `config.json`, `engines/<family>/`, `frontend_data/`,
+`tn_cache/` and `nltk_data/`. The NLTK corpora ship with it precisely so the
+container never calls `nltk.download()` at runtime. Upstream is
+[Starlight777/VITS2-ZH-EN-Male-16k](https://www.modelscope.cn/models/Starlight777/VITS2-ZH-EN-Male-16k)
+at revision `14954122c4baf4e80b44436c4b2b167e38db4103`; the runtime-required
+files of that revision were repacked and mirrored to COS.
+
+Installation happens in a background loader on the first `start`/`speak`, which
+returns `{"state": "loading"}` immediately — the download plus three TensorRT
+engines plus warmup takes far longer than the 60 s Agent Core allows a
+processor `tools/call`. Instances that were requested while the model loaded
+come up on their own when it is ready, and utterances queued in the meantime
+play then. `info` never blocks and never triggers a load.

@@ -32,34 +32,45 @@ log = logging.getLogger(__name__)
 AUDIO_EOF_MAGIC = b"\x01\x00\xff\xff\x01\x00\xff\xff"
 
 
-def _ensure_release(model_dir: str) -> str:
-    """Install the release and return the engine dir for this TensorRT."""
-    from utils.model_downloader import ensure_vits2_model
+def _env_int(name: str, default: int, low: int, high: int) -> int:
+    """Read a bounded int from the environment, falling back on bad input.
 
-    return ensure_vits2_model(model_dir)
-FRAME_INTERVAL_MS = int(os.getenv("MIX_VITS_FRAME_INTERVAL_MS", "70"))
-if not 0 <= FRAME_INTERVAL_MS <= 1000:
-    raise ValueError("MIX_VITS_FRAME_INTERVAL_MS must be between zero and 1000")
-FIRST_FRAME_DELAY_MS = int(os.getenv("MIX_VITS_FIRST_FRAME_DELAY_MS", "0"))
-if not 0 <= FIRST_FRAME_DELAY_MS <= 1000:
-    raise ValueError("MIX_VITS_FIRST_FRAME_DELAY_MS must be between zero and 1000")
-SUBSCRIBER_WAIT_MS = int(os.getenv("MIX_VITS_SUBSCRIBER_WAIT_MS", "5000"))
-if not 0 <= SUBSCRIBER_WAIT_MS <= 60000:
-    raise ValueError("MIX_VITS_SUBSCRIBER_WAIT_MS must be between zero and 60000")
-SUBSCRIBER_POLL_MS = int(os.getenv("MIX_VITS_SUBSCRIBER_POLL_MS", "10"))
-if not 1 <= SUBSCRIBER_POLL_MS <= 1000:
-    raise ValueError("MIX_VITS_SUBSCRIBER_POLL_MS must be between one and 1000")
-SUBSCRIBER_SETTLE_MS = int(os.getenv("MIX_VITS_SUBSCRIBER_SETTLE_MS", "500"))
-if not 0 <= SUBSCRIBER_SETTLE_MS <= 5000:
-    raise ValueError("MIX_VITS_SUBSCRIBER_SETTLE_MS must be between zero and 5000")
+    These are tuning knobs, and this module is imported while main.py builds
+    the plugin list. Raising here would take the whole perception process down
+    — ASR, VOP and OCR included — over one mistyped TTS variable, so an
+    unusable value is logged and the default is used instead.
+    """
+    raw = os.getenv(name)
+    if raw is None or raw.strip() == "":
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        log.warning("[vits2_tts_trt] %s=%r is not an integer; using %d", name, raw, default)
+        return default
+    if not low <= value <= high:
+        log.warning(
+            "[vits2_tts_trt] %s=%d is outside [%d, %d]; using %d",
+            name, value, low, high, default,
+        )
+        return default
+    return value
+
+
+FRAME_INTERVAL_MS = _env_int("MIX_VITS_FRAME_INTERVAL_MS", 70, 0, 1000)
+FIRST_FRAME_DELAY_MS = _env_int("MIX_VITS_FIRST_FRAME_DELAY_MS", 0, 0, 1000)
+SUBSCRIBER_WAIT_MS = _env_int("MIX_VITS_SUBSCRIBER_WAIT_MS", 5000, 0, 60000)
+SUBSCRIBER_POLL_MS = _env_int("MIX_VITS_SUBSCRIBER_POLL_MS", 10, 1, 1000)
+SUBSCRIBER_SETTLE_MS = _env_int("MIX_VITS_SUBSCRIBER_SETTLE_MS", 500, 0, 5000)
 ALLOW_FAST_DELIVERY = os.getenv("MIX_VITS_ALLOW_FAST_DELIVERY", "1") == "1"
 if FRAME_INTERVAL_MS < PCM_FRAME_MS and not ALLOW_FAST_DELIVERY:
-    raise ValueError(
-        f"MIX_VITS_FRAME_INTERVAL_MS={FRAME_INTERVAL_MS} sends "
-        f"{PCM_FRAME_MS:.0f}ms PCM frames faster than realtime; use at least "
-        f"{PCM_FRAME_MS:.0f}, or explicitly set MIX_VITS_ALLOW_FAST_DELIVERY=1 "
-        "for an offline benchmark"
+    log.warning(
+        "[vits2_tts_trt] MIX_VITS_FRAME_INTERVAL_MS=%d sends %.0fms PCM frames "
+        "faster than realtime; pacing at %.0fms instead (set "
+        "MIX_VITS_ALLOW_FAST_DELIVERY=1 for an offline benchmark)",
+        FRAME_INTERVAL_MS, PCM_FRAME_MS, PCM_FRAME_MS,
     )
+    FRAME_INTERVAL_MS = int(PCM_FRAME_MS)
 
 _LOW_LAT_QOS = QoSProfile(
     reliability=ReliabilityPolicy.BEST_EFFORT,
@@ -68,45 +79,58 @@ _LOW_LAT_QOS = QoSProfile(
     durability=DurabilityPolicy.VOLATILE,
 )
 
-TOOLS = [
-    {
-        "name": "tts",
-        "type": "processor",
-        "multiInstance": True,
-        "description": "TTS - start/stop speech synthesis, speak text, or get status",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "action": {
-                    "type": "string",
-                    "enum": [
-                        "start",
-                        "stop",
-                        "speak",
-                        "info",
-                        "config",
-                        "interrupt",
-                    ],
-                },
-                "input_topic": {"type": "string"},
-                "text": {"type": "string"},
-            },
-            "required": ["action"],
-            "x-completion": {"actions": ["speak"], "timeout": 60},
-            "x-hooks": {"on_interrupt_speak": {"action": "interrupt"}},
-        },
-        "configSchema": {
-            "type": "object",
-            "properties": {
-                "speaker_id": {"type": "integer", "default": 0, "scope": "shared"},
-                "speed": {"type": "number", "default": 1.0, "scope": "shared"},
-            },
-            "required": [],
-        },
-        "topic_in": [{"format": "data/json", "desc": "text to synthesize"}],
-        "topic_out": [{"format": "audio/pcm-16k", "desc": "synthesized PCM audio"}],
-    }
-]
+# The tool contract (actions, x-completion, x-hooks, configSchema) is owned by
+# plugins/tts.py — this package is one implementation behind it. Importing it
+# rather than restating it is what keeps the two engines from drifting into
+# different config forms for the same tool.
+from plugins.tts import TOOLS  # noqa: E402
+def _release_actions(items) -> None:
+    """Cancel ACP actions for utterances that will never be played."""
+    for text, action_id in items:
+        _complete_action(action_id, text, 0, interrupted=True)
+
+
+def _node_suffix(key: str) -> str:
+    """Turn an instance key into a ROS-node-name-safe suffix."""
+    return key.replace("/", "_").replace("-", "_")
+
+
+def _complete_action(
+    action_id: str, text: str, frames_sent: int, interrupted: bool
+) -> None:
+    """Notify Agent Core that an MCP speak action has terminated.
+
+    Module level, not a node method: an utterance can also die before any node
+    exists (load failure, stop while the model is still downloading), and the
+    ACP barrier in agent-core waits for every action it registered.
+    """
+    if not action_id:
+        return
+    try:
+        import urllib.request
+        from urllib.parse import urlparse
+
+        agent_core_url = os.getenv("AGENT_CORE_URL", "https://localhost:15678")
+        if urlparse(agent_core_url).scheme != "https":
+            raise ValueError("AGENT_CORE_URL must use HTTPS")
+        payload = json.dumps(
+            {
+                "action_id": action_id,
+                "status": "cancelled" if interrupted else "completed",
+                "result": {"text": text[:100], "frames": frames_sent},
+            }
+        ).encode()
+        request = urllib.request.Request(
+            f"{agent_core_url}/api/acp/complete",
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        urllib.request.urlopen(request, timeout=3)
+    except Exception as exc:
+        log.warning("[vits2_tts_trt] ACP completion callback failed: %s", exc)
+
+
 class _Vits2TTSNode(Node):
     def __init__(
         self,
@@ -176,7 +200,7 @@ class _Vits2TTSNode(Node):
                 text, action_id = str(item), ""
             discarded.append((text, action_id))
         for text, action_id in discarded:
-            self._complete_action(action_id, text, 0, interrupted=True)
+            _complete_action(action_id, text, 0, interrupted=True)
         return len(discarded)
 
     def enqueue(self, text: str, action_id: str = ""):
@@ -204,37 +228,6 @@ class _Vits2TTSNode(Node):
     def _publish_eof(self):
         """Publish the protocol end-of-utterance marker."""
         self._publish(AUDIO_EOF_MAGIC)
-
-    @staticmethod
-    def _complete_action(
-        action_id: str, text: str, frames_sent: int, interrupted: bool
-    ) -> None:
-        """Notify Agent Core that an MCP speak action has terminated."""
-        if not action_id:
-            return
-        try:
-            import urllib.request
-            from urllib.parse import urlparse
-
-            agent_core_url = os.getenv("AGENT_CORE_URL", "https://localhost:15678")
-            if urlparse(agent_core_url).scheme != "https":
-                raise ValueError("AGENT_CORE_URL must use HTTPS")
-            payload = json.dumps(
-                {
-                    "action_id": action_id,
-                    "status": "cancelled" if interrupted else "completed",
-                    "result": {"text": text[:100], "frames": frames_sent},
-                }
-            ).encode()
-            request = urllib.request.Request(
-                f"{agent_core_url}/api/acp/complete",
-                data=payload,
-                headers={"Content-Type": "application/json"},
-                method="POST",
-            )
-            urllib.request.urlopen(request, timeout=3)
-        except Exception as exc:
-            log.warning("[vits2_tts_trt] ACP completion callback failed: %s", exc)
 
     def _utterance_cancelled(self) -> bool:
         return self._stop_event.is_set() or self._interrupt_event.is_set()
@@ -288,7 +281,7 @@ class _Vits2TTSNode(Node):
             if self._interrupt_event.is_set():
                 self._interrupt_event.clear()
                 self._publish_eof()
-                self._complete_action(action_id, text, 0, interrupted=True)
+                _complete_action(action_id, text, 0, interrupted=True)
                 continue
             subscriber_gate_cancel = threading.Event()
             subscriber_gate_done = threading.Event()
@@ -410,7 +403,7 @@ class _Vits2TTSNode(Node):
                     )
                 self._publish_eof()
                 eof_published = True
-                self._complete_action(action_id, text, frames_sent, interrupted)
+                _complete_action(action_id, text, frames_sent, interrupted)
                 if interrupted:
                     log.info(
                         "[vits2_tts_trt] utterance interrupted after %d frames",
@@ -419,7 +412,7 @@ class _Vits2TTSNode(Node):
                 self._interrupt_event.clear()
             except Exception:
                 log.exception("[vits2_tts_trt] synthesis failed")
-                self._complete_action(action_id, text, 0, interrupted=True)
+                _complete_action(action_id, text, 0, interrupted=True)
             finally:
                 if not eof_published:
                     self._publish_eof()
@@ -437,61 +430,200 @@ class _Vits2TTSNode(Node):
             ],
         }
 
-
 class TTSPlugin:
-    """VITS2 TensorRT implementation exposed as an optional MCP tool."""
+    """VITS2 TensorRT implementation behind the standard ``tts`` tool.
 
-    PREFIX = "vits2"
+    Lifecycle mirrors plugins/ocr.py, for the same reason: the slow work (a
+    60 MB release download, three TensorRT engines, a warmup pass) takes far
+    longer than the 60 s Agent Core allows a processor tools/call
+    (agent-core/src/mcp_client.py), so it must not run on the request thread.
+
+        idle --start--> loading --ok--> ready/running
+                          |               ^
+                          +----fail--> error (next start retries)
+
+    * first start records the instance as pending, spawns the single loader and
+      immediately returns {"state": "loading"};
+    * concurrent starts only add pending instances — one download, N instances;
+    * info never blocks and never triggers a load;
+    * stop during loading cancels the pending instance;
+    * config bumps a generation token so a stale loader cannot install an
+      adapter built from an outdated configuration.
+    """
+
+    PREFIX = "tts"
+    NAME = "VITS2 TTS"
+    DESC = "VITS2 TensorRT text-to-speech"
 
     def __init__(self, plugin_cfg: dict, executor):
         self._cfg = dict(plugin_cfg)
         self._executor = executor
+
+        # Everything below is guarded by _state_lock, which is only ever held
+        # for dict/flag updates — never across a download, an engine build or a
+        # node start/stop. See perception/README.md § Plugin Concurrency.
+        self._state_lock = threading.RLock()
         self._nodes = {}
-        # Serializes instance lifecycle state across concurrent MCP requests.
-        self._nodes_lock = threading.RLock()
-        self._starting = {}
+        self._pending_starts = {}        # node_key -> input_topic
+        self._pending_speech = {}        # node_key -> [(text, action_id), ...]
         self._adapter = None
-        self._model_name = "vits2"
+        self._adapter_state = "idle"     # idle|loading|ready|error
         self._load_error = None
-        self._load_lock = threading.Lock()
+        self._load_generation = 0
+        self._model_name = "vits2"
+
         backend = str(self._cfg.get("backend", "trt")).lower()
         if backend != "trt":
-            raise ValueError("The JP6 VITS2 plugin supports backend=trt only")
+            raise ValueError("The VITS2 TTS plugin supports backend=trt only")
         if int(self._cfg.get("speaker_id", 0)) != 0:
             raise ValueError("The VITS2 model supports only speaker_id=0")
-
-    def _ensure_adapter(self):
-        if self._adapter is not None:
-            return self._adapter
-        with self._load_lock:
-            if self._adapter is not None:
-                return self._adapter
-            model_dir = self._cfg.get("model_dir", "/models/vits2")
-            try:
-                cfg = dict(self._cfg)
-                cfg["engine_dir"] = _ensure_release(model_dir)
-                adapter = build_adapter(cfg)
-                if self._cfg.get("warmup", True):
-                    started = time.monotonic()
-                    warmup_bytes = adapter.warmup()
-                    log.info(
-                        "[vits2_tts_trt] engine ready: bytes=%d elapsed=%.3fs",
-                        warmup_bytes,
-                        time.monotonic() - started,
-                    )
-                self._adapter = adapter
-                if not isinstance(adapter, Vits2TensorRTAdapter):
-                    raise RuntimeError("Unexpected non-TensorRT VITS2 adapter")
-                self._model_name = "vits2-tensorrt-jp6"
-                self._load_error = None
-            except Exception as exc:
-                self._load_error = str(exc)
-                log.exception("[vits2_tts_trt] failed to load engine")
-                raise RuntimeError("VITS2 model load or warmup failed") from exc
-            return self._adapter
+        log.info(
+            "[vits2_tts_trt] plugin init: model_dir=%s, speed=%s, warmup=%s",
+            self._cfg.get("model_dir", "/models/vits2"),
+            self._cfg.get("speed", 1.0),
+            self._cfg.get("warmup", True),
+        )
 
     def get_tools(self):
         return TOOLS
+
+    # ── background loader (single-flight) ────────────────────────────────
+
+    def _spawn_loader_locked(self) -> None:
+        """Start the one background adapter loader. Caller holds the lock."""
+        self._adapter_state = "loading"
+        self._load_error = None
+        threading.Thread(
+            target=self._loader, args=(self._load_generation, dict(self._cfg)),
+            name="vits2-adapter-loader", daemon=True,
+        ).start()
+
+    def _loader(self, generation: int, cfg: dict) -> None:
+        try:
+            from utils.model_downloader import ensure_vits2_model
+
+            # Returns the engine directory of the family that matches the
+            # TensorRT actually importable here, so the adapter never has to
+            # guess between engines/jp61 and engines/jp511.
+            cfg["engine_dir"] = ensure_vits2_model(
+                cfg.get("model_dir", "/models/vits2")
+            )
+            adapter = build_adapter(cfg)
+            if not isinstance(adapter, Vits2TensorRTAdapter):
+                raise RuntimeError("Unexpected non-TensorRT VITS2 adapter")
+            if cfg.get("warmup", True):
+                started = time.monotonic()
+                warmup_bytes = adapter.warmup()
+                log.info(
+                    "[vits2_tts_trt] engine ready: bytes=%d elapsed=%.3fs",
+                    warmup_bytes, time.monotonic() - started,
+                )
+        except Exception as error:  # noqa: BLE001 - surfaced via state/info
+            log.exception("[vits2_tts_trt] adapter load failed")
+            with self._state_lock:
+                if generation != self._load_generation:
+                    return
+                self._adapter_state = "error"
+                self._load_error = str(error)
+                # Abandon the queued work rather than leave the caller's ACP
+                # action pending forever; the reason is on the tool state.
+                self._pending_starts.clear()
+                abandoned = self._take_pending_speech_locked(list(self._pending_speech))
+            _release_actions(abandoned)
+            return
+
+        with self._state_lock:
+            superseded = generation != self._load_generation
+            if not superseded:
+                self._adapter = adapter
+                self._adapter_state = "ready"
+                self._load_error = None
+                self._model_name = "vits2-tensorrt"
+        if superseded:
+            # A config change happened mid-load; never install the result.
+            return
+
+        self._bring_up_pending(generation, adapter)
+
+    def _bring_up_pending(self, generation: int, adapter) -> None:
+        """Start every instance whose start arrived while the model loaded."""
+        while True:
+            with self._state_lock:
+                if generation != self._load_generation or not self._pending_starts:
+                    return
+                node_key, input_topic = next(iter(self._pending_starts.items()))
+            try:
+                node = _Vits2TTSNode(
+                    input_topic or None, adapter, _node_suffix(node_key)
+                )
+            except Exception:  # noqa: BLE001 - keep serving the other instances
+                log.exception("[vits2_tts_trt] failed to build instance %r", node_key)
+                with self._state_lock:
+                    self._pending_starts.pop(node_key, None)
+                    abandoned = self._take_pending_speech_locked([node_key])
+                _release_actions(abandoned)
+                continue
+            # Register before starting (README lifecycle rule): a started but
+            # unregistered node is unreachable, and its publisher would keep the
+            # ROS node name until the process exits.
+            committed = False
+            with self._state_lock:
+                still_wanted = (
+                    generation == self._load_generation
+                    and self._pending_starts.get(node_key) == input_topic
+                )
+                if still_wanted:
+                    try:
+                        self._executor.add_node(node)
+                    except Exception:  # noqa: BLE001
+                        log.exception(
+                            "[vits2_tts_trt] failed to register instance %r", node_key
+                        )
+                    else:
+                        self._nodes[node_key] = node
+                        committed = True
+                self._pending_starts.pop(node_key, None)
+            if not committed:
+                self._dispose_node(node, node_key)
+                with self._state_lock:
+                    abandoned = self._take_pending_speech_locked([node_key])
+                _release_actions(abandoned)
+                continue
+            try:
+                node.start()
+            except Exception:  # noqa: BLE001
+                log.exception("[vits2_tts_trt] failed to start instance %r", node_key)
+                with self._state_lock:
+                    self._nodes.pop(node_key, None)
+                    abandoned = self._take_pending_speech_locked([node_key])
+                self._dispose_node(node, node_key)
+                _release_actions(abandoned)
+                continue
+            self._flush_pending_speech(node_key, node)
+
+    def _flush_pending_speech(self, node_key: str, node) -> None:
+        """Hand a freshly started node the utterances queued while it loaded."""
+        with self._state_lock:
+            queued = self._pending_speech.pop(node_key, [])
+        for text, action_id in queued:
+            try:
+                node.enqueue(text, action_id=action_id)
+            except Exception:  # noqa: BLE001
+                log.exception("[vits2_tts_trt] failed to queue deferred utterance")
+                _complete_action(action_id, text, 0, interrupted=True)
+
+    def _take_pending_speech_locked(self, node_keys: list) -> list:
+        """Detach queued utterances so the caller can release them off-lock.
+
+        The completion callback is an HTTPS POST with a 3 s timeout; running it
+        under _state_lock would stall info/start for every instance.
+        """
+        taken = []
+        for node_key in node_keys:
+            taken.extend(self._pending_speech.pop(node_key, []))
+        return taken
+
+    # ── helpers ─────────────────────────────────────────────────────────
 
     def _dispose_node(self, node, key):
         """Release a node after its caller has removed it from _nodes."""
@@ -509,224 +641,255 @@ class TTSPlugin:
         except Exception:
             log.exception("[vits2_tts_trt] node destroy failed: %s", key)
 
-    def _create_node(self, key, input_topic, adapter):
-        suffix = key.replace("/", "_").replace("-", "_")
-        node = _Vits2TTSNode(input_topic or None, adapter, suffix)
-        self._executor.add_node(node)
-        self._nodes[key] = node
-        return node
+    def _identity(self, **extra) -> dict:
+        base = {
+            "name": self.NAME,
+            "manufacture": "Embodied",
+            "model": self._model_name,
+            "engine": "vits2_trt",
+            "desc": self.DESC,
+        }
+        base.update(extra)
+        return base
 
-    def _reserve_start(self, key):
-        """Reserve an instance while model initialization executes outside the lock."""
-        with self._nodes_lock:
-            if key in self._starting:
-                return None
-            marker = threading.Event()
-            self._starting[key] = marker
-            return marker
+    def _describe(self, state: str) -> str:
+        if state == "loading":
+            return "Downloading and initializing the VITS2 TensorRT model..."
+        if state == "error" and self._load_error:
+            return f"Model load failed: {self._load_error}"
+        return self.DESC
 
-    def _finish_start(self, key, marker):
-        with self._nodes_lock:
-            if self._starting.get(key) is marker:
-                del self._starting[key]
+    def _request_load_locked(self) -> None:
+        """Ensure a loader is running (or has already produced an adapter)."""
+        if self._adapter_state in ("loading", "ready"):
+            return
+        self._spawn_loader_locked()
+
+    # ── dispatch ────────────────────────────────────────────────────────
 
     def dispatch(self, name: str, args: dict):
         action = args.get("action") if name == "tts" else name
         instance_id = args.get("instance_id", "")
 
         if action == "info":
-            if self._load_error:
-                return {
-                    "name": "VITS2 TTS",
-                    "manufacture": "Embodied",
-                    "model": self._model_name,
-                    "state": "error",
-                    "desc": self._load_error,
-                }
-            with self._nodes_lock:
-                node = self._nodes.get(instance_id) if instance_id else None
-                nodes = list(self._nodes.values())
-                loading = bool(self._starting)
-            if instance_id and node is not None:
-                return {
-                    "name": "VITS2 TTS",
-                    "manufacture": "Embodied",
-                    "model": self._model_name,
-                    **node.status(),
-                    "desc": "VITS2 TensorRT text-to-speech",
-                }
-            input_topic = args.get("input_topic", "")
-            if instance_id:
-                output_topic = (
-                    f"{input_topic}/tts" if input_topic else "/perception/tts"
-                )
-                return {
-                    "name": "VITS2 TTS",
-                    "manufacture": "Embodied",
-                    "model": self._model_name,
-                    "state": "idle",
-                    "topic_in": (
-                        [{"topic": input_topic, "format": "data/json", "desc": ""}]
-                        if input_topic
-                        else []
-                    ),
-                    "topic_out": [
-                        {"topic": output_topic, "format": "audio/pcm-16k", "desc": ""}
-                    ],
-                    "desc": "VITS2 TensorRT text-to-speech",
-                }
-            state = (
-                "running"
-                if any(node.state == "running" for node in nodes)
-                else "loading" if loading else "idle"
-            )
-            topics_in = [
-                {"topic": node._input_topic, "format": "data/json", "desc": ""}
-                for node in nodes
-            ]
-            topics_out = [
-                {"topic": node._output_topic, "format": "audio/pcm-16k", "desc": ""}
-                for node in nodes
-            ]
-            if not topics_out:
-                output_topic = (
-                    f"{input_topic}/tts" if input_topic else "/perception/tts"
-                )
-                topics_in = (
-                    [{"topic": input_topic, "format": "data/json", "desc": ""}]
-                    if input_topic
-                    else []
-                )
-                topics_out = [
-                    {"topic": output_topic, "format": "audio/pcm-16k", "desc": ""}
-                ]
-            return {
-                "name": "VITS2 TTS",
-                "manufacture": "Embodied",
-                "model": self._model_name,
-                "state": state,
-                "topic_in": topics_in,
-                "topic_out": topics_out,
-                "desc": "VITS2 TensorRT text-to-speech",
-            }
+            return self._info(args, instance_id)
 
         if action == "start":
-            input_topic = args.get("input_topic") or ""
-            key = instance_id or input_topic or "_default"
-            marker = self._reserve_start(key)
-            if marker is None:
-                return {"state": "loading", "message": "TTS start is already in progress"}
-            try:
-                adapter = self._ensure_adapter()
-            except RuntimeError:
-                self._finish_start(key, marker)
-                return {"state": "error", "message": self._load_error}
-            old_node = None
-            try:
-                with self._nodes_lock:
-                    if marker.is_set():
-                        return {"state": "idle"}
-                    node = self._nodes.get(key)
-                    if node is not None and input_topic != node._input_topic:
-                        old_node = self._nodes.pop(key)
-                        node = None
-                    if node is not None:
-                        return node.start()
-                if old_node is not None:
-                    self._dispose_node(old_node, key)
-                with self._nodes_lock:
-                    if marker.is_set():
-                        return {"state": "idle"}
-                    node = self._create_node(key, input_topic, adapter)
-                    return node.start()
-            finally:
-                self._finish_start(key, marker)
+            return self._start(args, instance_id)
 
         if action == "stop":
-            with self._nodes_lock:
-                keys = [instance_id] if instance_id else list(self._nodes)
-                markers = [self._starting[key] for key in keys if key in self._starting]
-                if not instance_id:
-                    markers = list(self._starting.values())
-                nodes = [(key, self._nodes.pop(key)) for key in keys if key in self._nodes]
-            for marker in markers:
-                marker.set()
-            for key, node in nodes:
-                self._dispose_node(node, key)
-            return {"state": "idle"}
+            return self._stop(instance_id)
 
         if action == "speak":
-            text = args.get("text", "").strip()
-            if not text:
-                raise ValueError("text is required")
-            import uuid
-
-            action_id = f"speak-{uuid.uuid4().hex[:8]}"
-            with self._nodes_lock:
-                node = next((n for n in self._nodes.values() if n.state == "running"), None)
-            if node is not None:
-                node.enqueue(text, action_id=action_id)
-                return {"status": "queued", "action_id": action_id, "text": text}
-            key = instance_id or "_default"
-            marker = self._reserve_start(key)
-            if marker is None:
-                return {"status": "loading", "message": "TTS start is already in progress"}
-            try:
-                adapter = self._ensure_adapter()
-            except RuntimeError:
-                self._finish_start(key, marker)
-                return {"state": "error", "message": self._load_error}
-            try:
-                with self._nodes_lock:
-                    if marker.is_set():
-                        return {"state": "idle"}
-                    node = next(
-                        (n for n in self._nodes.values() if n.state == "running"),
-                        None,
-                    )
-                    if node is None:
-                        node = self._create_node(
-                            key, args.get("input_topic") or "", adapter
-                        )
-                        node.start()
-            finally:
-                self._finish_start(key, marker)
-            node.enqueue(text, action_id=action_id)
-            return {"status": "queued", "action_id": action_id, "text": text}
+            return self._speak(args, instance_id)
 
         if action == "config":
-            if "speaker_id" in args:
-                self._cfg["speaker_id"] = int(args["speaker_id"])
-            if "speed" in args:
-                self._cfg["speed"] = float(args["speed"])
-            if int(self._cfg.get("speaker_id", 0)) != 0:
-                raise ValueError("The VITS2 model supports only speaker_id=0")
-            with self._nodes_lock:
-                markers = list(self._starting.values())
-                nodes = list(self._nodes.items())
-                self._nodes.clear()
-            for marker in markers:
-                marker.set()
-            if self._adapter is not None:
-                self._adapter.set_speed(float(self._cfg.get("speed", 1.0)))
-            for key, node in nodes:
-                self._dispose_node(node, key)
-            self._load_error = None
-            return {"status": "configured"}
+            return self._config(args)
 
         if action == "interrupt":
-            with self._nodes_lock:
-                if instance_id:
-                    targets = [self._nodes[instance_id]] if instance_id in self._nodes else []
-                else:
-                    targets = [node for node in self._nodes.values() if node.state == "running"]
-            cleared = 0
-            for node in targets:
-                result = node.interrupt()
-                cleared += result.get("cleared", 0)
-            return {"status": "interrupted", "nodes": len(targets), "cleared": cleared}
+            return self._interrupt(instance_id)
 
         return None
 
+    def _info(self, args: dict, instance_id: str) -> dict:
+        input_topic = args.get("input_topic", "")
+        with self._state_lock:
+            node = self._nodes.get(instance_id) if instance_id else None
+            nodes = list(self._nodes.values())
+            adapter_state = self._adapter_state
+            pending = bool(self._pending_starts)
+            error = self._load_error
+
+        if instance_id and node is not None:
+            state = node.state
+            if adapter_state == "loading" and state != "running":
+                state = "loading"
+            return self._identity(**{**node.status(), "state": state,
+                                     "desc": self._describe(state)})
+
+        if instance_id:
+            # Known instance that is not up yet: report the shared model state
+            # so the dashboard shows "loading" instead of a misleading idle.
+            state = ("loading" if adapter_state == "loading"
+                     else "error" if adapter_state == "error" else "idle")
+            output_topic = f"{input_topic}/tts" if input_topic else "/perception/tts"
+            result = self._identity(
+                state=state,
+                topic_in=([{"topic": input_topic, "format": "data/json", "desc": ""}]
+                          if input_topic else []),
+                topic_out=[{"topic": output_topic, "format": "audio/pcm-16k",
+                            "desc": ""}],
+                desc=self._describe(state),
+            )
+            if state == "error" and error:
+                result["error"] = error
+            return result
+
+        if any(n.state == "running" for n in nodes):
+            state = "running"
+        elif adapter_state == "loading" or pending:
+            state = "loading"
+        elif adapter_state == "error":
+            state = "error"
+        else:
+            state = "idle"
+        topics_in = [{"topic": n._input_topic, "format": "data/json", "desc": ""}
+                     for n in nodes]
+        topics_out = [{"topic": n._output_topic, "format": "audio/pcm-16k", "desc": ""}
+                      for n in nodes]
+        if not topics_out:
+            output_topic = f"{input_topic}/tts" if input_topic else "/perception/tts"
+            topics_in = ([{"topic": input_topic, "format": "data/json", "desc": ""}]
+                         if input_topic else [])
+            topics_out = [{"topic": output_topic, "format": "audio/pcm-16k",
+                           "desc": ""}]
+        result = self._identity(state=state, topic_in=topics_in,
+                                topic_out=topics_out, desc=self._describe(state))
+        if state == "error" and error:
+            result["error"] = error
+        return result
+
+    def _start(self, args: dict, instance_id: str) -> dict:
+        input_topic = args.get("input_topic") or ""
+        key = instance_id or input_topic or "_default"
+        with self._state_lock:
+            node = self._nodes.get(key)
+            stale = None
+            if node is not None and input_topic and node._input_topic != input_topic:
+                stale = self._nodes.pop(key)
+                node = None
+            if node is not None:
+                if self._adapter is not None:
+                    return node.start()
+                # Adapter was discarded by a config change; rebuild from scratch.
+                stale = self._nodes.pop(key)
+                node = None
+            self._pending_starts[key] = input_topic
+            adapter = self._adapter
+            state = self._adapter_state
+            error = self._load_error
+            if adapter is None:
+                self._request_load_locked()
+        if stale is not None:
+            self._dispose_node(stale, key)
+
+        if adapter is None:
+            if state == "error" and error and self._adapter_state == "error":
+                with self._state_lock:
+                    self._pending_starts.pop(key, None)
+                return {"state": "error", "message": error}
+            return {"state": "loading",
+                    "message": "VITS2 model is initializing; it will start "
+                               "automatically when ready"}
+
+        # Model already resident: bring this instance up inline, which is fast.
+        self._bring_up_pending(self._load_generation, adapter)
+        with self._state_lock:
+            node = self._nodes.get(key)
+            error = self._load_error
+        if node is None:
+            return {"state": "error",
+                    "message": error or "failed to start VITS2 instance"}
+        return node.status()
+
+    def _stop(self, instance_id: str) -> dict:
+        with self._state_lock:
+            keys = [instance_id] if instance_id else list(self._nodes)
+            nodes = [(key, self._nodes.pop(key)) for key in keys if key in self._nodes]
+            cancel = [instance_id] if instance_id else list(self._pending_starts)
+            for key in cancel:
+                self._pending_starts.pop(key, None)
+            abandoned = self._take_pending_speech_locked(
+                [instance_id] if instance_id else list(self._pending_speech)
+            )
+        for key, node in nodes:
+            self._dispose_node(node, key)
+        _release_actions(abandoned)
+        return {"state": "idle"}
+
+    def _speak(self, args: dict, instance_id: str) -> dict:
+        text = args.get("text", "").strip()
+        if not text:
+            raise ValueError("text is required")
+        import uuid
+
+        action_id = f"speak-{uuid.uuid4().hex[:8]}"
+        with self._state_lock:
+            node = next((n for n in self._nodes.values() if n.state == "running"), None)
+            if node is None:
+                # Queue against the instance that will serve it and make sure a
+                # load is in flight. The ACP action stays pending until the
+                # utterance actually plays (or the load fails), which is what
+                # the barrier in agent-core expects.
+                key = instance_id or "_default"
+                if self._adapter_state == "error" and self._load_error:
+                    return {"state": "error", "message": self._load_error}
+                self._pending_starts.setdefault(key, args.get("input_topic") or "")
+                self._pending_speech.setdefault(key, []).append((text, action_id))
+                self._request_load_locked()
+                adapter = self._adapter
+        if node is not None:
+            node.enqueue(text, action_id=action_id)
+            return {"status": "queued", "action_id": action_id, "text": text}
+        if adapter is not None:
+            # Model is resident (a stopped instance, say) — start it now.
+            self._bring_up_pending(self._load_generation, adapter)
+        return {"status": "queued", "action_id": action_id, "text": text,
+                "state": "loading"}
+
+    def _config(self, args: dict) -> dict:
+        if "speaker_id" in args:
+            self._cfg["speaker_id"] = int(args["speaker_id"])
+        if "speed" in args:
+            self._cfg["speed"] = float(args["speed"])
+        if int(self._cfg.get("speaker_id", 0)) != 0:
+            raise ValueError("The VITS2 model supports only speaker_id=0")
+        speed = float(self._cfg.get("speed", 1.0))
+        with self._state_lock:
+            # Speed is a scale on the loaded engine, so an in-place update
+            # avoids tearing down a resident model for a slider change.
+            adapter = self._adapter
+            if adapter is None:
+                # No model yet: invalidate the loader in flight so it cannot
+                # install an adapter built from the previous configuration, then
+                # start a fresh one if anybody is still waiting to come up. The
+                # canvas does config→start within seconds, so dropping the
+                # pending start here would leave the instance stuck at idle.
+                self._load_generation += 1
+                self._adapter_state = "idle"
+                self._load_error = None
+                if self._pending_starts or self._pending_speech:
+                    self._spawn_loader_locked()
+        if adapter is not None:
+            adapter.set_speed(speed)
+        return {"status": "configured"}
+
+    def _interrupt(self, instance_id: str) -> dict:
+        with self._state_lock:
+            if instance_id:
+                targets = ([self._nodes[instance_id]]
+                           if instance_id in self._nodes else [])
+                queues = [instance_id]
+            else:
+                targets = [n for n in self._nodes.values() if n.state == "running"]
+                queues = list(self._pending_speech)
+            abandoned = self._take_pending_speech_locked(queues)
+        cleared = len(abandoned)
+        _release_actions(abandoned)
+        for node in targets:
+            cleared += node.interrupt().get("cleared", 0)
+        return {"status": "interrupted", "nodes": len(targets), "cleared": cleared}
+
     def synthesize_raw(self, text: str) -> bytes:
-        return self._ensure_adapter().synthesize(text)
+        """Synthesize to PCM for the HTTP test endpoint (blocking by design)."""
+        with self._state_lock:
+            adapter = self._adapter
+            if adapter is None:
+                self._request_load_locked()
+                state = self._adapter_state
+                error = self._load_error
+        if adapter is None:
+            raise RuntimeError(
+                f"VITS2 model not ready ({state}): {error or 'still loading'}"
+            )
+        return adapter.synthesize(text)

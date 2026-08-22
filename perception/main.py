@@ -90,8 +90,16 @@ class PerceptionBundle:
 
         if plugins_cfg.get("tts", {}).get("enabled", False):
             from plugins.tts import TTSPlugin
-            self._plugins.append(TTSPlugin(plugins_cfg["tts"], executor))
-            log.info("TTSPlugin loaded")
+            # Guarded: TTSPlugin validates its engine configuration in the
+            # constructor (backend, speaker_id, engine name). An unusable TTS
+            # config must not take ASR/VOP/OCR down with it — the tool simply
+            # does not appear, which is visible in the dashboard.
+            try:
+                self._plugins.append(TTSPlugin(plugins_cfg["tts"], executor))
+                log.info("TTSPlugin loaded")
+            except Exception:
+                log.error("TTSPlugin failed to load; continuing without TTS",
+                          exc_info=True)
 
         if plugins_cfg.get("vop", {}).get("enabled", False):
             import re, socket
