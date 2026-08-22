@@ -5509,6 +5509,11 @@ html, body {
   color: var(--text-muted);
   font-size: 12px;
   margin-left: auto;
+  /* Right-aligned like the one-word statuses beside it: a tool's own message
+     (e.g. the TTS model-loading notice) wraps onto two lines, and left-aligning
+     that made it read as a stray paragraph rather than this row's status. */
+  text-align: right;
+  max-width: 62%;
 }
 .startup-modal-footer {
   display: flex;
