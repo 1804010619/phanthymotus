@@ -24,16 +24,9 @@ from utils.qos import CAMERA_QOS
 from utils.ros_lifecycle import dispose_node
 
 from plugins.ocr_runtime import (
-    DEFAULT_CROP_REFINEMENT_ENABLED,
-    DEFAULT_CROP_REFINEMENT_MIN_GAIN,
-    DEFAULT_CROP_REFINEMENT_MIN_SCORE,
-    DEFAULT_CROP_REFINEMENT_PROFILES,
     DEFAULT_DET_BOX_THRESH,
     DEFAULT_DET_THRESH,
     DEFAULT_DET_UNCLIP_RATIO,
-    DEFAULT_EMPTY_RESULT_RETRY_DET_BOX_THRESH,
-    DEFAULT_EMPTY_RESULT_RETRY_DET_THRESH,
-    DEFAULT_EMPTY_RESULT_RETRY_ENABLED,
     DEFAULT_MAX_SIDE_LEN,
     DEFAULT_REC_MIN_SCORE,
     RapidOCRAdapter,
@@ -73,63 +66,16 @@ TOOLS = [
             },
             "required": ["action"]
         },
+        # Deliberately minimal: only what an operator meaningfully decides.
+        # Expert knobs (model_dir, device_id, DB thresholds, crop refinement,
+        # empty-result retry, ...) stay config.yaml-only — the dispatch below
+        # still honors them, they are just not advertised to the config UI.
         "configSchema": {
             "type": "object",
             "properties": {
-                "model_dir": {"type": "string", "description": "OCR 模型或 TensorRT engine 目录", "scope": "shared"},
-                "device_id": {"type": "integer", "minimum": 0, "default": 0, "scope": "shared"},
-                "use_angle_cls": {"type": "boolean", "default": True, "description": "启用 0/180 度文字方向分类", "scope": "shared"},
-                "provider": {"type": "string", "enum": ["rapidocr"], "description": "OCR 运行时", "scope": "shared"},
                 "language": {"type": "string", "description": "默认语言", "default": "zh", "scope": "instance"},
-                "max_side_len": {"type": "integer", "minimum": 32, "default": DEFAULT_MAX_SIDE_LEN, "description": "检测输入最长边", "scope": "shared"},
-                "det_thresh": {"type": "number", "minimum": 0, "maximum": 1, "default": DEFAULT_DET_THRESH, "description": "DB 文本像素阈值", "scope": "shared"},
-                "det_box_thresh": {"type": "number", "minimum": 0, "maximum": 1, "default": DEFAULT_DET_BOX_THRESH, "description": "DB 文本框阈值", "scope": "shared"},
-                "det_unclip_ratio": {"type": "number", "exclusiveMinimum": 0, "default": DEFAULT_DET_UNCLIP_RATIO, "description": "DB 文本框扩张比例", "scope": "shared"},
-                "rec_min_score": {"type": "number", "minimum": 0, "maximum": 1, "default": DEFAULT_REC_MIN_SCORE, "description": "识别结果最低置信度", "scope": "shared"},
-                "enable_preprocess": {"type": "boolean", "default": True, "description": "启用 OCR 图像预处理", "scope": "shared"},
-                "crop_refinement": {
-                    "type": "object",
-                    "description": "TensorRT 低置信文本框二次裁剪识别",
-                    "scope": "shared",
-                    "default": {
-                        "enabled": DEFAULT_CROP_REFINEMENT_ENABLED,
-                        "min_score": DEFAULT_CROP_REFINEMENT_MIN_SCORE,
-                        "min_gain": DEFAULT_CROP_REFINEMENT_MIN_GAIN,
-                        "min_text_length": 2,
-                        "profiles": list(DEFAULT_CROP_REFINEMENT_PROFILES),
-                    },
-                    "properties": {
-                        "enabled": {"type": "boolean"},
-                        "min_score": {"type": "number", "minimum": 0, "maximum": 1},
-                        "min_gain": {"type": "number", "minimum": 0},
-                        "min_text_length": {"type": "integer", "minimum": 1},
-                        "profiles": {
-                            "type": "array",
-                            "items": {
-                                "type": "string",
-                                "enum": ["prefix_65", "upper_center", "upper_tight"],
-                            },
-                        },
-                    },
-                },
-                "empty_result_retry": {
-                    "type": "object",
-                    "description": "TensorRT 主流程空输出时复用检测图进行低阈值后处理",
-                    "scope": "shared",
-                    "default": {
-                        "enabled": DEFAULT_EMPTY_RESULT_RETRY_ENABLED,
-                        "det_thresh": DEFAULT_EMPTY_RESULT_RETRY_DET_THRESH,
-                        "det_box_thresh": DEFAULT_EMPTY_RESULT_RETRY_DET_BOX_THRESH,
-                    },
-                    "properties": {
-                        "enabled": {"type": "boolean"},
-                        "det_thresh": {"type": "number", "minimum": 0, "maximum": 1},
-                        "det_box_thresh": {"type": "number", "minimum": 0, "maximum": 1},
-                    },
-                },
                 "min_interval_ms": {"type": "integer", "minimum": 0, "default": 0, "description": "帧处理最小间隔(ms)，限制 GPU 占用，0=不限", "scope": "instance"},
             },
-            "required": ["provider"]
         },
         "topic_in":  [{"format": "image/jpeg", "desc": "camera image input"}],
         "topic_out": [{"format": "data/json",  "desc": "OCR result with text boxes"}],

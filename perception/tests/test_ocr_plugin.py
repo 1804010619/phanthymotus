@@ -370,3 +370,64 @@ def test_ocr_model_dir_confined_to_models_tree(monkeypatch):
         md.ensure_ocr_model("/etc/cron.d")
     with pytest.raises(ValueError):
         md.ensure_ocr_model("/models/../root")
+
+
+# ── result payload structure (LLM-consumable) ────────────────────────────────
+
+def test_ocr_payload_carries_size_and_hierarchy():
+    """Items gain height/prominence/line and the payload names its coordinate
+    frame, so an LLM consumer can tell a headline from fine print."""
+    from plugins.ocr_runtime import build_ocr_payload
+
+    items = [
+        {"text": "大标题", "bbox": [100, 40, 500, 120], "score": 0.99},   # h=80
+        {"text": "左栏", "bbox": [80, 300, 200, 340], "score": 0.95},     # h=40
+        {"text": "右栏", "bbox": [260, 305, 380, 335], "score": 0.94},    # 同一行
+        {"text": "小字注脚", "bbox": [90, 600, 220, 620], "score": 0.90}, # h=20
+    ]
+    payload = build_ocr_payload(items, 1.0, "zh", image_size=(640, 800))
+
+    assert payload["image_size"] == [640, 800]
+    heights = [item["height"] for item in payload["items"]]
+    assert heights == [80, 40, 30, 20]
+    assert payload["items"][0]["prominence"] == 1.0
+    assert payload["items"][3]["prominence"] == 0.25
+    # 同一水平带的两段并入一行，text 按行拼接
+    lines = [item["line"] for item in payload["items"]]
+    assert lines == [0, 1, 1, 2]
+    assert payload["text"] == "大标题\n左栏 右栏\n小字注脚"
+
+
+def test_ocr_payload_line_join_sorts_left_to_right():
+    from plugins.ocr_runtime import build_ocr_payload
+
+    items = [
+        {"text": "second", "bbox": [300, 10, 400, 50], "score": 0.9},
+        {"text": "first", "bbox": [10, 12, 120, 48], "score": 0.9},
+    ]
+    payload = build_ocr_payload(items, 0.0, "en")
+    assert payload["text"] == "first second"
+    assert "image_size" not in payload
+
+
+def test_ocr_payload_empty_and_error():
+    from plugins.ocr_runtime import build_ocr_payload
+
+    payload = build_ocr_payload([], 0.0, "zh", error=RuntimeError("boom"))
+    assert payload["text"] == "" and payload["items"] == []
+    assert payload["error"] == "boom"
+
+
+# ── config surface (培育→配置) ───────────────────────────────────────────────
+
+def test_ocr_config_schema_exposes_only_operator_fields():
+    """The config UI renders configSchema verbatim; expert TensorRT/DB knobs
+    live in config.yaml only, and no object-typed property may appear (the
+    frontend renders those as [object Object])."""
+    from plugins.ocr import TOOLS
+
+    schema = TOOLS[0]["configSchema"]
+    assert set(schema["properties"]) == {"language", "min_interval_ms"}
+    for name, spec in schema["properties"].items():
+        assert spec["type"] != "object", name
+    assert "required" not in schema
