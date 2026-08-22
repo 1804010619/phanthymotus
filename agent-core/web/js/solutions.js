@@ -652,15 +652,18 @@ async function _loadSavePanel() {
     <div class="solution-save-form">
       <div class="solution-section-label">打包内容</div>
 
-      <label class="solution-check solution-check-locked">
-        <input type="checkbox" checked disabled>
-        <span>画布（必选）—— ${data.canvas.cards} 张卡片、${data.canvas.devices.length} 个设备</span>
-      </label>
-      ${data.canvas.unresolved.length ? `
-        <div class="solution-load-error">
-          画布上有卡片引用了未注册的设备（${data.canvas.unresolved.map(_esc).join('、')}），
-          请先删除这些卡片再打包。
-        </div>` : ''}
+      <div class="solution-check-group">
+        <div class="solution-check-group-title">画布（必选）</div>
+        <label class="solution-check solution-check-locked">
+          <input type="checkbox" checked disabled>
+          <span>${data.canvas.cards} 张卡片、${data.canvas.devices.length} 个设备 —— 解决方案必须包含画布</span>
+        </label>
+        ${data.canvas.unresolved.length ? `
+          <div class="solution-load-error">
+            画布上有卡片引用了未注册的设备（${data.canvas.unresolved.map(_esc).join('、')}），
+            请先删除这些卡片再打包。
+          </div>` : ''}
+      </div>
 
       <div class="solution-check-group">
         <div class="solution-check-group-title">技能（仅当前激活）</div>

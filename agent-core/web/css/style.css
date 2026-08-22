@@ -7044,7 +7044,25 @@ html, body {
 
 /* ── 保存 / 打包 ── */
 
+/* 保存面板是 div 而不是 form，拿不到 .skill-form-body form 的 gap:12px，
+   所以这里显式给字段行之间留出竖向节奏 —— 否则每一行的 label 会紧贴上一行的
+   输入框，密到看不出分组。 */
 .solution-save-form { padding-bottom: 8px; }
+.solution-save-form .skill-form-row,
+.solution-save-form > .skill-form-field { margin-top: 14px; }
+/* 紧跟小标题的第一行不再叠加：标题自己的 8px 下边距就够了 */
+.solution-save-form .solution-section-label + .skill-form-row,
+.solution-save-form .solution-section-label + .skill-form-field,
+.solution-save-form .solution-section-label + .solution-check-group { margin-top: 0; }
+.solution-save-form .skill-form-field { gap: 6px; }
+.solution-save-form .skill-form-field textarea { min-height: 76px; }
+.solution-save-form .skill-form-error { margin-top: 14px; }
+.solution-save-form .skill-form-footer {
+  margin-top: 20px;
+  padding-top: 14px;
+  align-items: center;
+  gap: 12px;
+}
 .solution-check-group {
   margin-top: 14px;
   padding: 10px 12px;
