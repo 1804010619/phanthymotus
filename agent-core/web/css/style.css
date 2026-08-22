@@ -172,7 +172,10 @@ html, body {
   margin-left: auto;
   display: flex;
   align-items: center;
-  gap: 8px;
+  /* 2px 而不是 8px：设置 / 我的 两个按钮自己还有 10px 内边距，pill 边到图标已经隔了
+     12px；原来 gap:8 + padding:14 是 22px，读起来像两个不相干的入口。
+     更新提示不属于这一组，用自己的 margin-right 补回间距。 */
+  gap: 2px;
 }
 
 .topbar-btn {
@@ -187,7 +190,7 @@ html, body {
   display: flex;
   align-items: center;
   gap: 6px;
-  padding: 6px 14px;
+  padding: 6px 10px;
   font-size: 12px;
   font-weight: 500;
   border: none;
@@ -279,6 +282,8 @@ html, body {
   display: flex;
   align-items: center;
   gap: 8px;
+  /* .topbar-actions 的 gap 收成 2px 是为了让设置/我的靠成一组，更新提示不属于那一组 */
+  margin-right: 8px;
   background: var(--yellow-bg);
   border: 1px solid var(--yellow);
   border-radius: var(--radius-sm);
