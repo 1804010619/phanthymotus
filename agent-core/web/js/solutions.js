@@ -317,26 +317,40 @@ function _renderLoadModal(data) {
   html += matched.map(d => `
     <div class="solution-driver-row">
       <span class="solution-driver-ok">✓</span>
-      <span class="solution-driver-name">${_esc(d.name || d.serverName)}</span>
-      <span class="solution-pill solution-pill-sm">${_esc(d.category || '')}</span>
-      ${_versionCell(d)}
-      <span class="solution-driver-image">已就绪 · ${_esc(d.mcpName || d.mcpId || '')}</span>
+      <div class="solution-driver-main">
+        <div class="solution-driver-line">
+          <span class="solution-driver-name">${_esc(d.name || d.serverName)}</span>
+          <span class="solution-pill solution-pill-sm">${_esc(d.category || '')}</span>
+          <span class="solution-driver-state">已就绪</span>
+        </div>
+        ${_versionCell(d)}
+      </div>
     </div>`).join('');
   html += installable.map(d => `
     <div class="solution-driver-row solution-driver-row-warn">
       <span class="solution-driver-warn">!</span>
-      <span class="solution-driver-name">${_esc(d.name || d.serverName)}</span>
-      <span class="solution-pill solution-pill-sm">${_esc(d.category || '')}</span>
-      ${_versionCell(d)}
-      <span class="solution-driver-image">${_esc(d.localImage || d.image || '')}</span>
+      <div class="solution-driver-main">
+        <div class="solution-driver-line">
+          <span class="solution-driver-name">${_esc(d.name || d.serverName)}</span>
+          <span class="solution-pill solution-pill-sm">${_esc(d.category || '')}</span>
+          <span class="solution-driver-state">未启动</span>
+        </div>
+        ${_versionCell(d)}
+        <div class="solution-driver-sub">${_esc(d.localImage || d.image || '')}</div>
+      </div>
       <button class="skill-btn skill-btn-sm skill-btn-primary" data-install="${_esc(d.localDriverId)}">一键安装</button>
     </div>`).join('');
   html += missing.map(d => `
     <div class="solution-driver-row solution-driver-row-error">
       <span class="solution-driver-err">✕</span>
-      <span class="solution-driver-name">${_esc(d.name || d.serverName)}</span>
-      <span class="solution-pill solution-pill-sm">${_esc(d.category || '')}</span>
-      <span class="solution-driver-image">本机没有此驱动：${_esc(d.registryImage || d.serverName)}</span>
+      <div class="solution-driver-main">
+        <div class="solution-driver-line">
+          <span class="solution-driver-name">${_esc(d.name || d.serverName)}</span>
+          <span class="solution-pill solution-pill-sm">${_esc(d.category || '')}</span>
+          <span class="solution-driver-state">本机缺少</span>
+        </div>
+        <div class="solution-driver-sub">${_esc(d.registryImage || d.serverName)}</div>
+      </div>
     </div>`).join('');
   html += `</div>`;
 
@@ -635,6 +649,10 @@ async function _loadSavePanel() {
   const localOnly = (data.configFields || []).filter(f => f.localOnly && !f.sensitive);
   const others    = (data.configFields || []).filter(f => !f.sensitive && !f.localOnly);
 
+  // 适用机型由后端从画布上的硬件驱动推出（没有硬件驱动就是空）—— 作者不能手填，
+  // 否则方案会声称支持一台打包这边根本没有驱动的机器
+  const robots = data.robotTypes || [];
+
   panel.innerHTML = `
     <div class="solution-save-form">
       <div class="solution-section-label">打包内容</div>
@@ -744,8 +762,15 @@ async function _loadSavePanel() {
       </div>
       <div class="skill-form-row">
         <div class="skill-form-field">
-          <label>适用机型（逗号分隔）</label>
-          <input type="text" id="sol-robots" placeholder="humanoid, quadruped">
+          <label>适用机型</label>
+          <div class="solution-robots">
+            ${robots.length
+              ? robots.map(m => `<span class="solution-pill solution-pill-driver">${_esc(m)}</span>`).join('')
+              : `<span class="solution-robots-none">None</span>`}
+          </div>
+          <div class="solution-hint">${robots.length
+            ? '由画布上的硬件驱动自动确定'
+            : '画布上没有硬件驱动，方案不声明适用机型'}</div>
         </div>
         <div class="skill-form-field">
           <label>标签（逗号分隔）</label>
@@ -787,7 +812,8 @@ async function _publish() {
     version:     panel.querySelector('#sol-version').value.trim(),
     oneLiner:    panel.querySelector('#sol-oneliner').value.trim(),
     description: panel.querySelector('#sol-description').value.trim(),
-    robotTypes:  _splitList(panel.querySelector('#sol-robots').value),
+    // 机型不来自表单，来自 /packable 推导出的画布硬件驱动
+    robotTypes:  _packable?.robotTypes || [],
     tags:        _splitList(panel.querySelector('#sol-tags').value),
   };
   if (!meta.name || !meta.slug || !meta.oneLiner || !meta.description) {

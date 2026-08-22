@@ -250,7 +250,26 @@ def _device_descriptor(ref: str, mcp: dict) -> dict:
         'image':         driver.get('image', ''),
         'name':          driver.get('name') or mcp.get('name') or server_name,
         'port':          _port_from_url(mcp.get('url', '')),
+        # 机型：只有硬件驱动才有。适用机型（robotTypes）由它推出来，不让作者手填 ——
+        # 手填的话方案会声称支持一台本机根本没有驱动的机器。
+        'provider':      driver.get('provider', ''),
+        'model':         driver.get('model', ''),
     }
+
+
+def _robot_models(devices: list) -> list:
+    """本机这套画布对应的机型列表 = 画布上硬件驱动的 model，去重保序。
+
+    没有硬件驱动（纯 core + perception 的方案）就返回空 —— 前端显示 None。
+    """
+    models: list = []
+    for d in devices:
+        if d.get('category') != 'driver':
+            continue
+        model = (d.get('model') or '').strip()
+        if model and model not in models:
+            models.append(model)
+    return models
 
 
 def _canvas_devices() -> tuple[list, dict, list]:
@@ -720,6 +739,8 @@ async def packable(request: fastapi.Request):
             'devices':     devices,
             'unresolved':  unresolved,
         },
+        # 适用机型：由画布上的硬件驱动推出，前端只展示不让改
+        'robotTypes': _robot_models(devices),
         'skills': {
             'available': [_skill_brief(s) for s in on_market],
             'offMarket': [_skill_brief(s) for s in off_market],

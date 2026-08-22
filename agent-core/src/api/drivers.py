@@ -397,6 +397,14 @@ def _upsert_from_catalog(manifest: list, catalog: dict) -> tuple[int, int]:
             # Also sync port from registry catalog for hardware drivers
             if item.get('port') and not existing.get('port'):
                 existing['port'] = item['port']
+            # Backfill provider/model on manifests written before these were stored.
+            # The id alone can't be split back apart ('x-humanoid-tianyi2.0' — the
+            # provider itself contains a hyphen), and 适用机型 is derived from model.
+            if category == 'driver':
+                if item.get('provider'):
+                    existing['provider'] = item['provider']
+                if item.get('model'):
+                    existing['model'] = item['model']
             updated += 1
         else:
             # Build human-readable name
@@ -414,6 +422,9 @@ def _upsert_from_catalog(manifest: list, catalog: dict) -> tuple[int, int]:
                 'description':    '',
                 **_SERVICE_ENDPOINTS.get(image_name, {}),
             }
+            if category == 'driver':
+                new_entry['provider'] = item.get('provider', '')
+                new_entry['model'] = item.get('model', '')
             # Preserve port from registry catalog for hardware drivers (used to derive mcp_url)
             if item.get('port') and 'port' not in new_entry:
                 new_entry['port'] = item['port']

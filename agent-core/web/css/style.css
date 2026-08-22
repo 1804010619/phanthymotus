@@ -6851,15 +6851,23 @@ html, body {
 
 .solution-modal { width: 680px; }
 .solution-load-modal {
-  width: 620px;
+  width: 680px;
   max-width: 95vw;
   max-height: 85vh;
   display: flex;
   flex-direction: column;
 }
+/* .modal-body 没有基础 padding（见 .account-modal-body 上方那段说明），不自己声明的话
+   内容会贴着弹窗边框，而标题却是缩进的 —— 看起来就是"挤在一起"。overflow-y 同样必须
+   自己声明：.modal 是 max-height + overflow:hidden，驱动多的时候底部会被直接裁掉。 */
+.solution-load-modal .modal-body {
+  padding: 18px 24px 22px;
+  overflow-y: auto;
+  flex: 1;
+}
 
 .solution-section-label {
-  margin: 16px 0 8px;
+  margin: 22px 0 8px;
   font-size: 10px;
   font-weight: 600;
   letter-spacing: .1em;
@@ -6919,30 +6927,60 @@ html, body {
 .solution-driver-list {
   display: flex;
   flex-direction: column;
-  gap: 4px;
+  gap: 6px;
 }
+/* 两行布局：第一行是"是什么"（名字 / 类别 / 状态），第二行是"哪个版本"。
+   之前挤在一行里的 5 个元素（图标 + 名字 + 类别 + 长 tag + 镜像 + 按钮）在 620px 下
+   正好塞满，jetson tag 一来就把「一键安装」压成两个字宽。 */
 .solution-driver-row {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 7px 10px;
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  /* start 而不是 center：行会有 2~3 行高（版本 + 镜像），图标和按钮要跟"名字"那一行
+     对齐，居中的话会飘到镜像地址旁边 */
+  align-items: start;
+  column-gap: 10px;
+  padding: 9px 12px;
   border: 1px solid var(--border);
   border-radius: var(--radius);
   background: var(--bg-input);
   font-size: 12px;
 }
+.solution-driver-main {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+}
+.solution-driver-line {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+}
 .solution-driver-row-warn  { border-color: var(--yellow); background: var(--yellow-bg); }
 .solution-driver-row-error { border-color: var(--red);    background: var(--red-bg); }
 .solution-driver-name { font-weight: 500; color: var(--text); }
-.solution-driver-image {
+/* 状态词（已就绪 / 待安装 / 缺失）—— 不再重复左边已经写过的驱动名 */
+.solution-driver-state {
   margin-left: auto;
+  font-size: 10px;
+  color: var(--text-dim);
+  white-space: nowrap;
+}
+.solution-driver-row-warn  .solution-driver-state { color: var(--yellow); }
+.solution-driver-row-error .solution-driver-state { color: var(--red); }
+/* 第二行：镜像 / 版本。长 tag 在这里换行，不再挤压同行的其它元素 */
+.solution-driver-sub {
   font-family: var(--font-mono, monospace);
   font-size: 10px;
   color: var(--text-dim);
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  overflow-wrap: anywhere;
 }
+.solution-driver-row .skill-btn { flex-shrink: 0; white-space: nowrap; }
+/* 图标和按钮跟第一行文字对齐（.solution-driver-line 的行高约 18px） */
+.solution-driver-ok,
+.solution-driver-warn,
+.solution-driver-err { line-height: 18px; }
 .solution-driver-ok   { color: var(--green);  font-weight: 700; }
 .solution-driver-warn { color: var(--yellow); font-weight: 700; }
 .solution-driver-err  { color: var(--red);    font-weight: 700; }
@@ -6951,6 +6989,20 @@ html, body {
   display: flex;
   flex-wrap: wrap;
   gap: 5px;
+}
+/* 适用机型：由画布上的硬件驱动推出，是展示而不是输入。高度对齐同一行的
+   「标签」输入框，两个 field 才不会一高一低。 */
+.solution-robots {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 5px;
+  min-height: 34px;
+}
+.solution-robots-none {
+  font-family: var(--font-mono, monospace);
+  font-size: 11px;
+  color: var(--text-dim);
 }
 .solution-need-item {
   padding: 3px 8px;
@@ -7081,7 +7133,11 @@ html, body {
 }
 
 /* 载入弹窗里的容器版本格挡：本机 tag → 方案 tag */
+/* 版本 chip。在驱动行里它自己占一行（.solution-driver-main 是纵向 flex），所以用
+   align-self 收窄到内容宽度，而不是撑满整行。long tag 允许换行，不再压缩兄弟元素。 */
 .solution-ver {
+  align-self: flex-start;
+  max-width: 100%;
   padding: 1px 6px;
   border: 1px solid var(--border);
   border-radius: var(--radius);
@@ -7089,7 +7145,7 @@ html, body {
   font-family: var(--font-mono);
   font-size: 10px;
   color: var(--text-muted);
-  white-space: nowrap;
+  overflow-wrap: anywhere;
 }
 .solution-ver-diff {
   border-color: var(--yellow);
