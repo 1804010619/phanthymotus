@@ -422,12 +422,13 @@ def test_ocr_payload_empty_and_error():
 
 def test_ocr_config_schema_exposes_only_operator_fields():
     """The config UI renders configSchema verbatim; expert TensorRT/DB knobs
-    live in config.yaml only, and no object-typed property may appear (the
-    frontend renders those as [object Object])."""
+    and the recognition-neutral `language` tag live in config.yaml only, and
+    no object-typed property may appear (the frontend renders those as
+    [object Object])."""
     from plugins.ocr import TOOLS
 
     schema = TOOLS[0]["configSchema"]
-    assert set(schema["properties"]) == {"language", "min_interval_ms"}
+    assert set(schema["properties"]) == {"min_interval_ms"}
     for name, spec in schema["properties"].items():
         assert spec["type"] != "object", name
     assert "required" not in schema

@@ -70,10 +70,13 @@ TOOLS = [
         # Expert knobs (model_dir, device_id, DB thresholds, crop refinement,
         # empty-result retry, ...) stay config.yaml-only — the dispatch below
         # still honors them, they are just not advertised to the config UI.
+        # language is also yaml-only: the TensorRT pipeline runs one bilingual
+        # zh/en model, so the value only annotates the published payload and
+        # offering it in the UI would suggest a recognition switch that does
+        # not exist.
         "configSchema": {
             "type": "object",
             "properties": {
-                "language": {"type": "string", "description": "默认语言", "default": "zh", "scope": "instance"},
                 "min_interval_ms": {"type": "integer", "minimum": 0, "default": 0, "description": "帧处理最小间隔(ms)，限制 GPU 占用，0=不限", "scope": "instance"},
             },
         },
