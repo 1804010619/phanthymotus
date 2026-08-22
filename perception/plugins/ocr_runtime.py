@@ -191,13 +191,70 @@ def scale_ocr_items(
     return scaled_items
 
 
-def build_ocr_payload(results, timestamp, language, error=None) -> dict:
+def annotate_ocr_items(items: list[dict]) -> list[dict]:
+    """Attach the size/hierarchy fields an LLM consumer needs to rank text.
+
+    Detection returns items in reading order (top-to-bottom, then left) with
+    only bbox+score, so a downstream LLM cannot tell a headline from fine
+    print. Each item gains:
+
+    - ``height``: bbox height in source pixels — a font-size proxy.
+    - ``prominence``: height relative to the largest text on the frame,
+      rounded to 2 decimals (1.0 = the most prominent text).
+    - ``line``: visual line index; an item joins the current line when its
+      vertical center falls inside that line's band.
+    """
+    annotated: list[dict] = []
+    band: tuple[float, float] | None = None
+    line = -1
+    for item in items:
+        x1, y1, x2, y2 = item["bbox"]
+        height = max(1, round(y2 - y1))
+        center = (y1 + y2) / 2
+        if band is None or not band[0] <= center <= band[1]:
+            line += 1
+            band = (y1, y2)
+        else:
+            band = (min(band[0], y1), max(band[1], y2))
+        annotated.append({**item, "height": height, "line": line})
+    if annotated:
+        max_height = max(item["height"] for item in annotated)
+        for item in annotated:
+            item["prominence"] = round(item["height"] / max_height, 2)
+    return annotated
+
+
+def build_ocr_payload(
+    results, timestamp, language, error=None, image_size=None
+) -> dict:
+    """Assemble the published OCR result.
+
+    ``text`` joins recognized fragments per visual line (left-to-right)
+    with newlines between lines; ``items`` carry bbox (source-pixel
+    [x1,y1,x2,y2]), score, height, prominence and line so consumers can
+    reason about size and importance; ``image_size`` ([width, height]) is
+    the coordinate reference frame for every bbox.
+    """
+    items = annotate_ocr_items(results)
+    lines: dict[int, list[dict]] = {}
+    for item in items:
+        if item.get("text"):
+            lines.setdefault(item["line"], []).append(item)
+    text = "\n".join(
+        " ".join(
+            item["text"]
+            for item in sorted(members, key=lambda entry: entry["bbox"][0])
+        )
+        for _line, members in sorted(lines.items())
+    )
     payload = {
-        "text": " ".join(item["text"] for item in results if item.get("text")),
-        "items": results,
+        "text": text,
+        "items": items,
         "timestamp": timestamp,
         "language": language,
     }
+    if image_size is not None:
+        payload["image_size"] = [int(image_size[0]), int(image_size[1])]
     if error is not None:
         payload["error"] = str(error)
     return payload
@@ -207,8 +264,13 @@ def recognize_to_payload(
     adapter, image_bytes: bytes, language: str, timestamp: float
 ) -> dict:
     try:
+        items = adapter.recognize(image_bytes, language)
+        try:
+            image_size = probe_image_header(image_bytes)
+        except ValueError:
+            image_size = None
         return build_ocr_payload(
-            adapter.recognize(image_bytes, language), timestamp, language
+            items, timestamp, language, image_size=image_size
         )
     except Exception as exc:
         return build_ocr_payload([], timestamp, language, error=exc)
