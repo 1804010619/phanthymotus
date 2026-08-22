@@ -4,19 +4,24 @@ utils/model_downloader.py — Auto-download sherpa-onnx models from COS if missi
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
-import fcntl
-import hashlib
-import json
-import shutil
 import tarfile
 import tempfile
+import time
 import zipfile
+import json
+import shutil
 from pathlib import Path
+from urllib.error import URLError
 from urllib.parse import quote
-from urllib.request import urlretrieve
-from urllib.request import urlopen
+from urllib.request import urlopen, urlretrieve
+
+try:  # Linux only; the perception images are Linux, dev hosts may not be.
+    import fcntl
+except ImportError:  # pragma: no cover - Windows/macOS dev hosts
+    fcntl = None
 
 log = logging.getLogger(__name__)
 
@@ -203,6 +208,267 @@ def _common_prefix_from_names(names: list[str]) -> str:
     return ""
 
 
+# ── Verified bundles (OCR / obstacle TensorRT artefacts) ─────────────────────
+# Pure additions consumed by the vision plugins' thin wrappers. The legacy
+# ensure_model() above (sherpa-onnx archives, X-ASR) is intentionally left
+# untouched. Every file in a verified bundle carries a pinned size and SHA256:
+# existing files are re-verified before reuse, downloads are staged next to
+# the destination, verified, and only then moved into place. Concurrent
+# instances sharing /models serialize on a per-bundle file lock. Entries that
+# ship one bundle per JetPack family use {"jp511": {...}, "jp61": {...}} keys
+# selected by the TensorRT that is actually importable
+# (see utils.tensorrt_runtime).
+
+
+MODELS_ROOT = "/models"
+
+
+def require_models_subpath(path: str, root: str = MODELS_ROOT) -> str:
+    """Validate that a caller-supplied model_dir stays inside the models tree.
+
+    model_dir is accepted over MCP config and the downloader runs as root in
+    the container, so an unchecked value would let a caller create or
+    overwrite files at arbitrary container paths.
+
+    A lexical check is not enough: ``/models/link`` passes it while ``link``
+    is a symlink pointing outside the tree, and every later makedirs/open/
+    os.replace would follow it. Resolve symlinks on both sides — for the
+    deepest component that exists, since the target directory is usually
+    created later — and compare the resolved paths. Returns the resolved
+    absolute path, which callers must use for all filesystem work.
+    """
+    candidate = os.path.normpath(os.path.join("/", str(path)))
+    root_real = os.path.realpath(root)
+
+    # Resolve the longest existing prefix, then re-attach the missing tail:
+    # realpath() on a not-yet-created directory cannot detect a symlinked
+    # parent otherwise.
+    existing = candidate
+    tail: list[str] = []
+    while not os.path.exists(existing) and existing not in ("/", ""):
+        existing, name = os.path.split(existing)
+        tail.append(name)
+    resolved = os.path.join(os.path.realpath(existing), *reversed(tail))
+    resolved = os.path.normpath(resolved)
+
+    if resolved != root_real and not resolved.startswith(root_real + os.sep):
+        raise ValueError(
+            f"model_dir must resolve under {root_real}/: got {path!r}"
+        )
+    return resolved
+
+
+def select_bundle_family(bundles: dict, family: str | None = None) -> str:
+    """Pick the bundle key ("jp511"/"jp61") for the runtime TensorRT.
+
+    An explicit ``family`` (or alias such as "61"/"511") wins; otherwise the
+    family is derived from the importable TensorRT major version. Never
+    depends on a Docker build argument or image ENV.
+    """
+    from utils.tensorrt_runtime import normalize_family, tensorrt_family
+
+    if family is not None:
+        key = normalize_family(family)
+        if key is None:
+            raise ValueError(f"Unknown model bundle family: {family!r}")
+    else:
+        key = tensorrt_family()
+    if key not in bundles:
+        raise RuntimeError(
+            f"No model bundle for TensorRT family {key}; available: {sorted(bundles)}"
+        )
+    return key
+
+
+def ensure_verified_bundle(
+    name: str, model_dir: str, base_url: str, files: dict
+) -> dict[str, str]:
+    """Ensure a size/SHA256-pinned bundle is present and valid in model_dir.
+
+    existing files → size check → SHA256 check → reuse
+    otherwise      → lock → re-check → download (retry) → verify → replace
+    Returns ``{filename: absolute path}``.
+    """
+    paths = {
+        filename: os.path.join(model_dir, filename) for filename in files
+    }
+    if _bundle_matches(model_dir, files):
+        log.info(f"[model_downloader] {name}: verified bundle already at {model_dir}")
+        return paths
+
+    os.makedirs(model_dir, exist_ok=True)
+    # Platform instances share /models. Serialize the download so a cold
+    # multi-instance launch fetches one copy instead of one per process; a
+    # waiter re-checks the bundle once it gets the lock.
+    lock_path = os.path.join(model_dir, f".{name.replace('/', '_')}.lock")
+    with open(lock_path, "a+b") as lock_file:
+        if fcntl is not None:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            if _bundle_matches(model_dir, files):
+                log.info(f"[model_downloader] {name}: verified by another instance")
+                return paths
+            _download_verified_bundle(name, base_url, model_dir, files)
+        finally:
+            if fcntl is not None:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+    return paths
+
+
+def _file_matches(path: str, metadata: dict) -> bool:
+    """Return whether one file exists and matches its pinned size and SHA256."""
+    try:
+        if not os.path.isfile(path):
+            return False
+        _verify_pinned_file(path, metadata)
+    except (OSError, ValueError):
+        return False
+    return True
+
+
+def _bundle_matches(model_dir: str, files: dict) -> bool:
+    """Return whether every bundle file matches its pinned size and SHA256."""
+    return all(
+        _file_matches(os.path.join(model_dir, filename), metadata)
+        for filename, metadata in files.items()
+    )
+
+
+def _verify_pinned_file(path: str, metadata: dict) -> None:
+    actual_size = os.path.getsize(path)
+    if actual_size != metadata["size"]:
+        raise ValueError(
+            f"size mismatch for {os.path.basename(path)}: "
+            f"expected {metadata['size']}, got {actual_size}"
+        )
+
+    digest = hashlib.sha256()
+    with open(path, "rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    actual_sha256 = digest.hexdigest()
+    if actual_sha256 != metadata["sha256"]:
+        raise ValueError(
+            f"SHA256 mismatch for {os.path.basename(path)}: "
+            f"expected {metadata['sha256']}, got {actual_sha256}"
+        )
+
+
+def _download_verified_bundle(
+    name: str, base_url: str, model_dir: str, files: dict
+) -> None:
+    """Download and verify a multi-file model before replacing its destination."""
+    os.makedirs(model_dir, exist_ok=True)
+    staging_prefix = f".{name.replace('/', '_')}-"
+    with tempfile.TemporaryDirectory(prefix=staging_prefix, dir=model_dir) as staging:
+        for filename, metadata in files.items():
+            if os.path.basename(filename) != filename:
+                raise ValueError(f"Invalid model filename: {filename}")
+            url = f"{base_url.rstrip('/')}/{filename}"
+            destination = os.path.join(staging, filename)
+            last_error = None
+            for attempt in range(1, 4):
+                try:
+                    log.info(
+                        f"[model_downloader] {name}: downloading {filename} "
+                        f"(attempt {attempt}/3)"
+                    )
+                    with urlopen(url, timeout=120) as response, open(destination, "wb") as output:
+                        while True:
+                            chunk = response.read(1024 * 1024)
+                            if not chunk:
+                                break
+                            output.write(chunk)
+                        output.flush()
+                        os.fsync(output.fileno())
+                    _verify_pinned_file(destination, metadata)
+                    os.chmod(destination, 0o644)
+                    break
+                except (URLError, TimeoutError, OSError, ValueError) as error:
+                    last_error = error
+                    if os.path.exists(destination):
+                        os.unlink(destination)
+                    if attempt < 3:
+                        time.sleep(3)
+            else:
+                raise RuntimeError(
+                    f"[model_downloader] {name}: failed to download {filename}"
+                ) from last_error
+
+        for filename in files:
+            os.replace(
+                os.path.join(staging, filename),
+                os.path.join(model_dir, filename),
+            )
+    log.info(f"[model_downloader] {name}: verified bundle ready at {model_dir}")
+
+
+# ── OCR (PP-OCRv6 small, TensorRT engines; one bundle per JetPack family) ──
+# The engines are built per TensorRT major and are not portable, so the
+# bundle is chosen from the TensorRT that is importable at runtime. Only the
+# base URL is provenance-specific: switching the distribution host (e.g. to
+# COS) means changing OCR_MODEL_BASE only.
+OCR_MODEL_BASE = os.environ.get(
+    "OCR_MODEL_BASE_URL",
+    "https://www.modelscope.cn/models/Flame4pd/"
+    "ppocrv6-small-edge-ocr/resolve/"
+    "0301e9299b3abe09c6a60796d7bed74c23fcc525",
+)
+_OCR_KEYS = {
+    "size": 74947,
+    "sha256": "b5f2bfe2bdd9448429e3e82b51c789775d9b42f2403d082b00662eb77e401c5d",
+}
+OCR_MODEL_BUNDLES = {
+    "jp61": {
+        "base_url": f"{OCR_MODEL_BASE}/tensorrt-jp6-trt10.4-orin-batch8-cls8",
+        "files": {
+            "det.engine": {
+                "size": 11194324,
+                "sha256": "3b36aae43b2cc4a1b1e2d74d846a1319b4b6f42fbc6d97747d8d72e12c74a1ef",
+            },
+            "rec.engine": {
+                "size": 23303292,
+                "sha256": "8149fa68d5418f2c0763b8c4e5088987cb679a407317c7510f88ab6de38dd641",
+            },
+            "cls.engine": {
+                "size": 1046484,
+                "sha256": "148a6895260d3b6b6f86e0c5787121fc1bba316f3427397f654421196c13cb77",
+            },
+            "keys.txt": _OCR_KEYS,
+        },
+    },
+    "jp511": {
+        "base_url": f"{OCR_MODEL_BASE}/tensorrt-jp511-trt8.5-orin-batch8-cls8",
+        "files": {
+            "det.engine": {
+                "size": 12334256,
+                "sha256": "1bb32a027e93b06d5319ac61e38bb3e447137b01465eacefa7a652f58130ebdf",
+            },
+            "rec.engine": {
+                "size": 19915466,
+                "sha256": "1e204f0469beba33d8590b29c06419cf1073d98d41243b5ee316d2f877340b61",
+            },
+            "cls.engine": {
+                "size": 1038858,
+                "sha256": "02c722e56e621b56a36678cc8aa124a31b41e9e3c9ca350b11e4de0d5bbd0a35",
+            },
+            "keys.txt": _OCR_KEYS,
+        },
+    },
+}
+
+
+def ensure_ocr_model(model_dir: str, family: str | None = None) -> dict[str, str]:
+    """Ensure the OCR TensorRT bundle matching the runtime TensorRT is present."""
+    model_dir = require_models_subpath(model_dir)
+    key = select_bundle_family(OCR_MODEL_BUNDLES, family)
+    entry = OCR_MODEL_BUNDLES[key]
+    log.info(f"[model_downloader] ocr: using {key} bundle")
+    return ensure_verified_bundle(
+        f"ocr/{key}", model_dir, entry["base_url"], entry["files"]
+    )
+
+
 # VITS2 uses a file-level manifest rather than the archive format above.
 VITS2_MODEL_ID = "Starlight777/VITS2-ZH-EN-Male-16k"
 VITS2_MODEL_REVISION = "14954122c4baf4e80b44436c4b2b167e38db4103"
@@ -344,7 +610,8 @@ def ensure_vits2_model(model_dir: str) -> None:
     target.parent.mkdir(parents=True, exist_ok=True)
     lock_path = target.parent / f".{target.name}.download.lock"
     with lock_path.open("a+") as lock_file:
-        fcntl.flock(lock_file, fcntl.LOCK_EX)
+        if fcntl is not None:
+            fcntl.flock(lock_file, fcntl.LOCK_EX)
         if _vits2_complete(target, target_name, tensorrt_major):
             log.info("[model_downloader] vits2: verified release at %s", target)
             return
