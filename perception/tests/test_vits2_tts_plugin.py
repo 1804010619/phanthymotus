@@ -310,3 +310,65 @@ def test_tool_is_the_standard_tts_tool_with_an_engine_selector():
     # rebuilding the image (see PR #112 review).
     assert config["tts_engine"]["enum"] == ["vits2_trt", "sherpa_onnx"]
     assert vits2.TTSPlugin.PREFIX == "tts"
+
+
+# ── ACP callback and error reporting (device regressions) ────────────────────
+
+def test_acp_callback_tolerates_the_self_signed_agent_core_cert(monkeypatch):
+    """Agent Core serves HTTPS with a self-signed cert.
+
+    Without an unverified context every completion POST raised
+    CERTIFICATE_VERIFY_FAILED, so no speak action ever completed and the ACP
+    barrier waited out its full timeout on each utterance.
+    """
+    import ssl
+
+    captured = {}
+
+    def fake_urlopen(request, timeout=0, context=None):
+        captured["url"] = request.full_url
+        captured["context"] = context
+        captured["body"] = request.data
+        return _NullResponse()
+
+    class _NullResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    import urllib.request
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setenv("AGENT_CORE_URL", "https://localhost:15678")
+
+    vits2._complete_action("speak-1", "你好", 3, interrupted=False)
+
+    assert captured["url"].endswith("/api/acp/complete")
+    ctx = captured["context"]
+    assert isinstance(ctx, ssl.SSLContext)
+    assert ctx.verify_mode == ssl.CERT_NONE and ctx.check_hostname is False
+    assert b'"status": "completed"' in captured["body"]
+
+
+def test_load_error_keeps_the_underlying_cause(monkeypatch):
+    """The dashboard must show why TensorRT was unavailable, not just that."""
+    plugin, _, _, _ = _plugin(monkeypatch)
+
+    import utils.model_downloader as md
+
+    def explode(model_dir, family=None):
+        try:
+            raise ImportError("libnvdla_compiler.so: file too short")
+        except ImportError as cause:
+            raise RuntimeError("TensorRT is not available in this runtime") from cause
+
+    monkeypatch.setattr(md, "ensure_vits2_model", explode, raising=False)
+    plugin.dispatch("tts", {"action": "start", "input_topic": "/say"})
+
+    assert _wait_until(
+        lambda: plugin.dispatch("tts", {"action": "info"})["state"] == "error"
+    )
+    error = plugin.dispatch("tts", {"action": "info"})["error"]
+    assert "TensorRT is not available" in error
+    assert "libnvdla_compiler.so" in error

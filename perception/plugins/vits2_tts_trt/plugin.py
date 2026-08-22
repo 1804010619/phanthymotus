@@ -84,6 +84,26 @@ _LOW_LAT_QOS = QoSProfile(
 # rather than restating it is what keeps the two engines from drifting into
 # different config forms for the same tool.
 from plugins.tts import TOOLS  # noqa: E402
+def _error_chain(error: BaseException) -> str:
+    """Flatten an exception chain into one line for info/error reporting.
+
+    The interesting part is usually the cause, not the wrapper: "TensorRT is not
+    available in this runtime" says nothing, while
+    "... : libnvdla_compiler.so: file too short" points straight at a container
+    started without the nvidia runtime.
+    """
+    parts = []
+    seen = set()
+    current = error
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        text = str(current).strip() or type(current).__name__
+        if text not in parts:
+            parts.append(text)
+        current = current.__cause__ or current.__context__
+    return ": ".join(parts[:4])
+
+
 def _release_actions(items) -> None:
     """Cancel ACP actions for utterances that will never be played."""
     for text, action_id in items:
@@ -107,12 +127,21 @@ def _complete_action(
     if not action_id:
         return
     try:
+        import ssl
         import urllib.request
         from urllib.parse import urlparse
 
         agent_core_url = os.getenv("AGENT_CORE_URL", "https://localhost:15678")
         if urlparse(agent_core_url).scheme != "https":
             raise ValueError("AGENT_CORE_URL must use HTTPS")
+        # Agent Core serves HTTPS with a self-signed certificate, so the default
+        # context rejects it and every completion POST fails — which leaves the
+        # ACP barrier waiting out its full timeout on each utterance. Same
+        # unverified context every other component uses for this endpoint
+        # (perception/main.py, the drivers' _acp_notify).
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
         payload = json.dumps(
             {
                 "action_id": action_id,
@@ -126,7 +155,7 @@ def _complete_action(
             headers={"Content-Type": "application/json"},
             method="POST",
         )
-        urllib.request.urlopen(request, timeout=3)
+        urllib.request.urlopen(request, timeout=3, context=ctx)
     except Exception as exc:
         log.warning("[vits2_tts_trt] ACP completion callback failed: %s", exc)
 
@@ -524,7 +553,7 @@ class TTSPlugin:
                 if generation != self._load_generation:
                     return
                 self._adapter_state = "error"
-                self._load_error = str(error)
+                self._load_error = _error_chain(error)
                 # Abandon the queued work rather than leave the caller's ACP
                 # action pending forever; the reason is on the tool state.
                 self._pending_starts.clear()
