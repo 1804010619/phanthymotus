@@ -432,3 +432,57 @@ def test_ocr_config_schema_exposes_only_operator_fields():
     for name, spec in schema["properties"].items():
         assert spec["type"] != "object", name
     assert "required" not in schema
+
+
+# ── node-level start/stop races (bot P1, 2026-08-22) ─────────────────────────
+
+def test_ocr_concurrent_starts_yield_exactly_one_worker(ocr):
+    """_OCRNode.start() is serialized by the node lock: N concurrent starts
+    on the same instance must produce one subscription and one live worker,
+    never overwrite each other's stop event / frame slot."""
+    plugin, executor, _ = ocr
+    _start_and_wait(plugin, executor, "/cam/a", instance_id="x")
+    node = executor.nodes[0]
+
+    barrier = threading.Barrier(8)
+    results = []
+
+    def racer():
+        barrier.wait()
+        results.append(
+            plugin.dispatch("ocr", {"action": "start", "input_topic": "/cam/a",
+                                    "instance_id": "x"})
+        )
+
+    threads = [threading.Thread(target=racer) for _ in range(8)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=5)
+    assert not any(thread.is_alive() for thread in threads)
+
+    assert len(executor.nodes) == 1 and executor.nodes[0] is node
+    assert len(node.subscriptions) == 1
+    live_workers = [t for t in node._worker_threads if t.is_alive()]
+    assert len(live_workers) == 1
+    assert all(r["state"] == "running" for r in results)
+
+    plugin.dispatch("ocr", {"action": "stop"})
+    assert _wait_until(lambda: not node.worker_alive)
+
+
+def test_ocr_start_on_retired_node_is_inert(ocr):
+    """A start that loses the race to stop must not touch the destroyed
+    node: retire() marks it dead under the node lock, and a late start()
+    reports idle without creating a subscription or worker."""
+    plugin, executor, _ = ocr
+    _start_and_wait(plugin, executor, "/cam/a", instance_id="x")
+    node = executor.nodes[0]
+    plugin.dispatch("ocr", {"action": "stop", "instance_id": "x"})
+    assert node.destroyed and node not in executor.nodes
+
+    subscriptions_before = len(node.subscriptions)
+    result = node.start()   # the in-flight start that lost the race
+    assert result["state"] == "idle"
+    assert len(node.subscriptions) == subscriptions_before
+    assert not node.worker_alive

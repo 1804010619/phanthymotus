@@ -159,11 +159,27 @@ class _OCRNode(Node):
         self._stop_event.set()
         self._generation = 0
         self._worker_threads: list[threading.Thread] = []
+        # Serializes start/stop/retire on this node. The plugin calls these
+        # outside its _state_lock, so without a per-node lock two concurrent
+        # starts could both pass the running check and overwrite each other's
+        # stop event / frame slot (obstacle's node has carried this lock from
+        # the start; same pattern here).
+        self._node_lock = threading.RLock()
+        self._retired = False
         self._log_gate = SampledLogGate(every=100)
         self._last_error_log_at: float | None = None
         log.info(f"[ocr] node created: subscribing={self._input_topic}, publishing={self._output_topic}")
 
     def start(self) -> dict:
+        with self._node_lock:
+            return self._start_locked()
+
+    def _start_locked(self) -> dict:
+        if self._retired:
+            # A concurrent stop retired (destroyed) this node between the
+            # plugin registering it and this call; report idle without
+            # touching the destroyed rclpy handle.
+            return self._status_dict()
         if self.state == "running":
             return self._status_dict()
 
@@ -196,25 +212,37 @@ class _OCRNode(Node):
         return self._status_dict()
 
     def stop(self) -> dict:
-        self.state = "idle"
-        self._stop_event.set()
-        self._frames.close()  # drops the pending frame and wakes the worker
-        deadline = time.monotonic() + 3.0
-        for thread in self._worker_threads:
-            if thread.is_alive():
-                thread.join(timeout=max(0.0, deadline - time.monotonic()))
-        self._worker_threads = [
-            thread for thread in self._worker_threads if thread.is_alive()
-        ]
-        if self._worker_threads:
-            log.warning(
-                "[ocr] %d worker(s) still stopping after timeout: %s",
-                len(self._worker_threads),
-                self._input_topic,
-            )
+        with self._node_lock:
+            self.state = "idle"
+            self._stop_event.set()
+            self._frames.close()  # drops the pending frame and wakes the worker
+            deadline = time.monotonic() + 3.0
+            for thread in self._worker_threads:
+                if thread.is_alive():
+                    thread.join(timeout=max(0.0, deadline - time.monotonic()))
+            self._worker_threads = [
+                thread for thread in self._worker_threads if thread.is_alive()
+            ]
+            if self._worker_threads:
+                log.warning(
+                    "[ocr] %d worker(s) still stopping after timeout: %s",
+                    len(self._worker_threads),
+                    self._input_topic,
+                )
 
-        log.info(f"[ocr] stopped: {self._input_topic}")
-        return {"state": "idle"}
+            log.info(f"[ocr] stopped: {self._input_topic}")
+            return {"state": "idle"}
+
+    def retire(self) -> dict:
+        """Stop the node and mark it dead-for-good before it is destroyed.
+
+        Set the flag and stop under one lock acquisition, so a start()
+        waiting on the lock cannot run between them and revive a worker on a
+        node that is about to be destroyed.
+        """
+        with self._node_lock:
+            self._retired = True
+            return self.stop()
 
     @property
     def worker_alive(self) -> bool:
@@ -463,7 +491,10 @@ class OCRPlugin:
     def _dispose(self, node_key: str, node: "_OCRNode") -> None:
         """Stop and fully destroy one node (worker, executor entry, handle)."""
         try:
-            node.stop()
+            # retire (not plain stop): marks the node dead under its lock so
+            # an in-flight start that lost the race reports idle instead of
+            # creating a subscription/worker on the destroyed handle.
+            node.retire()
         finally:
             dispose_node(self._executor, node, label=f"ocr/{node_key}")
         log.info(f"[ocr] node disposed: {node_key}")
