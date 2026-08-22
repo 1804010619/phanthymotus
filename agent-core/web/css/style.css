@@ -4240,7 +4240,13 @@ html, body {
   text-align: center;
   color: var(--text-dim);
   font-size: 13px;
-  padding: 40px 0;
+  line-height: 1.8;
+  padding: 40px 24px;
+}
+/* 空态里的按钮独占一行并居中，别和说明文字挤在一起 */
+.skill-empty .skill-btn {
+  display: block;
+  margin: 18px auto 0;
 }
 .skill-empty.hidden { display: none; }
 
@@ -7119,7 +7125,14 @@ html, body {
 .topbar-account-badge.hidden { display: none; }
 
 .account-modal { width: 480px; }
-.account-modal-body { padding: 18px 24px 22px; }
+/* 必须自己声明滚动：.modal 是 max-height:88vh + overflow:hidden，body 不滚动的话
+   超出的内容会被直接裁掉（表现为最后一行文字被切、看不到下边距）。
+   .skill-modal-body / .reset-modal .modal-body 也都是各自声明的。 */
+.account-modal-body {
+  padding: 18px 24px 26px;
+  overflow-y: auto;
+  flex: 1;
+}
 
 .account-notice {
   margin-bottom: 14px;
@@ -7292,7 +7305,8 @@ html, body {
   white-space: nowrap;
 }
 .account-hint {
-  margin: 10px 0 0;
+  /* 最后一个元素，和容器下边界之间要留出呼吸感（否则贴着描边） */
+  margin: 14px 0 2px;
   font-size: 11px;
   line-height: 1.7;
   color: var(--text-dim);

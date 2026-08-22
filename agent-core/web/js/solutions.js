@@ -603,7 +603,7 @@ async function _loadSavePanel() {
   if (!isRcLoggedIn()) {
     panel.innerHTML = `
       <div class="skill-empty">
-        发布解决方案需要先登录 Resource Center。<br>
+        发布解决方案需要先登录 Resource Center。
         <button class="skill-btn skill-btn-primary" id="sol-goto-login">去「我的」登录</button>
       </div>`;
     panel.querySelector('#sol-goto-login').addEventListener('click', () => showAccount());
