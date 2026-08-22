@@ -80,9 +80,24 @@ def _get_rc_token(request: fastapi.Request) -> Optional[str]:
     return request.headers.get('x-rc-token')
 
 
+def _rc_error(status: int, error: str) -> str:
+    """Resource Center 报错中文化。鉴权类的原文是 Unauthorized，用户看不懂。"""
+    from api.account import normalize_rc_error
+    return normalize_rc_error(status, error)
+
+
+_UNAUTHORIZED = '未登录或登录已过期，请在「我的」中登录'
+
+
 async def _rc_request(method: str, path: str, token: Optional[str] = None,
                       json_body: Any = None, timeout: float = 20) -> dict:
-    """向 Resource Center 发一个请求，返回 {'ok', 'status', 'data'|'error'}。"""
+    """向 Resource Center 发一个请求。
+
+    返回 {'ok', 'status', 'data'|'error', 'payload'}。`data` 是 RC 的 `data`
+    字段（大多数端点的约定），`payload` 是整个响应体 —— 登录与 session 这类
+    端点把结果放在顶层（`{ok, token, userId}` / `{ok, user}`），调用方要自己从
+    payload 里取。
+    """
     url = f'{_get_rc_url()}{path}'
     headers = {'Content-Type': 'application/json'}
     if token:
@@ -94,14 +109,16 @@ async def _rc_request(method: str, path: str, token: Optional[str] = None,
             try:
                 data = resp.json()
             except Exception:
-                return {'ok': False, 'status': resp.status_code,
+                return {'ok': False, 'status': resp.status_code, 'payload': {},
                         'error': f'Resource Center 返回了非 JSON 响应 (HTTP {resp.status_code})'}
             if resp.status_code in (200, 201) and data.get('ok'):
-                return {'ok': True, 'status': resp.status_code, 'data': data.get('data')}
-            return {'ok': False, 'status': resp.status_code,
+                return {'ok': True, 'status': resp.status_code,
+                        'data': data.get('data'), 'payload': data}
+            return {'ok': False, 'status': resp.status_code, 'payload': data,
                     'error': data.get('error', f'请求失败 (HTTP {resp.status_code})')}
     except Exception as e:
-        return {'ok': False, 'status': 502, 'error': f'无法连接 Resource Center: {e}'}
+        return {'ok': False, 'status': 502, 'payload': {},
+                'error': f'无法连接 Resource Center: {e}'}
 
 
 def _core_version() -> str:
@@ -754,7 +771,7 @@ async def publish(request: fastapi.Request, req: PublishRequest):
     """打包并作为草稿推到 Resource Center（之后由作者提交审核）。"""
     token = _get_rc_token(request)
     if not token:
-        return {'code': 401, 'error': '未登录 Resource Center'}
+        return {'code': 401, 'error': _UNAUTHORIZED}
 
     built = await _build_payload(
         PackRequest(include=req.include, extra_redact=req.extra_redact), token)
@@ -771,7 +788,8 @@ async def publish(request: fastapi.Request, req: PublishRequest):
     }
     result = await _rc_request('POST', '/api/solutions/mine', token, body, timeout=60)
     if not result['ok']:
-        return {'code': result['status'], 'error': result['error']}
+        return {'code': result['status'],
+                'error': _rc_error(result['status'], result['error'])}
     return {'code': 200, 'data': result['data']}
 
 
@@ -788,7 +806,7 @@ class LoadRequest(BaseModel):
 
 
 async def _load_solution(req: LoadRequest, token: Optional[str]) -> dict:
-    """取回要载入的方案：优先用请求里带的 payload，否则按 slug 拉 RC。"""
+    """取回要载入的方案：优先用请求里带的 payload，否则按 slug 拉 Resource Center。"""
     if req.payload:
         return {'ok': True, 'solution': {
             'slug':     req.slug,
@@ -1122,38 +1140,41 @@ def _apply_tasks(tasks: list) -> dict:
 
 @router.get('/rc/mine')
 async def rc_my_solutions(request: fastapi.Request):
-    """代理获取用户在 RC 上的解决方案列表。"""
+    """代理获取用户在 Resource Center 上的解决方案列表。"""
     token = _get_rc_token(request)
     if not token:
-        return {'code': 401, 'error': '未登录 Resource Center'}
+        return {'code': 401, 'error': _UNAUTHORIZED}
     result = await _rc_request('GET', '/api/solutions/mine', token)
     if not result['ok']:
-        return {'code': result['status'], 'error': result['error']}
+        return {'code': result['status'],
+                'error': _rc_error(result['status'], result['error'])}
     return {'code': 200, 'data': result['data']}
 
 
 @router.put('/rc/mine/{solution_id}')
 async def rc_update_solution(solution_id: str, request: fastapi.Request,
                              body: dict = fastapi.Body(...)):
-    """代理更新 RC 上的解决方案（只改展示信息）。"""
+    """代理更新 Resource Center 上的解决方案（只改展示信息）。"""
     token = _get_rc_token(request)
     if not token:
-        return {'code': 401, 'error': '未登录 Resource Center'}
+        return {'code': 401, 'error': _UNAUTHORIZED}
     result = await _rc_request('PUT', f'/api/solutions/mine/{solution_id}', token, body)
     if not result['ok']:
-        return {'code': result['status'], 'error': result['error']}
+        return {'code': result['status'],
+                'error': _rc_error(result['status'], result['error'])}
     return {'code': 200, 'data': result['data']}
 
 
 @router.delete('/rc/mine/{solution_id}')
 async def rc_delete_solution(solution_id: str, request: fastapi.Request):
-    """代理删除 RC 上的解决方案。"""
+    """代理删除 Resource Center 上的解决方案。"""
     token = _get_rc_token(request)
     if not token:
-        return {'code': 401, 'error': '未登录 Resource Center'}
+        return {'code': 401, 'error': _UNAUTHORIZED}
     result = await _rc_request('DELETE', f'/api/solutions/mine/{solution_id}', token)
     if not result['ok']:
-        return {'code': result['status'], 'error': result['error']}
+        return {'code': result['status'],
+                'error': _rc_error(result['status'], result['error'])}
     return {'code': 200, 'data': {'id': solution_id}}
 
 
@@ -1162,11 +1183,12 @@ async def rc_submit_solution(solution_id: str, request: fastapi.Request):
     """代理提交解决方案送审。"""
     token = _get_rc_token(request)
     if not token:
-        return {'code': 401, 'error': '未登录 Resource Center'}
+        return {'code': 401, 'error': _UNAUTHORIZED}
     result = await _rc_request('POST', f'/api/solutions/mine/{solution_id}/submit',
                                token, {})
     if not result['ok']:
-        return {'code': result['status'], 'error': result['error']}
+        return {'code': result['status'],
+                'error': _rc_error(result['status'], result['error'])}
     return {'code': 200, 'data': result['data']}
 
 
@@ -1185,7 +1207,8 @@ async def market(search: str = '', industry: str = 'all', limit: int = 20):
         params.append(f'industry={industry}')
     result = await _rc_request('GET', f'/api/solutions?{"&".join(params)}')
     if not result['ok']:
-        return {'code': result['status'], 'error': result['error']}
+        return {'code': result['status'],
+                'error': _rc_error(result['status'], result['error'])}
     return {'code': 200, 'data': result['data']}
 
 
@@ -1195,5 +1218,6 @@ async def market_detail(slug: str, request: fastapi.Request):
     result = await _rc_request('GET', f'/api/solutions/{slug}',
                                _get_rc_token(request), timeout=60)
     if not result['ok']:
-        return {'code': result['status'], 'error': result['error']}
+        return {'code': result['status'],
+                'error': _rc_error(result['status'], result['error'])}
     return {'code': 200, 'data': result['data']}

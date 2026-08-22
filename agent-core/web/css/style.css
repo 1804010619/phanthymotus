@@ -6844,45 +6844,9 @@ html, body {
 
 
 /* ══════════════════════════════════════════════════════════════════════════
-   Solutions — 解决方案（左上角入口 + 当前方案 / 市场 / 保存）
+   Solutions — 解决方案（入口在「我的」里 + 当前方案 / 市场 / 保存）
    复用 .skill-* 的 modal / card / button 语言，这里只加方案特有的部件。
    ══════════════════════════════════════════════════════════════════════════ */
-
-.solution-entry-btn {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  margin-left: 10px;
-  padding: 5px 10px;
-  max-width: 260px;
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
-  background: var(--bg-card);
-  color: var(--text-muted);
-  font-size: 12px;
-  font-weight: 500;
-  cursor: pointer;
-  transition: border-color .15s, color .15s, background .15s;
-}
-.solution-entry-btn:hover {
-  border-color: var(--accent);
-  color: var(--accent);
-  background: var(--accent-dim);
-}
-.solution-entry-label { white-space: nowrap; }
-.solution-entry-badge {
-  max-width: 110px;
-  padding: 1px 6px;
-  border-radius: 999px;
-  background: var(--accent-dim);
-  color: var(--accent);
-  font-size: 10px;
-  font-weight: 600;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-.solution-entry-badge.hidden { display: none; }
 
 .solution-modal { width: 680px; }
 .solution-load-modal {
@@ -7109,10 +7073,10 @@ html, body {
   color: var(--text-muted);
 }
 
-/* 中等宽度下 topbar 挤，入口收成纯图标（角标保留，用户还需要知道载入了什么） */
+/* 中等宽度下 topbar 挤，「我的」收成纯图标（角标里的账号名先省略） */
 @media (max-width: 1100px) {
-  .solution-entry-label { display: none; }
-  .solution-entry-badge { max-width: 72px; }
+  .topbar-account-btn > span:not(.topbar-account-badge) { display: none; }
+  .topbar-account-badge { max-width: 72px; }
 }
 
 /* 载入弹窗里的容器版本格挡：本机 tag → 方案 tag */
@@ -7132,3 +7096,220 @@ html, body {
   color: var(--yellow);
 }
 .solution-ver-unknown { color: var(--text-dim); }
+
+/* ══════════════════════════════════════════════════════════════════════════
+   我的（账号）—— 顶栏按钮 + 桌面 modal + 移动端整页面板
+   桌面与移动共用 .account-content 里的同一份 HTML（js/account.js 渲染），
+   所以这里的样式不区分端，只在移动端断点里放大触摸目标。
+   ══════════════════════════════════════════════════════════════════════════ */
+
+.topbar-account-btn { position: relative; }
+.topbar-account-badge {
+  max-width: 110px;
+  padding: 1px 6px;
+  border-radius: 999px;
+  background: var(--accent-dim);
+  color: var(--accent);
+  font-size: 10px;
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.topbar-account-badge.hidden { display: none; }
+
+.account-modal { width: 480px; }
+.account-modal-body { padding: 18px 24px 22px; }
+
+.account-notice {
+  margin-bottom: 14px;
+  padding: 9px 12px;
+  border: 1px solid var(--yellow);
+  border-radius: var(--radius-sm);
+  background: var(--yellow-bg);
+  font-size: 12px;
+  color: var(--yellow);
+}
+
+.account-card {
+  padding: 16px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-card);
+}
+.account-card-signed {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+.account-card-head {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 14px;
+}
+.account-avatar {
+  flex: 0 0 40px;
+  width: 40px;
+  height: 40px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 50%;
+  background: var(--accent);
+  color: #fff;
+  font-size: 16px;
+  font-weight: 600;
+}
+.account-avatar-empty {
+  background: var(--bg-input);
+  color: var(--text-dim);
+}
+.account-identity { flex: 1; min-width: 0; }
+.account-identity-name {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.account-identity-sub,
+.account-identity-meta {
+  margin-top: 3px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  color: var(--text-dim);
+  flex-wrap: wrap;
+}
+.account-role {
+  padding: 1px 6px;
+  border-radius: 999px;
+  background: var(--accent-dim);
+  color: var(--accent);
+  font-weight: 600;
+}
+.account-id {
+  font-family: var(--font-mono);
+  max-width: 150px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.account-copy-btn {
+  border: none;
+  background: none;
+  padding: 0;
+  color: var(--accent);
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.account-form {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.account-form input {
+  height: 38px;
+  padding: 0 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg);
+  color: var(--text);
+  font-size: 13px;
+  outline: none;
+}
+.account-form input:focus { border-color: var(--accent); }
+.account-form-error {
+  margin: 0;
+  font-size: 11px;
+  color: var(--red);
+}
+.account-submit-btn {
+  height: 40px;
+  border: none;
+  border-radius: var(--radius-sm);
+  background: var(--accent);
+  color: #fff;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+}
+.account-submit-btn:disabled { opacity: .6; cursor: default; }
+/* 一行只放一件事，且居中：三项 space-between 会把"注册"甩到左右之间的随机位置 */
+.account-switch {
+  margin-top: 12px;
+  text-align: center;
+  font-size: 11px;
+  color: var(--text-dim);
+}
+.account-web-link {
+  margin-top: 6px;
+  padding-top: 8px;
+  border-top: 1px solid var(--border);
+  text-align: center;
+}
+.account-link {
+  border: none;
+  background: none;
+  padding: 0;
+  color: var(--accent);
+  font-size: 11px;
+  cursor: pointer;
+  text-decoration: none;
+}
+
+.account-section-label {
+  margin: 18px 0 8px;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: .1em;
+  text-transform: uppercase;
+  color: var(--text-dim);
+}
+/* 桌面 modal 里的入口行比移动端的 52px 紧一些 */
+.account-entry-list .settings-item {
+  padding: 12px 14px;
+  min-height: 0;
+  font-size: 13px;
+}
+.settings-item-text {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+  text-align: left;
+}
+.settings-item-sub {
+  font-size: 11px;
+  font-weight: 400;
+  color: var(--text-dim);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.account-hint {
+  margin: 10px 0 0;
+  font-size: 11px;
+  line-height: 1.7;
+  color: var(--text-dim);
+}
+
+@media (max-width: 768px) {
+  /* 移动端是整页面板，触摸目标放大回 52px（与设置列表一致） */
+  .account-entry-list .settings-item {
+    padding: 14px 18px;
+    min-height: 52px;
+    font-size: 15px;
+  }
+  .account-card { padding: 18px 16px; }
+  .account-form input { height: 44px; font-size: 15px; }
+  .account-submit-btn { height: 46px; font-size: 15px; }
+  .account-id { max-width: 40vw; }
+}
+
+/* 「我的」tab 上的圆点表示"已登录"，不是未读/告警，所以不用 .tabbar-badge 的红色 */
+#account-tab-badge { background: var(--accent); }

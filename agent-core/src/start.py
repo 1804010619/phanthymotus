@@ -454,6 +454,9 @@ app_api.include_router(api.agent_definition.router)
 import api.skills
 app_api.include_router(api.skills.router)
 
+import api.account
+app_api.include_router(api.account.router)
+
 import api.solutions
 app_api.include_router(api.solutions.router)
 

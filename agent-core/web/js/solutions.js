@@ -1,7 +1,7 @@
 /**
  * solutions.js — 解决方案：查看当前方案 / 方案市场载入 / 打包保存。
  *
- * 入口在左上角品牌区旁边（index.html 的 #btn-solutions）。
+ * 入口在「我的」里（js/account.js），它点的是隐藏的 #btn-solutions。
  *
  * 包体格式与"为什么卡片用 deviceRef 而不是 mcpId"见 src/api/solutions.py 顶部注释。
  * 这里只负责三件事：
@@ -12,6 +12,7 @@
 
 import { openInstanceConfigModal, openToolConfigModal } from './sidebar.js';
 import { reloadFromServer } from './canvas.js';
+import { isRcLoggedIn, rcHeaders, rcFetch, showAccount, refreshAccount } from './account.js';
 
 // 与 resource-center/lib/solution.ts 的 INDUSTRIES 保持一致
 const INDUSTRIES = [
@@ -41,16 +42,6 @@ let _marketCache = [];
 let _packable = null;
 let _loadTarget = null;   // 待载入的方案 {slug, name, ...}
 let _alignVersions = false;  // 载入时是否把相关容器对齐到方案记录的 tag
-
-// ── RC 登录态（与 skills.js 共用 localStorage 里的 rc_token）───────────────
-
-function _rcToken() { return localStorage.getItem('rc_token'); }
-function _rcHeaders() {
-  const h = { 'Content-Type': 'application/json' };
-  const token = _rcToken();
-  if (token) h['X-RC-Token'] = token;
-  return h;
-}
 
 // ── Init ─────────────────────────────────────────────────────────────────────
 
@@ -104,19 +95,12 @@ export function hide() {
   _overlay.classList.add('hidden');
 }
 
-/** 左上角入口上的当前方案角标。 */
-async function _syncEntryBadge() {
-  const badge = document.getElementById('solution-entry-badge');
-  if (!badge) return;
-  try {
-    const data = (await (await fetch('/api/solutions/current')).json()).data;
-    if (data && data.name) {
-      badge.textContent = data.name;
-      badge.classList.remove('hidden');
-    } else {
-      badge.classList.add('hidden');
-    }
-  } catch { badge.classList.add('hidden'); }
+/**
+ * 当前方案的展示位在「我的」里（解决方案条目的副文本），载入 / 清除后刷新它。
+ * 顶栏原来那个角标随入口按钮一起收进了「我的」。
+ */
+function _syncEntryBadge() {
+  refreshAccount();
 }
 
 // ── Tab 1：当前方案 ─────────────────────────────────────────────────────────
@@ -285,7 +269,7 @@ function _sessionId() { return sessionStorage.getItem('canvas_session_id') || ''
 
 async function _preflight(slug) {
   const res = await fetch('/api/solutions/preflight', {
-    method: 'POST', headers: _rcHeaders(),
+    method: 'POST', headers: rcHeaders(),
     body: JSON.stringify({ slug, session_id: _sessionId() }),
   });
   return res.json();
@@ -519,7 +503,7 @@ async function _confirmLoad() {
 
     confirmBtn.textContent = '载入中…';
     const res = await fetch('/api/solutions/apply', {
-      method: 'POST', headers: _rcHeaders(),
+      method: 'POST', headers: rcHeaders(),
       body: JSON.stringify({
         slug: _loadTarget.slug, confirm: true, session_id: _sessionId(),
         align_versions: _alignVersions,
@@ -571,7 +555,7 @@ async function _alignAllVersions(statusBtn) {
     let json;
     try {
       const res = await fetch('/api/solutions/align-device', {
-        method: 'POST', headers: _rcHeaders(),
+        method: 'POST', headers: rcHeaders(),
         body: JSON.stringify({ slug: _loadTarget.slug, ref }),
       });
       json = await res.json();
@@ -616,18 +600,19 @@ async function _loadSavePanel() {
   const panel = document.getElementById('solution-save-panel');
   panel.innerHTML = `<div class="skill-empty">加载中…</div>`;
 
-  if (!_rcToken()) {
+  if (!isRcLoggedIn()) {
     panel.innerHTML = `
       <div class="skill-empty">
         发布解决方案需要先登录 Resource Center。<br>
-        请到「设置 → 技能 → 我的技能」登录后再回到这里。
+        <button class="skill-btn skill-btn-primary" id="sol-goto-login">去「我的」登录</button>
       </div>`;
+    panel.querySelector('#sol-goto-login').addEventListener('click', () => showAccount());
     return;
   }
 
   let data;
   try {
-    const json = await (await fetch('/api/solutions/packable', { headers: _rcHeaders() })).json();
+    const json = await (await fetch('/api/solutions/packable', { headers: rcHeaders() })).json();
     if (json.code !== 200) {
       panel.innerHTML = `<div class="skill-empty">${_esc(json.error || '读取失败')}</div>`;
       return;
@@ -817,15 +802,14 @@ async function _publish() {
   btn.disabled = true;
   btn.textContent = '发布中…';
   try {
-    const res = await fetch('/api/solutions/publish', {
-      method: 'POST', headers: _rcHeaders(),
+    const json = await rcFetch('/api/solutions/publish', {
+      method: 'POST',
       body: JSON.stringify({
         meta,
         include: _collectInclude(),
         extra_redact: [...panel.querySelectorAll('.sol-redact:checked')].map(el => el.value),
       }),
     });
-    const json = await res.json();
     if (json.code !== 200) {
       const detail = json.detail ? `（${[].concat(json.detail).join('、')}）` : '';
       errorEl.textContent = `${json.error || '发布失败'}${detail}`;
