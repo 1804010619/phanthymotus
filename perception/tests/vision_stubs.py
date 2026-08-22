@@ -30,9 +30,15 @@ class _FakePublisher:
     def __init__(self, topic):
         self.topic = topic
         self.messages = []
+        # TTS gates each utterance on a matched reader; tests that do not care
+        # about the gate get a reader by default.
+        self.subscription_count = 1
 
     def publish(self, msg):
         self.messages.append(msg.data)
+
+    def get_subscription_count(self):
+        return self.subscription_count
 
 
 class _FakeSubscription:
@@ -68,6 +74,17 @@ class _FakeNode:
     def destroy_node(self):
         self.destroyed = True
 
+    def get_clock(self):
+        return _FakeClock()
+
+
+class _FakeClock:
+    def now(self):
+        return self
+
+    def to_msg(self):
+        return 0
+
 
 class _FakeExecutor:
     def __init__(self):
@@ -89,6 +106,15 @@ class _FakeCompressedImage:
     def __init__(self, data: bytes, fmt="jpeg"):
         self.data = data
         self.format = fmt
+
+
+class _FakeAudioChunk:
+    """Stands in for audio_msgs.msg.AudioChunk (built from a ROS .msg on device)."""
+
+    def __init__(self):
+        self.header = types.SimpleNamespace(stamp=None)
+        self.format = ""
+        self.data = []
 
 
 def _install_fake_ros():
@@ -114,10 +140,14 @@ def _install_fake_ros():
     std_msgs = types.ModuleType("std_msgs")
     std_msgs_msg = types.ModuleType("std_msgs.msg")
     std_msgs_msg.String = _FakeString
+    audio_msgs = types.ModuleType("audio_msgs")
+    audio_msgs_msg = types.ModuleType("audio_msgs.msg")
+    audio_msgs_msg.AudioChunk = _FakeAudioChunk
     for name, module in {
         "rclpy": rclpy, "rclpy.node": node_mod, "rclpy.qos": qos_mod,
         "sensor_msgs": sensor_msgs, "sensor_msgs.msg": sensor_msgs_msg,
         "std_msgs": std_msgs, "std_msgs.msg": std_msgs_msg,
+        "audio_msgs": audio_msgs, "audio_msgs.msg": audio_msgs_msg,
     }.items():
         sys.modules[name] = module
 

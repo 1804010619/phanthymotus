@@ -1,5 +1,7 @@
 # ── Jetson GPU variant ──────────────────────────────────────────────
 # Base: jetson-base:jp511-torch (torch 2.0 + torchvision 0.15 with CUDA)
+# JP_VERSION selects the corresponding Jetson base; TensorRT plans are loaded
+# only when the runtime target matches the host TensorRT major version.
 #
 # Build context: repo root (phanthy-motus/) so we can access both
 # src/perception_stack/ and deploy/ros-base/audio_msgs/
@@ -11,8 +13,10 @@
 ARG PYPI_MIRROR=https://pypi.tuna.tsinghua.edu.cn/simple/
 ARG APT_MIRROR=mirrors.tuna.tsinghua.edu.cn
 ARG JP_VERSION=511
+ARG ENABLE_VITS2_TRT=1
+
 FROM bj-warehouse.tencentcloudcr.com/phanthy-motus/jetson-base:jp${JP_VERSION}-torch
-ARG PYPI_MIRROR APT_MIRROR JP_VERSION
+ARG PYPI_MIRROR APT_MIRROR JP_VERSION ENABLE_VITS2_TRT
 
 # ── APT mirror (conditional) ─────────────────────────────────────
 RUN if [ -n "${APT_MIRROR}" ]; then \
@@ -149,12 +153,38 @@ RUN mv /usr/sbin/ldconfig /usr/sbin/ldconfig.real && \
     rm -rf /var/lib/apt/lists/*
 RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} phonemizer
 
+# ── VITS2 TTS frontend deps ───────────────────────────────────────
+# The model release contains compiled TN FSTs; the container executes them with
+# WeText/kaldifst and does not build Pynini.
+#
+# numpy is NOT pinned in the requirements file: the OCR layer above already
+# pins it to whatever each JetPack's torch/cv2 stack ships, and a second pin
+# here would silently downgrade it (jp61 1.26.4 → 1.24.4, jp511 1.24.4 →
+# 1.23.5), breaking the numpy C-ABI those wheels were built against. The same
+# NUMPY_VERSION is re-stated on this pip invocation, and asserted afterwards,
+# so a transitive requirement of wetext/g2p-en/nltk cannot move it either.
+COPY perception/plugins/vits2_tts_trt/requirements.jetson.txt /tmp/vits2-requirements.txt
+RUN if [ "${ENABLE_VITS2_TRT}" = "1" ]; then \
+      if [ "${JP_VERSION}" = "61" ]; then NUMPY_VERSION=1.26.4; else NUMPY_VERSION=1.24.4; fi; \
+      pip3 install --no-cache-dir -i "${PYPI_MIRROR}" \
+        "numpy==${NUMPY_VERSION}" -r /tmp/vits2-requirements.txt && \
+      python3 -c "import kaldifst, numpy; assert numpy.__version__ == '${NUMPY_VERSION}', numpy.__version__"; \
+    fi && rm -f /tmp/vits2-requirements.txt
+COPY perception/plugins/vits2_tts_trt/requirements.jetson.txt /tmp/vits2-requirements.txt
+RUN if [ "${ENABLE_VITS2_TRT}" = "1" ]; then \
+      if [ "${JP_VERSION}" = "61" ]; then NUMPY_VERSION=1.26.4; else NUMPY_VERSION=1.24.4; fi; \
+      pip3 install --no-cache-dir -i "${PYPI_MIRROR}" \
+        "numpy==${NUMPY_VERSION}" -r /tmp/vits2-requirements.txt && \
+      python3 -c "import kaldifst, numpy; assert numpy.__version__ == '${NUMPY_VERSION}', numpy.__version__"; \
+    fi && rm -f /tmp/vits2-requirements.txt
+
 # ── Application code ───────────────────────────────────────────────
 WORKDIR /work
 COPY perception/main.py    /work/main.py
 COPY perception/plugins/   /work/plugins/
 COPY perception/utils/     /work/utils/
 COPY perception/config.yaml /work/config.yaml
+COPY perception/deploy/    /deploy/
 
 EXPOSE 15720
 EXPOSE 15721

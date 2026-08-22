@@ -614,3 +614,82 @@ def test_require_models_subpath_rejects_symlink_escape(tmp_path):
     assert require_models_subpath(str(root / "new" / "bundle"), root=str(root)) == str(
         root.resolve() / "new" / "bundle"
     )
+
+
+def test_ensure_model_publishes_check_file_only_when_complete(tmp_path, monkeypatch):
+    """A concurrent reader must never see a half-written model.
+
+    ensure_model used to urlretrieve() straight onto check_file, so a second
+    caller saw the file the moment the transfer began and loaded a truncated
+    model — on device: "Load model from .../vocos-16khz-univ.onnx failed:
+    Protobuf parsing failed" while the log showed that file still at 30%.
+    """
+    from utils import model_downloader
+
+    model_dir = tmp_path / "sherpa"
+    check_file = "vocos-16khz-univ.onnx"
+    seen_midway = []
+
+    def fake_urlretrieve(url, dest, reporthook=None):
+        # Mid-transfer: whatever a parallel caller can see must not be the
+        # check_file, and the partial bytes must live somewhere else.
+        with open(dest, "wb") as handle:
+            handle.write(b"partial")
+            handle.flush()
+        seen_midway.append(sorted(p.name for p in model_dir.iterdir()))
+        with open(dest, "wb") as handle:
+            handle.write(b"complete-onnx-payload")
+
+    monkeypatch.setattr(model_downloader, "urlretrieve", fake_urlretrieve)
+    monkeypatch.setitem(
+        model_downloader.MODELS, "tts_vocoder",
+        {"url": "https://example.invalid/vocos.onnx", "check_file": check_file,
+         "single_file": True},
+    )
+
+    model_downloader.ensure_model("tts_vocoder", str(model_dir))
+
+    assert check_file not in seen_midway[0], seen_midway[0]
+    assert (model_dir / check_file).read_bytes() == b"complete-onnx-payload"
+    # No .part leftovers.
+    assert not [p.name for p in model_dir.iterdir() if p.name.endswith(".part")]
+
+
+def test_ensure_model_archive_is_published_atomically(tmp_path, monkeypatch):
+    """Same guarantee for the archive path: extract to staging, then move in."""
+    import tarfile
+    from utils import model_downloader
+
+    model_dir = tmp_path / "asr"
+    archive = tmp_path / "src.tar.bz2"
+    payload = tmp_path / "build"
+    (payload / "sub").mkdir(parents=True)
+    (payload / "tokens.txt").write_text("tokens")
+    (payload / "sub" / "encoder.onnx").write_bytes(b"weights")
+    with tarfile.open(archive, "w:bz2") as handle:
+        handle.add(payload / "tokens.txt", arcname="model/tokens.txt")
+        handle.add(payload / "sub" / "encoder.onnx", arcname="model/sub/encoder.onnx")
+
+    seen_midway = []
+
+    def fake_urlretrieve(url, dest, reporthook=None):
+        seen_midway.append(sorted(p.name for p in model_dir.iterdir()))
+        with open(archive, "rb") as src, open(dest, "wb") as out:
+            out.write(src.read())
+
+    monkeypatch.setattr(model_downloader, "urlretrieve", fake_urlretrieve)
+    monkeypatch.setitem(
+        model_downloader.MODELS, "asr",
+        {"url": "https://example.invalid/asr.tar.bz2", "check_file": "tokens.txt"},
+    )
+
+    model_downloader.ensure_model("asr", str(model_dir))
+
+    assert "tokens.txt" not in seen_midway[0]
+    assert (model_dir / "tokens.txt").read_text() == "tokens"
+    assert (model_dir / "sub" / "encoder.onnx").read_bytes() == b"weights"
+
+    # Second call is a no-op that does not re-download.
+    seen_midway.clear()
+    model_downloader.ensure_model("asr", str(model_dir))
+    assert seen_midway == []
