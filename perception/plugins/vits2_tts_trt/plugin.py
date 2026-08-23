@@ -728,6 +728,15 @@ class TTSPlugin:
             adapter_state = self._adapter_state
             pending = bool(self._pending_starts)
             error = self._load_error
+            # An instance that started while the model loads has no node yet, and
+            # info is routinely called without input_topic (Agent Core's start
+            # sequencer does). Remembering the topic the pending start asked for
+            # is what keeps the reported output topic real instead of the
+            # /perception/tts fallback — and that reported topic is what the
+            # dashboard subscribes to for its waveform. Same reason ocr.py keeps
+            # its _pending_starts lookup.
+            if instance_id and node is None and not input_topic:
+                input_topic = self._pending_starts.get(instance_id, "")
 
         if instance_id and node is not None:
             state = node.state

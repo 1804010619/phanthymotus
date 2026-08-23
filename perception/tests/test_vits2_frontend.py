@@ -15,6 +15,7 @@ or from the repo, with a release under /models/vits2:
 
 from __future__ import annotations
 
+import importlib.util
 import os
 from pathlib import Path
 
@@ -24,10 +25,19 @@ import vision_stubs  # noqa: F401  (installs ROS stubs, puts perception on sys.p
 
 MODEL_DIR = Path(os.getenv("VITS2_MODEL_DIR", "/models/vits2"))
 
-pytest.importorskip("jieba", reason="VITS2 frontend dependency")
-pytest.importorskip("pypinyin", reason="VITS2 frontend dependency")
-pytest.importorskip("wetext", reason="VITS2 frontend dependency")
-pytest.importorskip("g2p_en", reason="VITS2 frontend dependency")
+# Presence is checked with find_spec, never by importing: on Python 3.8 `import
+# wetext` fails until wetext_compat has patched importlib.resources.files (which
+# frontend/fst_tn.py does before it touches wetext), and importing g2p_en calls
+# nltk.download() unless nltk.data.path already points at the release. Both
+# orderings belong to the frontend package — a test must not front-run them.
+_MISSING = [
+    name for name in
+    ("jieba", "pypinyin", "wetext", "kaldifst", "g2p_en", "inflect", "nltk")
+    if importlib.util.find_spec(name) is None
+]
+if _MISSING:
+    pytest.skip(f"VITS2 frontend dependencies missing: {', '.join(_MISSING)}",
+                allow_module_level=True)
 if not (MODEL_DIR / "tn_cache").is_dir():
     pytest.skip(f"no VITS2 release at {MODEL_DIR}", allow_module_level=True)
 

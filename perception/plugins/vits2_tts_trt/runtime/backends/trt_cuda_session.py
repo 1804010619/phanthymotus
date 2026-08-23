@@ -9,6 +9,8 @@ from pathlib import Path
 
 import numpy as np
 
+from utils.tensorrt_runtime import trt_dtype_to_numpy
+
 
 def _load_cuda_runtime():
     library = ctypes.util.find_library("cudart") or "libcudart.so"
@@ -196,7 +198,13 @@ class TensorRTCudaSession:
         for index in range(self.engine.num_io_tensors):
             name = self.engine.get_tensor_name(index)
             mode = self.engine.get_tensor_mode(name)
-            dtype = np.dtype(trt.nptype(self.engine.get_tensor_dtype(name)))
+            # Not trt.nptype(): TensorRT 8.5's binding maps BOOL through
+            # np.bool, which NumPy removed in 1.24 — so on jp511 (TRT 8.5.2.2 +
+            # numpy 1.24.4) the first engine run dies with AttributeError. The
+            # shared helper resolves the common dtypes itself and only falls
+            # back to nptype() for exotic ones; OCR has relied on it since it
+            # shipped.
+            dtype = trt_dtype_to_numpy(trt, self.engine.get_tensor_dtype(name))
             if mode == trt.TensorIOMode.INPUT:
                 if name not in inputs:
                     raise KeyError(f"Missing TensorRT input {name!r}")

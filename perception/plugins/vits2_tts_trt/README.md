@@ -26,6 +26,44 @@ same pin is passed to this package's install — `requirements.jetson.txt`
 deliberately does not list numpy. See the comment there before adding a
 dependency that wants a different one.
 
+### JetPack 5.1.1 / TensorRT 8
+
+Both lines build from the same source; `ENABLE_VITS2_TRT` defaults to 1. What
+differs on jp511, and what to check when bringing a device up:
+
+- **Python 3.8.** The frontend needs `importlib.resources.files`, which arrived
+  in 3.9 — `requirements.jetson.txt` installs the `importlib_resources`
+  backport under a marker and `frontend/wetext_compat.py` patches it in before
+  WeText loads. Nothing else in the package uses 3.9+ syntax.
+- **One source build.** Every dependency resolves to a cp38 aarch64 wheel
+  except `pyahocorasick` (wetext → contractions → textsearch), which has never
+  published one. The Dockerfile installs `python3-dev` only if `Python.h` is
+  missing, so this compiles during the build — slow under qemu, fine natively.
+- **Compute capability must be 8.7.** The engines are built for Orin
+  (`trtexec 8.5.2.2`, sm87) and `_validate_manifest` refuses a mismatch with
+  `GPU compute capability mismatch`. Orin AGX/NX/Nano are 8.7; a Xavier device
+  (7.2) needs its own plans built on it. Check with
+  `python3 -c "import torch;print(torch.cuda.get_device_capability())"`.
+- **The TensorRT API in use is 8.5+**: `num_io_tensors`, `get_tensor_name`,
+  `get_tensor_mode`, `set_input_shape`, `set_tensor_address`,
+  `get_tensor_shape`, `execute_async_v3`. All present in 8.5.2 — the same
+  name-based API `utils/tensorrt_runtime.py` relies on for OCR.
+- **Memory is the practical limit.** jp511 devices are usually Orin NX 8/16 GB
+  and perception already keeps ASR, VOP (YOLOv8-World) and OCR (TensorRT)
+  resident. VITS2 adds ~54 MB of engines plus a CUDA context. Measure on 8 GB
+  before enabling everything at once.
+- `runtime: nvidia` is required, as on jp61: the L4T base ships zero-length
+  placeholders for the driver libraries and only that runtime mounts the real
+  ones over them (`deploy/service.yml` sets it).
+
+### A landmine worth knowing
+
+`g2p_en` calls `nltk.download()` at **module import** if the corpora are not on
+`nltk.data.path`. `frontend/english.py` therefore inserts the release's
+`nltk_data` directory before importing it, and nothing may import `g2p_en`
+earlier — including build-time checks, which is why the Dockerfile only asserts
+the package is installed rather than importing it.
+
 ## Configure
 
 The engine is a `configSchema` field, so it is visible and switchable in the
