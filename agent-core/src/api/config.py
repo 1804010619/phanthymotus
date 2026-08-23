@@ -136,10 +136,10 @@ async def _do_start_project():
     LOADING_POLL_S = 3
     LOADING_TIMEOUT_S = 900
 
-    def _tool_state(result) -> tuple[str | None, str]:
-        """Pull (state, message) out of an MCP call result of either shape."""
+    def _payload(result) -> dict:
+        """Unwrap an MCP call result of either shape into a dict."""
         if result.get('code') != 200:
-            return None, str(result.get('message') or '')[:200]
+            return {}
         payload = result.get('data')
         if isinstance(payload, list) and payload:
             try:
@@ -151,24 +151,59 @@ async def _do_start_project():
                 payload = _json.loads(payload)
             except Exception:
                 payload = {}
-        if not isinstance(payload, dict):
+        return payload if isinstance(payload, dict) else {}
+
+    def _tool_state(result) -> tuple[str | None, str]:
+        """Pull (state, message) out of an MCP call result of either shape."""
+        if result.get('code') != 200:
+            return None, str(result.get('message') or '')[:200]
+        payload = _payload(result)
+        if not payload:
             return None, ''
         return payload.get('state'), str(
             payload.get('error') or payload.get('message') or payload.get('desc') or ''
         )[:200]
 
-    async def _settle_loading_item(mcp_id: str, tool_name: str, card_id: str) -> None:
+    async def _resolve_and_register(mcp_id: str, tool_name: str, card_id: str,
+                                   info_args: dict) -> dict:
+        """info() the card, register its topic_out on the bus, return the payload.
+
+        info_args carries the input_topic the card was started with: without it a
+        tool that has no live node yet can only report its fallback output topic
+        (perception TTS answers /perception/tts), and that wrong topic is what
+        the dashboard would then subscribe to — no waveform, while audio flows on
+        the real one.
+        """
+        info = await mcp_call_tool(mcp_id, MCPCallRequest(
+            tool=tool_name, arguments={'action': 'info', 'instance_id': card_id,
+                                       **info_args},
+        ))
+        data = _payload(info)
+        topic_out = data.get('topic_out') or []
+        if topic_out:
+            resolved_topics[card_id] = topic_out
+            from api.inspection import register_topic_internal
+            for tp in topic_out:
+                if tp.get('topic') and tp.get('format'):
+                    await register_topic_internal(tp['topic'], tp['format'], mcp_id)
+        return data
+
+    async def _settle_loading_item(mcp_id: str, tool_name: str, card_id: str,
+                                  info_args: dict) -> None:
         """Poll a card that started into `loading` and report its real outcome.
 
         Runs detached: a 60 MB model download must not hold up the other cards,
         and the operator must not be told 已就绪 before the tool can do its job.
+        On success the topics are registered again: they were resolved before the
+        node existed, so only now can the card report the real ones.
         """
         deadline = time.time() + LOADING_TIMEOUT_S
         while time.time() < deadline:
             await _asyncio.sleep(LOADING_POLL_S)
             try:
                 info = await mcp_call_tool(mcp_id, MCPCallRequest(
-                    tool=tool_name, arguments={'action': 'info', 'instance_id': card_id},
+                    tool=tool_name, arguments={'action': 'info', 'instance_id': card_id,
+                                               **info_args},
                 ))
             except Exception as error:
                 print(f'[start-project] {tool_name} info during load failed: {error}')
@@ -189,6 +224,11 @@ async def _do_start_project():
                 return
             status = 'error' if state == 'error' else 'ready'
             print(f'[start-project] {tool_name} ({mcp_id}) settled: {state}')
+            if status == 'ready':
+                try:
+                    await _resolve_and_register(mcp_id, tool_name, card_id, info_args)
+                except Exception as error:
+                    print(f'[start-project] {tool_name} topic re-register failed: {error}')
             await push_event({'type': 'project_start_item', 'payload': {
                 'tool': tool_name, 'mcp_id': mcp_id, 'status': status,
                 'message': message if status == 'error' else '',
@@ -237,10 +277,13 @@ async def _do_start_project():
         }})
 
         args = {'action': 'start', 'instance_id': card_id}
+        info_args: dict = {}
         if input_topics and len(input_topics) > 1:
             args['input_topics'] = input_topics
+            info_args['input_topics'] = input_topics
         elif input_topic:
             args['input_topic'] = input_topic
+            info_args['input_topic'] = input_topic
 
         try:
             req = MCPCallRequest(tool=tool_name, arguments=args)
@@ -282,42 +325,19 @@ async def _do_start_project():
                         'message': message,
                     }})
                     _asyncio.create_task(
-                        _settle_loading_item(mcp_id, tool_name, card_id)
+                        _settle_loading_item(mcp_id, tool_name, card_id, info_args)
                     )
                 else:
                     print(f'[start-project] started {tool_name} ({mcp_id})')
                     await push_event({'type': 'project_start_item', 'payload': {
                         'tool': tool_name, 'mcp_id': mcp_id, 'status': 'ready',
                     }})
-                # After successful start, query info() to get resolved topic_out
+                # Resolve topic_out for the downstream cards and register it on
+                # the bus. Non-fatal: a card that cannot answer info() still runs.
                 try:
-                    info_req = MCPCallRequest(tool=tool_name, arguments={'action': 'info', 'instance_id': card_id})
-                    info_result = await mcp_call_tool(mcp_id, info_req)
-                    if info_result.get('code') == 200:
-                        data = info_result.get('data')
-                        # Parse MCP JSON-RPC content format: [{"type":"text","text":"..."}]
-                        if isinstance(data, list) and data:
-                            text = data[0].get('text', '{}') if isinstance(data[0], dict) else '{}'
-                            try:
-                                data = _json.loads(text)
-                            except Exception:
-                                data = {}
-                        elif isinstance(data, str):
-                            try:
-                                data = _json.loads(data)
-                            except Exception:
-                                data = {}
-                        if isinstance(data, dict):
-                            topic_out = data.get('topic_out', [])
-                            if topic_out:
-                                resolved_topics[card_id] = topic_out
-                                # Register resolved topics so WebSocket relay works
-                                from api.inspection import register_topic_internal
-                                for tp in topic_out:
-                                    if tp.get('topic') and tp.get('format'):
-                                        await register_topic_internal(tp['topic'], tp['format'], mcp_id)
-                except Exception:
-                    pass  # info() failure is non-fatal
+                    await _resolve_and_register(mcp_id, tool_name, card_id, info_args)
+                except Exception as error:
+                    print(f'[start-project] {tool_name} info() failed: {error}')
             else:
                 # `message` is where mcp_call_tool puts the human-readable
                 # reason; `data` is None on those responses, so reading data

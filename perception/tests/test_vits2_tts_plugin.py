@@ -420,3 +420,33 @@ def test_load_error_keeps_the_underlying_cause(monkeypatch):
     error = plugin.dispatch("tts", {"action": "info"})["error"]
     assert "TensorRT is not available" in error
     assert "libnvdla_compiler.so" in error
+
+
+def test_info_while_loading_reports_the_pending_output_topic(monkeypatch):
+    """The dashboard subscribes to whatever info() reports — it must be real.
+
+    Agent Core's start sequencer calls info() with only instance_id, and while
+    the model loads there is no node to ask. Falling back to /perception/tts
+    registered the wrong topic on the bus, so the waveform stayed empty while
+    audio flowed on <input_topic>/tts. Only reproducible on a cold start: with
+    the engine resident, start returns running and info reads the live node.
+    """
+    plugin, executor, state = _plugin(monkeypatch, gated=True)
+    plugin.dispatch("tts", {"action": "start", "instance_id": "card-x",
+                            "input_topic": "/remote_control/message"})
+
+    loading = plugin.dispatch("tts", {"action": "info", "instance_id": "card-x"})
+    assert loading["state"] == "loading"
+    assert [t["topic"] for t in loading["topic_out"]] == [
+        "/remote_control/message/tts"
+    ]
+    assert [t["topic"] for t in loading["topic_in"]] == ["/remote_control/message"]
+
+    # And the same topic once it is actually up.
+    state["release"]()
+    assert _wait_until(lambda: executor.nodes and executor.nodes[0].state == "running")
+    running = plugin.dispatch("tts", {"action": "info", "instance_id": "card-x"})
+    assert running["state"] == "running"
+    assert [t["topic"] for t in running["topic_out"]] == [
+        "/remote_control/message/tts"
+    ]
