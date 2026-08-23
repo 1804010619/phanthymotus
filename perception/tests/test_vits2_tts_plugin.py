@@ -76,23 +76,46 @@ def completions(monkeypatch):
     return seen
 
 
-def _plugin(monkeypatch, *, load_delay=0.0, fail=None, adapter=None):
-    """Build a plugin whose loader is instrumented instead of touching a GPU."""
-    adapter = adapter or _FakeAdapter()
-    state = {"loads": 0, "engine_dirs": []}
+def _installed(plugin):
+    """The adapter the plugin actually committed, or None while loading."""
+    return plugin._adapter
+
+
+def _plugin(monkeypatch, *, gated=False, fail=None):
+    """Build a plugin whose loader is instrumented instead of touching a GPU.
+
+    `gated=True` blocks every load inside the model install until the test calls
+    `state["release"]()`. That is what makes "while the model is loading"
+    deterministic — a sleep only makes it likely, and a scheduler hiccup on a
+    busy machine then turns the interleaving the test means to exercise into a
+    coin flip.
+
+    Each build returns its own adapter, recorded in state["adapters"] in
+    completion order. One shared adapter would have let a discarded stale loader
+    mutate the object under assertion — a test artifact, not a product bug: the
+    plugin never installs a superseded adapter.
+    """
+    gate = threading.Event()
+    state = {
+        "loads": 0, "engine_dirs": [], "adapters": [],
+        "release": gate.set, "entered": threading.Event(),
+    }
 
     def fake_ensure(model_dir, family=None):
         state["loads"] += 1
-        if load_delay:
-            time.sleep(load_delay)
+        state["entered"].set()
+        if gated and not gate.wait(10):
+            raise RuntimeError("test never released the load gate")
         if fail is not None and state["loads"] <= fail:
             raise RuntimeError("release download failed")
         return f"{model_dir}/engines/jp61"
 
     def fake_build(cfg):
         state["engine_dirs"].append(cfg.get("engine_dir"))
-        adapter.set_speed(float(cfg.get("speed", 1.0)))
-        return adapter
+        built = _FakeAdapter()
+        built.set_speed(float(cfg.get("speed", 1.0)))
+        state["adapters"].append(built)
+        return built
 
     import utils.model_downloader as md
     monkeypatch.setattr(md, "ensure_vits2_model", fake_ensure, raising=False)
@@ -102,13 +125,13 @@ def _plugin(monkeypatch, *, load_delay=0.0, fail=None, adapter=None):
     plugin = vits2.TTSPlugin(
         {"model_dir": "/models/vits2", "backend": "trt", "speed": 1.0}, executor
     )
-    return plugin, executor, adapter, state
+    return plugin, executor, state
 
 
 # ── start never blocks on the model ──────────────────────────────────────────
 
 def test_start_returns_loading_without_waiting_for_the_model(monkeypatch):
-    plugin, executor, _, state = _plugin(monkeypatch, load_delay=0.4)
+    plugin, executor, state = _plugin(monkeypatch, gated=True)
 
     began = time.monotonic()
     result = plugin.dispatch("tts", {"action": "start", "input_topic": "/say",
@@ -117,14 +140,16 @@ def test_start_returns_loading_without_waiting_for_the_model(monkeypatch):
 
     assert result["state"] == "loading"
     assert elapsed < 0.2, f"start blocked for {elapsed:.2f}s"
+    assert executor.nodes == [], "a node was created before the model was ready"
     # ...and the instance comes up on its own once the load finishes.
+    state["release"]()
     assert _wait_until(lambda: executor.nodes and executor.nodes[0].state == "running")
     assert state["loads"] == 1
     assert state["engine_dirs"] == ["/models/vits2/engines/jp61"]
 
 
 def test_concurrent_starts_load_once_and_yield_one_node_each(monkeypatch):
-    plugin, executor, _, state = _plugin(monkeypatch, load_delay=0.3)
+    plugin, executor, state = _plugin(monkeypatch, gated=True)
 
     results = []
     threads = [
@@ -143,12 +168,13 @@ def test_concurrent_starts_load_once_and_yield_one_node_each(monkeypatch):
         t.join()
 
     assert all(r["state"] == "loading" for r in results)
+    state["release"]()
     assert _wait_until(lambda: len(executor.nodes) == 6)
     assert state["loads"] == 1, f"downloaded {state['loads']} times"
 
 
 def test_info_reports_loading_for_instance_and_aggregate(monkeypatch):
-    plugin, _, _, _ = _plugin(monkeypatch, load_delay=0.4)
+    plugin, _, state = _plugin(monkeypatch, gated=True)
     plugin.dispatch("tts", {"action": "start", "input_topic": "/say",
                             "instance_id": "a"})
 
@@ -160,13 +186,14 @@ def test_info_reports_loading_for_instance_and_aggregate(monkeypatch):
     assert aggregate["state"] == "loading"
     assert "initializing" in per_instance["desc"]
 
+    state["release"]()
     assert _wait_until(
         lambda: plugin.dispatch("tts", {"action": "info"})["state"] == "running"
     )
 
 
 def test_info_never_triggers_a_load(monkeypatch):
-    plugin, _, _, state = _plugin(monkeypatch)
+    plugin, _, state = _plugin(monkeypatch)
     for _ in range(3):
         assert plugin.dispatch("tts", {"action": "info"})["state"] == "idle"
     assert state["loads"] == 0
@@ -175,7 +202,7 @@ def test_info_never_triggers_a_load(monkeypatch):
 # ── failure and retry ────────────────────────────────────────────────────────
 
 def test_load_failure_surfaces_then_next_start_retries(monkeypatch):
-    plugin, executor, _, state = _plugin(monkeypatch, fail=1)
+    plugin, executor, state = _plugin(monkeypatch, fail=1)
 
     first = plugin.dispatch("tts", {"action": "start", "input_topic": "/say"})
     assert first["state"] == "loading"
@@ -192,13 +219,14 @@ def test_load_failure_surfaces_then_next_start_retries(monkeypatch):
 
 
 def test_load_failure_releases_queued_speak_actions(monkeypatch, completions):
-    plugin, _, _, _ = _plugin(monkeypatch, fail=1, load_delay=0.2)
+    plugin, _, state = _plugin(monkeypatch, fail=1, gated=True)
 
     queued = plugin.dispatch("tts", {"action": "speak", "text": "你好"})
     assert queued["status"] == "queued"
     action_id = queued["action_id"]
 
     # The ACP barrier waits for this action; a failed load must still end it.
+    state["release"]()
     assert _wait_until(lambda: any(c[0] == action_id for c in completions))
     assert [c for c in completions if c[0] == action_id][0][3] is True
 
@@ -206,40 +234,47 @@ def test_load_failure_releases_queued_speak_actions(monkeypatch, completions):
 # ── stop / interrupt while still loading ─────────────────────────────────────
 
 def test_stop_during_loading_cancels_the_pending_instance(monkeypatch):
-    plugin, executor, _, _ = _plugin(monkeypatch, load_delay=0.3)
+    plugin, executor, state = _plugin(monkeypatch, gated=True)
 
     plugin.dispatch("tts", {"action": "start", "input_topic": "/say",
                             "instance_id": "a"})
+    assert state["entered"].wait(3), "the loader never started"
     assert plugin.dispatch("tts", {"action": "stop", "instance_id": "a"}) == {
         "state": "idle"
     }
 
-    time.sleep(0.5)  # let the loader finish and try to bring instances up
+    # Only now may the load finish: it must find nothing left to bring up.
+    state["release"]()
+    time.sleep(0.3)
     assert executor.nodes == [], "cancelled instance was started anyway"
     assert plugin.dispatch("tts", {"action": "info"})["state"] == "idle"
 
 
 def test_stop_during_loading_releases_queued_speak(monkeypatch, completions):
-    plugin, executor, _, _ = _plugin(monkeypatch, load_delay=0.3)
+    plugin, executor, state = _plugin(monkeypatch, gated=True)
 
     queued = plugin.dispatch("tts", {"action": "speak", "text": "取消我"})
+    assert state["entered"].wait(3), "the loader never started"
     plugin.dispatch("tts", {"action": "stop"})
 
     assert _wait_until(lambda: any(c[0] == queued["action_id"] for c in completions))
     assert [c for c in completions if c[0] == queued["action_id"]][0][3] is True
-    time.sleep(0.4)
+    state["release"]()
+    time.sleep(0.3)
     assert executor.nodes == []
 
 
 # ── speak queued before the model is resident ────────────────────────────────
 
 def test_speak_before_ready_plays_once_the_model_lands(monkeypatch, completions):
-    plugin, executor, adapter, _ = _plugin(monkeypatch, load_delay=0.2)
+    plugin, executor, state = _plugin(monkeypatch, gated=True)
 
     queued = plugin.dispatch("tts", {"action": "speak", "text": "延迟播报"})
     assert queued["action_id"].startswith("speak-")
+    assert executor.nodes == [], "the utterance was not queued behind the load"
 
-    assert _wait_until(lambda: adapter.spoken == ["延迟播报"])
+    state["release"]()
+    assert _wait_until(lambda: any(a.spoken == ["延迟播报"] for a in state["adapters"]))
     assert _wait_until(lambda: any(c[0] == queued["action_id"] for c in completions))
     # Completed, not cancelled, and the utterance reached a real node.
     assert [c for c in completions if c[0] == queued["action_id"]][0][3] is False
@@ -247,14 +282,16 @@ def test_speak_before_ready_plays_once_the_model_lands(monkeypatch, completions)
 
 
 def test_speak_after_ready_reuses_the_running_node(monkeypatch):
-    plugin, executor, adapter, state = _plugin(monkeypatch)
+    plugin, executor, state = _plugin(monkeypatch)
 
     plugin.dispatch("tts", {"action": "start", "input_topic": "/say"})
     assert _wait_until(lambda: executor.nodes and executor.nodes[0].state == "running")
     plugin.dispatch("tts", {"action": "speak", "text": "第一句"})
     plugin.dispatch("tts", {"action": "speak", "text": "第二句"})
 
-    assert _wait_until(lambda: adapter.spoken == ["第一句", "第二句"])
+    assert _wait_until(
+        lambda: _installed(plugin) and _installed(plugin).spoken == ["第一句", "第二句"]
+    )
     assert len(executor.nodes) == 1
     assert state["loads"] == 1
 
@@ -262,7 +299,7 @@ def test_speak_after_ready_reuses_the_running_node(monkeypatch):
 # ── config ───────────────────────────────────────────────────────────────────
 
 def test_config_speed_updates_a_resident_model_without_a_reload(monkeypatch):
-    plugin, executor, adapter, state = _plugin(monkeypatch)
+    plugin, executor, state = _plugin(monkeypatch)
 
     plugin.dispatch("tts", {"action": "start", "input_topic": "/say"})
     assert _wait_until(lambda: executor.nodes and executor.nodes[0].state == "running")
@@ -271,24 +308,35 @@ def test_config_speed_updates_a_resident_model_without_a_reload(monkeypatch):
     assert plugin.dispatch("tts", {"action": "config", "speed": 1.4}) == {
         "status": "configured"
     }
-    assert adapter.speed == pytest.approx(1.4)
+    assert _installed(plugin).speed == pytest.approx(1.4)
     # A slider change must not cost a 60 MB reload or drop the live node.
     assert state["loads"] == 1
     assert executor.nodes == [node] and node.state == "running"
 
 
 def test_config_during_loading_discards_the_stale_adapter(monkeypatch):
-    plugin, executor, adapter, state = _plugin(monkeypatch, load_delay=0.3)
+    plugin, executor, state = _plugin(monkeypatch, gated=True)
 
     plugin.dispatch("tts", {"action": "start", "input_topic": "/say"})
+    assert state["entered"].wait(3), "the loader never started"
+    # config now provably lands mid-load, which is the case under test.
     plugin.dispatch("tts", {"action": "config", "speed": 0.8})
+    state["release"]()
 
     # The in-flight loader was building from the old config, so its adapter must
     # be dropped — but the pending start survives and a fresh load serves it.
     assert _wait_until(lambda: executor.nodes and executor.nodes[0].state == "running",
                        timeout=5.0)
-    assert adapter.speed == pytest.approx(0.8)
+    # Both loaders ran — one per config — and the one the plugin committed, and
+    # that the live node actually uses, is the one built from the new config.
+    # Asserted without indexing state["adapters"]: that list is ordered by build
+    # completion, and the superseded loader may finish either first or last.
     assert state["loads"] == 2
+    assert sorted(a.speed for a in state["adapters"]) == [
+        pytest.approx(0.8), pytest.approx(1.0),
+    ]
+    assert _installed(plugin).speed == pytest.approx(0.8)
+    assert executor.nodes[0]._adapter is _installed(plugin)
     assert len(executor.nodes) == 1
 
 
@@ -353,7 +401,7 @@ def test_acp_callback_tolerates_the_self_signed_agent_core_cert(monkeypatch):
 
 def test_load_error_keeps_the_underlying_cause(monkeypatch):
     """The dashboard must show why TensorRT was unavailable, not just that."""
-    plugin, _, _, _ = _plugin(monkeypatch)
+    plugin, _, _ = _plugin(monkeypatch)
 
     import utils.model_downloader as md
 
