@@ -187,17 +187,12 @@ RUN if [ "${ENABLE_VITS2_TRT}" = "1" ]; then \
       if [ "${JP_VERSION}" = "61" ]; then NUMPY_VERSION=1.26.4; else NUMPY_VERSION=1.24.4; fi; \
       pip3 install --no-cache-dir -i "${PYPI_MIRROR}" \
         "numpy==${NUMPY_VERSION}" -r /tmp/vits2-requirements.txt && \
-      python3 -c "import importlib.util as u, numpy, kaldifst, wetext, pypinyin, jieba, inflect, nltk; \
-assert u.find_spec('g2p_en'), 'g2p_en missing'; \
+      python3 -c "import importlib.util as u, sys, numpy, kaldifst, pypinyin, jieba, inflect, nltk; \
+need = ['wetext', 'g2p_en', 'contractions'] + (['importlib_resources'] if sys.version_info < (3, 9) else []); \
+missing = [m for m in need if u.find_spec(m) is None]; \
+assert not missing, 'missing: %s' % missing; \
 assert numpy.__version__ == '${NUMPY_VERSION}', numpy.__version__; \
 print('[build] VITS2 frontend ok on numpy ' + numpy.__version__)"; \
-    fi && rm -f /tmp/vits2-requirements.txt
-COPY perception/plugins/vits2_tts_trt/requirements.jetson.txt /tmp/vits2-requirements.txt
-RUN if [ "${ENABLE_VITS2_TRT}" = "1" ]; then \
-      if [ "${JP_VERSION}" = "61" ]; then NUMPY_VERSION=1.26.4; else NUMPY_VERSION=1.24.4; fi; \
-      pip3 install --no-cache-dir -i "${PYPI_MIRROR}" \
-        "numpy==${NUMPY_VERSION}" -r /tmp/vits2-requirements.txt && \
-      python3 -c "import kaldifst, numpy; assert numpy.__version__ == '${NUMPY_VERSION}', numpy.__version__"; \
     fi && rm -f /tmp/vits2-requirements.txt
 
 # ── Application code ───────────────────────────────────────────────
