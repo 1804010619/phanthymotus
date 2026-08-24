@@ -129,7 +129,7 @@ class SherpaOnnxTTSAdapter(TTSAdapter):
         if not os.path.isdir(data_dir):
             data_dir = ""
         # Both weights are fp32, so auto lands on cuda where the wheel supports
-        # it — measured 4.4x faster than 2-thread CPU on an Orin NX.
+        # it — measured 4.3x faster than CPU at num_threads=2 on an Orin NX.
         provider = resolve_provider(hw_provider, (acoustic_model, vocoder))
 
         # Gather rule FSTs

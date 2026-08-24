@@ -12,23 +12,39 @@ JetPack 5.11, CUDA 11.4, 6 CPU cores) against sherpa-onnx 1.13.6+cuda:
 2. **The GPU only wins on fp32 weights.** ONNX Runtime's CUDA execution provider
    has no kernels for the quantised ops in an int8 model, so it partitions the
    graph and falls back to CPU node by node, adding a H2D/D2H copy at every
-   boundary. Measured, same audio, steady-state median:
+   boundary. Measured, same audio, steady-state median, every provider swept
+   across 1/2/4 `num_threads` (the ratio changes a lot with thread count, so a
+   single-thread-count comparison is misleading):
 
-   | model                                   | CPU (2 thr) | CUDA    |         |
-   |-----------------------------------------|-------------|---------|---------|
-   | streaming paraformer `encoder.int8.onnx`| 3412 ms     | 10804 ms| 0.32x   |
-   | offline SenseVoice `model.int8.onnx`    | 2021 ms     | 3787 ms | 0.53x   |
-   | Matcha TTS fp32 (`model-steps-3.onnx`)  | 1751 ms     |  400 ms | 4.38x   |
+   | model                                    | dtype       | CPU t=2 | CUDA t=2 | ratio | best CPU    | best CUDA  | ratio |
+   |------------------------------------------|-------------|---------|----------|-------|-------------|------------|-------|
+   | streaming paraformer `encoder.int8.onnx` | int8        | 3383 ms | 11125 ms | 0.30x | 3097 (t=4)  | 10524 (t=4)| 0.29x |
+   | X-ASR offline transducer, beam search    | int8 + fp32 | 2832 ms |  5707 ms | 0.50x | 2503 (t=4)  |  5707 (t=2)| 0.44x |
+   | offline SenseVoice `model.int8.onnx`     | int8        | 2022 ms |  2341 ms | 0.86x | 1354 (t=4)  |  1694 (t=4)| 0.80x |
+   | Matcha TTS `model-steps-3.onnx` + vocos  | fp32        | 1784 ms |   416 ms | 4.28x | 1175 (t=4)  |   416 (t=1)| 2.83x |
+
+   X-ASR is the case that justifies `is_quantised` treating *any* int8 file as
+   disqualifying: its bundle is mixed precision (int8 encoder and joiner, fp32
+   decoder) and CUDA still lost by 2x.
+
+   The per-node fallback is not just an inference from that contrast: on the
+   streaming int8 model the *CUDA* path speeds up 1.7x when given more **CPU**
+   threads (17861 -> 11125 -> 10524 ms for 1/2/4). Thread count would barely
+   matter if the graph were executing on the GPU. GPU contention is not the
+   explanation either — the idle GR3D baseline was 0%, and GR3D sat at 88-92%
+   during the CUDA runs, so the work does reach the GPU, just slowly.
 
 So `hw_provider: auto` means "cuda when the wheel supports it *and* this model's
 weights are fp32". Every ASR and KWS bundle deployed today ships int8 weights, so
 auto keeps them on CPU; Matcha TTS is fp32 and gets the GPU.
 
-Caveat worth knowing: the int8 rule is what the measurements support. A
-*streaming* fp32 model is untested — the streaming penalty above (0.32x vs 0.53x
-for the same dtype) shows sherpa's per-chunk decode adds its own GPU overhead, so
-a streaming fp32 model might not reach anything like Matcha's 4.4x. Pin
-`hw_provider: cpu` explicitly if you deploy one and it disappoints.
+Caveat worth knowing: the int8 rule is what the measurements support, and only for
+these shapes. A *streaming* fp32 model is untested, and the streaming-vs-offline
+gap at the same dtype above is large (0.30x vs 0.86x) — sherpa's per-chunk decode
+carries substantial GPU overhead of its own, so a streaming fp32 model may land
+nowhere near Matcha's speed-up. Pin `hw_provider: cpu` explicitly if you deploy
+one and it disappoints. Note also that the deployed `num_threads` is 2; at 4
+threads the CPU closes much of Matcha's gap (2.83x rather than 4.28x).
 """
 
 from __future__ import annotations
@@ -64,6 +80,10 @@ def cuda_available() -> bool:
 def is_quantised(model_paths: Iterable[str]) -> bool:
     """True when any of these model files carries int8 weights.
 
+    *Any*, not all: X-ASR ships an int8 encoder and joiner beside an fp32 decoder,
+    and CUDA still lost by 2x on it, so one quantised file is enough to disqualify
+    the bundle.
+
     Filename, not graph inspection: `.int8.onnx` is the naming every sherpa-onnx
     bundle uses, and it is already what `asr.py` and `x_asr.py` match on to
     *prefer* the quantised file. Parsing the ONNX protobuf for QuantizeLinear
@@ -96,7 +116,7 @@ def resolve_provider(value: str | None, model_paths: Iterable[str] = ()) -> str:
         reason = "the installed sherpa_onnx wheel has no CUDA provider"
     elif is_quantised(paths):
         reason = ("int8 weights — ONNX Runtime's CUDA provider falls back to CPU "
-                  "per node on quantised ops, which measured 2-3x slower")
+                  "per node on quantised ops, measured up to 3x slower")
     else:
         log.info("[onnx_provider] hw_provider=auto -> cuda (fp32 weights, CUDA wheel installed)")
         return "cuda"

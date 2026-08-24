@@ -122,10 +122,11 @@ ENV YOLO_CONFIG_DIR=/work
 #
 # Installing it does NOT move everything to the GPU: utils/onnx_provider.py only
 # routes fp32 models there, because ONNX Runtime's CUDA provider has no int8
-# kernels and falls back per node. Measured on an Orin NX, int8 ASR came out
-# 2-3x slower on CUDA while fp32 Matcha TTS came out 4.4x faster — the numbers
-# and the reasoning are in perception/README.md § sherpa-onnx Execution Provider,
-# along with how to rebuild this wheel.
+# kernels and falls back per node. Measured on an Orin NX at matched num_threads,
+# streaming int8 ASR came out 3.3x slower on CUDA while fp32 Matcha TTS came out
+# 4.3x faster — the numbers, the thread sweep and the reasoning are in
+# perception/README.md § sherpa-onnx Execution Provider, along with how to
+# rebuild this wheel.
 #
 # The gate is on JP_VERSION, not on "is this a Jetson": the wheel links
 # libcudart.so.11.0, which jp6.1 (CUDA 12.6) does not provide. jp6.1 would need

@@ -94,7 +94,8 @@ def test_auto_picks_cuda_for_fp32_on_gpu_wheel(monkeypatch, tmp_path):
 
 def test_auto_picks_cpu_for_int8_even_on_gpu_wheel(monkeypatch, tmp_path):
     """The measured reason: ONNX Runtime's CUDA EP has no int8 kernels and falls
-    back per node, which came out 2-3x slower than 2-thread CPU on an Orin NX."""
+    back per node, which came out 3.3x slower than CPU at the same num_threads on
+    an Orin NX (streaming paraformer)."""
     _install_fake_sherpa(monkeypatch, tmp_path, with_cuda=True)
     assert onnx_provider.resolve_provider("auto", (INT8,)) == "cpu"
 
