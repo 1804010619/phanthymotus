@@ -16,35 +16,45 @@ JetPack 5.11, CUDA 11.4, 6 CPU cores) against sherpa-onnx 1.13.6+cuda:
    across 1/2/4 `num_threads` (the ratio changes a lot with thread count, so a
    single-thread-count comparison is misleading):
 
-   | model                                    | dtype       | CPU t=2 | CUDA t=2 | ratio | best CPU    | best CUDA  | ratio |
-   |------------------------------------------|-------------|---------|----------|-------|-------------|------------|-------|
-   | streaming paraformer `encoder.int8.onnx` | int8        | 3383 ms | 11125 ms | 0.30x | 3097 (t=4)  | 10524 (t=4)| 0.29x |
-   | X-ASR offline transducer, beam search    | int8 + fp32 | 2832 ms |  5707 ms | 0.50x | 2503 (t=4)  |  5707 (t=2)| 0.44x |
-   | offline SenseVoice `model.int8.onnx`     | int8        | 2022 ms |  2341 ms | 0.86x | 1354 (t=4)  |  1694 (t=4)| 0.80x |
-   | Matcha TTS `model-steps-3.onnx` + vocos  | fp32        | 1784 ms |   416 ms | 4.28x | 1175 (t=4)  |   416 (t=1)| 2.83x |
+   | model                                    | dtype       | CPU t=2 | CUDA t=2 | ratio  |
+   |------------------------------------------|-------------|---------|----------|--------|
+   | streaming paraformer `encoder.int8.onnx` | int8        | 3383 ms | 11125 ms |  0.30x |
+   | X-ASR offline transducer, beam search    | int8 + fp32 | 2832 ms |  5707 ms |  0.50x |
+   | offline SenseVoice `model.int8.onnx`     | int8        | 2086 ms |  2332 ms |  0.89x |
+   | offline SenseVoice `model.onnx`          | fp32        | 4905 ms |   426 ms | 11.52x |
+   | Matcha TTS `model-steps-3.onnx` + vocos  | fp32        | 1784 ms |   416 ms |  4.28x |
 
-   X-ASR is the case that justifies `is_quantised` treating *any* int8 file as
-   disqualifying: its bundle is mixed precision (int8 encoder and joiner, fp32
-   decoder) and CUDA still lost by 2x.
+   The two SenseVoice rows are the same model in both dtypes, so this is a dtype
+   result and not a per-model coincidence. X-ASR is why `is_quantised` disqualifies
+   a bundle on *any* int8 file: it is mixed precision (int8 encoder and joiner,
+   fp32 decoder) and CUDA still lost by 2x.
 
-   The per-node fallback is not just an inference from that contrast: on the
-   streaming int8 model the *CUDA* path speeds up 1.7x when given more **CPU**
-   threads (17861 -> 11125 -> 10524 ms for 1/2/4). Thread count would barely
-   matter if the graph were executing on the GPU. GPU contention is not the
-   explanation either — the idle GR3D baseline was 0%, and GR3D sat at 88-92%
-   during the CUDA runs, so the work does reach the GPU, just slowly.
+   Mechanism confirmed two ways. fp32-CUDA is completely insensitive to thread
+   count (433/426/431 ms at 1/2/4) with GR3D pinned at 97% — the graph really is
+   on the GPU. int8-CUDA instead scales with *CPU* threads (3314 -> 2332 -> 1797
+   for SenseVoice, 17861 -> 11125 -> 10524 for streaming paraformer), which only
+   makes sense if much of it is not. GPU contention is not the explanation: the
+   idle GR3D baseline was 0%.
+
+   int8 on CUDA is also numerically noisier, because every int8<->fp32 partition
+   boundary requantises. Same model and audio at num_threads=2, CPU vs CUDA:
+   SenseVoice int8 differed on 3 of 4 clips (including `不然` -> `主然`, a real
+   word error); SenseVoice fp32 differed on 0 of 4. So keeping int8 on CPU buys
+   output stability as well as speed.
 
 So `hw_provider: auto` means "cuda when the wheel supports it *and* this model's
 weights are fp32". Every ASR and KWS bundle deployed today ships int8 weights, so
 auto keeps them on CPU; Matcha TTS is fp32 and gets the GPU.
 
-Caveat worth knowing: the int8 rule is what the measurements support, and only for
-these shapes. A *streaming* fp32 model is untested, and the streaming-vs-offline
-gap at the same dtype above is large (0.30x vs 0.86x) — sherpa's per-chunk decode
-carries substantial GPU overhead of its own, so a streaming fp32 model may land
-nowhere near Matcha's speed-up. Pin `hw_provider: cpu` explicitly if you deploy
-one and it disappoints. Note also that the deployed `num_threads` is 2; at 4
-threads the CPU closes much of Matcha's gap (2.83x rather than 4.28x).
+Putting ASR on the GPU is a *model* change, not a config one: ship the fp32 bundle
+and auto routes it to CUDA by itself (426 ms vs the 2086 ms the deployed int8-on-CPU
+takes). The trade-offs — 894 MB vs 228 MB, accuracy that differs in both directions
+and needs a labelled set to judge, streaming still unmeasured at fp32, and fp16 as
+the likely better target — are written up in perception/README.md.
+
+`int16` is not a middle ground worth trying: ONNX Runtime's int16 quantisation is
+newer than int8, the CUDA provider has no kernels for it either, and the CPU side
+lacks the dot-product paths that make int8 fast.
 """
 
 from __future__ import annotations
