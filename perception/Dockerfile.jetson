@@ -120,18 +120,20 @@ ENV YOLO_CONFIG_DIR=/work
 # jp5.11 installs a CUDA-enabled wheel built on an Orin against onnxruntime-gpu
 # 1.16.0 (CUDA 11.4, cuDNN 8) with -DSHERPA_ONNX_ENABLE_GPU=ON.
 #
-# Installing it does NOT move everything to the GPU: utils/onnx_provider.py only
-# routes fp32 models there, because ONNX Runtime's CUDA provider has no int8
-# kernels and falls back per node. Measured on an Orin NX at matched num_threads,
-# streaming int8 ASR came out 3.3x slower on CUDA while fp32 Matcha TTS came out
-# 4.3x faster — the numbers, the thread sweep and the reasoning are in
-# perception/README.md § sherpa-onnx Execution Provider, along with how to
-# rebuild this wheel.
+# Installing it does NOT move anything to the GPU on its own: that is opt-in via
+# `device: gpu` in the ASR/TTS config, and only for the (model, device) pairs
+# ASR_MODELS lists. int8 weights are *slower* on CUDA — ONNX Runtime's CUDA
+# provider has no int8 kernels and falls back per node — so `device: gpu` loads
+# different, non-quantised weights. Measured on an Orin NX at matched num_threads:
+# SenseVoice fp16 5.8x faster, streaming paraformer fp32 1.8x faster, while the
+# same models' int8 weights were 0.4-0.7x, i.e. worse. The numbers, the thread
+# sweep and the reasoning are in perception/README.md § sherpa-onnx Device
+# Selection, along with how to rebuild this wheel.
 #
 # The gate is on JP_VERSION, not on "is this a Jetson": the wheel links
 # libcudart.so.11.0, which jp6.1 (CUDA 12.6) does not provide. jp6.1 would need
-# its own build against onnxruntime-gpu 1.18.1 on a JetPack 6 host, so until
-# then it keeps the CPU wheel from PyPI and hw_provider: auto resolves to cpu.
+# its own build against onnxruntime-gpu 1.18.1 on a JetPack 6 host, so until then
+# it keeps the CPU wheel from PyPI and `device: gpu` falls back to cpu there.
 #
 # Cost: 74 MB compressed / ~250 MB unpacked, nearly all of it
 # libonnxruntime_providers_cuda.so, versus ~30 MB for the CPU wheel.

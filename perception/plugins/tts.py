@@ -80,12 +80,14 @@ TOOLS = [
                                               "sherpa_onnx = sherpa-onnx Matcha)",
                                "default": "vits2_trt", "scope": "shared"},
                 # sherpa_onnx only — vits2_trt is a TensorRT engine and never
-                # touches ONNX Runtime, so this field does nothing for it.
-                "hw_provider": {"type": "string", "enum": ["auto", "cuda", "cpu"],
-                                "description": "ONNX Runtime provider for the sherpa_onnx engine "
-                                               "(auto = cuda on images with the CUDA wheel, since "
-                                               "Matcha's weights are fp32)",
-                                "default": "auto", "scope": "shared"},
+                # touches ONNX Runtime, so this field does nothing for it. Matcha's
+                # weights are fp32, so both devices load the same files and only
+                # the provider changes; measured 4.3x faster on gpu.
+                "device":      {"type": "string", "enum": ["cpu", "gpu"],
+                                "description": "Inference device for the sherpa_onnx engine "
+                                               "(gpu needs the CUDA sherpa-onnx wheel; ~4.3x faster)",
+                                "default": "cpu", "scope": "shared",
+                                "x-show-when": {"tts_engine": "sherpa_onnx"}},
                 "speaker_id": {"type": "integer", "description": "Speaker ID (VITS2 supports 0 only)", "default": 0, "scope": "shared"},
                 "speed":      {"type": "number", "description": "Speech speed (1.0 = normal)", "default": 1.0, "scope": "shared"},
             },
@@ -112,10 +114,10 @@ class SherpaOnnxTTSAdapter(TTSAdapter):
     """On-device TTS using sherpa-onnx Matcha (flow-matching, fast non-autoregressive)."""
 
     def __init__(self, model_dir: str, speaker_id: int = 0, speed: float = 1.0,
-                 hw_provider: str = "auto"):
+                 device: str = "cpu"):
         import os
         from utils.model_downloader import ensure_model
-        from utils.onnx_provider import resolve_provider
+        from utils.onnx_provider import provider_for_device
         ensure_model("tts", model_dir)
         ensure_model("tts_vocoder", model_dir)
 
@@ -128,9 +130,9 @@ class SherpaOnnxTTSAdapter(TTSAdapter):
         data_dir = os.path.join(model_dir, "espeak-ng-data")
         if not os.path.isdir(data_dir):
             data_dir = ""
-        # Both weights are fp32, so auto lands on cuda where the wheel supports
-        # it — measured 4.3x faster than CPU at num_threads=2 on an Orin NX.
-        provider = resolve_provider(hw_provider, (acoustic_model, vocoder))
+        # Both weights are fp32, so there is only one file set and device just
+        # picks the provider — measured 4.3x faster on gpu at num_threads=2.
+        provider = provider_for_device(device, (acoustic_model, vocoder))
 
         # Gather rule FSTs
         rule_fsts = []
@@ -158,7 +160,8 @@ class SherpaOnnxTTSAdapter(TTSAdapter):
         self._sid = speaker_id
         self._speed = speed
         log.info(f"[tts] sherpa-onnx Matcha loaded: model_dir={model_dir}, "
-                 f"speaker_id={speaker_id}, speed={speed}, provider={provider}")
+                 f"speaker_id={speaker_id}, speed={speed}, "
+                 f"device={device}, provider={provider}")
 
     def synthesize(self, text: str) -> bytes:
         return b''.join(self.synthesize_stream(text))
@@ -178,11 +181,12 @@ class SherpaOnnxTTSAdapter(TTSAdapter):
 
 def _build_tts_adapter(cfg: dict) -> TTSAdapter:
     import os
+    from utils.onnx_provider import normalize_device
     model_dir = cfg.get('model_dir', '/models/sherpa-onnx/tts')
     speaker_id = int(cfg.get('speaker_id', 0))
     speed = float(cfg.get('speed', 1.0))
-    return SherpaOnnxTTSAdapter(model_dir, speaker_id, speed,
-                                cfg.get('hw_provider', 'auto'))
+    device = normalize_device(cfg.get('device'), cfg.get('hw_provider'))
+    return SherpaOnnxTTSAdapter(model_dir, speaker_id, speed, device)
 
 
 # ── ROS2 Node ─────────────────────────────────────────────────────────────────
@@ -705,8 +709,8 @@ class SherpaOnnxTTSPlugin:
                 self._cfg['speaker_id'] = int(cfg['speaker_id'])
             if 'speed' in cfg:
                 self._cfg['speed'] = float(cfg['speed'])
-            if 'hw_provider' in cfg:
-                self._cfg['hw_provider'] = cfg['hw_provider']
+            if 'device' in cfg:
+                self._cfg['device'] = cfg['device']
             self._adapter = _build_tts_adapter(self._cfg)
             # Stop all nodes (they'll use new adapter on next start)
             with self._nodes_lock:
@@ -898,7 +902,7 @@ class TTSPlugin:
         requested = args.get("tts_engine") or args.get("engine")
         forwarded = {k: v for k, v in args.items()
                      if k not in ("tts_engine", "engine")}
-        for key in ("speaker_id", "speed", "hw_provider"):
+        for key in ("speaker_id", "speed", "device"):
             if key in args:
                 self._cfg[key] = args[key]
 

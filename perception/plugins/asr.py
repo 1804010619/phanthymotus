@@ -293,6 +293,17 @@ TOOLS = [
             "type": "object",
             "properties": {
                 "asr_model":     {"type": "string", "enum": ["x-asr-zh-en", "paraformer-zh-en", "paraformer-offline", "zipformer-en", "sensevoice-small"], "description": "ASR model (x-asr-zh-en = bilingual offline transducer with hotwords, paraformer-zh-en = bilingual streaming, paraformer-offline = bilingual offline, zipformer-en = English streaming, sensevoice-small = multilingual offline)", "default": "sensevoice-small", "scope": "shared"},
+                # Which weights each device loads is in ASR_MODELS; only models
+                # with a verified gpu entry list one, so x-show-when hides this
+                # field for the rest rather than offering a choice that would be
+                # rejected. Keep the list in sync with ASR_MODELS — the unit test
+                # test_asr_device_registry.py asserts they match.
+                "device":        {"type": "string", "enum": ["cpu", "gpu"],
+                                  "description": "Inference device. gpu loads non-quantised weights "
+                                                 "(SenseVoice fp16 ~5.8x, streaming paraformer fp32 ~1.8x "
+                                                 "vs int8-on-cpu) and needs the CUDA sherpa-onnx wheel",
+                                  "default": "cpu", "scope": "shared",
+                                  "x-show-when": {"asr_model": ["paraformer-zh-en", "sensevoice-small"]}},
                 "trigger_mode":  {"type": "string", "enum": ["vad", "kws", "asr_kws"], "description": "Trigger mode (vad = always listen, kws = KWS model, asr_kws = ASR + phoneme matching)", "default": "kws", "scope": "shared"},
                 "kws_model":     {"type": "string", "enum": ["zh", "en", "zh-en"], "description": "KWS 模型 (zh=纯中文, en=纯英文, zh-en=双语)", "default": "zh", "scope": "shared", "x-show-when": {"trigger_mode": "kws"}},
                 "kws_keywords":  {"type": "string", "description": "Wake word (zh: 'f àn sh ì x iǎo g ǒu @范式小狗', en: '▁FA N C Y ▁RO B O T @FANCY_ROBOT')", "scope": "shared", "x-show-when": {"trigger_mode": "kws"}},
@@ -333,32 +344,33 @@ class ASRAdapter(ABC):
 class SherpaOnnxASRAdapter(ASRAdapter):
     """On-device streaming ASR using sherpa-onnx paraformer (no network required)."""
 
-    def __init__(self, model_dir: str, hw_provider: str = "auto", num_threads: int = 2):
-        from utils.model_downloader import ensure_model
-        from utils.onnx_provider import resolve_provider
-        ensure_model("asr", model_dir)
+    def __init__(self, model_dir: str, device: str = "cpu", num_threads: int = 2):
+        from utils.onnx_provider import pick_weights, provider_for_device
 
         import sherpa_onnx
-        # Streaming paraformer uses encoder + decoder (not a single model file)
-        encoder_path = os.path.join(model_dir, "encoder.int8.onnx")
-        if not os.path.exists(encoder_path):
-            encoder_path = os.path.join(model_dir, "encoder.onnx")
-        decoder_path = os.path.join(model_dir, "decoder.int8.onnx")
-        if not os.path.exists(decoder_path):
-            decoder_path = os.path.join(model_dir, "decoder.onnx")
+        # Streaming paraformer uses encoder + decoder (not a single model file).
+        # Candidate order flips with the device: a gpu bundle holds fp32 weights,
+        # a cpu bundle holds int8. See utils/onnx_provider.py for why.
+        enc = ("encoder.onnx", "encoder.int8.onnx") if device == "gpu" else \
+              ("encoder.int8.onnx", "encoder.onnx")
+        dec = ("decoder.onnx", "decoder.int8.onnx") if device == "gpu" else \
+              ("decoder.int8.onnx", "decoder.onnx")
+        encoder_path = pick_weights(model_dir, *enc)
+        decoder_path = pick_weights(model_dir, *dec)
         tokens_path = os.path.join(model_dir, "tokens.txt")
-        hw_provider = resolve_provider(hw_provider, (encoder_path, decoder_path))
+        provider = provider_for_device(device, (encoder_path, decoder_path))
 
         self._recognizer = sherpa_onnx.OnlineRecognizer.from_paraformer(
             encoder=encoder_path,
             decoder=decoder_path,
             tokens=tokens_path,
             num_threads=num_threads,
-            provider=hw_provider,
+            provider=provider,
             sample_rate=SAMPLE_RATE,
             decoding_method="greedy_search",
         )
-        log.info(f"[asr] sherpa-onnx paraformer adapter loaded: encoder={encoder_path}, provider={hw_provider}")
+        log.info(f"[asr] sherpa-onnx paraformer adapter loaded: encoder={encoder_path}, "
+                 f"device={device}, provider={provider}")
 
     def transcribe(self, wav_bytes: bytes, language: str) -> str:
         import io as _io, wave as _wave
@@ -384,15 +396,16 @@ class SherpaOnnxASRAdapter(ASRAdapter):
 class SherpaOnnxZipformerAdapter(ASRAdapter):
     """On-device streaming ASR using sherpa-onnx zipformer transducer (English)."""
 
-    def __init__(self, model_dir: str, hw_provider: str = "auto", num_threads: int = 2):
-        from utils.model_downloader import ensure_model
-        from utils.onnx_provider import resolve_provider
-        ensure_model("asr_en", model_dir)
+    def __init__(self, model_dir: str, device: str = "cpu", num_threads: int = 2):
+        from utils.onnx_provider import provider_for_device
 
         import sherpa_onnx
         import glob as _glob
 
-        # Find encoder/decoder/joiner (prefer int8 + chunk-16)
+        # Find encoder/decoder/joiner (prefer chunk-16; dtype follows the device —
+        # int8 for cpu, non-int8 for gpu, see utils/onnx_provider.py)
+        prefer_int8 = device != "gpu"
+
         def _find(prefix, prefer_int8=True):
             pattern = os.path.join(model_dir, f"{prefix}-*.onnx")
             files = _glob.glob(pattern)
@@ -410,27 +423,29 @@ class SherpaOnnxZipformerAdapter(ASRAdapter):
                     return fp32f[0]
             return cands[0]
 
-        encoder_path = _find("encoder", prefer_int8=True)
+        encoder_path = _find("encoder", prefer_int8=prefer_int8)
+        # The decoder is tiny, so the fp32 copy is preferred on both devices.
         decoder_path = _find("decoder", prefer_int8=False)
-        joiner_path = _find("joiner", prefer_int8=True)
+        joiner_path = _find("joiner", prefer_int8=prefer_int8)
         tokens_path = os.path.join(model_dir, "tokens.txt")
 
         if not all([encoder_path, decoder_path, joiner_path]):
             raise RuntimeError(f"[asr] zipformer model files not found in {model_dir}")
 
-        hw_provider = resolve_provider(hw_provider,
-                                       (encoder_path, decoder_path, joiner_path))
+        provider = provider_for_device(
+            device, (encoder_path, decoder_path, joiner_path))
         self._recognizer = sherpa_onnx.OnlineRecognizer.from_transducer(
             encoder=encoder_path,
             decoder=decoder_path,
             joiner=joiner_path,
             tokens=tokens_path,
             num_threads=num_threads,
-            provider=hw_provider,
+            provider=provider,
             sample_rate=SAMPLE_RATE,
             decoding_method="greedy_search",
         )
-        log.info(f"[asr] sherpa-onnx zipformer adapter loaded: encoder={encoder_path}, provider={hw_provider}")
+        log.info(f"[asr] sherpa-onnx zipformer adapter loaded: encoder={encoder_path}, "
+                 f"device={device}, provider={provider}")
 
     def transcribe(self, wav_bytes: bytes, language: str) -> str:
         import io as _io, wave as _wave
@@ -458,27 +473,30 @@ class SherpaOnnxSenseVoiceAdapter(ASRAdapter):
     code-switching scenarios. Uses sherpa_onnx.OfflineRecognizer.
     """
 
-    def __init__(self, model_dir: str, hw_provider: str = "auto", num_threads: int = 2):
-        from utils.model_downloader import ensure_model
-        from utils.onnx_provider import resolve_provider
-        ensure_model("asr_sensevoice", model_dir)
+    def __init__(self, model_dir: str, device: str = "cpu", num_threads: int = 2):
+        from utils.onnx_provider import pick_weights, provider_for_device
 
         import sherpa_onnx
-        model_path = os.path.join(model_dir, "model.int8.onnx")
-        if not os.path.exists(model_path):
-            model_path = os.path.join(model_dir, "model.onnx")
+        # The gpu bundle ships fp16 (fastest here and transcript-identical to
+        # fp32); the cpu bundle ships int8. fp32 is listed as a middle fallback
+        # for a hand-assembled directory.
+        names = ("model.fp16.onnx", "model.onnx", "model.int8.onnx") \
+            if device == "gpu" else \
+            ("model.int8.onnx", "model.onnx")
+        model_path = pick_weights(model_dir, *names)
         tokens_path = os.path.join(model_dir, "tokens.txt")
-        hw_provider = resolve_provider(hw_provider, (model_path,))
+        provider = provider_for_device(device, (model_path,))
 
         self._recognizer = sherpa_onnx.OfflineRecognizer.from_sense_voice(
             model=model_path,
             tokens=tokens_path,
             num_threads=num_threads,
-            provider=hw_provider,
+            provider=provider,
             use_itn=True,
             language="auto",
         )
-        log.info(f"[asr] sherpa-onnx sensevoice adapter loaded: model={model_path}, provider={hw_provider}")
+        log.info(f"[asr] sherpa-onnx sensevoice adapter loaded: model={model_path}, "
+                 f"device={device}, provider={provider}")
 
     def transcribe(self, wav_bytes: bytes, language: str) -> str:
         import io as _io, wave as _wave
@@ -504,27 +522,27 @@ class SherpaOnnxOfflineParaformerAdapter(ASRAdapter):
     Uses sherpa_onnx.OfflineRecognizer.from_paraformer.
     """
 
-    def __init__(self, model_dir: str, hw_provider: str = "auto", num_threads: int = 2):
-        from utils.model_downloader import ensure_model
-        from utils.onnx_provider import resolve_provider
-        ensure_model("asr_paraformer_offline", model_dir)
+    def __init__(self, model_dir: str, device: str = "cpu", num_threads: int = 2):
+        from utils.onnx_provider import pick_weights, provider_for_device
 
         import sherpa_onnx
-        model_path = os.path.join(model_dir, "model.int8.onnx")
-        if not os.path.exists(model_path):
-            model_path = os.path.join(model_dir, "model.onnx")
+        names = ("model.fp16.onnx", "model.onnx", "model.int8.onnx") \
+            if device == "gpu" else \
+            ("model.int8.onnx", "model.onnx")
+        model_path = pick_weights(model_dir, *names)
         tokens_path = os.path.join(model_dir, "tokens.txt")
-        hw_provider = resolve_provider(hw_provider, (model_path,))
+        provider = provider_for_device(device, (model_path,))
 
         self._recognizer = sherpa_onnx.OfflineRecognizer.from_paraformer(
             paraformer=model_path,
             tokens=tokens_path,
             num_threads=num_threads,
-            provider=hw_provider,
+            provider=provider,
             sample_rate=SAMPLE_RATE,
             decoding_method="greedy_search",
         )
-        log.info(f"[asr] sherpa-onnx offline paraformer adapter loaded: model={model_path}, provider={hw_provider}")
+        log.info(f"[asr] sherpa-onnx offline paraformer adapter loaded: "
+                 f"model={model_path}, device={device}, provider={provider}")
 
     def transcribe(self, wav_bytes: bytes, language: str) -> str:
         import io as _io, wave as _wave
@@ -544,64 +562,149 @@ class SherpaOnnxOfflineParaformerAdapter(ASRAdapter):
 class SherpaOnnxXASRAdapter(ASRAdapter):
     """Offline X-ASR transducer with general robot-domain hotword biasing."""
 
-    def __init__(self, model_dir: str, hw_provider: str = "auto", num_threads: int = 2):
-        from utils.model_downloader import ensure_model
+    def __init__(self, model_dir: str, device: str = "cpu", num_threads: int = 2):
         from plugins.x_asr import XASRAdapter
 
-        ensure_model("asr_x_asr", model_dir)
-        self._delegate = XASRAdapter(model_dir, hw_provider, num_threads)
+        self._delegate = XASRAdapter(model_dir, device, num_threads)
 
     def transcribe(self, wav_bytes: bytes, language: str) -> str:
         return self._delegate.transcribe(wav_bytes, language)
 
 
-# ASR model registry
+# ASR model registry.
+#
+# `devices` maps the config's `device` value to the weights that device loads.
+# Quantised weights are the right choice on the CPU and the wrong one on the GPU
+# (ONNX Runtime's CUDA provider has no int8 kernels and falls back per node), so
+# the two devices generally want different files — which is the whole reason this
+# is a table rather than one directory per model. `download` is the
+# model_downloader key; `gpu` entries are size/SHA256-pinned bundles fetched with
+# ensure_gpu_model, `cpu` entries are the legacy archives fetched with ensure_model.
+#
+# A `gpu` entry is only listed after that (model, device) pair was benchmarked AND
+# its transcripts were read. Speed and self-consistency are not sufficient
+# evidence: streaming paraformer fp16 on CUDA was fast, identical across thread
+# counts, and emitted nothing but `</s>`. See utils/onnx_provider.py for the
+# measurements and perception/README.md for the admission checklist.
 ASR_MODELS = {
     "x-asr-zh-en": {
         "label": "X-ASR Bilingual (zh+en, offline transducer)",
         "adapter": SherpaOnnxXASRAdapter,
-        "default_model_dir": "/models/sherpa-onnx/x-asr-zh-en",
+        "devices": {
+            # No gpu entry: measured 0.80x on CUDA at matched threads. Its bundle
+            # is mixed precision (int8 encoder+joiner, fp32 decoder) and the int8
+            # parts are enough to make the GPU lose.
+            "cpu": {"download": "asr_x_asr", "dtype": "int8",
+                    "dir": "/models/sherpa-onnx/x-asr-zh-en"},
+        },
     },
     "paraformer-zh-en": {
         "label": "Paraformer Bilingual (zh+en, streaming)",
         "adapter": SherpaOnnxASRAdapter,
-        "default_model_dir": "/models/sherpa-onnx/asr",
+        "devices": {
+            "cpu": {"download": "asr", "dtype": "int8",
+                    "dir": "/models/sherpa-onnx/asr"},
+            # fp32, not fp16: fp16 on CUDA emits only `</s>` for this model, and
+            # is slower than fp32 anyway (2077 ms vs 1859 ms).
+            "gpu": {"download": "asr_gpu", "dtype": "fp32",
+                    "dir": "/models/sherpa-onnx/asr-gpu"},
+        },
     },
     "paraformer-offline": {
         "label": "Paraformer Offline (zh+en, small)",
         "adapter": SherpaOnnxOfflineParaformerAdapter,
-        "default_model_dir": "/models/sherpa-onnx/asr-paraformer-offline",
+        "devices": {
+            # No gpu entry: no non-quantised variant has been built or measured.
+            "cpu": {"download": "asr_paraformer_offline", "dtype": "int8",
+                    "dir": "/models/sherpa-onnx/asr-paraformer-offline"},
+        },
     },
     "zipformer-en": {
         "label": "Zipformer English (streaming)",
         "adapter": SherpaOnnxZipformerAdapter,
-        "default_model_dir": "/models/sherpa-onnx/asr-en",
+        "devices": {
+            # No gpu entry: not measured.
+            "cpu": {"download": "asr_en", "dtype": "int8",
+                    "dir": "/models/sherpa-onnx/asr-en"},
+        },
     },
     "sensevoice-small": {
         "label": "SenseVoice Small (zh+en+ja+ko+yue)",
         "adapter": SherpaOnnxSenseVoiceAdapter,
-        "default_model_dir": "/models/sherpa-onnx/sensevoice",
+        "devices": {
+            "cpu": {"download": "asr_sensevoice", "dtype": "int8",
+                    "dir": "/models/sherpa-onnx/sensevoice"},
+            # fp16: 344 ms vs 416 ms for fp32 on CUDA, half the size, and
+            # transcript-identical to fp32 on both providers.
+            "gpu": {"download": "asr_sensevoice_gpu", "dtype": "fp16",
+                    "dir": "/models/sherpa-onnx/sensevoice-gpu"},
+        },
     },
 }
 
+DEFAULT_ASR_MODEL = "sensevoice-small"
+
+
+def asr_models_supporting(device: str) -> list[str]:
+    """Model names whose registry entry has weights for this device."""
+    return sorted(name for name, info in ASR_MODELS.items()
+                  if device in info["devices"])
+
+
+_REGISTRY_DIRS = {spec["dir"]
+                  for info in ASR_MODELS.values()
+                  for spec in info["devices"].values()}
+
+
+def _model_dir_for(cfg: dict, spec: dict) -> str:
+    """Honour an explicit `model_dir`, unless it is another entry's default.
+
+    config.yaml ships a `model_dir` for the one bundle it was written for. Carrying
+    that path over to a different model — or to the same model's other device —
+    would download the wrong weights into it. Same intent as the pre-`device`
+    guard, extended across devices.
+    """
+    requested = cfg.get('model_dir')
+    if not requested or (requested in _REGISTRY_DIRS and requested != spec["dir"]):
+        return spec["dir"]
+    return requested
+
 
 def _build_asr_adapter(cfg: dict) -> Optional[ASRAdapter]:
-    model_name = cfg.get('asr_model', 'paraformer-zh-en')
+    from utils.onnx_provider import normalize_device
+
+    model_name = cfg.get('asr_model', DEFAULT_ASR_MODEL)
     model_info = ASR_MODELS.get(model_name)
     if not model_info:
-        log.warning(f"[asr] unknown model '{model_name}', falling back to paraformer-zh-en")
-        model_info = ASR_MODELS["paraformer-zh-en"]
-        model_name = "paraformer-zh-en"
+        log.warning(f"[asr] unknown model '{model_name}', falling back to "
+                    f"{DEFAULT_ASR_MODEL}")
+        model_name = DEFAULT_ASR_MODEL
+        model_info = ASR_MODELS[model_name]
 
-    model_dir = cfg.get('model_dir', model_info["default_model_dir"])
-    # If model_dir points to another model's default, use correct default
-    other_defaults = [v["default_model_dir"] for k, v in ASR_MODELS.items() if k != model_name]
-    if model_dir in other_defaults:
-        model_dir = model_info["default_model_dir"]
+    device = normalize_device(cfg.get('device'), cfg.get('hw_provider'))
+    if device not in model_info["devices"]:
+        # Degrade rather than refuse to boot: a baked config.yaml asking for a
+        # device this model has no verified weights for should still come up on
+        # CPU. The `config` action validates up front and reports the error there,
+        # where someone is watching.
+        log.warning("[asr] model '%s' has no '%s' weights — it was either measured "
+                    "slower there or never verified. Using cpu. Models with %s "
+                    "support: %s", model_name, device, device,
+                    ", ".join(asr_models_supporting(device)) or "(none)")
+        device = "cpu"
+    spec = model_info["devices"][device]
 
-    hw_provider = cfg.get('hw_provider', 'auto')
+    model_dir = _model_dir_for(cfg, spec)
+    if device == "gpu":
+        # Size/SHA256-pinned: these are the largest downloads in the stack.
+        from utils.model_downloader import ensure_gpu_model
+        ensure_gpu_model(spec["download"], model_dir)
+    else:
+        from utils.model_downloader import ensure_model
+        ensure_model(spec["download"], model_dir)
+
     num_threads = int(cfg.get('num_threads', 2))
-    return model_info["adapter"](model_dir, hw_provider, num_threads)
+    return model_info["adapter"](model_dir, device, num_threads)
 
 
 # ── VAD Worker Process ────────────────────────────────────────────────────────
@@ -638,7 +741,6 @@ def _vad_worker(pcm_q: multiprocessing.Queue, result_q: multiprocessing.Queue,
     # ── Initialize VAD ──
     import sherpa_onnx
     from utils.model_downloader import ensure_model
-    from utils.onnx_provider import resolve_provider
 
     vad_model_dir = '/models/sherpa-onnx/vad'
     ensure_model("vad", vad_model_dir)
@@ -660,7 +762,8 @@ def _vad_worker(pcm_q: multiprocessing.Queue, result_q: multiprocessing.Queue,
         # a CUDA session pays a kernel launch plus a H2D/D2H copy per 32 ms of
         # audio for a model small enough to finish on one core. It would also
         # hold a second CUDA context in this child process. Only ASR, KWS and
-        # sherpa TTS follow hw_provider.
+        # hold a second CUDA context in this child process. Only ASR and the
+        # sherpa TTS engine follow `device`.
         provider="cpu",
     )
     vad = sherpa_onnx.VoiceActivityDetector(vad_config, buffer_size_in_seconds=30)
@@ -726,8 +829,11 @@ def _vad_worker(pcm_q: multiprocessing.Queue, result_q: multiprocessing.Queue,
                     joiner=joiner,
                     keywords_file=kws_keywords_file,
                     num_threads=1,
-                    provider=resolve_provider(kws_cfg.get('hw_provider'),
-                                              (encoder, decoder, joiner)),
+                    # KWS is pinned to CPU. Its zipformer bundle ships int8 only,
+                    # and int8 on CUDA measured slower than CPU on every model
+                    # tried — so there is nothing to gain and the `device` setting
+                    # deliberately does not reach here. See utils/onnx_provider.py.
+                    provider="cpu",
                     keywords_score=1.5,
                     keywords_threshold=0.1,
                 )
@@ -1318,8 +1424,16 @@ class ASRPlugin:
     PREFIX = "asr"
 
     def __init__(self, plugin_cfg: dict, executor):
+        from utils.onnx_provider import normalize_device
         self._language     = plugin_cfg.get('language', 'zh-CN')
-        self._asr_model    = plugin_cfg.get('asr_model', 'paraformer-zh-en')
+        self._asr_model    = plugin_cfg.get('asr_model', DEFAULT_ASR_MODEL)
+        # Mirrors what _build_asr_adapter resolved, including its fall back to cpu
+        # for a model with no weights for the requested device, so `info` and the
+        # next `config` comparison report what is actually loaded.
+        self._device       = normalize_device(plugin_cfg.get('device'),
+                                             plugin_cfg.get('hw_provider'))
+        if self._device not in ASR_MODELS.get(self._asr_model, {}).get("devices", {}):
+            self._device = "cpu"
         self._plugin_cfg   = plugin_cfg
         self._loading      = False
         self._load_error   = None
@@ -1329,10 +1443,6 @@ class ASRPlugin:
         self._vad_threshold = float(vad_cfg.get('threshold', SPEECH_THRESH))
         self._vad_silence_ms = int(vad_cfg.get('silence_ms', 400))
         self._kws_cfg      = plugin_cfg.get('kws', {})
-        # KWS is built inside the VAD child process, which only receives kws_cfg
-        # (see _vad_worker), so the plugin-level hw_provider has to ride along in
-        # it. setdefault so an explicit kws.hw_provider can still override.
-        self._kws_cfg.setdefault('hw_provider', plugin_cfg.get('hw_provider', 'auto'))
         # On by default: the saved segments are the only way to audit what the VAD
         # actually handed the recogniser when a transcription looks wrong. Bounded
         # by _max_saved_segments — see _enforce_retention(), which unlike the
@@ -1348,7 +1458,8 @@ class ASRPlugin:
         # cancel it. See perception/README.md § Plugin Concurrency.
         self._nodes_lock = threading.RLock()
         self._executor = executor
-        log.info(f"[asr] plugin init: model={self._asr_model}, vad={self._vad_backend}, threshold={self._vad_threshold}, "
+        log.info(f"[asr] plugin init: model={self._asr_model}, device={self._device}, "
+                 f"vad={self._vad_backend}, threshold={self._vad_threshold}, "
                  f"silence_ms={self._vad_silence_ms}, pre_roll_ms={self._vad_pre_roll_ms}, "
                  f"kws_enabled={self._kws_cfg.get('enabled', False)}")
 
@@ -1583,8 +1694,32 @@ class ASRPlugin:
                 self._max_saved_segments = int(cfg['max_saved_segments'])
             if 'vad_pre_roll_ms' in cfg:
                 self._vad_pre_roll_ms = int(cfg['vad_pre_roll_ms'])
-            # ASR model switch — load in background if changed
-            if 'asr_model' in cfg and cfg['asr_model'] != self._asr_model:
+            # Model or device switch — either one changes which weights are loaded,
+            # so both go through the same background reload. Validated together
+            # because a request can change both at once, and whether a device is
+            # allowed depends on the model.
+            from utils.onnx_provider import normalize_device
+            new_model = cfg.get('asr_model', self._asr_model)
+            new_device = (normalize_device(cfg['device']) if 'device' in cfg
+                          else self._device)
+            if new_model not in ASR_MODELS:
+                return {"status": "error", "asr_model": self._asr_model,
+                        "message": f"Unknown asr_model '{new_model}'; "
+                                   f"available: {', '.join(sorted(ASR_MODELS))}"}
+            if new_device not in ASR_MODELS[new_model]["devices"]:
+                # Reject rather than silently degrade: someone is looking at the
+                # result of this call, and a request for gpu that quietly runs on
+                # cpu is how a "GPU is not faster" bug report gets written.
+                supported = asr_models_supporting(new_device)
+                return {"status": "error",
+                        "asr_model": self._asr_model, "device": self._device,
+                        "message": (
+                            f"Model '{new_model}' has no '{new_device}' weights — it "
+                            f"was either measured slower there or never verified. "
+                            f"Models with {new_device} support: "
+                            f"{', '.join(supported) or '(none)'}")}
+
+            if (new_model, new_device) != (self._asr_model, self._device):
                 # Stop all running nodes first
                 with self._nodes_lock:
                     nodes = [(k, self._nodes.pop(k)) for k in list(self._nodes.keys())]
@@ -1592,10 +1727,14 @@ class ASRPlugin:
                     node.request_stop()
                 for key, node in nodes:
                     self._dispose_node(node, key)
-                self._asr_model = cfg['asr_model']
+                self._asr_model = new_model
+                self._device = new_device
+                self._plugin_cfg['device'] = new_device
                 self._load_model_async(self._asr_model)
                 return {"status": "loading", "asr_model": self._asr_model,
-                        "message": f"Switching to model '{self._asr_model}', downloading..."}
+                        "device": self._device,
+                        "message": f"Switching to model '{self._asr_model}' on "
+                                   f"{self._device}, downloading..."}
             # Hot-reload: stop running nodes, apply new config, restart automatically
             with self._nodes_lock:
                 was_running = [(key, node) for key, node in self._nodes.items()

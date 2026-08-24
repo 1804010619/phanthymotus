@@ -3,16 +3,19 @@ mcp_port: 15720
 plugins:
   asr:
     enabled: true
-    asr_model: paraformer-zh-en   # paraformer-zh-en | zipformer-en | sensevoice-small
-    model_dir: /models/sherpa-onnx/asr
-    # auto | cuda | cpu — auto picks cuda only when the image installed the CUDA
-    # sherpa-onnx wheel (jetson jp5.11) AND the model's weights are fp32. Every
-    # ASR/KWS bundle here is int8, and ONNX Runtime's CUDA provider has no int8
-    # kernels — it falls back per node, measured 1.25x-3.3x SLOWER than CPU at
-    # the same num_threads on an Orin NX. So this resolves to cpu today. Numbers
-    # and method in utils/onnx_provider.py.
-    hw_provider: auto
-    num_threads: 2
+    # Matches the configSchema default. SenseVoice on CPU is also the faster of
+    # the two int8 options (RTF 14.2x vs 9.1x for streaming paraformer) and has
+    # the largest gpu upside (fp16, ~5.8x).
+    asr_model: sensevoice-small   # x-asr-zh-en | paraformer-zh-en | paraformer-offline | zipformer-en | sensevoice-small
+    # cpu | gpu — which weights get loaded is per (model, device) in
+    # plugins/asr.py ASR_MODELS. gpu needs the CUDA sherpa-onnx wheel (jetson
+    # jp5.11 only) and is only offered for models where it was benchmarked and
+    # the transcripts were read: sensevoice-small (fp16, ~5.8x) and
+    # paraformer-zh-en (fp32, ~1.8x). Everything else is cpu-only — int8 weights
+    # are slower on CUDA, not faster, because ONNX Runtime's CUDA provider has no
+    # int8 kernels. Numbers and method in utils/onnx_provider.py.
+    device: cpu
+    num_threads: 2   # cpu only; 4 buys ~1.2-1.5x. Ignored on gpu.
     language: zh-CN
     vad:
       model: sherpa_onnx    # sherpa_onnx | silero (same silero_vad.onnx, via sherpa-onnx) | webrtc
@@ -35,9 +38,9 @@ plugins:
     warmup: true
     max_chunk_tokens: 256
     # sherpa_onnx engine only — vits2_trt runs on TensorRT and ignores this.
-    # Matcha's weights are fp32, so auto resolves to cuda on jp5.11 (measured
-    # 4.3x faster than CPU at num_threads=2, 2.8x at each side's best).
-    hw_provider: auto
+    # Matcha is fp32, so both devices load the same weights and only the provider
+    # changes; gpu measured ~4.3x faster at num_threads=2.
+    device: cpu
 
   vop:
     enabled: true

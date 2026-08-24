@@ -23,7 +23,8 @@ if str(PERCEPTION_ROOT) not in sys.path:
 from utils import onnx_provider  # noqa: E402
 
 INT8 = "/models/asr/encoder.int8.onnx"
-FP32 = "/models/tts/model-steps-3.onnx"
+FP32 = "/models/asr/encoder.onnx"
+FP16 = "/models/asr/model.fp16.onnx"
 
 
 @pytest.fixture(autouse=True)
@@ -71,11 +72,12 @@ def test_cuda_available_false_when_sherpa_missing(monkeypatch):
     assert onnx_provider.cuda_available() is False
 
 
-# ── is_quantised ─────────────────────────────────────────────────────────────
+# ── dtype detection ──────────────────────────────────────────────────────────
 
 @pytest.mark.parametrize("paths, expected", [
     ((INT8,), True),
     ((FP32,), False),
+    ((FP16,), False),
     ((INT8, FP32), True),                       # any int8 file poisons the set
     (("/m/decoder-epoch-99-avg-1.onnx", "/m/joiner-epoch-99-avg-1.int8.onnx"), True),
     ((), False),
@@ -85,47 +87,118 @@ def test_is_quantised(paths, expected):
     assert onnx_provider.is_quantised(paths) is expected
 
 
-# ── resolve_provider ─────────────────────────────────────────────────────────
+@pytest.mark.parametrize("paths, expected", [
+    ((FP16,), True),
+    ((FP32,), False),
+    ((INT8,), False),
+    ((FP32, FP16), True),
+    ((), False),
+])
+def test_is_fp16(paths, expected):
+    assert onnx_provider.is_fp16(paths) is expected
 
-def test_auto_picks_cuda_for_fp32_on_gpu_wheel(monkeypatch, tmp_path):
+
+# ── normalize_device ─────────────────────────────────────────────────────────
+
+@pytest.mark.parametrize("value, expected", [
+    ("cpu", "cpu"),
+    ("gpu", "gpu"),
+    ("GPU", "gpu"),
+    (" gpu ", "gpu"),
+    ("cuda", "gpu"),        # provider name accepted as an alias
+    ("nvidia", "gpu"),
+    (None, "cpu"),
+    ("", "cpu"),
+    ("tpu", "cpu"),         # unknown falls back rather than raising
+])
+def test_normalize_device(value, expected):
+    assert onnx_provider.normalize_device(value) == expected
+
+
+@pytest.mark.parametrize("legacy, expected", [
+    ("cuda", "gpu"),
+    ("gpu", "gpu"),
+    ("cpu", "cpu"),
+    ("auto", "cpu"),        # the old `auto` has no device meaning; default applies
+])
+def test_normalize_device_accepts_legacy_hw_provider(legacy, expected):
+    """A deployment mounting its own pre-`device` config.yaml keeps working."""
+    assert onnx_provider.normalize_device(None, legacy) == expected
+
+
+def test_explicit_device_wins_over_legacy_key(monkeypatch):
+    assert onnx_provider.normalize_device("cpu", "cuda") == "cpu"
+
+
+# ── provider_for_device ──────────────────────────────────────────────────────
+
+def test_gpu_with_fp16_weights_uses_cuda(monkeypatch, tmp_path):
     _install_fake_sherpa(monkeypatch, tmp_path, with_cuda=True)
-    assert onnx_provider.resolve_provider("auto", (FP32,)) == "cuda"
+    assert onnx_provider.provider_for_device("gpu", (FP16,)) == "cuda"
 
 
-def test_auto_picks_cpu_for_int8_even_on_gpu_wheel(monkeypatch, tmp_path):
-    """The measured reason: ONNX Runtime's CUDA EP has no int8 kernels and falls
-    back per node, which came out 3.3x slower than CPU at the same num_threads on
-    an Orin NX (streaming paraformer)."""
+def test_gpu_with_fp32_weights_uses_cuda(monkeypatch, tmp_path):
     _install_fake_sherpa(monkeypatch, tmp_path, with_cuda=True)
-    assert onnx_provider.resolve_provider("auto", (INT8,)) == "cpu"
+    assert onnx_provider.provider_for_device("gpu", (FP32,)) == "cuda"
 
 
-def test_auto_with_no_paths_assumes_fp32(monkeypatch, tmp_path):
-    """A caller that forgets model_paths errs toward the GPU, not toward a silent
-    CPU pin — an unexpectedly slow ASR is harder to notice than a fast one."""
+def test_gpu_with_int8_weights_falls_back_to_cpu(monkeypatch, tmp_path):
+    """A registry bug, and the measured reason to catch it: ONNX Runtime's CUDA EP
+    has no int8 kernels, falls back per node, and ran 1.25x-3.3x slower than CPU."""
     _install_fake_sherpa(monkeypatch, tmp_path, with_cuda=True)
-    assert onnx_provider.resolve_provider("auto") == "cuda"
+    assert onnx_provider.provider_for_device("gpu", (INT8,)) == "cpu"
 
 
-@pytest.mark.parametrize("value", ["auto", "AUTO", " auto ", "", None])
-def test_auto_and_unset_fall_back_to_cpu_on_cpu_wheel(monkeypatch, tmp_path, value):
+def test_gpu_on_cpu_only_wheel_falls_back(monkeypatch, tmp_path):
+    """jp6.1 and x86 install the PyPI CPU wheel; ASR must still come up."""
     _install_fake_sherpa(monkeypatch, tmp_path, with_cuda=False)
-    assert onnx_provider.resolve_provider(value, (FP32,)) == "cpu"
+    assert onnx_provider.provider_for_device("gpu", (FP16,)) == "cpu"
 
 
-@pytest.mark.parametrize("value", ["cuda", "CUDA", " cuda "])
-def test_explicit_cuda_passes_through_on_int8_and_cpu_wheel(monkeypatch, tmp_path, value):
-    """A pinned provider is not second-guessed: either it is a deliberate choice
-    or a misconfigured deployment, and both should stay visible."""
-    _install_fake_sherpa(monkeypatch, tmp_path, with_cuda=False)
-    assert onnx_provider.resolve_provider(value, (INT8,)) == "cuda"
-
-
-def test_explicit_cpu_passes_through_for_fp32_on_gpu_wheel(monkeypatch, tmp_path):
+def test_cpu_stays_cpu_for_every_dtype(monkeypatch, tmp_path):
     _install_fake_sherpa(monkeypatch, tmp_path, with_cuda=True)
-    assert onnx_provider.resolve_provider("cpu", (FP32,)) == "cpu"
+    for path in (INT8, FP32, FP16):
+        assert onnx_provider.provider_for_device("cpu", (path,)) == "cpu"
 
 
-def test_unknown_value_falls_back_to_cpu(monkeypatch, tmp_path):
+def test_cpu_with_fp16_logs_an_error(monkeypatch, tmp_path, caplog):
+    """fp16 on CPU measured 42890 ms against int8's 3383 ms — ONNX Runtime has no
+    fp16 CPU kernels. It still runs, but the registry is wrong and should say so."""
     _install_fake_sherpa(monkeypatch, tmp_path, with_cuda=True)
-    assert onnx_provider.resolve_provider("trt", (FP32,)) == "cpu"
+    with caplog.at_level("ERROR"):
+        assert onnx_provider.provider_for_device("cpu", (FP16,)) == "cpu"
+    assert any("fp16" in r.message.lower() or "fp16" in r.getMessage().lower()
+               for r in caplog.records)
+
+
+def test_unknown_device_is_treated_as_cpu(monkeypatch, tmp_path):
+    _install_fake_sherpa(monkeypatch, tmp_path, with_cuda=True)
+    assert onnx_provider.provider_for_device("tpu", (FP32,)) == "cpu"
+
+
+# ── pick_weights ─────────────────────────────────────────────────────────────
+
+def test_pick_weights_returns_first_existing(tmp_path):
+    (tmp_path / "model.onnx").write_bytes(b"")
+    picked = onnx_provider.pick_weights(str(tmp_path), "model.fp16.onnx",
+                                        "model.onnx", "model.int8.onnx")
+    assert picked == str(tmp_path / "model.onnx")
+
+
+def test_pick_weights_respects_candidate_order(tmp_path):
+    (tmp_path / "model.onnx").write_bytes(b"")
+    (tmp_path / "model.int8.onnx").write_bytes(b"")
+    assert onnx_provider.pick_weights(str(tmp_path), "model.int8.onnx",
+                                      "model.onnx") == str(tmp_path / "model.int8.onnx")
+    assert onnx_provider.pick_weights(str(tmp_path), "model.onnx",
+                                      "model.int8.onnx") == str(tmp_path / "model.onnx")
+
+
+def test_pick_weights_falls_back_to_last_candidate(tmp_path):
+    """So the caller's own "not found" error names the file it wanted."""
+    assert onnx_provider.pick_weights(str(tmp_path), "a.onnx", "b.onnx") == \
+        str(tmp_path / "b.onnx")
+
+
+def test_pick_weights_with_no_candidates(tmp_path):
+    assert onnx_provider.pick_weights(str(tmp_path)) == ""
