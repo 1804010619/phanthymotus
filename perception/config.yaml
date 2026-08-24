@@ -8,9 +8,9 @@ plugins:
     # auto | cuda | cpu — auto picks cuda only when the image installed the CUDA
     # sherpa-onnx wheel (jetson jp5.11) AND the model's weights are fp32. Every
     # ASR/KWS bundle here is int8, and ONNX Runtime's CUDA provider has no int8
-    # kernels — it falls back per node, which measured 3.3x SLOWER than CPU at the
-    # same num_threads on an Orin NX. So this resolves to cpu today. Numbers and
-    # method in utils/onnx_provider.py.
+    # kernels — it falls back per node, measured 1.25x-3.3x SLOWER than CPU at
+    # the same num_threads on an Orin NX. So this resolves to cpu today. Numbers
+    # and method in utils/onnx_provider.py.
     hw_provider: auto
     num_threads: 2
     language: zh-CN

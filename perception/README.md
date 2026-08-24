@@ -93,34 +93,41 @@ ONNX Runtime's CUDA execution provider has no kernels for the quantised ops in a
 int8 model. It partitions the graph and falls back to CPU node by node, inserting
 a host↔device copy at every boundary — so an int8 model runs *slower* on the GPU
 than on the CPU. Measured on orin5 (Orin NX, JetPack 5.11, CUDA 11.4, 6 cores),
-sherpa-onnx 1.13.6+cuda, same audio, steady-state median. Both providers were
-swept across 1/2/4 `num_threads`, because the ratio moves a lot with thread count
-and a single-thread-count comparison overstates the effect in both directions:
+sherpa-onnx 1.13.6+cuda, same audio, steady-state median, **on an idle box** (all
+services stopped, idle `GR3D_FREQ` 0%, verified per run). Both providers were swept
+across 1/2/4 `num_threads`, because the ratio moves a lot with thread count and a
+single-thread-count comparison overstates the effect in both directions:
 
 | model | dtype | CPU t=2 | CUDA t=2 | ratio | best CPU | best CUDA | ratio |
 |-------|-------|---------|----------|-------|----------|-----------|-------|
 | streaming paraformer `encoder.int8.onnx` (30.7 s audio) | int8 | 3383 ms | 11125 ms | **0.30x** | 3097 ms (t=4) | 10524 ms (t=4) | **0.29x** |
-| X-ASR offline transducer, beam search (28.7 s audio) | int8 encoder+joiner, fp32 decoder | 2832 ms | 5707 ms | **0.50x** | 2503 ms (t=4) | 5707 ms (t=2) | **0.44x** |
-| offline SenseVoice `model.int8.onnx` (28.7 s audio) | int8 | 2086 ms | 2332 ms | **0.89x** | 1404 ms (t=4) | 1797 ms (t=4) | **0.78x** |
-| offline SenseVoice `model.onnx` (28.7 s audio) | **fp32** | 4905 ms | **426 ms** | **11.52x** | 2842 ms (t=4) | 426 ms (t=2) | **6.68x** |
+| X-ASR offline transducer, beam search (28.7 s audio) | int8 encoder+joiner, fp32 decoder | 2645 ms | 3294 ms | **0.80x** | 2200 ms (t=4) | 2896 ms (t=4) | **0.76x** |
+| offline SenseVoice `model.int8.onnx` (28.7 s audio) | int8 | 1996 ms | 2753 ms | **0.73x** | 1314 ms (t=4) | 1905 ms (t=4) | **0.69x** |
+| offline SenseVoice `model.onnx` (28.7 s audio) | **fp32** | 4792 ms | **416 ms** | **11.52x** | 2784 ms (t=4) | 415 ms (t=4) | **6.71x** |
+| offline SenseVoice `model.fp16.onnx` (28.7 s audio) | **fp16** | 8117 ms | **344 ms** | **23.60x** | 5652 ms (t=4) | 343 ms (t=1) | **16.48x** |
 | Matcha TTS `model-steps-3.onnx` + vocos (13.3 s audio) | fp32 | 1784 ms | 416 ms | **4.28x** | 1175 ms (t=4) | 416 ms (t=1) | **2.83x** |
 
 `num_threads: 2` is what `config.yaml` deploys, so the `t=2` columns are the
 operationally relevant ones; the best-of-each columns are there because the CPU
 scales further with threads while CUDA does not (Matcha at t=4 regresses to
-538 ms, X-ASR to 6238 ms). Model load also gets slower on CUDA for int8 — X-ASR
-went from ~8.6 s to ~11 s.
+538 ms). Model load also gets slower on CUDA for int8 — X-ASR went from ~8.0 s to
+~10.4 s — but *faster* for fp16 (4.5 s versus 10.6 s on CPU).
 
 X-ASR is the useful case for the rule as written: its bundle is *mixed* precision
 (int8 encoder and joiner, fp32 decoder), `is_quantised()` treats any int8 file as
 disqualifying, and the measurement confirms that is the right call.
 
-The two SenseVoice rows are the same model in both dtypes, which is what makes
+The three SenseVoice rows are the same model in three dtypes, which is what makes
 this a dtype result rather than a per-model coincidence: int8 loses on CUDA, fp32
-wins by 11.5x. Mechanism confirmed two ways — fp32-CUDA is completely insensitive
-to thread count (433 / 426 / 431 ms at 1/2/4) with GR3D pinned at 97%, i.e. the
-graph really is on the GPU; int8-CUDA instead scales with **CPU** threads
-(3314 → 2332 → 1797 ms), i.e. much of it is not.
+wins by 11.5x, fp16 by 23.6x. Mechanism confirmed two ways — fp32 and fp16 on CUDA
+are completely insensitive to thread count (417/416/415 and 343/344/346 ms at
+1/2/4) with GR3D pinned at 95–97%, i.e. the graph really is on the GPU; int8-CUDA
+instead scales with **CPU** threads (3793 → 2753 → 1905 ms), i.e. much of it is
+not.
+
+fp16 is the mirror image: it is the fastest thing on the GPU and the *slowest*
+thing on the CPU (13051 ms at one thread, 4x worse than int8), because ONNX
+Runtime has no fp16 CPU kernels and casts everything. fp16 is a GPU-only choice.
 
 ### int8 on CUDA also changes the output
 
@@ -131,56 +138,73 @@ every int8↔fp32 partition boundary perturbs results. Same model, same audio,
 - SenseVoice **int8**: CPU vs CUDA differed on **3 of 4** clips — not only
   punctuation but a real word substitution (`不然` → `主然`).
 - SenseVoice **fp32**: CPU vs CUDA differed on **0 of 4** clips.
+- SenseVoice **fp16**: identical to fp32 on **all** clips, on both providers — so
+  the fp16 conversion cost nothing measurable here.
 - X-ASR (int8 encoder/joiner, beam search): differed on 1 of 4, by one character
   (「嗯」vs「呃」, both hesitation particles). Beam search reorders near-tied
   hypotheses under provider-level numeric differences.
 - streaming paraformer int8 with greedy search: byte-identical.
 
 So keeping int8 models on CPU buys output stability as well as speed. Conversely,
-fp32 is provider-consistent, so moving an fp32 model to the GPU does not change
-what it transcribes.
+fp32 and fp16 are provider-consistent, so moving them to the GPU does not change
+what they transcribe.
 
 ### Putting ASR on the GPU
 
-It is possible, and the code already supports it — but it needs a **model change,
-not a config change**. Ship the fp32 bundle instead of the int8 one and
-`hw_provider: auto` routes it to CUDA on its own. For offline SenseVoice that is
-426 ms versus the 2086 ms the deployed int8-on-CPU takes, a **4.9x** end-to-end
-win on the same audio.
+It is possible, and the code already supports fp32 — but it needs a **model
+change, not a config change**. Ship non-int8 weights and `hw_provider: auto`
+routes them to CUDA on its own. Against the 1996 ms the deployed int8-on-CPU takes
+on the same audio:
 
-What that costs, and what is still unknown:
+| option | model size | CUDA t=2 | vs deployed |
+|--------|-----------|----------|-------------|
+| int8 on CPU (deployed) | 228 MB | — | 1.00x |
+| int8 on CPU, `num_threads: 4` | 228 MB | — | 1.52x (no model change at all) |
+| fp32 on CUDA | 894 MB | 416 ms | **4.80x** |
+| fp16 on CUDA | 448 MB | 344 ms | **5.81x** |
 
-- **Size.** SenseVoice fp32 `model.onnx` is 894 MB against 228 MB for int8 — on
-  the COS download and on disk, per robot.
-- **Accuracy is different, not obviously better.** On these four clips the two
-  dtypes disagree in both directions (int8 produced `礼拜2` where fp32 gave
-  `礼2`; fp32 emitted a spurious leading `，`). Four clips cannot settle it —
+fp16 is the best of these: fastest, half the size of fp32, and transcript-identical
+to it. It is produced from the fp32 ONNX with
+`onnxconverter_common.float16.convert_float_to_float16(model, keep_io_types=True)`
+— `keep_io_types` is required because sherpa hands the session fp32 features, and
+shape inference must be left **on** (`disable_shape_infer=False`), otherwise the
+Cast fencing around block-listed ops is placed wrongly and ONNX Runtime rejects the
+model with `Type 'tensor(float16)' ... of operator (Range) ... is invalid`.
+
+Caveats before acting on this:
+
+- **`auto` does not yet know about fp16.** `is_quantised()` only looks for
+  `int8` in the filename, so an fp16 model resolves to `cuda` — correct — but it
+  would also resolve to `cuda` on a CPU-only wheel, where fp16 is catastrophic
+  (13 s vs 2 s). If fp16 models get deployed, that rule needs a matching guard.
+- **Accuracy versus int8 is different, not obviously better.** On these four clips
+  int8 and fp32/fp16 disagree in both directions (int8 produced `礼拜2` where fp32
+  gave `礼2`; fp32 emitted a spurious leading `，`). Four clips cannot settle it;
   switching dtype needs a labelled set.
-- **Streaming is untested at fp32.** These fp32 numbers are the *offline*
-  recogniser. At int8 the streaming path was 3x worse than offline relative to CPU
-  (0.30x vs 0.89x), so sherpa's per-chunk decode carries real GPU overhead and a
-  streaming fp32 model may not see anything like 11x. The deployed default
-  (`paraformer-zh-en`) is streaming.
-- **fp16 is probably the better target than fp32** and has not been measured:
-  Orin's fp16 throughput is far above fp32 and ONNX Runtime's CUDA provider has
-  full fp16 kernel coverage (unlike int8), so it should keep the GPU win at
-  roughly half the memory and bandwidth. It needs an fp32→fp16 ONNX conversion
-  and a check that sherpa-onnx feeds it correctly.
+- **Streaming is untested at fp32/fp16.** These numbers are the *offline*
+  recogniser. At int8 the streaming path was far worse than offline relative to CPU
+  (0.30x vs 0.73x), so sherpa's per-chunk decode carries real GPU overhead and a
+  streaming fp32/fp16 model may not see anything like these ratios. The deployed
+  default (`paraformer-zh-en`) is streaming.
+- **The cheapest win needs no GPU at all.** int8 at `num_threads: 4` is 1.52x for
+  a one-line config change and no extra bytes on disk.
+- **int16 is not a middle ground.** ONNX Runtime's int16 quantisation
+  (`QInt16`/`QUInt16`, opset 21) is newer than int8, the CUDA provider has no
+  kernels for it either, and the CPU side lacks the dot-product paths that make
+  int8 fast — it would likely lose on both providers.
 
-GPU contention is not an alternative explanation for any of the above: the idle
-`GR3D_FREQ` baseline was 0%, and GR3D sat at 88–97% during the CUDA runs, so the
-work does reach the GPU — int8 is simply slower there. The same thread-sensitivity
-signature shows up on the streaming int8 model too (17861 → 11125 → 10524 ms at
-1/2/4 threads on CUDA).
+GPU contention is not an alternative explanation for any of the above: every run
+above was taken with `embodied-perception` and `agent-core` stopped, the idle
+`GR3D_FREQ` baseline verified at 0% per run, and GR3D at 88–97% during the CUDA
+runs — so the work does reach the GPU, and int8 is simply slower there. The
+thread-sensitivity signature shows up on the streaming int8 model too
+(17861 → 11125 → 10524 ms at 1/2/4 threads on CUDA). Contention is not a
+hypothetical concern: an earlier X-ASR run taken while another container was
+building TensorRT engines read 0.50x instead of 0.80x.
 
 So `auto` keeps every int8 ASR/KWS bundle on CPU and gives fp32 models — Matcha
 TTS today — the GPU. `is_quantised()` decides from the filename (`*.int8.onnx`),
 the same convention `asr.py`'s `_find(prefer_int8=...)` already relies on.
-
-One more caveat on the rule's reach: `int16` is not a middle ground worth trying.
-ONNX Runtime's int16 quantisation (`QInt16`/`QUInt16`, opset 21) is newer than
-int8, the CUDA provider has no kernels for it either, and the CPU side lacks the
-dot-product paths that make int8 fast — it would likely lose on both providers.
 
 **What follows `hw_provider`:** ASR (all sherpa adapters, including X-ASR), KWS,
 and the `sherpa_onnx` TTS engine.
