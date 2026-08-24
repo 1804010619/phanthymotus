@@ -9,7 +9,9 @@ channel/manager.py — Channel 生命周期管理器。
 """
 
 import asyncio
+import hashlib
 import json
+import re
 import time
 
 import config
@@ -20,6 +22,24 @@ from channel import acl
 # ── Channel Config 持久化 ────────────────────────────────────────────────────
 
 _CONFIG_KEY = 'channel_configs'
+_TOPIC_COMPONENT_MAX = 80
+
+
+def channel_request_topic(channel_id: str) -> str:
+    """Return a deterministic ROS-safe inbound topic for a Channel ID."""
+    if not channel_id:
+        return '/channel/request'
+
+    raw = str(channel_id)
+    if re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]{0,79}', raw):
+        return f'/channel/request/{raw}'
+
+    slug = re.sub(r'[^A-Za-z0-9_]+', '_', raw).strip('_') or 'channel'
+    if slug[0].isdigit():
+        slug = f'channel_{slug}'
+    slug = slug[:_TOPIC_COMPONENT_MAX].rstrip('_') or 'channel'
+    digest = hashlib.sha256(raw.encode('utf-8')).hexdigest()[:10]
+    return f'/channel/request/{slug}_{digest}'
 
 
 def _get_channel_configs() -> list[dict]:
@@ -438,8 +458,7 @@ class ChannelManager:
         #    附件已由 adapter 落盘到持久化目录，这里只带容器内本地路径给 LLM
         from api.inspection import publish_to_topic
         files = [a.to_dict() for a in (msg.attachments or [])]
-        topic_id = msg.channel_id.replace(' ', '_')
-        topic = f'/channel/request/{topic_id}'
+        topic = channel_request_topic(msg.channel_id)
         payload = {
             'platform': msg.platform,
             'channel_id': msg.channel_id,
