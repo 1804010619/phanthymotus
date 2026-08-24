@@ -5,7 +5,12 @@ plugins:
     enabled: true
     asr_model: paraformer-zh-en   # paraformer-zh-en | zipformer-en | sensevoice-small
     model_dir: /models/sherpa-onnx/asr
-    hw_provider: cpu
+    # auto | cuda | cpu — auto picks cuda only when the image installed the CUDA
+    # sherpa-onnx wheel (jetson jp5.11) AND the model's weights are fp32. Every
+    # ASR/KWS bundle here is int8, and ONNX Runtime's CUDA provider has no int8
+    # kernels — it falls back per node and measured 2-3x SLOWER than 2-thread CPU
+    # on an Orin NX. So this resolves to cpu today. See utils/onnx_provider.py.
+    hw_provider: auto
     num_threads: 2
     language: zh-CN
     vad:
@@ -28,6 +33,10 @@ plugins:
     speed: 1.0
     warmup: true
     max_chunk_tokens: 256
+    # sherpa_onnx engine only — vits2_trt runs on TensorRT and ignores this.
+    # Matcha's weights are fp32, so auto resolves to cuda on jp5.11 (measured
+    # 4.4x faster than 2-thread CPU).
+    hw_provider: auto
 
   vop:
     enabled: true

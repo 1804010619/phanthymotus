@@ -333,8 +333,9 @@ class ASRAdapter(ABC):
 class SherpaOnnxASRAdapter(ASRAdapter):
     """On-device streaming ASR using sherpa-onnx paraformer (no network required)."""
 
-    def __init__(self, model_dir: str, hw_provider: str = "cuda", num_threads: int = 2):
+    def __init__(self, model_dir: str, hw_provider: str = "auto", num_threads: int = 2):
         from utils.model_downloader import ensure_model
+        from utils.onnx_provider import resolve_provider
         ensure_model("asr", model_dir)
 
         import sherpa_onnx
@@ -346,6 +347,7 @@ class SherpaOnnxASRAdapter(ASRAdapter):
         if not os.path.exists(decoder_path):
             decoder_path = os.path.join(model_dir, "decoder.onnx")
         tokens_path = os.path.join(model_dir, "tokens.txt")
+        hw_provider = resolve_provider(hw_provider, (encoder_path, decoder_path))
 
         self._recognizer = sherpa_onnx.OnlineRecognizer.from_paraformer(
             encoder=encoder_path,
@@ -382,8 +384,9 @@ class SherpaOnnxASRAdapter(ASRAdapter):
 class SherpaOnnxZipformerAdapter(ASRAdapter):
     """On-device streaming ASR using sherpa-onnx zipformer transducer (English)."""
 
-    def __init__(self, model_dir: str, hw_provider: str = "cuda", num_threads: int = 2):
+    def __init__(self, model_dir: str, hw_provider: str = "auto", num_threads: int = 2):
         from utils.model_downloader import ensure_model
+        from utils.onnx_provider import resolve_provider
         ensure_model("asr_en", model_dir)
 
         import sherpa_onnx
@@ -415,6 +418,8 @@ class SherpaOnnxZipformerAdapter(ASRAdapter):
         if not all([encoder_path, decoder_path, joiner_path]):
             raise RuntimeError(f"[asr] zipformer model files not found in {model_dir}")
 
+        hw_provider = resolve_provider(hw_provider,
+                                       (encoder_path, decoder_path, joiner_path))
         self._recognizer = sherpa_onnx.OnlineRecognizer.from_transducer(
             encoder=encoder_path,
             decoder=decoder_path,
@@ -453,8 +458,9 @@ class SherpaOnnxSenseVoiceAdapter(ASRAdapter):
     code-switching scenarios. Uses sherpa_onnx.OfflineRecognizer.
     """
 
-    def __init__(self, model_dir: str, hw_provider: str = "cuda", num_threads: int = 2):
+    def __init__(self, model_dir: str, hw_provider: str = "auto", num_threads: int = 2):
         from utils.model_downloader import ensure_model
+        from utils.onnx_provider import resolve_provider
         ensure_model("asr_sensevoice", model_dir)
 
         import sherpa_onnx
@@ -462,6 +468,7 @@ class SherpaOnnxSenseVoiceAdapter(ASRAdapter):
         if not os.path.exists(model_path):
             model_path = os.path.join(model_dir, "model.onnx")
         tokens_path = os.path.join(model_dir, "tokens.txt")
+        hw_provider = resolve_provider(hw_provider, (model_path,))
 
         self._recognizer = sherpa_onnx.OfflineRecognizer.from_sense_voice(
             model=model_path,
@@ -497,8 +504,9 @@ class SherpaOnnxOfflineParaformerAdapter(ASRAdapter):
     Uses sherpa_onnx.OfflineRecognizer.from_paraformer.
     """
 
-    def __init__(self, model_dir: str, hw_provider: str = "cuda", num_threads: int = 2):
+    def __init__(self, model_dir: str, hw_provider: str = "auto", num_threads: int = 2):
         from utils.model_downloader import ensure_model
+        from utils.onnx_provider import resolve_provider
         ensure_model("asr_paraformer_offline", model_dir)
 
         import sherpa_onnx
@@ -506,6 +514,7 @@ class SherpaOnnxOfflineParaformerAdapter(ASRAdapter):
         if not os.path.exists(model_path):
             model_path = os.path.join(model_dir, "model.onnx")
         tokens_path = os.path.join(model_dir, "tokens.txt")
+        hw_provider = resolve_provider(hw_provider, (model_path,))
 
         self._recognizer = sherpa_onnx.OfflineRecognizer.from_paraformer(
             paraformer=model_path,
@@ -535,7 +544,7 @@ class SherpaOnnxOfflineParaformerAdapter(ASRAdapter):
 class SherpaOnnxXASRAdapter(ASRAdapter):
     """Offline X-ASR transducer with general robot-domain hotword biasing."""
 
-    def __init__(self, model_dir: str, hw_provider: str = "cpu", num_threads: int = 2):
+    def __init__(self, model_dir: str, hw_provider: str = "auto", num_threads: int = 2):
         from utils.model_downloader import ensure_model
         from plugins.x_asr import XASRAdapter
 
@@ -590,7 +599,7 @@ def _build_asr_adapter(cfg: dict) -> Optional[ASRAdapter]:
     if model_dir in other_defaults:
         model_dir = model_info["default_model_dir"]
 
-    hw_provider = cfg.get('hw_provider', 'cpu')
+    hw_provider = cfg.get('hw_provider', 'auto')
     num_threads = int(cfg.get('num_threads', 2))
     return model_info["adapter"](model_dir, hw_provider, num_threads)
 
@@ -629,6 +638,7 @@ def _vad_worker(pcm_q: multiprocessing.Queue, result_q: multiprocessing.Queue,
     # ── Initialize VAD ──
     import sherpa_onnx
     from utils.model_downloader import ensure_model
+    from utils.onnx_provider import resolve_provider
 
     vad_model_dir = '/models/sherpa-onnx/vad'
     ensure_model("vad", vad_model_dir)
@@ -645,6 +655,12 @@ def _vad_worker(pcm_q: multiprocessing.Queue, result_q: multiprocessing.Queue,
         ),
         sample_rate=SAMPLE_RATE,
         num_threads=1,
+        # CPU on purpose, even when the image has the CUDA-enabled wheel and ASR
+        # runs on the GPU: silero VAD infers one 512-sample window at a time, so
+        # a CUDA session pays a kernel launch plus a H2D/D2H copy per 32 ms of
+        # audio for a model small enough to finish on one core. It would also
+        # hold a second CUDA context in this child process. Only ASR, KWS and
+        # sherpa TTS follow hw_provider.
         provider="cpu",
     )
     vad = sherpa_onnx.VoiceActivityDetector(vad_config, buffer_size_in_seconds=30)
@@ -710,7 +726,8 @@ def _vad_worker(pcm_q: multiprocessing.Queue, result_q: multiprocessing.Queue,
                     joiner=joiner,
                     keywords_file=kws_keywords_file,
                     num_threads=1,
-                    provider="cpu",
+                    provider=resolve_provider(kws_cfg.get('hw_provider'),
+                                              (encoder, decoder, joiner)),
                     keywords_score=1.5,
                     keywords_threshold=0.1,
                 )
@@ -1312,6 +1329,10 @@ class ASRPlugin:
         self._vad_threshold = float(vad_cfg.get('threshold', SPEECH_THRESH))
         self._vad_silence_ms = int(vad_cfg.get('silence_ms', 400))
         self._kws_cfg      = plugin_cfg.get('kws', {})
+        # KWS is built inside the VAD child process, which only receives kws_cfg
+        # (see _vad_worker), so the plugin-level hw_provider has to ride along in
+        # it. setdefault so an explicit kws.hw_provider can still override.
+        self._kws_cfg.setdefault('hw_provider', plugin_cfg.get('hw_provider', 'auto'))
         # On by default: the saved segments are the only way to audit what the VAD
         # actually handed the recogniser when a transcription looks wrong. Bounded
         # by _max_saved_segments — see _enforce_retention(), which unlike the
@@ -1685,6 +1706,8 @@ def _vad_segment_sync(audio_bytes: bytes, model: str = 'silero',
                 ),
                 sample_rate=SAMPLE_RATE,
                 num_threads=1,
+                # CPU on purpose — same reasoning as the _vad_worker VAD above:
+                # per-window inference is too small to amortise a CUDA session.
                 provider="cpu",
             ),
             buffer_size_in_seconds=30,

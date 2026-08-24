@@ -75,6 +75,107 @@ The VAD parameters can be adjusted per ASR canvas card via the instance config (
 
 ---
 
+## sherpa-onnx Execution Provider
+
+`hw_provider` (under `plugins.asr` and `plugins.tts` in `config.yaml`) selects the
+ONNX Runtime provider for everything that goes through sherpa-onnx. `auto` is the
+default and is resolved by `utils/onnx_provider.py`:
+
+| Value | Behaviour |
+|-------|-----------|
+| `auto` | `cuda` only if the installed wheel bundles `libonnxruntime_providers_cuda.so` **and** the model's weight files are fp32. Otherwise `cpu`. |
+| `cuda` | Passed through unchanged. Either a deliberate override or a misconfigured deployment — both should stay visible. |
+| `cpu` | Passed through unchanged. |
+
+### Why the fp32 condition exists
+
+ONNX Runtime's CUDA execution provider has no kernels for the quantised ops in an
+int8 model. It partitions the graph and falls back to CPU node by node, inserting
+a host↔device copy at every boundary — so an int8 model runs *slower* on the GPU
+than on the CPU. Measured on orin5 (Orin NX, JetPack 5.11, CUDA 11.4, 6 cores),
+sherpa-onnx 1.13.6+cuda, same audio, steady-state median over 5–10 rounds:
+
+| model | CPU (2 threads) | CUDA | |
+|-------|-----------------|------|---|
+| streaming paraformer `encoder.int8.onnx` (30.7 s audio) | 3412 ms | 10804 ms | **0.32x** |
+| offline SenseVoice `model.int8.onnx` (28.7 s audio) | 2021 ms | 3787 ms | **0.53x** |
+| Matcha TTS fp32 `model-steps-3.onnx` (13.3 s audio) | 1751 ms | 400 ms | **4.38x** |
+
+Transcripts were byte-identical between providers, so this is throughput, not
+correctness. `auto` therefore keeps every int8 ASR/KWS bundle on CPU and gives
+Matcha TTS the GPU. `is_quantised()` decides from the filename (`*.int8.onnx`),
+the same convention `asr.py`'s `_find(prefer_int8=...)` already relies on.
+
+Caveat: the int8 rule is what the data supports. A *streaming* fp32 model is
+untested — the streaming-vs-offline gap above (0.32x vs 0.53x at the same dtype)
+shows sherpa's per-chunk decode adds GPU overhead of its own, so a streaming fp32
+model may not approach Matcha's 4.4x. Pin `hw_provider: cpu` if you deploy one and
+it disappoints.
+
+**What follows `hw_provider`:** ASR (all sherpa adapters, including X-ASR), KWS,
+and the `sherpa_onnx` TTS engine.
+
+**What does not:** the VAD, in both `_vad_worker` and the `ws_asr` path, is pinned
+to `provider="cpu"`. silero VAD infers one 512-sample window at a time, so a CUDA
+session would pay a kernel launch plus a H2D/D2H copy per 32 ms of audio for a
+model that finishes on a single core — and in `_vad_worker` it would hold a second
+CUDA context in a child process. The `vits2_trt` TTS engine also ignores it: that
+is a TensorRT engine and never touches ONNX Runtime.
+
+### The jp5.11 CUDA wheel
+
+PyPI ships CPU-only `sherpa-onnx`, so `Dockerfile.jetson` downloads a wheel built
+in-house for JetPack 5.11 from COS
+(`public/sherpa-onnx/sherpa_onnx-<ver>+cuda-cp38-cp38-linux_aarch64.whl`) and
+falls back to the PyPI CPU wheel for every other `JP_VERSION`.
+
+To rebuild it, build **inside a container started from the perception image** for
+the target JetPack — that image already carries cmake, g++, the matching CPython
+headers and CUDA, so the pybind extension lands on the right CPython ABI and
+glibc. Building on the host instead is what produces an unusable wheel: the
+extension is tagged `cp<major><minor>` and will not import under a different
+Python.
+
+```bash
+# on the build host (must match the target JetPack: jp5.11 → L4T R35, jp6.1 → R36)
+docker run -d --name sherpa-build \
+  -v /path/to/k2-fsa/sherpa-onnx:/src:ro -v /path/to/outdir:/out \
+  --entrypoint bash <perception-image-for-that-jp> /out/build.sh
+
+# inside, against a *writable* copy of the tree (setup.py appends __version__ to it):
+export SHERPA_ONNX_ENABLE_GPU=ON
+export SHERPA_ONNX_LINUX_ARM64_GPU_ONNXRUNTIME_VERSION=1.16.0   # jp5.11 / CUDA 11.4
+export SHERPA_ONNX_MAKE_ARGS="-j2"                              # Orin has 6 cores but ~4 GB free
+SHERPA_ONNX_CMAKE_ARGS="-DCMAKE_BUILD_TYPE=Release \
+  -DSHERPA_ONNX_ENABLE_GPU=ON \
+  -DSHERPA_ONNX_LINUX_ARM64_GPU_ONNXRUNTIME_VERSION=1.16.0 \
+  -DPYTHON_EXECUTABLE=/usr/bin/python3.8 \
+  -DPython_EXECUTABLE=/usr/bin/python3.8" \
+  python3.8 setup.py bdist_wheel
+```
+
+Notes:
+
+- `setup.py bdist_wheel` builds its **own** cmake tree at
+  `build/temp.linux-aarch64-cpython-<ver>/` with `SHERPA_ONNX_ENABLE_PYTHON=ON`. A
+  tree left behind by `build-aarch64-linux-gnu.sh` has `ENABLE_PYTHON=OFF` and is
+  not reusable — expect a full compile.
+- To avoid re-downloading onnxruntime, drop
+  `onnxruntime-linux-aarch64-gpu-<ver>.tar.bz2` in `/tmp/`;
+  `cmake/onnxruntime-linux-aarch64-gpu.cmake` checks there before GitHub.
+- Upload the result under the `public/` COS prefix (anonymous read, same prefix
+  `utils/model_downloader.py` uses) and bump `SHERPA_GPU_WHEEL` in
+  `Dockerfile.jetson`.
+
+**TODO — jp6.1.** The jp5.11 wheel links `libcudart.so.11.0` and cannot run on
+jp6.1 (CUDA 12.6). That target needs its own build with
+`SHERPA_ONNX_LINUX_ARM64_GPU_ONNXRUNTIME_VERSION=1.18.1` and
+`PYTHON_EXECUTABLE=python3.10`, run on a JetPack 6 host inside
+`jetson-base:jp61-torch`. Until then jp6.1 stays on the CPU wheel and `auto`
+resolves to `cpu`.
+
+---
+
 ## Plugin Concurrency
 
 **`dispatch()` is not single-threaded.** `main.py` serves MCP over

@@ -77,9 +77,11 @@ class XASRAdapter:
     def __init__(
         self,
         model_dir: str,
-        hw_provider: str = "cpu",
+        hw_provider: str = "auto",
         num_threads: int = 2,
     ):
+        from utils.onnx_provider import resolve_provider
+
         root = Path(model_dir)
         encoder = root / "encoder-epoch-99-avg-1.int8.onnx"
         decoder = root / "decoder-epoch-99-avg-1.onnx"
@@ -105,6 +107,8 @@ class XASRAdapter:
 
         import sherpa_onnx
 
+        hw_provider = resolve_provider(hw_provider,
+                                       (str(encoder), str(decoder), str(joiner)))
         encoded_hotwords = _prepare_hotwords_file(hotwords)
         self._recognizer = sherpa_onnx.OfflineRecognizer.from_transducer(
             encoder=str(encoder),
