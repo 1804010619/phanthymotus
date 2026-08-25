@@ -20,6 +20,7 @@ import asyncio
 import inspect
 import json
 import logging
+import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -758,6 +759,11 @@ class ReviewAgent:
             name=name,
             args=args,
             summary=_tool_summary(name, args, content),
+            # Both, because the caps are in characters and this used to report
+            # only bytes: a 4000-char cap showing "4115 bytes" on a file with
+            # non-ASCII comments made the limit look like a byte limit, and sent
+            # more than one diagnosis looking in the wrong place.
+            chars=len(content),
             bytes=len(content.encode("utf-8", errors="replace")),
             ms=int((time.monotonic() - started) * 1000),
             # The review is markdown meant to be read, not tool output; flagged
@@ -871,6 +877,10 @@ class ReviewAgent:
         )
 
 
+# `path  (lines 2200-2420 of 4741)` — the first line of a read_file result.
+_READ_RANGE_RE = re.compile(r"^\S.*?  \(lines (\d+)-(\d+) of \d+\)")
+
+
 def _tool_summary(name: str, args: dict, result: str = "") -> str:
     """A one-line "what was asked for", for the timeline row.
 
@@ -879,12 +889,23 @@ def _tool_summary(name: str, args: dict, result: str = "") -> str:
     """
     path = str(args.get("path", "")) or "."
     if name == "read_file":
+        # The range the tool *delivered*, parsed out of its own header — not the
+        # range that was asked for. Deriving it from `max_lines` is how twenty
+        # rounds of thrashing on PR #174 rendered as twenty reasonable-looking
+        # reads: every row said `device.py:2200-2719` for a call that returned 65
+        # lines, so the traces read as normal and the truncation bug survived
+        # several passes over them. The instrument has to measure the output.
+        m = _READ_RANGE_RE.match(result)
+        if m:
+            return f"{path}:{m.group(1)}-{m.group(2)}"
         start = args.get("start_line", 1) or 1
         try:
             end = int(start) + int(args.get("max_lines", 200) or 200) - 1
         except (TypeError, ValueError):
             end = start
-        return f"{path}:{start}-{end}"
+        # `?` because this is the requested range, not the delivered one: an
+        # error result ("does not exist") has no header to parse.
+        return f"{path}:{start}-{end}?"
     if name == "grep":
         glob = args.get("glob")
         where = f"{path}{f' ({glob})' if glob else ''}"
