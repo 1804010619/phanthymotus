@@ -38,9 +38,13 @@ from .reviewer import (
 
 logger = logging.getLogger(__name__)
 
-# Cap on one tool result inside the transcript. Mirrors the subagent's 2500 but a
-# little larger, since diffs are the main payload here.
-MAX_TOOL_RESULT = 4000
+# Cap on one tool result inside the transcript. Matches tools.MAX_READ_CHARS, and
+# must move with it: this truncation is applied *again* here, after the tool has
+# already sized its own result and written a header describing it. A smaller
+# value re-creates the bug tools.py was rewritten to fix, one level removed —
+# the tool's now-honest "lines 2200-2340" header describing content this cap has
+# since cut off.
+MAX_TOOL_RESULT = 12_000
 
 # Consecutive rounds returning neither text nor tool calls before giving up. One
 # is a transient; three in a row is a misconfiguration worth reporting.
@@ -57,7 +61,9 @@ MAX_EMPTY_ROUNDS = 3
 LLM_RETRY_DELAYS = (1.0, 4.0, 10.0)
 
 # The written review is the point of the log, so it gets a larger cap than a
-# tool result. Still bounded: review_trace trims per field as a backstop.
+# tool result. Still bounded: review_trace trims per field as a backstop — and
+# only since that backstop was raised above this number does this cap do
+# anything at all. At the old MAX_FIELD_CHARS of 8000 it was dead code.
 MAX_REVIEW_IN_TRACE = 20_000
 
 

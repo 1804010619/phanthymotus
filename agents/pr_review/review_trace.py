@@ -21,9 +21,12 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-# Per-field cap. Tool results are already capped at MAX_RESULT_CHARS (4000) by
-# tools.py, but args and narration come from the model and have no such bound.
-MAX_FIELD_CHARS = 8000
+# Per-field cap. Deliberately above review_agent.MAX_TOOL_RESULT (12000) so the
+# trace is never the narrower cap: when it was, the trace showed less than the
+# model was actually given, and the traces were the only evidence anyone had.
+# That is how a truncation bug survived several passes over them — the debugging
+# instrument was lying the same way the model's input was.
+MAX_FIELD_CHARS = 16_000
 
 
 class ReviewTrace:
