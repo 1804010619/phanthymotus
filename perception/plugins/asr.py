@@ -143,40 +143,98 @@ def _phonemize_safe(text: str, lang: str) -> str:
 
 
 
-def _text_to_ipa(text: str) -> list:
-    """Convert text to IPA phoneme sequence using persistent espeak-ng backend.
-    Returns a list of IPA phoneme strings (one per word/character).
-    """
-    # Separate Chinese and non-Chinese segments
-    segments = []
-    current = ''
-    current_is_cjk = None
-    for char in text:
-        is_cjk = '\u4e00' <= char <= '\u9fff'
-        if current_is_cjk is None:
-            current_is_cjk = is_cjk
-        if is_cjk != current_is_cjk:
-            if current.strip():
-                segments.append((current.strip(), current_is_cjk))
-            current = ''
-            current_is_cjk = is_cjk
-        current += char
-    if current.strip():
-        segments.append((current.strip(), current_is_cjk))
+def _text_segments(text: str):
+    """Runs of CJK / non-CJK as `(start, end, is_cjk)` offsets into `text`.
 
+    Offsets rather than substrings because a phoneme index has to be mapped back to
+    a character index, and the previous code `strip()`ed each run before handing it
+    on, which silently broke that correspondence.
+    """
+    spans = []
+    run_start = None
+    run_is_cjk = None
+    for i, char in enumerate(text):
+        is_cjk = '\u4e00' <= char <= '\u9fff'
+        if run_is_cjk is None:
+            run_start, run_is_cjk = i, is_cjk
+        elif is_cjk != run_is_cjk:
+            spans.append((run_start, i, run_is_cjk))
+            run_start, run_is_cjk = i, is_cjk
+    if run_is_cjk is not None:
+        spans.append((run_start, len(text), run_is_cjk))
+
+    trimmed = []
+    for seg_start, seg_end, is_cjk in spans:
+        while seg_start < seg_end and text[seg_start].isspace():
+            seg_start += 1
+        while seg_end > seg_start and text[seg_end - 1].isspace():
+            seg_end -= 1
+        if seg_start < seg_end:
+            trimmed.append((seg_start, seg_end, is_cjk))
+    return trimmed
+
+
+def _segment_phones(seg_text: str, lang: str):
+    """``(phones, phonemized)``; phonemized is False on the character fallback."""
+    try:
+        ipa = _phonemize_safe(seg_text, lang)
+        # Remove tone numbers and diacritics for fuzzy matching
+        ipa = _re.sub(r'[0-9\u02e5\u02e6\u02e7\u02e8\u02e9\xb9\xb2\xb3\u2074\u2075]', '', ipa)
+        return [p for p in ipa.split() if p], True
+    except Exception:
+        return list(seg_text), False
+
+
+def _phone_char_ends(text: str, start: int, end: int, lang: str,
+                     phones: list, phonemized: bool) -> list:
+    """For one segment, the character offset each of its phonemes ends at.
+
+    Counted from growing prefixes of the segment, phonemized with the same function
+    that produced ``phones``, so the mapping is exact. The previous code
+    extrapolated it from a phonemes-per-character ratio, which ate a character
+    whenever that ratio was not uniform: for '\u5c0f\u6f58\u5c0f\u6f58\uff0c\u73b0\u5728\u53d1\u751f\u4ec0\u4e48\u4e86\uff1f' with end_pos=12 it
+    computed round(12 * 11 / 29) = 5 and cut five characters, dropping \u73b0 from the
+    result. It also measured that ratio over a *different* segmentation, since it
+    skipped punctuation where _text_to_ipa splits on it.
+    """
+    if not phonemized:
+        # One "phoneme" per character, so the mapping is the identity.
+        return list(range(start + 1, end + 1))
+    ends = []
+    for i in range(start + 1, end + 1):
+        prefix_phones, ok = _segment_phones(text[start:i], lang)
+        if not ok:
+            break
+        target = min(len(prefix_phones), len(phones))
+        while len(ends) < target:
+            ends.append(i)
+    # Phonemizing the whole segment can yield more phonemes than any prefix did —
+    # espeak is context-sensitive and warns about word-count mismatches on Chinese.
+    # Attribute the remainder to the segment's last character.
+    while len(ends) < len(phones):
+        ends.append(end)
+    return ends
+
+
+def _text_to_ipa(text: str, with_positions: bool = False):
+    """Convert text to an IPA phoneme sequence using the persistent espeak backend.
+
+    Returns the phoneme list, or ``(phones, char_ends)`` when ``with_positions`` is
+    set, where ``char_ends[i]`` is the offset in ``text`` just past the last
+    character that produced ``phones[i]``. Positions cost one phonemize call per
+    character, so they are opt-in — only asr_kws needs them, to find where the wake
+    word ends.
+    """
     ipa_seq = []
-    for seg_text, is_cjk in segments:
+    char_ends = []
+    for seg_start, seg_end, is_cjk in _text_segments(text):
         lang = 'cmn' if is_cjk else 'en-us'
-        try:
-            ipa = _phonemize_safe(seg_text, lang)
-            # Remove tone numbers and diacritics for fuzzy matching
-            ipa = _re.sub(r'[0-9˥˦˧˨˩¹²³⁴⁵]', '', ipa)
-            phones = [p for p in ipa.split() if p]
-            ipa_seq.extend(phones)
-        except Exception:
-            # Fallback: use characters as-is
-            ipa_seq.extend(list(seg_text))
-    return ipa_seq
+        phones, phonemized = _segment_phones(text[seg_start:seg_end], lang)
+        if with_positions:
+            char_ends.extend(_phone_char_ends(text, seg_start, seg_end, lang,
+                                              phones, phonemized))
+        ipa_seq.extend(phones)
+    return (ipa_seq, char_ends) if with_positions else ipa_seq
 
 
 def _phoneme_edit_distance(seq1: list, seq2: list) -> float:
@@ -255,70 +313,20 @@ def _find_keyword_in_ipa(text_ipa: list, keyword_ipa: list, threshold: float):
     return best_dist <= threshold, best_end
 
 
-def _extract_after_keyword(text: str, keyword_text: str, end_pos: int) -> str:
-    """Extract text after the matched keyword using IPA end_pos to locate cut point.
+def _text_after_phoneme(text: str, char_ends: list, end_pos: int) -> str:
+    """The text following the phoneme at ``end_pos - 1``, by exact character offset.
 
-    end_pos is the IPA phoneme index where the keyword match ends.
-    We map this back to the original text by counting phoneme-producing
-    characters and their IPA token counts per segment.
+    ``char_ends`` comes from ``_text_to_ipa(text, with_positions=True)``, so this is
+    a lookup rather than the estimate it replaces — and it needs no second
+    phonemization pass, which used to redo the work with a *different* segmentation
+    (it skipped punctuation where _text_to_ipa splits on it) and therefore could not
+    have agreed with the index it was given.
     """
-    # Build segments of phoneme-producing characters
-    segments = []
-    current = ''
-    current_is_cjk = None
-    for char in text:
-        is_cjk = '\u4e00' <= char <= '\u9fff'
-        is_alpha = char.isalpha()
-        if not is_cjk and not is_alpha:
-            continue
-        if current_is_cjk is None:
-            current_is_cjk = is_cjk
-        if is_cjk != current_is_cjk:
-            if current.strip():
-                segments.append((current.strip(), current_is_cjk))
-            current = ''
-            current_is_cjk = is_cjk
-        current += char
-    if current.strip():
-        segments.append((current.strip(), current_is_cjk))
+    if end_pos <= 0 or not char_ends:
+        return ''
+    cut = char_ends[min(end_pos, len(char_ends)) - 1]
+    return text[cut:].lstrip('\uff0c\u3002\uff01\uff1f\u3001\uff1b\uff1a,.!?;: ')
 
-    # Count IPA tokens per segment to find the text position for end_pos
-    ipa_idx = 0
-    phoneme_char_pos = 0
-
-    for seg_text, is_cjk in segments:
-        lang = 'cmn' if is_cjk else 'en-us'
-        try:
-            ipa = _phonemize_safe(seg_text, lang)
-            ipa = _re.sub(r'[0-9˥˦˧˨˩¹²³⁴⁵]', '', ipa)
-            phones = [p for p in ipa.split() if p]
-        except Exception:
-            phones = list(seg_text)
-
-        seg_ipa_count = len(phones)
-        if ipa_idx + seg_ipa_count >= end_pos:
-            offset_in_seg = end_pos - ipa_idx
-            chars_in_seg = len(seg_text)
-            if seg_ipa_count > 0:
-                cut_chars = round(offset_in_seg * chars_in_seg / seg_ipa_count)
-            else:
-                cut_chars = chars_in_seg
-            cut_chars = min(cut_chars, chars_in_seg)
-
-            found = 0
-            for i, c in enumerate(text):
-                if '\u4e00' <= c <= '\u9fff' or c.isalpha():
-                    found += 1
-                if found >= phoneme_char_pos + cut_chars:
-                    cut_idx = i + 1
-                    remaining = text[cut_idx:]
-                    remaining = remaining.lstrip('，。！？、；：,.!?;: ')
-                    return remaining
-            return ''
-        ipa_idx += seg_ipa_count
-        phoneme_char_pos += len(seg_text)
-
-    return ''
 
 _ASR_PUB_QOS = QoSProfile(
     reliability=ReliabilityPolicy.BEST_EFFORT,
@@ -1470,7 +1478,8 @@ class _ASRNode(Node):
                 # ASR-based keyword spotting
                 if trigger_mode == 'asr_kws' and keyword_ipa:
                     _t1 = time.time()
-                    text_ipa = _text_to_ipa(text)
+                    text_ipa, text_char_ends = _text_to_ipa(
+                        text, with_positions=True)
                     _spans.append({"span": "kws_phonemize", "component": "perception",
                                    "start_ts": _t1, "end_ts": time.time(),
                                    "meta": {"text": text[:20]}})
@@ -1485,7 +1494,7 @@ class _ASRNode(Node):
                     if not matched:
                         continue
                     # Extract text after keyword
-                    remaining = _extract_after_keyword(text, kw_text, end_pos)
+                    remaining = _text_after_phoneme(text, text_char_ends, end_pos)
                     log.info(f"[asr] asr_kws TRIGGERED: '{text}' → '{remaining}'")
                     _kws_triggered = True
                     if not remaining.strip():

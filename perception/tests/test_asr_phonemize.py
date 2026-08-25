@@ -167,3 +167,105 @@ def test_mixed_language_text_builds_one_backend_per_language(monkeypatch):
     asr._text_to_ipa("小范小范，jump forward.")
     assert sorted(set(builds)) == ["cmn", "en-us"]
     assert len(builds) == 2, f"built {len(builds)} backends for two languages"
+
+
+# ── mapping a phoneme index back to a character offset ───────────────────────
+#
+# The reported symptom: 小潘小潘，现在发生什么了？ triggered on the wake word and the
+# remainder came back as 在发生什么了？ — 现 was eaten. end_pos was right; the mapping
+# was a phonemes-per-character extrapolation, round(12 * 11 / 29) = 5, measured over
+# a segmentation that skipped punctuation where _text_to_ipa splits on it.
+
+def _fake_cmn_phonemizer(monkeypatch, per_char=3):
+    """espeak stand-in: `per_char` phonemes per CJK character, one per latin char.
+
+    Deliberately non-uniform across languages, which is what broke the ratio
+    estimate; a uniform stub would pass either implementation.
+    """
+    class _Backend:
+        def __init__(self, lang, with_stress=False):
+            self.lang = lang
+
+        def phonemize(self, texts, separator=None, strip=False):
+            t = texts[0]
+            if self.lang == "cmn":
+                return [" ".join("p%d" % i for i in range(len(t) * per_char))]
+            return [" ".join(list(t))]
+
+    backend_mod = types.ModuleType("phonemizer.backend")
+    backend_mod.EspeakBackend = _Backend
+    sep_mod = types.ModuleType("phonemizer.separator")
+    sep_mod.Separator = lambda **kw: object()
+    monkeypatch.setitem(sys.modules, "phonemizer", types.ModuleType("phonemizer"))
+    monkeypatch.setitem(sys.modules, "phonemizer.backend", backend_mod)
+    monkeypatch.setitem(sys.modules, "phonemizer.separator", sep_mod)
+
+
+def test_segments_are_offsets_into_the_original_text():
+    text = "小范小范，你好。"
+    spans = asr._text_segments(text)
+    assert [text[s:e] for s, e, _ in spans] == ["小范小范", "，", "你好", "。"]
+    assert [cjk for _, _, cjk in spans] == [True, False, True, False]
+
+
+def test_the_reported_case_keeps_every_character_after_the_wake_word(monkeypatch):
+    _fake_cmn_phonemizer(monkeypatch)
+    text = "小潘小潘，现在发生什么了？"
+    phones, char_ends = asr._text_to_ipa(text, with_positions=True)
+    assert len(char_ends) == len(phones)
+    # 4 CJK chars x 3 phonemes = the wake word ends at phoneme 12
+    assert asr._text_after_phoneme(text, char_ends, 12) == "现在发生什么了？"
+
+
+@pytest.mark.parametrize("end_pos, expected", [
+    (3,  "潘小潘，现在发生什么了？"),   # after the first character
+    (6,  "小潘，现在发生什么了？"),
+    (12, "现在发生什么了？"),          # after the wake word
+    (15, "在发生什么了？"),
+])
+def test_cut_points_are_exact_not_estimated(monkeypatch, end_pos, expected):
+    _fake_cmn_phonemizer(monkeypatch)
+    text = "小潘小潘，现在发生什么了？"
+    _, char_ends = asr._text_to_ipa(text, with_positions=True)
+    assert asr._text_after_phoneme(text, char_ends, end_pos) == expected
+
+
+def test_mixed_script_cut(monkeypatch):
+    """The old estimate was worst here: CJK and latin have very different
+    phonemes-per-character, and it applied one ratio to a merged segment."""
+    _fake_cmn_phonemizer(monkeypatch)
+    text = "小范小范，jump forward."
+    _, char_ends = asr._text_to_ipa(text, with_positions=True)
+    assert asr._text_after_phoneme(text, char_ends, 12) == "jump forward."
+
+
+def test_char_ends_are_monotonic(monkeypatch):
+    _fake_cmn_phonemizer(monkeypatch)
+    _, char_ends = asr._text_to_ipa("小范小范，你好啊。", with_positions=True)
+    assert char_ends == sorted(char_ends)
+
+
+def test_positions_work_on_the_character_fallback(monkeypatch):
+    """Without espeak each character is its own phoneme, so the cut is direct."""
+    monkeypatch.setattr(asr, "_get_espeak_backend",
+                        lambda lang: (_ for _ in ()).throw(RuntimeError("nope")))
+    text = "小范小范，你好。"
+    phones, char_ends = asr._text_to_ipa(text, with_positions=True)
+    assert len(char_ends) == len(phones)
+    assert asr._text_after_phoneme(text, char_ends, 4) == "你好。"
+
+
+def test_out_of_range_end_pos_is_safe(monkeypatch):
+    _fake_cmn_phonemizer(monkeypatch)
+    text = "小范小范"
+    _, char_ends = asr._text_to_ipa(text, with_positions=True)
+    assert asr._text_after_phoneme(text, char_ends, 0) == ""
+    assert asr._text_after_phoneme(text, char_ends, 9999) == ""
+    assert asr._text_after_phoneme(text, [], 5) == ""
+
+
+def test_positions_are_opt_in(monkeypatch):
+    """Callers that only match still get a plain list, and pay no prefix passes."""
+    _fake_cmn_phonemizer(monkeypatch)
+    out = asr._text_to_ipa("小范小范")
+    assert isinstance(out, list) and out and isinstance(out[0], str)

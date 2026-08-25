@@ -122,7 +122,7 @@ Inference is not the latency. Captured from the plugin's own spans on a live
 | `asr_transcribe` | 120 ms | 91 ms |
 | `kws_phonemize` | **5256 ms** | **5234 ms** |
 | `kws_match` | 0 ms | 0 ms |
-| unaccounted (queue wait + `_extract_after_keyword`) | 1775 ms | 5376 ms |
+| unaccounted (queue wait + cutting the wake word off) | 1775 ms | 5376 ms |
 
 Transcription was 91–120 ms. Almost all of it was `kws_phonemize` doing nothing
 useful — see § asr_kws and espeak below — and the growing unaccounted figure is the
@@ -396,6 +396,25 @@ The persistent-backend cache the code always claimed to have only starts working
 once construction succeeds — before this, the dict stayed empty and every segment
 rebuilt.
 
+**Cutting the wake word off the transcript used to guess.** The match returns a
+*phoneme* index, but what gets forwarded to the agent is *text*, so the two have to
+be related. The old code estimated: it re-phonemized the segment containing the
+match and scaled, `round(offset_in_seg * chars_in_seg / seg_ipa_count)`. Chinese
+characters are not a fixed number of phonemes each — 「小潘小潘，现在发生什么了？」
+phonemizes to 29 phonemes over 12 characters and the wake word ends at phoneme 12,
+where the estimate gives `round(12 * 11 / 29) = 5` and eats 现, so the agent was
+asked 「在发生什么了？」. Off-by-one on a syllable also silently changes the utterance
+in mixed script, where latin and CJK have very different phonemes-per-character and
+one ratio was applied to both.
+
+`_text_to_ipa(text, with_positions=True)` now also returns, per phoneme, the
+character offset in the original string that phoneme ends at — built from growing
+prefixes of each segment, phonemized through the same function that produced the
+phonemes. Segments are `(start, end, is_cjk)` offsets rather than `strip()`ed
+substrings, so punctuation and whitespace stay accounted for. `_text_after_phoneme`
+is then a lookup, which also removes the second phonemization pass. Positions are
+opt-in: callers that only need to match pay nothing for the prefix passes.
+
 ---
 
 ## Plugin Concurrency
@@ -511,6 +530,25 @@ iteration` in the middle of a start. Copy under the lock, then iterate the copy.
 Every MCP server in the project uses `ThreadingHTTPServer` — `perception/main.py`
 and each robot driver's `main.py`. Any plugin holding a `self._nodes` /
 `self._instances` / `self._streams` dict needs the treatment above.
+
+### The other way to orphan a node: nobody sends `stop`
+
+The same symptoms — two nodes publishing the same kind of output, one of them on a
+topic no card accounts for, and rclpy's duplicate-node-name warning — also appear
+when the plugin is correct and the `stop` simply never arrives.
+
+Agent Core's `stop-project` walks the cards in the *saved canvas layout*. A card
+deleted from the canvas is no longer in that list, so from that moment nothing can
+reach its instance again: it keeps its ROS node, its subscription, its subprocess
+and (on `device: gpu`) ~1.4 GB of CUDA context until perception exits. On orin5 a
+deleted TTS card left `vits2_trt_card_mt4rkb752py8` publishing to the topic of a
+connection that had already been deleted, while the live card published elsewhere —
+the dashboard read "running", and there was no sound.
+
+`api/canvas.py` and `api/solutions.py` now diff the card set on every layout write
+and `stop` whatever left it (`api/config.py: stop_removed_cards`). So when you see
+an orphan, check both sides: the plugin's locking *and* whether a `stop` for that
+instance_id ever showed up in the log.
 
 ---
 
