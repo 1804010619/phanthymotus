@@ -611,3 +611,31 @@ packaging blanks declared fields only, there is no field-name blocklist:
 An unmarked credential is uploaded in clear text and readable by anyone who
 downloads the solution. Full spec: `phanthymotus-driver/README_dev.md`
 § "Marking sensitive fields".
+
+---
+
+## Running the tests inside a perception image
+
+`python3 -m pytest tests -q` from a checkout works anywhere. Running the same
+suite **inside a perception container** — which is how you confirm a fix behaves on
+the Python the device actually ships — needs one flag:
+
+```bash
+docker cp tests <container>:/work/
+docker exec <container> bash -c 'source /opt/ros/humble/install/setup.bash && \
+  source /ros_ws/install/setup.bash && cd /work && \
+  PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python3 -m pytest tests -q -p pytest_mock'
+```
+
+Without `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1`, **`caplog` captures nothing** and every
+test that asserts on a log record fails while the log line is plainly there in the
+captured stderr. The image inherits ROS 2's own pytest plugins from the base
+(`launch_testing`, `launch_testing_ros`, six `ament_*`, `colcon-core`) alongside
+`pytest-cov 3.0.0` / `pytest-timeout 2.1.0`, and something in that set breaks
+`_pytest.logging`'s capture handler under pytest 8. Verified by reduction: a
+two-line test logging to a plain `logging.getLogger("probe")` fails the same way,
+and passes the moment autoload is off. It is not the tests, and not a Python 3.10
+difference.
+
+Measured on jp6.1 (Python 3.10.12, pytest 8.3.3): 175 passed / 1 failed with
+autoload on, **176 passed** with it off.
