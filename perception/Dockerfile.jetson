@@ -151,23 +151,34 @@ ENV YOLO_CONFIG_DIR=/work
 # Cost: 74 MB compressed / ~250 MB unpacked, nearly all of it
 # libonnxruntime_providers_cuda.so, versus ~30 MB for the CPU wheel.
 #
-# The URL needs %2B for the '+cuda' local version, but the file on disk must
-# keep the literal '+' or pip refuses to parse the version out of the filename.
-ARG SHERPA_GPU_WHEEL_511=sherpa_onnx-1.13.6+cuda-cp38-cp38-linux_aarch64.whl
-ARG SHERPA_GPU_WHEEL_61=sherpa_onnx-1.13.6+cuda-cp310-cp310-linux_aarch64.whl
+# The COS key carries the JetPack, the filename does not. Upstream's setup.py
+# tags the wheel `1.13.6+cuda-cp<abi>`, so the only thing separating the two
+# builds in a flat directory would be `cp38` vs `cp310` — which is a *Python*
+# discriminator, not a CUDA one. It happens to select correctly today, since each
+# image ships exactly one Python, but a second cp310 build for another JetPack 6.x
+# on a different CUDA would collide. Renaming the file is not an option (pip parses
+# the version out of it and it must match the wheel metadata), so the directory
+# records what the name cannot.
+#
+# The URL needs %2B for the '+cuda' local version — `quote` leaves the '/' of the
+# key alone — while the file on disk must keep the literal '+' or pip refuses to
+# parse the version out of the filename.
+ARG SHERPA_GPU_WHEEL_511=jp511/sherpa_onnx-1.13.6+cuda-cp38-cp38-linux_aarch64.whl
+ARG SHERPA_GPU_WHEEL_61=jp61/sherpa_onnx-1.13.6+cuda-cp310-cp310-linux_aarch64.whl
 RUN case "${JP_VERSION}" in \
         511) WHEEL="${SHERPA_GPU_WHEEL_511}" ;; \
         61)  WHEEL="${SHERPA_GPU_WHEEL_61}"  ;; \
         *)   WHEEL="" ;; \
     esac; \
     if [ -n "${WHEEL}" ]; then \
+        FILE="$(basename "${WHEEL}")" && \
         echo "[build] sherpa-onnx: GPU wheel for jp${JP_VERSION} — ${WHEEL}" && \
         python3 -c "import urllib.request, urllib.parse, sys; \
-name = sys.argv[1]; \
-urllib.request.urlretrieve('https://agi-phanthy-dev-1252788780.cos.ap-beijing.myqcloud.com/public/sherpa-onnx/' + urllib.parse.quote(name), '/tmp/' + name)" \
-            "${WHEEL}" && \
-        pip3 install --no-cache-dir "/tmp/${WHEEL}" && \
-        rm -f "/tmp/${WHEEL}" && \
+key, dest = sys.argv[1], sys.argv[2]; \
+urllib.request.urlretrieve('https://agi-phanthy-dev-1252788780.cos.ap-beijing.myqcloud.com/public/sherpa-onnx/' + urllib.parse.quote(key), dest)" \
+            "${WHEEL}" "/tmp/${FILE}" && \
+        pip3 install --no-cache-dir "/tmp/${FILE}" && \
+        rm -f "/tmp/${FILE}" && \
         python3 -c "import sherpa_onnx, pathlib; \
 lib = pathlib.Path(sherpa_onnx.__file__).parent / 'lib' / 'libonnxruntime_providers_cuda.so'; \
 assert lib.is_file(), 'CUDA provider missing from the installed wheel'; \

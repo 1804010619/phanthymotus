@@ -308,19 +308,26 @@ are converted from those with `tools/convert_onnx_fp16.py`.
 ### The CUDA wheels
 
 PyPI ships CPU-only `sherpa-onnx`, so `Dockerfile.jetson` downloads a wheel built
-in-house from COS (`public/sherpa-onnx/sherpa_onnx-<ver>+cuda-<abi>-linux_aarch64.whl`),
-one per JetPack line, and falls back to the PyPI CPU wheel for any `JP_VERSION`
-without one:
+in-house from COS under `public/sherpa-onnx/<jp>/`, one per JetPack line, and falls
+back to the PyPI CPU wheel for any `JP_VERSION` without one:
 
-| | onnxruntime-gpu | CUDA / cuDNN | wheel |
+| | onnxruntime-gpu | CUDA / cuDNN | COS key |
 |---|---|---|---|
-| jp5.11 (focal, L4T R35) | 1.16.0 | 11.4 / 8 | `…+cuda-cp38-cp38-linux_aarch64.whl` |
-| jp6.1 (jammy, L4T R36) | 1.18.1 | 12.6 / 9 | `…+cuda-cp310-cp310-linux_aarch64.whl` |
+| jp5.11 (focal, L4T R35) | 1.16.0 | 11.4 / 8 | `jp511/sherpa_onnx-<ver>+cuda-cp38-cp38-linux_aarch64.whl` |
+| jp6.1 (jammy, L4T R36) | 1.18.1 | 12.6 / 9 | `jp61/sherpa_onnx-<ver>+cuda-cp310-cp310-linux_aarch64.whl` |
 
 Neither the ONNX Runtime pairing nor the CPython ABI is portable, which is why
 there are two wheels rather than one. `cmake/onnxruntime-linux-aarch64-gpu.cmake`
 in sherpa-onnx pins the URL and SHA256 per version and names the target board for
 each; 1.18.1 is the one it lists for L4T R36 + CUDA 12.6.
+
+**The directory carries the JetPack, because the filename cannot.** Upstream's
+`setup.py` tags the wheel `<ver>+cuda-cp<abi>`, so in a flat directory the only
+thing separating the two builds is `cp38` vs `cp310` — a *Python* discriminator,
+not a CUDA one. It selects correctly today, since each image ships exactly one
+Python and pip refuses a wheel built for another, but a second cp310 build for
+another JetPack 6.x on a different CUDA would collide. Renaming the file is not an
+option: pip parses the version out of it and it has to match the wheel metadata.
 
 **Check the cuDNN soname before committing to a build.** ONNX Runtime's aarch64 GPU
 packages do not encode it in the filename past 1.18.0, and it is what decides
@@ -372,9 +379,12 @@ Notes:
   `cmake/onnxruntime-linux-aarch64-gpu.cmake` checks there before GitHub. Use that
   exact generic name even when the release asset is called something else — the
   hash it checks is the one for the asset it would have downloaded.
-- Upload the result under the `public/` COS prefix (anonymous read, same prefix
-  `utils/model_downloader.py` uses) and bump the matching `SHERPA_GPU_WHEEL_<jp>`
-  in `Dockerfile.jetson`.
+- Upload the result to `public/sherpa-onnx/<jp>/` (anonymous read, same `public/`
+  prefix `utils/model_downloader.py` uses) and bump the matching
+  `SHERPA_GPU_WHEEL_<jp>` in `Dockerfile.jetson` — the ARG holds the key *with* its
+  directory, and the build downloads it to `/tmp/$(basename …)`. COS credentials
+  live in `resource-center/deploy/values.env` (`COS_SECRET_ID` / `COS_SECRET_KEY`);
+  the bucket is `agi-phanthy-dev-1252788780` in `ap-beijing`.
 
 ---
 
