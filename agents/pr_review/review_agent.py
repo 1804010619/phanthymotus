@@ -61,6 +61,11 @@ BUDGET_WARN_ROUNDS = 5
 # what keeps their product from ever actually overflowing the window.
 CONTEXT_WARN_TOKENS = 120_000
 
+# Shortest trailing narration `_salvage` will pass off as a review. Under this
+# it is a sentence about what the model was about to do next, which posted under
+# a "Code Review" heading reads as a review that found nothing.
+MIN_SALVAGE_CHARS = 400
+
 # Wall clock held back from the round loop so there is always room for one
 # forced finish_review. Without the reserve, a review that runs to its timeout
 # has by definition no budget left to write anything — which is the one case
@@ -842,13 +847,22 @@ class ReviewAgent:
             return ""
 
     def _salvage(self, messages: list[dict], result: ReviewResult) -> str:
-        """Recover something useful when the loop ended without finish_review."""
+        """Recover something useful when the loop ended without finish_review.
+
+        Only reached once the forced finish_review has also failed, so this is
+        the floor rather than the plan. It applies a length floor because the
+        last assistant turn is usually narration, not a review: PR #174's ended
+        on "I'm now tracing the full request state machine…" and 335 characters
+        of that posted under a "Code Review" heading is barely better than the
+        placeholder. Below the floor the job fails instead, which says what
+        actually happened.
+        """
         prose = [
             (m.get("content") or "").strip()
             for m in messages
             if m.get("role") == "assistant" and (m.get("content") or "").strip()
         ]
-        if prose:
+        if prose and len(prose[-1]) >= MIN_SALVAGE_CHARS:
             return prose[-1]
         result.empty = True
         return (
