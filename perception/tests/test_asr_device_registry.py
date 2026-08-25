@@ -11,7 +11,7 @@ expensive to notice:
 - pointing a `gpu` entry at int8 weights, which runs 1.25x-3.3x *slower* than the
   CPU because ONNX Runtime's CUDA provider has no int8 kernels, and
 - pointing a `cpu` entry at fp16 weights, which measured 42890 ms against int8's
-  3383 ms because ONNX Runtime has no fp16 CPU kernels.
+  3295 ms because ONNX Runtime has no fp16 CPU kernels.
 
 Neither raises; both just make the product slow. Also asserted: the configSchema's
 `device` visibility list matches the models that actually have gpu weights, so the
@@ -76,7 +76,7 @@ def test_gpu_entries_are_never_int8():
 
 def test_cpu_entries_are_never_fp16():
     """ONNX Runtime has no fp16 CPU kernels and casts everything: 42890 ms where
-    int8 took 3383 ms on the same audio."""
+    int8 took 3295 ms on the same audio."""
     for model, device, spec in _device_specs():
         if device == "cpu":
             assert spec["dtype"] != "fp16", \
@@ -150,3 +150,61 @@ def test_model_dir_from_another_entry_is_ignored():
     spec = asr.ASR_MODELS["sensevoice-small"]["devices"]["gpu"]
     other = asr.ASR_MODELS["paraformer-zh-en"]["devices"]["cpu"]["dir"]
     assert asr._model_dir_for({"model_dir": other}, spec) == spec["dir"]
+
+
+# ── warmup ───────────────────────────────────────────────────────────────────
+#
+# The first CUDA inference cost 1777 ms against a 77 ms steady state (lazy kernel
+# loading, cuDNN autotuning, memory pool). Untouched, that lands on the operator's
+# first utterance, right after the model finished loading.
+
+def test_silence_wav_is_a_decodable_16k_mono_wav():
+    import io
+    import wave
+    data = asr._silence_wav(0.5)
+    with wave.open(io.BytesIO(data)) as wf:
+        assert wf.getnchannels() == 1
+        assert wf.getsampwidth() == 2
+        assert wf.getframerate() == asr.SAMPLE_RATE
+        assert wf.getnframes() == int(asr.SAMPLE_RATE * 0.5)
+
+
+def test_warmup_decodes_one_clip():
+    calls = []
+
+    class _Adapter:
+        def transcribe(self, wav_bytes, language):
+            calls.append((len(wav_bytes), language))
+            return ""
+
+    asr._warmup_adapter(_Adapter(), "sensevoice-small", "gpu")
+    assert len(calls) == 1
+    assert calls[0][0] > 0
+
+
+@pytest.mark.parametrize("cfg, expect_warm", [
+    ({}, True),                      # on by default — the gpu first-call cost
+    ({"warmup": True}, True),
+    ({"warmup": False}, False),      # opt out
+])
+def test_build_warms_up_unless_disabled(monkeypatch, cfg, expect_warm):
+    warmed = []
+    monkeypatch.setattr(asr, "_warmup_adapter",
+                        lambda adapter, model, device: warmed.append((model, device)))
+    monkeypatch.setattr("utils.model_downloader.ensure_model",
+                        lambda *a, **k: None)
+    monkeypatch.setitem(asr.ASR_MODELS["sensevoice-small"], "adapter",
+                        lambda model_dir, device, num_threads: object())
+
+    asr._build_asr_adapter({"asr_model": "sensevoice-small", "device": "cpu", **cfg})
+    assert bool(warmed) is expect_warm
+
+
+def test_warmup_failure_does_not_propagate():
+    """A model that cannot decode silence still fails loudly on real audio; it must
+    not stop the plugin from coming up."""
+    class _Broken:
+        def transcribe(self, wav_bytes, language):
+            raise RuntimeError("no session")
+
+    asr._warmup_adapter(_Broken(), "sensevoice-small", "gpu")  # must not raise

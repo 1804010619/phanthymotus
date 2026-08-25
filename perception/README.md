@@ -88,11 +88,20 @@ just a different provider string.
 
 | `asr_model` | `device: cpu` | `device: gpu` | gpu speed-up |
 |-------------|---------------|---------------|--------------|
-| `sensevoice-small` (default) | int8, 228 MB | **fp16, 448 MB** | **5.81x** |
+| `sensevoice-small` (default) | int8, 228 MB | **fp16, 448 MB** | **~2.5x** per utterance |
 | `paraformer-zh-en` (streaming) | int8, 226 MB | **fp32, 825 MB** | **1.77x** |
 | `x-asr-zh-en` | int8 + fp32 | — not offered | 0.80x, i.e. slower |
 | `paraformer-offline` | int8 | — not offered | unmeasured |
 | `zipformer-en` | int8 | — not offered | unmeasured |
+
+**gpu costs about 2 GB of RAM, and ~1.4 GB of that is unreturnable.** Measured with
+only ASR resident: the cpu adapter adds 542 MB and drops back to 129 MB when
+released; the gpu adapter adds 1968 MB and still holds 1516 MB after release,
+because a process that has touched CUDA does not give its context and memory pool
+back. On a 7.4 GB Orin already running vop (YOLO), OCR (TensorRT) and TTS, turning
+on gpu ASR was enough to exhaust memory: perception was restarted in a loop, Agent
+Core could not reach port 15720, and the dashboard rolled the project back and the
+cards vanished. Budget for it before enabling.
 
 TTS is simpler: Matcha is fp32 only, so both devices load the same files and
 `device` only picks the provider (gpu measured ~4.3x). The `vits2_trt` engine
@@ -101,6 +110,30 @@ ignores `device` entirely — it is a TensorRT engine and never touches ONNX Run
 `device: gpu` also needs the CUDA sherpa-onnx wheel, which only the jp5.11 image
 installs (see § The jp5.11 CUDA wheel). On jp6.1 and x86 dev hosts it falls back to
 `cpu` with a warning rather than failing to start.
+
+### Latency per utterance, which is what an operator feels
+
+Same box, SenseVoice, real VAD segments (1–4 s of speech, the length a wake-word
+turn actually produces), decoded one at a time with a 3 s gap, with the rest of
+perception left running:
+
+| | cpu (int8) | gpu (fp16) | |
+|---|---|---|---|
+| first call | 185 ms | **1777 ms** | **gpu 9.6x slower** |
+| median after the first | 193 ms | **77 ms** | gpu 2.5x faster |
+| adapter build | 5.5 s | 11.6 s | |
+
+Two things follow. First, the 1777 ms is CUDA initialisation — lazy kernel loading,
+cuDNN autotuning, memory pool — and it lands on whatever utterance comes first.
+`_warmup_adapter()` therefore decodes a second of silence right after building, so
+that cost is paid inside the `loading` window the dashboard already shows. Set
+`warmup: false` to skip it.
+
+Second, **the steady-state speed-up on real utterances is ~2.5x, not the 5.81x in
+the table below.** That number came from the model's own `test_wavs`, which are 7 s
+each; short utterances give the GPU less to amortise its fixed cost against. The
+batch figures are still the right way to compare dtypes against each other — they
+are just not the latency a user sees.
 
 ### Measurements
 

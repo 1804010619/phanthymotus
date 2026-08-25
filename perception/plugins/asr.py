@@ -300,8 +300,9 @@ TOOLS = [
                 # test_asr_device_registry.py asserts they match.
                 "device":        {"type": "string", "enum": ["cpu", "gpu"],
                                   "description": "Inference device. gpu loads non-quantised weights "
-                                                 "(SenseVoice fp16 ~5.8x, streaming paraformer fp32 ~1.8x "
-                                                 "vs int8-on-cpu) and needs the CUDA sherpa-onnx wheel",
+                                                 "(~2.5x faster per utterance) but costs ~2 GB RAM "
+                                                 "vs ~0.5 GB on cpu, ~1.4 GB of which a CUDA context "
+                                                 "never gives back — check headroom before enabling",
                                   "default": "cpu", "scope": "shared",
                                   "x-show-when": {"asr_model": ["paraformer-zh-en", "sensevoice-small"]}},
                 "trigger_mode":  {"type": "string", "enum": ["vad", "kws", "asr_kws"], "description": "Trigger mode (vad = always listen, kws = KWS model, asr_kws = ASR + phoneme matching)", "default": "kws", "scope": "shared"},
@@ -704,7 +705,45 @@ def _build_asr_adapter(cfg: dict) -> Optional[ASRAdapter]:
         ensure_model(spec["download"], model_dir)
 
     num_threads = int(cfg.get('num_threads', 2))
-    return model_info["adapter"](model_dir, device, num_threads)
+    adapter = model_info["adapter"](model_dir, device, num_threads)
+    if cfg.get('warmup', True):
+        _warmup_adapter(adapter, model_name, device)
+    return adapter
+
+
+def _silence_wav(seconds: float = 1.0) -> bytes:
+    import io
+    buf = io.BytesIO()
+    with wave.open(buf, 'wb') as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(SAMPLE_RATE)
+        w.writeframes(b'\x00\x00' * int(SAMPLE_RATE * seconds))
+    return buf.getvalue()
+
+
+def _warmup_adapter(adapter: ASRAdapter, model_name: str, device: str) -> None:
+    """Decode one second of silence so the first real utterance is not the one
+    that pays initialisation.
+
+    On CUDA the first inference measured 1777 ms against a 77 ms steady state —
+    lazy kernel loading, cuDNN autotuning and the memory pool all land on it. That
+    is precisely the utterance an operator notices, because it arrives right after
+    the model finished loading. Warming up here moves the cost inside the `loading`
+    window the dashboard is already showing.
+
+    Best-effort: a model that cannot decode silence is not necessarily broken (and
+    would fail loudly on the first real utterance anyway), so a failure here is
+    logged and does not stop the plugin from coming up.
+    """
+    t0 = time.monotonic()
+    try:
+        adapter.transcribe(_silence_wav(), 'zh-CN')
+    except Exception as error:  # noqa: BLE001
+        log.warning("[asr] warmup of %s on %s failed: %s", model_name, device, error)
+        return
+    log.info("[asr] warmup: %s on %s took %.0f ms", model_name, device,
+             (time.monotonic() - t0) * 1000)
 
 
 # ── VAD Worker Process ────────────────────────────────────────────────────────

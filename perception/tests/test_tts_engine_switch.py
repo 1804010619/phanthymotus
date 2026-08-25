@@ -306,3 +306,75 @@ def test_engine_that_reports_error_after_construction_is_not_installed(monkeypat
     # And no action may claim success against it.
     assert plugin.dispatch("tts", {"action": "start"})["state"] == "error"
     assert plugin.dispatch("tts", {"action": "speak", "text": "hi"})["state"] == "error"
+
+
+# ── starts that arrive mid-build ─────────────────────────────────────────────
+#
+# The dashboard sends config (which triggers the switch) and start back to back,
+# so a start during a build is the normal path, not a rare race. Answering
+# `state: loading` and dropping it left the engine idle once it finished, and
+# Agent Core — which polls `info` after a loading start and reports "启动已取消"
+# if it ever sees idle — cancelled the card even though the engine loaded fine.
+
+def test_start_during_a_switch_is_replayed_once_the_engine_is_up(_fake_engines):
+    plugin = _plugin()
+    plugin.dispatch("tts", {"action": "config", "tts_engine": "sherpa_onnx"})
+
+    # The build is still in flight, so the call cannot start anything yet.
+    result = plugin.dispatch("tts", {"action": "start",
+                                     "instance_id": "card-1",
+                                     "input_topic": "/say"})
+    assert result["state"] == "loading"
+
+    _wait_until(lambda: "sherpa_onnx" in _fake_engines)
+    incoming = _fake_engines["sherpa_onnx"]
+    _wait_until(lambda: any(c.get("action") == "start" for c in incoming.calls))
+
+    started = [c for c in incoming.calls if c.get("action") == "start"]
+    assert len(started) == 1, "the deferred start must be replayed exactly once"
+    assert started[0]["input_topic"] == "/say"
+    assert started[0]["instance_id"] == "card-1"
+
+
+def test_a_stop_during_a_switch_cancels_the_deferred_start(_fake_engines):
+    """Otherwise the node reappears after the operator asked for it to stop."""
+    plugin = _plugin()
+    plugin.dispatch("tts", {"action": "config", "tts_engine": "sherpa_onnx"})
+    plugin.dispatch("tts", {"action": "start", "instance_id": "card-1",
+                            "input_topic": "/say"})
+    assert plugin.dispatch("tts", {"action": "stop",
+                                   "instance_id": "card-1"})["state"] == "idle"
+
+    _wait_until(lambda: "sherpa_onnx" in _fake_engines)
+    incoming = _fake_engines["sherpa_onnx"]
+    time.sleep(0.4)   # past the fake build delay, so a replay would have landed
+    assert not [c for c in incoming.calls if c.get("action") == "start"]
+
+
+def test_deferred_starts_are_per_instance(_fake_engines):
+    plugin = _plugin()
+    plugin.dispatch("tts", {"action": "config", "tts_engine": "sherpa_onnx"})
+    for card, topic in (("card-1", "/say/a"), ("card-2", "/say/b")):
+        plugin.dispatch("tts", {"action": "start", "instance_id": card,
+                                "input_topic": topic})
+
+    _wait_until(lambda: "sherpa_onnx" in _fake_engines)
+    incoming = _fake_engines["sherpa_onnx"]
+    _wait_until(lambda: len([c for c in incoming.calls
+                             if c.get("action") == "start"]) == 2)
+    topics = sorted(c["input_topic"] for c in incoming.calls
+                    if c.get("action") == "start")
+    assert topics == ["/say/a", "/say/b"]
+
+
+def test_start_after_the_build_finishes_is_not_replayed_twice(_fake_engines):
+    """A start that the live engine already handled must not also be queued."""
+    plugin = _plugin()
+    plugin.dispatch("tts", {"action": "config", "tts_engine": "sherpa_onnx"})
+    _wait_until(lambda: plugin.dispatch("tts", {"action": "info"})["state"] != "loading")
+
+    plugin.dispatch("tts", {"action": "start", "instance_id": "card-1",
+                            "input_topic": "/say"})
+    time.sleep(0.2)
+    incoming = _fake_engines["sherpa_onnx"]
+    assert len([c for c in incoming.calls if c.get("action") == "start"]) == 1

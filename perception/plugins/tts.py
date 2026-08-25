@@ -773,6 +773,16 @@ class TTSPlugin:
         self._impl_engine = ""
         self._building = ""          # engine name while a build is in flight
         self._build_error = None
+        # `start` calls that arrived while a build was in flight, keyed by
+        # instance_id, replayed against the new engine once it is resident. Agent
+        # Core's contract for a start that answers `state: loading` is that the
+        # tool will reach `running` on its own — it polls `info` and reports
+        # "启动已取消" if it ever sees `idle` (see agent-core api/config.py
+        # _settle_loading_item). Dropping the start satisfied the letter of
+        # "never block" and broke that contract: switching engine and starting in
+        # the same batch, which is exactly what the dashboard does, left the card
+        # cancelled even though the engine had loaded fine.
+        self._pending_starts: dict[str, dict] = {}
         engine = self._select_engine(self._cfg.get("engine")
                                      or self._cfg.get("tts_engine"))
         self._engine = engine
@@ -845,6 +855,7 @@ class TTSPlugin:
                         self._build_error = str(error)
                 return
             stale = None
+            replay = []
             with self._lock:
                 if self._building != engine:
                     stale = impl          # another switch superseded this one
@@ -853,8 +864,24 @@ class TTSPlugin:
                     self._impl_engine = engine
                     self._building = ""
                     self._build_error = None
+                    replay = list(self._pending_starts.values())
+                    self._pending_starts.clear()
             if stale is not None:
                 _dispose_impl(stale)
+                return
+
+            # Honour the starts that arrived mid-build. Without this the engine
+            # comes up idle, and Agent Core — which polls `info` after a start
+            # answered `loading` — reports the card as "启动已取消".
+            for start_args in replay:
+                try:
+                    log.info("[tts] replaying start deferred during the %s build: %s",
+                             engine, start_args.get("instance_id") or
+                             start_args.get("input_topic"))
+                    impl.dispatch("tts", start_args)
+                except Exception:
+                    log.error("[tts] deferred start failed after the %s build",
+                              engine, exc_info=True)
 
         threading.Thread(target=_run, name=f"tts-engine-{engine}", daemon=True).start()
 
@@ -893,6 +920,29 @@ class TTSPlugin:
                 result["error"] = error
             return result
         if building:
+            if action == "start":
+                # Defer, do not drop. The dashboard sends config (which triggers
+                # the switch) and start back to back, so this is the normal path,
+                # not a rare race — and _build_async replays it.
+                with self._lock:
+                    if self._building:
+                        key = args.get("instance_id") or args.get("input_topic") or ""
+                        self._pending_starts[key] = dict(args)
+                        deferred = True
+                    else:
+                        deferred = False   # build finished while we waited on the lock
+                if not deferred:
+                    return self.dispatch(name, args)
+            elif action == "stop":
+                # Cancel a deferred start rather than letting it revive the node
+                # after the operator asked for it to stop.
+                with self._lock:
+                    key = args.get("instance_id") or args.get("input_topic") or ""
+                    if key in self._pending_starts:
+                        self._pending_starts.pop(key, None)
+                    elif not key:
+                        self._pending_starts.clear()
+                return {"state": "idle"}
             return {"state": "loading",
                     "message": f"TTS engine {building} is initializing, retry shortly"}
         return {"state": "error", "message": f"TTS engine {engine} failed: {error}"}

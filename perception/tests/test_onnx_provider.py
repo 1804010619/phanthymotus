@@ -162,7 +162,7 @@ def test_cpu_stays_cpu_for_every_dtype(monkeypatch, tmp_path):
 
 
 def test_cpu_with_fp16_logs_an_error(monkeypatch, tmp_path, caplog):
-    """fp16 on CPU measured 42890 ms against int8's 3383 ms — ONNX Runtime has no
+    """fp16 on CPU measured 42890 ms against int8's 3295 ms — ONNX Runtime has no
     fp16 CPU kernels. It still runs, but the registry is wrong and should say so."""
     _install_fake_sherpa(monkeypatch, tmp_path, with_cuda=True)
     with caplog.at_level("ERROR"):
