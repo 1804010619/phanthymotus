@@ -11,6 +11,7 @@ import json
 import logging
 import queue
 import threading
+import time
 from abc import ABC, abstractmethod
 from typing import Optional
 
@@ -77,8 +78,17 @@ TOOLS = [
                 # without rebuilding the image. Mirrors asr_model in asr.py.
                 "tts_engine": {"type": "string", "enum": ["vits2_trt", "sherpa_onnx"],
                                "description": "TTS engine (vits2_trt = VITS2 TensorRT on Jetson, "
-                                              "sherpa_onnx = sherpa-onnx Matcha on CPU)",
+                                              "sherpa_onnx = sherpa-onnx Matcha)",
                                "default": "vits2_trt", "scope": "shared"},
+                # sherpa_onnx only — vits2_trt is a TensorRT engine and never
+                # touches ONNX Runtime, so this field does nothing for it. Matcha's
+                # weights are fp32, so both devices load the same files and only
+                # the provider changes; measured 4.3x faster on gpu.
+                "device":      {"type": "string", "enum": ["cpu", "gpu"],
+                                "description": "Inference device for the sherpa_onnx engine "
+                                               "(gpu needs the CUDA sherpa-onnx wheel; ~4.3x faster)",
+                                "default": "cpu", "scope": "shared",
+                                "x-show-when": {"tts_engine": "sherpa_onnx"}},
                 "speaker_id": {"type": "integer", "description": "Speaker ID (VITS2 supports 0 only)", "default": 0, "scope": "shared"},
                 "speed":      {"type": "number", "description": "Speech speed (1.0 = normal)", "default": 1.0, "scope": "shared"},
             },
@@ -104,9 +114,11 @@ class TTSAdapter(ABC):
 class SherpaOnnxTTSAdapter(TTSAdapter):
     """On-device TTS using sherpa-onnx Matcha (flow-matching, fast non-autoregressive)."""
 
-    def __init__(self, model_dir: str, speaker_id: int = 0, speed: float = 1.0):
+    def __init__(self, model_dir: str, speaker_id: int = 0, speed: float = 1.0,
+                 device: str = "cpu"):
         import os
         from utils.model_downloader import ensure_model
+        from utils.onnx_provider import provider_for_device
         ensure_model("tts", model_dir)
         ensure_model("tts_vocoder", model_dir)
 
@@ -119,6 +131,9 @@ class SherpaOnnxTTSAdapter(TTSAdapter):
         data_dir = os.path.join(model_dir, "espeak-ng-data")
         if not os.path.isdir(data_dir):
             data_dir = ""
+        # Both weights are fp32, so there is only one file set and device just
+        # picks the provider — measured 4.3x faster on gpu at num_threads=2.
+        provider = provider_for_device(device, (acoustic_model, vocoder))
 
         # Gather rule FSTs
         rule_fsts = []
@@ -138,7 +153,7 @@ class SherpaOnnxTTSAdapter(TTSAdapter):
                     length_scale=1.0 / speed if speed else 1.0,
                 ),
                 num_threads=2,
-                provider="cpu",
+                provider=provider,
             ),
             rule_fsts=",".join(rule_fsts) if rule_fsts else "",
         )
@@ -146,7 +161,8 @@ class SherpaOnnxTTSAdapter(TTSAdapter):
         self._sid = speaker_id
         self._speed = speed
         log.info(f"[tts] sherpa-onnx Matcha loaded: model_dir={model_dir}, "
-                 f"speaker_id={speaker_id}, speed={speed}")
+                 f"speaker_id={speaker_id}, speed={speed}, "
+                 f"device={device}, provider={provider}")
 
     def synthesize(self, text: str) -> bytes:
         return b''.join(self.synthesize_stream(text))
@@ -166,10 +182,12 @@ class SherpaOnnxTTSAdapter(TTSAdapter):
 
 def _build_tts_adapter(cfg: dict) -> TTSAdapter:
     import os
+    from utils.onnx_provider import normalize_device
     model_dir = cfg.get('model_dir', '/models/sherpa-onnx/tts')
     speaker_id = int(cfg.get('speaker_id', 0))
     speed = float(cfg.get('speed', 1.0))
-    return SherpaOnnxTTSAdapter(model_dir, speaker_id, speed)
+    device = normalize_device(cfg.get('device'), cfg.get('hw_provider'))
+    return SherpaOnnxTTSAdapter(model_dir, speaker_id, speed, device)
 
 
 # ── ROS2 Node ─────────────────────────────────────────────────────────────────
@@ -692,6 +710,8 @@ class SherpaOnnxTTSPlugin:
                 self._cfg['speaker_id'] = int(cfg['speaker_id'])
             if 'speed' in cfg:
                 self._cfg['speed'] = float(cfg['speed'])
+            if 'device' in cfg:
+                self._cfg['device'] = cfg['device']
             self._adapter = _build_tts_adapter(self._cfg)
             # Stop all nodes (they'll use new adapter on next start)
             with self._nodes_lock:
@@ -731,6 +751,13 @@ ENGINE_MODEL_DIRS = {
     "vits2_trt": "/models/vits2",
     "sherpa_onnx": "/models/sherpa-onnx/tts",
 }
+# How long an `action=config` engine switch waits for the new engine before
+# answering `loading`. Sized so the bounded part of a build finishes inside it
+# (constructing the sherpa session measured ~2 s on cpu, ~5 s on gpu) while a cold
+# model download does not — that one genuinely has to go async. Also under the 30 s
+# the LLM path allows a tools/call (agent-core/src/mcp_client.py), in case a config
+# ever arrives from there rather than from the dashboard.
+ENGINE_SWITCH_WAIT_S = 20
 
 
 class TTSPlugin:
@@ -739,9 +766,17 @@ class TTSPlugin:
     A facade rather than a `__new__` switch: the engine is a configSchema field,
     so it can change at runtime (`action=config`, `tts_engine=...`) and not only
     at process start. Switching disposes the previous engine's nodes and builds
-    the new one in the background — sherpa-onnx downloads its Matcha model in
-    its constructor, which would otherwise blow through the 60 s Agent Core
-    allows a processor call.
+    the new one on a background thread, because sherpa-onnx downloads its Matcha
+    model in its constructor and that is open-ended.
+
+    `action=config` then waits up to ENGINE_SWITCH_WAIT_S for that build and only
+    answers `loading` if it is still going, so the bounded part — constructing the
+    session, ~2 s on cpu and ~5 s on gpu — is not something callers have to poll
+    for. It can afford to wait: the dashboard's start-project path
+    (agent-core/src/api/mcp_manage.py mcp_call_tool) sets no client timeout at all,
+    and its loading watcher polls for up to 900 s. The 60 s figure that used to be
+    cited here belongs to the *LLM* tool path (agent-core/src/mcp_client.py), which
+    does not send config.
     """
 
     PREFIX = "tts"
@@ -754,6 +789,16 @@ class TTSPlugin:
         self._impl_engine = ""
         self._building = ""          # engine name while a build is in flight
         self._build_error = None
+        # `start` calls that arrived while a build was in flight, keyed by
+        # instance_id, replayed against the new engine once it is resident. Agent
+        # Core's contract for a start that answers `state: loading` is that the
+        # tool will reach `running` on its own — it polls `info` and reports
+        # "启动已取消" if it ever sees `idle` (see agent-core api/config.py
+        # _settle_loading_item). Dropping the start satisfied the letter of
+        # "never block" and broke that contract: switching engine and starting in
+        # the same batch, which is exactly what the dashboard does, left the card
+        # cancelled even though the engine had loaded fine.
+        self._pending_starts: dict[str, dict] = {}
         engine = self._select_engine(self._cfg.get("engine")
                                      or self._cfg.get("tts_engine"))
         self._engine = engine
@@ -826,6 +871,7 @@ class TTSPlugin:
                         self._build_error = str(error)
                 return
             stale = None
+            replay = []
             with self._lock:
                 if self._building != engine:
                     stale = impl          # another switch superseded this one
@@ -834,8 +880,24 @@ class TTSPlugin:
                     self._impl_engine = engine
                     self._building = ""
                     self._build_error = None
+                    replay = list(self._pending_starts.values())
+                    self._pending_starts.clear()
             if stale is not None:
                 _dispose_impl(stale)
+                return
+
+            # Honour the starts that arrived mid-build. Without this the engine
+            # comes up idle, and Agent Core — which polls `info` after a start
+            # answered `loading` — reports the card as "启动已取消".
+            for start_args in replay:
+                try:
+                    log.info("[tts] replaying start deferred during the %s build: %s",
+                             engine, start_args.get("instance_id") or
+                             start_args.get("input_topic"))
+                    impl.dispatch("tts", start_args)
+                except Exception:
+                    log.error("[tts] deferred start failed after the %s build",
+                              engine, exc_info=True)
 
         threading.Thread(target=_run, name=f"tts-engine-{engine}", daemon=True).start()
 
@@ -874,16 +936,63 @@ class TTSPlugin:
                 result["error"] = error
             return result
         if building:
+            if action == "start":
+                # Defer, do not drop. The dashboard sends config (which triggers
+                # the switch) and start back to back, so this is the normal path,
+                # not a rare race — and _build_async replays it.
+                with self._lock:
+                    if self._building:
+                        key = args.get("instance_id") or args.get("input_topic") or ""
+                        self._pending_starts[key] = dict(args)
+                        deferred = True
+                    else:
+                        deferred = False   # build finished while we waited on the lock
+                if not deferred:
+                    return self.dispatch(name, args)
+            elif action == "stop":
+                # Cancel a deferred start rather than letting it revive the node
+                # after the operator asked for it to stop.
+                with self._lock:
+                    key = args.get("instance_id") or args.get("input_topic") or ""
+                    if key in self._pending_starts:
+                        self._pending_starts.pop(key, None)
+                    elif not key:
+                        self._pending_starts.clear()
+                return {"state": "idle"}
             return {"state": "loading",
                     "message": f"TTS engine {building} is initializing, retry shortly"}
         return {"state": "error", "message": f"TTS engine {engine} failed: {error}"}
+
+    def _await_build(self, engine: str, timeout_s: float) -> tuple[bool, str | None]:
+        """Wait for an in-flight build. Returns (ready, error).
+
+        `ready` false with no error means it is still going, which is the caller's
+        cue to answer `loading` and let the deferred-start machinery finish the job.
+        Another switch superseding this one also reads as not-ready: this build's
+        result is about to be discarded, so claiming success would be wrong.
+        """
+        deadline = time.monotonic() + timeout_s
+        while True:
+            with self._lock:
+                if self._engine != engine:
+                    return False, None          # superseded by a newer switch
+                if self._impl is not None and self._impl_engine == engine:
+                    return True, None
+                if self._build_error:
+                    return False, self._build_error
+                if not self._building:
+                    # Neither resident nor building nor failed: nothing to wait on.
+                    return False, None
+            if time.monotonic() >= deadline:
+                return False, None
+            time.sleep(0.2)
 
     def _config(self, name: str, args: dict) -> dict:
         """Apply shared config, switching engines when tts_engine changes."""
         requested = args.get("tts_engine") or args.get("engine")
         forwarded = {k: v for k, v in args.items()
                      if k not in ("tts_engine", "engine")}
-        for key in ("speaker_id", "speed"):
+        for key in ("speaker_id", "speed", "device"):
             if key in args:
                 self._cfg[key] = args[key]
 
@@ -906,6 +1015,20 @@ class TTSPlugin:
                     _dispose_impl(outgoing)
                 self._build_async(engine)
                 log.info("[tts] switching engine to %s", engine)
+                # Wait for it, up to a bound. Only part of a build is open-ended
+                # (downloading a model); constructing the session afterwards took
+                # ~2 s on cpu and ~5 s on gpu, and answering `loading` for that is
+                # what made the dashboard send a start the engine could not honour.
+                # A time bound rather than "does it need to download" because the
+                # download is not the only slow phase — the gpu paraformer encoder
+                # is 636 MB and reading it cold takes seconds on its own.
+                ready, error = self._await_build(engine, ENGINE_SWITCH_WAIT_S)
+                if error:
+                    return {"status": "error", "engine": engine,
+                            "state": "error", "message": error}
+                if ready:
+                    log.info("[tts] engine %s ready", engine)
+                    return {"status": "configured", "engine": engine}
                 return {"status": "configured", "state": "loading",
                         "engine": engine,
                         "message": f"loading the {engine} engine"}
