@@ -107,9 +107,11 @@ TTS is simpler: Matcha is fp32 only, so both devices load the same files and
 `device` only picks the provider (gpu measured ~4.3x). The `vits2_trt` engine
 ignores `device` entirely — it is a TensorRT engine and never touches ONNX Runtime.
 
-`device: gpu` also needs the CUDA sherpa-onnx wheel, which only the jp5.11 image
-installs (see § The jp5.11 CUDA wheel). On jp6.1 and x86 dev hosts it falls back to
-`cpu` with a warning rather than failing to start.
+`device: gpu` also needs a CUDA sherpa-onnx wheel. Both Jetson images install one —
+jp5.11 and jp6.1 each have their own build, because the wheel is tied to a
+CUDA/cuDNN pair and a CPython ABI (see § The CUDA wheels). On x86 dev hosts, and on
+any JetPack line we have not built a wheel for, it falls back to `cpu` with a
+warning rather than failing to start.
 
 ### Latency per utterance, which is what an operator feels
 
@@ -303,14 +305,37 @@ are converted from those with `tools/convert_onnx_fp16.py`.
 
 ---
 
-### The jp5.11 CUDA wheel
+### The CUDA wheels
 
 PyPI ships CPU-only `sherpa-onnx`, so `Dockerfile.jetson` downloads a wheel built
-in-house for JetPack 5.11 from COS
-(`public/sherpa-onnx/sherpa_onnx-<ver>+cuda-cp38-cp38-linux_aarch64.whl`) and
-falls back to the PyPI CPU wheel for every other `JP_VERSION`.
+in-house from COS (`public/sherpa-onnx/sherpa_onnx-<ver>+cuda-<abi>-linux_aarch64.whl`),
+one per JetPack line, and falls back to the PyPI CPU wheel for any `JP_VERSION`
+without one:
 
-To rebuild it, build **inside a container started from the perception image** for
+| | onnxruntime-gpu | CUDA / cuDNN | wheel |
+|---|---|---|---|
+| jp5.11 (focal, L4T R35) | 1.16.0 | 11.4 / 8 | `…+cuda-cp38-cp38-linux_aarch64.whl` |
+| jp6.1 (jammy, L4T R36) | 1.18.1 | 12.6 / 9 | `…+cuda-cp310-cp310-linux_aarch64.whl` |
+
+Neither the ONNX Runtime pairing nor the CPython ABI is portable, which is why
+there are two wheels rather than one. `cmake/onnxruntime-linux-aarch64-gpu.cmake`
+in sherpa-onnx pins the URL and SHA256 per version and names the target board for
+each; 1.18.1 is the one it lists for L4T R36 + CUDA 12.6.
+
+**Check the cuDNN soname before committing to a build.** ONNX Runtime's aarch64 GPU
+packages do not encode it in the filename past 1.18.0, and it is what decides
+whether the provider loads at all. Two minutes with `readelf` beats an hour of
+compiling:
+
+```bash
+readelf -d libonnxruntime_providers_cuda.so | grep NEEDED
+```
+
+1.18.1 needs `libcudnn.so.9` / `libcudart.so.12` / `libcublas.so.12`, all of which
+the jp6.1 image resolves (cuDNN 9.4.0, CUDA 12.6). 1.18.0 would not — it is built
+against cuDNN 8.9.4, which that image does not carry.
+
+To build one, build **inside a container started from the perception image** for
 the target JetPack — that image already carries cmake, g++, the matching CPython
 headers and CUDA, so the pybind extension lands on the right CPython ABI and
 glibc. Building on the host instead is what produces an unusable wheel: the
@@ -319,20 +344,21 @@ Python.
 
 ```bash
 # on the build host (must match the target JetPack: jp5.11 → L4T R35, jp6.1 → R36)
-docker run -d --name sherpa-build \
+docker run -d --name sherpa-build --runtime nvidia \
   -v /path/to/k2-fsa/sherpa-onnx:/src:ro -v /path/to/outdir:/out \
   --entrypoint bash <perception-image-for-that-jp> /out/build.sh
 
-# inside, against a *writable* copy of the tree (setup.py appends __version__ to it):
+# inside, against a *writable* copy of the tree (setup.py appends __version__ to it).
+# jp6.1 shown; for jp5.11 use 1.16.0 and python3.8.
 export SHERPA_ONNX_ENABLE_GPU=ON
-export SHERPA_ONNX_LINUX_ARM64_GPU_ONNXRUNTIME_VERSION=1.16.0   # jp5.11 / CUDA 11.4
-export SHERPA_ONNX_MAKE_ARGS="-j2"                              # Orin has 6 cores but ~4 GB free
+export SHERPA_ONNX_LINUX_ARM64_GPU_ONNXRUNTIME_VERSION=1.18.1   # jp6.1 / CUDA 12.6
+export SHERPA_ONNX_MAKE_ARGS="-j2"                              # Orin has 6 cores but ~3 GB free
 SHERPA_ONNX_CMAKE_ARGS="-DCMAKE_BUILD_TYPE=Release \
   -DSHERPA_ONNX_ENABLE_GPU=ON \
-  -DSHERPA_ONNX_LINUX_ARM64_GPU_ONNXRUNTIME_VERSION=1.16.0 \
-  -DPYTHON_EXECUTABLE=/usr/bin/python3.8 \
-  -DPython_EXECUTABLE=/usr/bin/python3.8" \
-  python3.8 setup.py bdist_wheel
+  -DSHERPA_ONNX_LINUX_ARM64_GPU_ONNXRUNTIME_VERSION=1.18.1 \
+  -DPYTHON_EXECUTABLE=/usr/bin/python3.10 \
+  -DPython_EXECUTABLE=/usr/bin/python3.10" \
+  python3.10 setup.py bdist_wheel
 ```
 
 Notes:
@@ -343,17 +369,12 @@ Notes:
   not reusable — expect a full compile.
 - To avoid re-downloading onnxruntime, drop
   `onnxruntime-linux-aarch64-gpu-<ver>.tar.bz2` in `/tmp/`;
-  `cmake/onnxruntime-linux-aarch64-gpu.cmake` checks there before GitHub.
+  `cmake/onnxruntime-linux-aarch64-gpu.cmake` checks there before GitHub. Use that
+  exact generic name even when the release asset is called something else — the
+  hash it checks is the one for the asset it would have downloaded.
 - Upload the result under the `public/` COS prefix (anonymous read, same prefix
-  `utils/model_downloader.py` uses) and bump `SHERPA_GPU_WHEEL` in
-  `Dockerfile.jetson`.
-
-**TODO — jp6.1.** The jp5.11 wheel links `libcudart.so.11.0` and cannot run on
-jp6.1 (CUDA 12.6). That target needs its own build with
-`SHERPA_ONNX_LINUX_ARM64_GPU_ONNXRUNTIME_VERSION=1.18.1` and
-`PYTHON_EXECUTABLE=python3.10`, run on a JetPack 6 host inside
-`jetson-base:jp61-torch`. Until then jp6.1 stays on the CPU wheel and
-`device: gpu` falls back to `cpu` there.
+  `utils/model_downloader.py` uses) and bump the matching `SHERPA_GPU_WHEEL_<jp>`
+  in `Dockerfile.jetson`.
 
 ---
 
