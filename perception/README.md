@@ -88,7 +88,7 @@ just a different provider string.
 
 | `asr_model` | `device: cpu` | `device: gpu` | gpu speed-up |
 |-------------|---------------|---------------|--------------|
-| `sensevoice-small` (default) | int8, 228 MB | **fp16, 448 MB** | **~2.5x** per utterance |
+| `sensevoice-small` (default) | int8, 228 MB | **fp16, 448 MB** | **3.4x** per utterance |
 | `paraformer-zh-en` (streaming) | int8, 226 MB | **fp32, 825 MB** | **1.77x** |
 | `x-asr-zh-en` | int8 + fp32 | — not offered | 0.80x, i.e. slower |
 | `paraformer-offline` | int8 | — not offered | unmeasured |
@@ -114,26 +114,55 @@ installs (see § The jp5.11 CUDA wheel). On jp6.1 and x86 dev hosts it falls bac
 ### Latency per utterance, which is what an operator feels
 
 Same box, SenseVoice, real VAD segments (1–4 s of speech, the length a wake-word
-turn actually produces), decoded one at a time with a 3 s gap, with the rest of
-perception left running:
+turn actually produces), with the rest of perception left running:
 
 | | cpu (int8) | gpu (fp16) | |
 |---|---|---|---|
-| first call | 185 ms | **1777 ms** | **gpu 9.6x slower** |
-| median after the first | 193 ms | **77 ms** | gpu 2.5x faster |
-| adapter build | 5.5 s | 11.6 s | |
+| first call, no warmup | 165 ms | **1659 ms** | gpu 10x slower |
+| first call, warmed | 162 ms | **82 ms** | gpu 2.0x faster |
+| sustained p50 (40 calls) | 195 ms | **58 ms** | gpu 3.4x faster |
+| sustained p90 | 319 ms | 70 ms | |
+| sustained p99 | 326 ms | **78 ms** | gpu's worst case beats cpu's median |
+| after 60 s idle | 159 ms | 73 ms | 1.3x its own p50 — no downclock cliff |
+| adapter build | 4.6 s | 5.3 s | |
 
-Two things follow. First, the 1777 ms is CUDA initialisation — lazy kernel loading,
-cuDNN autotuning, memory pool — and it lands on whatever utterance comes first.
-`_warmup_adapter()` therefore decodes a second of silence right after building, so
-that cost is paid inside the `loading` window the dashboard already shows. Set
-`warmup: false` to skip it.
+Three things worth knowing:
 
-Second, **the steady-state speed-up on real utterances is ~2.5x, not the 5.81x in
-the table below.** That number came from the model's own `test_wavs`, which are 7 s
-each; short utterances give the GPU less to amortise its fixed cost against. The
-batch figures are still the right way to compare dtypes against each other — they
-are just not the latency a user sees.
+- **Warmup does its job.** 1659 ms cold versus 82 ms warmed, so
+  `_warmup_adapter()` (a second of silence right after building) is what keeps that
+  cost out of the operator's first utterance. `warmup: false` opts out.
+- **No drift and no idle cliff.** Across 40 back-to-back calls the first half and
+  second half both sat at a 57.7 ms p50, and a call after 60 s of silence took
+  73 ms — an idle Orin GPU downclocking was a plausible worry and did not
+  materialise.
+- **The GPU is also steadier.** cpu p99 is 1.7x its own p50 (326 vs 195 ms) because
+  vop and OCR compete for cores; gpu p99 is 1.35x (78 vs 58 ms). The GPU's worst
+  case is faster than the CPU's median.
+
+The batch figures in § Measurements are larger (up to 23x) because they decode the
+model's own `test_wavs`, which are 7 s each — longer audio gives the GPU more to
+amortise its fixed cost against. Those numbers are the right way to compare dtypes
+with each other; the table above is the latency a user experiences.
+
+### Switching engine or device blocks for the bounded part
+
+`action=config` on the `tts` tool waits up to `ENGINE_SWITCH_WAIT_S` (20 s) for the
+new engine before answering `loading`. Only some of a build is open-ended — a cold
+model download — while constructing the session afterwards took ~2 s on cpu and ~5 s
+on gpu. Reporting `loading` for that made the dashboard send its `start` into a
+facade with no engine, and the start was dropped: the engine then came up idle, and
+Agent Core's loading watcher (`api/config.py` `_settle_loading_item`) reports "启动已
+取消" the moment it sees `idle`.
+
+Waiting is safe on that path — `mcp_call_tool` sets no client timeout and the
+watcher polls for up to 900 s. (The 60 s often quoted in these plugins belongs to
+the *LLM* tool path in `agent-core/src/mcp_client.py`, which does not send `config`.)
+A build that outlives the bound still goes async, and `TTSPlugin` records any
+`start` that arrives mid-build and replays it once the engine is resident, so the
+card reaches `running` instead of being cancelled. A `stop` cancels a pending
+replay. The bound is a time limit rather than a "does it need to download?" check
+because the download is not the only slow phase: the gpu paraformer encoder is
+636 MB and reading it cold takes seconds by itself.
 
 ### Measurements
 

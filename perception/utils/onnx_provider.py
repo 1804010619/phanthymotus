@@ -61,7 +61,7 @@ CUDA it does not give that back. On a 7.4 GB Orin already running vop (YOLO), OC
 perception restarted in a loop. So `cpu` stays the default even on images that
 *can* use the GPU — gpu is a deliberate choice for a box with headroom.
 
-**And the first gpu inference is the expensive one.** 1777 ms against a 77 ms
+**And the first gpu inference is the expensive one.** 1659 ms against a 58 ms
 steady state: lazy kernel loading, cuDNN autotuning and the memory pool all land
 on it. plugins/asr.py warms the adapter up with one second of silence after
 building so an operator never pays that on a real utterance.

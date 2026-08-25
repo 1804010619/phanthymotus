@@ -11,6 +11,7 @@ import json
 import logging
 import queue
 import threading
+import time
 from abc import ABC, abstractmethod
 from typing import Optional
 
@@ -750,6 +751,13 @@ ENGINE_MODEL_DIRS = {
     "vits2_trt": "/models/vits2",
     "sherpa_onnx": "/models/sherpa-onnx/tts",
 }
+# How long an `action=config` engine switch waits for the new engine before
+# answering `loading`. Sized so the bounded part of a build finishes inside it
+# (constructing the sherpa session measured ~2 s on cpu, ~5 s on gpu) while a cold
+# model download does not — that one genuinely has to go async. Also under the 30 s
+# the LLM path allows a tools/call (agent-core/src/mcp_client.py), in case a config
+# ever arrives from there rather than from the dashboard.
+ENGINE_SWITCH_WAIT_S = 20
 
 
 class TTSPlugin:
@@ -758,9 +766,17 @@ class TTSPlugin:
     A facade rather than a `__new__` switch: the engine is a configSchema field,
     so it can change at runtime (`action=config`, `tts_engine=...`) and not only
     at process start. Switching disposes the previous engine's nodes and builds
-    the new one in the background — sherpa-onnx downloads its Matcha model in
-    its constructor, which would otherwise blow through the 60 s Agent Core
-    allows a processor call.
+    the new one on a background thread, because sherpa-onnx downloads its Matcha
+    model in its constructor and that is open-ended.
+
+    `action=config` then waits up to ENGINE_SWITCH_WAIT_S for that build and only
+    answers `loading` if it is still going, so the bounded part — constructing the
+    session, ~2 s on cpu and ~5 s on gpu — is not something callers have to poll
+    for. It can afford to wait: the dashboard's start-project path
+    (agent-core/src/api/mcp_manage.py mcp_call_tool) sets no client timeout at all,
+    and its loading watcher polls for up to 900 s. The 60 s figure that used to be
+    cited here belongs to the *LLM* tool path (agent-core/src/mcp_client.py), which
+    does not send config.
     """
 
     PREFIX = "tts"
@@ -947,6 +963,30 @@ class TTSPlugin:
                     "message": f"TTS engine {building} is initializing, retry shortly"}
         return {"state": "error", "message": f"TTS engine {engine} failed: {error}"}
 
+    def _await_build(self, engine: str, timeout_s: float) -> tuple[bool, str | None]:
+        """Wait for an in-flight build. Returns (ready, error).
+
+        `ready` false with no error means it is still going, which is the caller's
+        cue to answer `loading` and let the deferred-start machinery finish the job.
+        Another switch superseding this one also reads as not-ready: this build's
+        result is about to be discarded, so claiming success would be wrong.
+        """
+        deadline = time.monotonic() + timeout_s
+        while True:
+            with self._lock:
+                if self._engine != engine:
+                    return False, None          # superseded by a newer switch
+                if self._impl is not None and self._impl_engine == engine:
+                    return True, None
+                if self._build_error:
+                    return False, self._build_error
+                if not self._building:
+                    # Neither resident nor building nor failed: nothing to wait on.
+                    return False, None
+            if time.monotonic() >= deadline:
+                return False, None
+            time.sleep(0.2)
+
     def _config(self, name: str, args: dict) -> dict:
         """Apply shared config, switching engines when tts_engine changes."""
         requested = args.get("tts_engine") or args.get("engine")
@@ -975,6 +1015,20 @@ class TTSPlugin:
                     _dispose_impl(outgoing)
                 self._build_async(engine)
                 log.info("[tts] switching engine to %s", engine)
+                # Wait for it, up to a bound. Only part of a build is open-ended
+                # (downloading a model); constructing the session afterwards took
+                # ~2 s on cpu and ~5 s on gpu, and answering `loading` for that is
+                # what made the dashboard send a start the engine could not honour.
+                # A time bound rather than "does it need to download" because the
+                # download is not the only slow phase — the gpu paraformer encoder
+                # is 636 MB and reading it cold takes seconds on its own.
+                ready, error = self._await_build(engine, ENGINE_SWITCH_WAIT_S)
+                if error:
+                    return {"status": "error", "engine": engine,
+                            "state": "error", "message": error}
+                if ready:
+                    log.info("[tts] engine %s ready", engine)
+                    return {"status": "configured", "engine": engine}
                 return {"status": "configured", "state": "loading",
                         "engine": engine,
                         "message": f"loading the {engine} engine"}

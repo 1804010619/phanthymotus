@@ -5,7 +5,7 @@ plugins:
     enabled: true
     # Matches the configSchema default. SenseVoice on CPU is also the faster of
     # the two int8 options (RTF 14.2x vs 9.1x for streaming paraformer) and has
-    # the largest gpu upside (fp16, ~5.8x).
+    # the largest gpu upside (fp16).
     asr_model: sensevoice-small   # x-asr-zh-en | paraformer-zh-en | paraformer-offline | zipformer-en | sensevoice-small
     # cpu | gpu — which weights get loaded is per (model, device) in
     # plugins/asr.py ASR_MODELS. gpu needs the CUDA sherpa-onnx wheel (jetson
@@ -14,7 +14,7 @@ plugins:
     # (fp32). Everything else is cpu-only — int8 weights are slower on CUDA, not
     # faster, because ONNX Runtime's CUDA provider has no int8 kernels.
     #
-    # gpu is ~2.5x faster per utterance (77 ms vs 193 ms on a 1-4 s utterance)
+    # gpu is ~3.4x faster per utterance (58 ms vs 195 ms p50 on 1-4 s of speech)
     # and costs ~2 GB RAM against ~0.5 GB on cpu, ~1.4 GB of it a CUDA context
     # the process never returns. On a 7.4 GB Orin already running vop + OCR +
     # TTS that is enough to run the box out of memory, so cpu is the default
@@ -22,7 +22,7 @@ plugins:
     device: cpu
     num_threads: 2   # cpu only; 4 buys ~1.2-1.5x. Ignored on gpu.
     # Decode 1 s of silence after the model loads. On gpu the first inference
-    # costs ~1.8 s (lazy kernels, cuDNN autotune, memory pool) against a 77 ms
+    # costs ~1.7 s (lazy kernels, cuDNN autotune, memory pool) against a 58 ms
     # steady state; without this the operator pays it on their first utterance.
     warmup: true
     language: zh-CN
