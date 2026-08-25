@@ -57,13 +57,55 @@ _LOW_LAT_QOS = QoSProfile(
 import re as _re
 
 # ── Persistent EspeakBackend instances (avoid 70ms+ re-init per call) ─────────
+#
+# The espeak library has to be pointed at explicitly. phonemizer locates it with
+# ctypes.util.find_library('espeak-ng'), which on Linux shells out to `ldconfig -p`
+# — and libespeak-ng is absent from the ld cache in the jetson image, because
+# Dockerfile.jetson stubs ldconfig out during apt installs to survive qemu and the
+# cache is never rebuilt. So find_library returns None, EspeakBackend raises
+# "espeak not installed", and phonemization silently degrades to matching raw
+# characters.
+#
+# That cost 5.2 s per utterance in production, measured from the plugin's own
+# kws_phonemize span. _text_to_ipa splits an utterance into CJK/non-CJK segments
+# (4 for '小范小范，你好。', since fullwidth punctuation is not in the CJK range),
+# _phonemize_safe used to retry each failure once, and every attempt forked
+# `ldconfig` from a 3.6 GB multi-threaded process. Eight subprocess spawns per
+# utterance. Out of process the same call took 320 ms, which is why this only ever
+# showed up in the span data.
 _ESPEAK_BACKENDS = {}  # lang -> EspeakBackend instance
 _ESPEAK_SEP = None
+_ESPEAK_UNAVAILABLE = None   # str reason once probing has failed; see below
+_ESPEAK_LIB_CANDIDATES = (
+    "/usr/lib/aarch64-linux-gnu/libespeak-ng.so.1",
+    "/usr/lib/x86_64-linux-gnu/libespeak-ng.so.1",
+    "/usr/lib/libespeak-ng.so.1",
+    "/usr/local/lib/libespeak-ng.so.1",
+)
+
+
+def _point_phonemizer_at_espeak() -> None:
+    """Tell phonemizer where libespeak-ng is, since the ld cache will not.
+
+    PHONEMIZER_ESPEAK_LIBRARY wins if the deployment already set it. Otherwise the
+    first candidate that exists is used — cheap `os.path.exists` checks rather than
+    find_library's subprocess.
+    """
+    if os.environ.get("PHONEMIZER_ESPEAK_LIBRARY"):
+        return
+    for path in _ESPEAK_LIB_CANDIDATES:
+        if os.path.exists(path):
+            os.environ["PHONEMIZER_ESPEAK_LIBRARY"] = path
+            log.info("[asr] phonemizer: using espeak library at %s", path)
+            return
+    log.warning("[asr] phonemizer: no libespeak-ng found in %s",
+                ", ".join(_ESPEAK_LIB_CANDIDATES))
 
 
 def _get_espeak_backend(lang):
     global _ESPEAK_SEP
     if _ESPEAK_SEP is None:
+        _point_phonemizer_at_espeak()
         from phonemizer.separator import Separator
         _ESPEAK_SEP = Separator(phone=' ', word='  ', syllable='')
     if lang not in _ESPEAK_BACKENDS:
@@ -73,15 +115,32 @@ def _get_espeak_backend(lang):
 
 
 def _phonemize_safe(text: str, lang: str) -> str:
-    """Phonemize with persistent backend; auto-rebuild on failure."""
-    backend = _get_espeak_backend(lang)
+    """Phonemize with a persistent backend, rebuilding once if espeak crashed.
+
+    A construction failure is remembered and never retried: espeak either resolves
+    or it does not, and retrying it per segment per utterance is what turned a
+    misconfiguration into 5.2 s of latency. `_text_to_ipa` still falls back to
+    characters, so a genuinely missing espeak degrades in quality, not in speed.
+    """
+    global _ESPEAK_UNAVAILABLE
+    if _ESPEAK_UNAVAILABLE is not None:
+        raise RuntimeError(_ESPEAK_UNAVAILABLE)
+    try:
+        backend = _get_espeak_backend(lang)
+    except Exception as error:  # noqa: BLE001 - espeak absent or unloadable
+        _ESPEAK_UNAVAILABLE = f"espeak unavailable: {error}"
+        log.error("[asr] phonemizer unusable, asr_kws will match on characters "
+                  "instead of phonemes: %s", error)
+        raise
     try:
         return backend.phonemize([text], separator=_ESPEAK_SEP, strip=True)[0]
     except Exception:
-        # espeak-ng may have crashed — rebuild backend and retry once
+        # espeak-ng may have crashed mid-run — rebuild the backend and retry once.
+        # Only reachable when construction previously succeeded.
         _ESPEAK_BACKENDS.pop(lang, None)
         backend = _get_espeak_backend(lang)
         return backend.phonemize([text], separator=_ESPEAK_SEP, strip=True)[0]
+
 
 
 def _text_to_ipa(text: str) -> list:

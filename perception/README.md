@@ -113,36 +113,53 @@ installs (see § The jp5.11 CUDA wheel). On jp6.1 and x86 dev hosts it falls bac
 
 ### Latency per utterance, which is what an operator feels
 
-Same box, SenseVoice, real VAD segments (1–4 s of speech, the length a wake-word
-turn actually produces), with the rest of perception left running:
+Inference is not the latency. Captured from the plugin's own spans on a live
+`device: gpu` instance, two consecutive wake-word utterances:
 
-| | cpu (int8) | gpu (fp16) | |
-|---|---|---|---|
-| first call, no warmup | 165 ms | **1659 ms** | gpu 10x slower |
-| first call, warmed | 162 ms | **82 ms** | gpu 2.0x faster |
-| sustained p50 (40 calls) | 195 ms | **58 ms** | gpu 3.4x faster |
-| sustained p90 | 319 ms | 70 ms | |
-| sustained p99 | 326 ms | **78 ms** | gpu's worst case beats cpu's median |
-| after 60 s idle | 159 ms | 73 ms | 1.3x its own p50 — no downclock cliff |
-| adapter build | 4.6 s | 5.3 s | |
+| span | utterance 1 | utterance 2 |
+|------|-------------|-------------|
+| `audio_end` → `asr_complete` (**felt latency**) | **7150 ms** | **10701 ms** |
+| `asr_transcribe` | 120 ms | 91 ms |
+| `kws_phonemize` | **5256 ms** | **5234 ms** |
+| `kws_match` | 0 ms | 0 ms |
+| unaccounted (queue wait + `_extract_after_keyword`) | 1775 ms | 5376 ms |
 
-Three things worth knowing:
+Transcription was 91–120 ms. Almost all of it was `kws_phonemize` doing nothing
+useful — see § asr_kws and espeak below — and the growing unaccounted figure is the
+utterance queue backing up behind it, because the VAD emits a segment every 2–3 s
+while each one took ~5.5 s to process. Latency accumulated over a session rather
+than being constant, which is why it felt worse the longer you talked.
 
-- **Warmup does its job.** 1659 ms cold versus 82 ms warmed, so
-  `_warmup_adapter()` (a second of silence right after building) is what keeps that
-  cost out of the operator's first utterance. `warmup: false` opts out.
-- **No drift and no idle cliff.** Across 40 back-to-back calls the first half and
-  second half both sat at a 57.7 ms p50, and a call after 60 s of silence took
-  73 ms — an idle Orin GPU downclocking was a plausible worry and did not
-  materialise.
-- **The GPU is also steadier.** cpu p99 is 1.7x its own p50 (326 vs 195 ms) because
-  vop and OCR compete for cores; gpu p99 is 1.35x (78 vs 58 ms). The GPU's worst
-  case is faster than the CPU's median.
+**Measure this from the spans, not from a `docker exec` one-liner.** The same
+`_text_to_ipa` call cost 320 ms in a small test process and 5256 ms inside
+perception, because the failure path forks `ldconfig` and forking a 3.6 GB
+many-threaded process is expensive. Out-of-process timing hid the entire problem.
+
+Inference alone, for comparison — real VAD segments (1–4 s), one at a time, rest of
+perception running:
+
+| | cpu (int8) | gpu (fp16) |
+|---|---|---|
+| first call, cold process | 165 ms | 1659–2269 ms |
+| sustained p50 (40 calls) | 195 ms | **58 ms** |
+| sustained p99 | 326 ms | **78 ms** |
+| after 60 s idle | 159 ms | 73 ms |
+
+No drift across 40 calls (both halves at a 57.7 ms p50) and no idle cliff. The gpu
+p99 beats the cpu median, because vop and OCR contend for cores but not for the GPU.
+
+`_warmup_adapter()` decodes a second of silence after building to keep CUDA's
+first-inference cost off the first real utterance. Be aware it does not fully
+absorb it: a cold process still measured 2269 ms on its first *real* segment after
+warming on silence, so the warmup does not cover every input shape. It is worth
+keeping — silence costs ~1.7 s inside the `loading` window either way — but the
+first utterance after a model switch can still be slow. (An earlier measurement
+that suggested warmup reduced this to 82 ms was an artifact of test ordering: an
+unwarmed adapter earlier in the same process had already paid the CUDA init.)
 
 The batch figures in § Measurements are larger (up to 23x) because they decode the
-model's own `test_wavs`, which are 7 s each — longer audio gives the GPU more to
-amortise its fixed cost against. Those numbers are the right way to compare dtypes
-with each other; the table above is the latency a user experiences.
+model's own `test_wavs`, which are 7 s each. Those compare dtypes with each other;
+this table is what a user experiences.
 
 ### Switching engine or device blocks for the bounded part
 
@@ -337,6 +354,47 @@ jp6.1 (CUDA 12.6). That target needs its own build with
 `PYTHON_EXECUTABLE=python3.10`, run on a JetPack 6 host inside
 `jetson-base:jp61-torch`. Until then jp6.1 stays on the CPU wheel and
 `device: gpu` falls back to `cpu` there.
+
+---
+
+## asr_kws and espeak
+
+`trigger_mode: asr_kws` transcribes every utterance and gates on a phoneme-level
+fuzzy match against the wake word, so it needs IPA for both. That path had two
+faults that together cost **5.2 s per utterance** and quietly degraded wake-word
+accuracy.
+
+**phonemizer could not find libespeak-ng.** It looks the library up with
+`ctypes.util.find_library('espeak-ng')`, which on Linux shells out to `ldconfig -p`.
+`Dockerfile.jetson` replaces `ldconfig` with a no-op during apt installs so the
+libc-bin trigger cannot segfault under qemu, and the cache is never rebuilt — so the
+package is installed (`/usr/bin/espeak-ng`, `libespeak-ng.so.1`, three debs) while
+`find_library` returns `None` and `EspeakBackend` raises "espeak not installed".
+`_text_to_ipa` caught that and fell back to comparing raw *characters*, which is
+also why 「小康小康」 failed to match 「小范小范」: at character level 康≠范 is a full
+mismatch, where the phonemes `kʰ ɑŋ` vs `f a n` still score a usable distance.
+
+Fixed by pointing at the library directly, both as an `ENV` in `Dockerfile.jetson`
+and as a runtime probe in `_point_phonemizer_at_espeak()` so an already-built image
+recovers too. `PHONEMIZER_ESPEAK_LIBRARY` set by the deployment always wins.
+
+**And every failure was retried.** `_text_to_ipa` splits an utterance into CJK /
+non-CJK segments — four for 「小范小范，你好。」, since fullwidth punctuation is outside
+`一-鿿` — and `_phonemize_safe` rebuilt the backend and retried on each one.
+Eight `find_library` calls per utterance, each forking `ldconfig` from a 3.6 GB
+many-threaded process. A construction failure is now remembered and never retried;
+the retry-on-crash path remains for a backend that worked once and then died.
+
+Measured in a deliberately large, threaded process:
+
+| | first call | subsequent | phonemes? |
+|---|---|---|---|
+| library located | 511 ms | **0.3–0.5 ms** | real IPA |
+| library missing | 385 ms | 0.0 ms (negative cache) | characters |
+
+The persistent-backend cache the code always claimed to have only starts working
+once construction succeeds — before this, the dict stayed empty and every segment
+rebuilt.
 
 ---
 

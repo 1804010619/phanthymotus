@@ -189,6 +189,15 @@ RUN mv /usr/sbin/ldconfig /usr/sbin/ldconfig.real && \
     { ldconfig || echo '[build] ldconfig skipped — emulated build, using default search path'; } && \
     rm -rf /var/lib/apt/lists/*
 RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} phonemizer
+# phonemizer finds libespeak-ng with ctypes.util.find_library, which shells out to
+# `ldconfig -p` — and the ldconfig shimming above means libespeak-ng never makes it
+# into the cache, so find_library returns None and EspeakBackend raises "espeak not
+# installed" even though the package is installed. Pointing at the library directly
+# skips that lookup entirely. Without it asr_kws degrades to matching raw characters
+# *and* spends 5.2 s per utterance forking ldconfig from a multi-GB process — see
+# plugins/asr.py _phonemize_safe. asr.py also probes for it at runtime, so an image
+# built before this line still recovers; this makes it not depend on that.
+ENV PHONEMIZER_ESPEAK_LIBRARY=/usr/lib/aarch64-linux-gnu/libespeak-ng.so.1
 
 # ── VITS2 TTS frontend deps ───────────────────────────────────────
 # The model release contains compiled TN FSTs; the container executes them with
