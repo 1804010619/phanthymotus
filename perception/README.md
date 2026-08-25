@@ -88,11 +88,16 @@ just a different provider string.
 
 | `asr_model` | `device: cpu` | `device: gpu` | gpu speed-up |
 |-------------|---------------|---------------|--------------|
-| `sensevoice-small` (default) | int8, 228 MB | **fp16, 448 MB** | **3.4x** per utterance |
+| `sensevoice-small` (default) | int8, 228 MB | **fp16, 448 MB** | **3.4x** per utterance ⚠️ |
 | `paraformer-zh-en` (streaming) | int8, 226 MB | **fp32, 825 MB** | **1.77x** |
 | `x-asr-zh-en` | int8 + fp32 | — not offered | 0.80x, i.e. slower |
 | `paraformer-offline` | int8 | — not offered | unmeasured |
 | `zipformer-en` | int8 | — not offered | unmeasured |
+
+⚠️ **`sensevoice-small` on gpu drops some utterances entirely** — fp16 under the
+CUDA provider returns an empty transcript for certain inputs, silently and
+reproducibly, on both JetPack lines. Read § jp6.1, and a silent failure the gpu
+path has always had before enabling it; the speed-up is real but so is the loss.
 
 **gpu costs about 2 GB of RAM, and ~1.4 GB of that is unreturnable.** Measured with
 only ASR resident: the cpu adapter adds 542 MB and drops back to 129 MB when
@@ -162,6 +167,51 @@ unwarmed adapter earlier in the same process had already paid the CUDA init.)
 The batch figures in § Measurements are larger (up to 23x) because they decode the
 model's own `test_wavs`, which are 7 s each. Those compare dtypes with each other;
 this table is what a user experiences.
+
+### jp6.1, and a silent failure the gpu path has always had
+
+Same measurement on orin6 (Orin NX, JetPack 6.1, CUDA 12.6, onnxruntime-gpu
+1.18.1, 6 cores), SenseVoice, `num_threads=2`, through `_build_asr_adapter` so the
+registry and provider selection are the production ones. `provider_for_device('gpu',
+fp16)` returns `'cuda'`, and 120 calls per device:
+
+| audio | cpu (int8) p50 / p99 | gpu (fp16) p50 / p99 | speed-up |
+|---|---|---|---|
+| rig's own VAD captures, 0.8–2.1 s | 119 / 194 ms | **49 / 58 ms** | 2.4x / 3.3x |
+| KWS bundle test_wavs, 4.5–16.7 s | 462 / 1305 ms | **67 / 169 ms** | 6.9x / 7.7x |
+
+The gpu p99 is below the cpu *minimum* in both rows, which is the useful sanity
+check that CUDA is actually doing the work. Longer audio wins more, consistent with
+the jp5.11 numbers. Building the gpu adapter took 3.7 s with weights already
+local, 86.3 s including the 449 MB fp16 download. Whole-box `MemAvailable` fell
+~605 MB while gpu was resident — well short of the ~2 GB the jp5.11 table reports,
+so budget from a measurement on the box you are deploying to rather than from
+either figure.
+
+**But `device: gpu` can lose an utterance outright.** SenseVoice fp16 under the
+CUDA provider returns an **empty** transcript for some inputs — deterministically,
+5/5 attempts, on the KWS bundle's own `en_0.wav`: 6.6 s of clear English peaking at
+0.535 FS, louder than the `en_1.wav` that decodes fine. Eight of the nine files in
+that bundle match cpu exactly.
+
+Isolated by varying one thing at a time, since dtype and provider normally change
+together:
+
+| | en_0.wav |
+|---|---|
+| `model.int8.onnx` + cpu | correct |
+| `model.fp16.onnx` + cpu | correct |
+| `model.fp16.onnx` + cuda | **empty** |
+
+So the fp16 export is fine and the CUDA provider is at fault. Reproduced on **both**
+lines — onnxruntime-gpu 1.16.0 on orin5 and 1.18.1 on orin6, byte-identical
+`model.fp16.onnx` — so it is not a property of either wheel and not new. An earlier
+note in `ASR_MODELS` claimed fp16 was "transcript-identical to fp32 on both
+providers"; that was wrong, and the failure is silent. An empty transcript is
+indistinguishable from silence, so the utterance is dropped with nothing in the
+log to say so. Untested alternative: SenseVoice fp32 on CUDA, which measured
+11.52x on jp5.11 and would still beat cpu — no fp32 bundle is published, so
+switching the registry to it means building one first.
 
 ### Switching engine or device blocks for the bounded part
 
