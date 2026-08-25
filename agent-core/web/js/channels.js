@@ -44,7 +44,7 @@ function _renderChannels(channels) {
     _channelList.innerHTML = `
       <div class="channel-empty">
         <p>No channels configured</p>
-        <p style="font-size:12px;color:var(--text-dim);margin-top:4px">Add a Telegram or Slack bot to enable remote messaging control</p>
+        <p style="font-size:12px;color:var(--text-dim);margin-top:4px">Add a Telegram, Slack, or Feishu bot to enable remote messaging control</p>
       </div>`;
     return;
   }
@@ -60,6 +60,10 @@ function _renderChannels(channels) {
       </div>
       ${ch.health_error ? `<div class="channel-item-error">${_esc(ch.health_error)}</div>` : ''}
       <div class="channel-item-actions">
+        ${ch.platform === 'feishu' ? `
+          <button class="btn-ghost btn-sm" onclick="window._channelSetBotToBot('${_esc(ch.id)}', ${!ch.bot_to_bot_enabled})">
+            Bot @ Bot: ${ch.bot_to_bot_enabled ? 'On' : 'Off'}
+          </button>` : ''}
         <button class="btn-ghost btn-sm" onclick="window._channelStop('${_esc(ch.id)}')">Stop</button>
         <button class="btn-ghost btn-sm" onclick="window._channelRestart('${_esc(ch.id)}')">Restart</button>
         <button class="btn-ghost btn-sm btn-danger" onclick="window._channelDelete('${_esc(ch.id)}')">Delete</button>
@@ -101,6 +105,11 @@ function _showAddForm() {
         <label>App Secret</label>
         <input type="password" id="channel-form-app-secret" placeholder="App Secret" />
       </div>
+      <div class="channel-form-row hidden" id="channel-form-bot-to-bot-row">
+        <label title="Accept explicit @ messages from any bot in any group this app joins">
+          <input type="checkbox" id="channel-form-bot-to-bot" /> Allow group Bot @ Bot
+        </label>
+      </div>
       <div class="channel-form-row">
         <label><input type="checkbox" id="channel-form-enabled" checked /> Enable immediately</label>
       </div>
@@ -122,6 +131,7 @@ function _showAddForm() {
     document.getElementById('channel-form-app-token-row').classList.toggle('hidden', !isSlack);
     document.getElementById('channel-form-app-id-row').classList.toggle('hidden', !isFeishu);
     document.getElementById('channel-form-app-secret-row').classList.toggle('hidden', !isFeishu);
+    document.getElementById('channel-form-bot-to-bot-row').classList.toggle('hidden', !isFeishu);
     document.getElementById('channel-form-token-row').querySelector('label').textContent =
       isSlack ? 'Bot Token (xoxb-...)' : 'Bot Token';
     document.getElementById('channel-form-token-row').classList.toggle('hidden', isFeishu);
@@ -145,6 +155,8 @@ async function _submitAdd(formEl) {
   const appId = document.getElementById('channel-form-app-id')?.value.trim() || '';
   const appSecret = document.getElementById('channel-form-app-secret')?.value.trim() || '';
   const enabled = document.getElementById('channel-form-enabled').checked;
+  const botToBotEnabled = platform === 'feishu'
+    && document.getElementById('channel-form-bot-to-bot').checked;
 
   if (!id) { alert('ID is required'); return; }
 
@@ -173,7 +185,13 @@ async function _submitAdd(formEl) {
     const res = await fetch('/api/channel/add', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ id, platform, config, enabled }),
+      body: JSON.stringify({
+        id,
+        platform,
+        config,
+        enabled,
+        bot_to_bot_enabled: botToBotEnabled,
+      }),
     });
     const json = await res.json();
     if (!res.ok) {
@@ -192,6 +210,33 @@ async function _submitAdd(formEl) {
 }
 
 // ── Actions ───────────────────────────────────────────────────────────────────
+
+window._channelSetBotToBot = async function(id, enabled) {
+  if (enabled && !confirm(
+    'Enable Bot @ Bot for this Feishu channel?\n\n'
+    + 'Any bot in any group containing this app can trigger the Agent and its bound tools '
+    + 'by explicitly @mentioning it.'
+  )) return;
+
+  const btn = event.target;
+  btn.disabled = true;
+  btn.textContent = 'Saving…';
+  try {
+    const res = await fetch(`/api/channel/${id}`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ bot_to_bot_enabled: enabled }),
+    });
+    if (!res.ok) {
+      const j = await res.json().catch(() => ({}));
+      alert(j.detail || `Update failed (${res.status})`);
+    }
+  } catch (e) {
+    alert('Update failed: ' + e.message);
+  } finally {
+    setTimeout(_loadChannels, 500);
+  }
+};
 
 window._channelStop = async function(id) {
   const btn = event.target;

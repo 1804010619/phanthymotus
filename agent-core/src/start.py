@@ -234,13 +234,19 @@ def _register_core_mcp(silent=False):
                 'name': 'channel_reply',
                 'type': 'actuator',
                 'description': (
-                    'Send a reply to a user on a messaging platform (Feishu / Telegram / Slack). '
+                    'Send a reply on a messaging platform (Feishu / Telegram / Slack). '
                     'This is the ONLY way those users receive anything from you — text left in '
                     '`content` reaches nobody. When the triggering event\'s channel attribute starts '
                     'with "channel:" (for example channel="channel:feishu"), any reply must go through '
                     'this tool, and only to that channel. Whether the event warrants a response at all '
                     'is a separate judgement — see the response rules; when it does not, just finish. '
-                    'Send text, and/or attach files (images, video, documents) through `files` — paths '
+                    'For Feishu bot collaboration, only set mention_open_id when another bot must '
+                    'provide specific information, perform an action, review a result, or receive the '
+                    'final result of its request. Never @ for acknowledgements, thanks, repetition, or '
+                    'a final message that requires no action. Set expect_reply=true only when the target '
+                    'has a concrete unresolved task; it defaults to false. A bot message with '
+                    'expect_reply=false must not be followed by another bot @. Copy source_message_id '
+                    'from the exact triggering event. Send text, and/or attach files through `files` — paths '
                     'must be under /work or /tmp. Do not use it for on-body channels '
                     '(local_mic / remote_mic / remote_web); answer those with the robot\'s own output tools.'
                 ),
@@ -249,6 +255,28 @@ def _register_core_mcp(silent=False):
                     'properties': {
                         'action': {'type': 'string', 'enum': ['send'], 'description': 'Action'},
                         'text': {'type': 'string', 'description': 'Reply text to send to the user'},
+                        'mention_open_id': {
+                            'type': 'string',
+                            'description': (
+                                'Optional Feishu bot open_id (ou_...) to @ in the triggering group. '
+                                'For a bot-triggered request this must be that sender\'s user_id.'
+                            ),
+                        },
+                        'source_message_id': {
+                            'type': 'string',
+                            'description': (
+                                'Trigger event message_id. Required with mention_open_id to prevent '
+                                'sending into a stale or different conversation.'
+                            ),
+                        },
+                        'expect_reply': {
+                            'type': 'boolean',
+                            'default': False,
+                            'description': (
+                                'Whether the mentioned bot has a concrete unresolved task and should '
+                                'reply. Defaults to false for final results.'
+                            ),
+                        },
                         'files': {
                             'type': 'array',
                             'description': ('Optional files to send. Each item is {"path": "<absolute path inside the container>", '

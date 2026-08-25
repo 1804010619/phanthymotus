@@ -40,12 +40,21 @@ class AddChannelReq(BaseModel):
     platform: str
     config: dict = {}
     enabled: bool = False
+    bot_to_bot_enabled: bool = False
 
 
 @router.post('/add')
 async def add_channel(req: AddChannelReq):
+    if req.bot_to_bot_enabled and req.platform != 'feishu':
+        raise fastapi.HTTPException(400, 'bot_to_bot_enabled is only supported by Feishu')
     try:
-        entry = add_channel_config(req.id, req.platform, req.config, req.enabled)
+        entry = add_channel_config(
+            req.id,
+            req.platform,
+            req.config,
+            req.enabled,
+            req.bot_to_bot_enabled,
+        )
     except ValueError as e:
         raise fastapi.HTTPException(400, str(e))
     # 如果 enabled，立即启动
@@ -58,6 +67,7 @@ class UpdateChannelReq(BaseModel):
     platform: str | None = None
     config: dict | None = None
     enabled: bool | None = None
+    bot_to_bot_enabled: bool | None = None
 
 
 @router.put('/{channel_id}')
@@ -65,9 +75,15 @@ async def update_channel(channel_id: str, req: UpdateChannelReq):
     updates = {k: v for k, v in req.model_dump().items() if v is not None}
     if not updates:
         raise fastapi.HTTPException(400, 'No fields to update')
-    result = update_channel_config(channel_id, **updates)
-    if result is None:
+    current = get_channel_config(channel_id)
+    if current is None:
         raise fastapi.HTTPException(404, f'Channel not found: {channel_id}')
+    target_platform = updates.get('platform', current['platform'])
+    if updates.get('bot_to_bot_enabled') and target_platform != 'feishu':
+        raise fastapi.HTTPException(400, 'bot_to_bot_enabled is only supported by Feishu')
+    if target_platform != 'feishu':
+        updates['bot_to_bot_enabled'] = False
+    result = update_channel_config(channel_id, **updates)
     # 重启 adapter 以应用新配置
     await manager.restart_adapter(channel_id)
     return {'channel': result}

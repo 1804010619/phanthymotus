@@ -6,11 +6,13 @@ channel/adapters/feishu.py — Feishu (Lark) adapter。
 不经过 SDK 的同步客户端——这样错误码可以统一处理，也不用为每个调用开线程池。
 
 Requires: pip install lark-oapi
-Config: {app_id, app_secret, domain?}
+Config: {app_id, app_secret, domain?, bot_to_bot_enabled?}
 
 Required Feishu permissions:
 - im:message                — 接收消息
 - im:message:send_as_bot    — 以机器人身份发消息（只发文本时够了）
+- im:message.group_at_msg.include_bot:readonly
+                            — 接收群内其他机器人明确 @ 当前机器人（Bot @ Bot 时必需）
 - im:resource               — 上传/下载图片与文件（收发附件必需；仅发送也可用
                               im:resource:upload。缺它时文本能发出去、附件一律 99991672）
 - im:chat:readonly          — 列出会话（可选）
@@ -23,6 +25,7 @@ Event subscription:
 import asyncio
 import json
 import os
+import re
 import threading
 import time
 
@@ -56,6 +59,10 @@ _PROBE_TTL = 15
 
 # 去重窗口：飞书可能重投递同一事件
 _DEDUP_MAX = 512
+
+_BOT_REQUEST_LABEL = '【机器人协作请求·需要回复】'
+_BOT_FINAL_LABEL = '【机器人协作答复·无需回复】'
+_BOT_OPEN_ID_RE = re.compile(r'^ou_[A-Za-z0-9_-]+$')
 
 # 上传时的 file_type（飞书只认这几种，其余用 stream）
 _FILE_TYPE_BY_EXT = {
@@ -101,6 +108,7 @@ class FeishuAdapter(ChannelAdapter):
         self._last_event_ts = 0.0
         self._seen_ids: list[str] = []
         self._seen_set: set[str] = set()
+        self._bot_open_id = ''
 
     # ── 基础设施：token / REST ────────────────────────────────────────────────
 
@@ -136,8 +144,9 @@ class FeishuAdapter(ChannelAdapter):
 
     async def _request(self, method: str, path: str, *, json_body: dict | None = None,
                        params: dict | None = None, data=None,
-                       raw: bool = False, retry_auth: bool = True):
-        """调用开放平台 REST。raw=True 时返回 (bytes, headers)，否则返回 data 字段。"""
+                       raw: bool = False, return_body: bool = False,
+                       retry_auth: bool = True):
+        """调用开放平台 REST。raw=True 返回二进制；return_body=True 返回完整 JSON。"""
         token = await self._tenant_token()
         url = f'{self._domain}{path}'
         headers = {'Authorization': f'Bearer {token}'}
@@ -165,9 +174,10 @@ class FeishuAdapter(ChannelAdapter):
             if retry_auth and code in (99991663, 99991668, 99991661):
                 await self._tenant_token(force=True)
                 return await self._request(method, path, json_body=json_body, params=params,
-                                          data=data, raw=raw, retry_auth=False)
+                                          data=data, raw=raw, return_body=return_body,
+                                          retry_auth=False)
             raise FeishuError(code, body.get('msg', ''), self._hint(code))
-        return body.get('data', {})
+        return body if return_body else body.get('data', {})
 
     # ── 生命周期 ─────────────────────────────────────────────────────────────
 
@@ -271,10 +281,15 @@ class FeishuAdapter(ChannelAdapter):
         if not force and time.time() - self._probe_ts < _PROBE_TTL:
             return self._probe_ok, self._probe_err
         try:
-            await self._request('GET', '/open-apis/bot/v3/info')
-            self._probe_ok, self._probe_err = True, ''
+            body = await self._request('GET', '/open-apis/bot/v3/info', return_body=True)
+            self._bot_open_id = ((body.get('bot') or {}).get('open_id') or '')
+            if self.config.get('bot_to_bot_enabled') and not self._bot_open_id:
+                self._probe_ok = False
+                self._probe_err = 'bot-to-bot is enabled but /bot/v3/info returned no bot.open_id'
+            else:
+                self._probe_ok, self._probe_err = True, ''
         except FeishuError as e:
-            if e.code == 99991672:
+            if e.code == 99991672 and not self.config.get('bot_to_bot_enabled'):
                 self._probe_ok, self._probe_err = True, ''
             else:
                 self._probe_ok, self._probe_err = False, str(e)
@@ -320,7 +335,26 @@ class FeishuAdapter(ChannelAdapter):
                                           kind=KIND_IMAGE, name='image.jpg',
                                           mime='image/jpeg', fallback_ext='.jpg'))
 
-        if msg.text:
+        if msg.mention_open_id:
+            if not self.config.get('bot_to_bot_enabled'):
+                raise ValueError('Feishu bot-to-bot is disabled for this channel')
+            if not _BOT_OPEN_ID_RE.fullmatch(msg.mention_open_id):
+                raise ValueError('mention_open_id must be a valid Feishu ou_... open_id')
+            if msg.mention_open_id == self._bot_open_id:
+                raise ValueError('Cannot @ this Feishu bot itself')
+            if not msg.text.strip():
+                raise ValueError('Bot mention requires a concrete text request or result')
+            if files:
+                raise ValueError('Bot mentions currently support text only; files were not sent')
+            label = _BOT_REQUEST_LABEL if msg.expect_reply else _BOT_FINAL_LABEL
+            wire_text = f'{label}\n<at user_id="{msg.mention_open_id}"></at> {msg.text}'
+            if len(wire_text) > _TEXT_CHUNK:
+                raise ValueError(
+                    f'Bot mention is too long ({len(wire_text)} chars); shorten it below '
+                    f'{_TEXT_CHUNK} chars so the @ is delivered in one message'
+                )
+            await self._send_raw(msg.chat_id, 'text', {'text': wire_text})
+        elif msg.text:
             for chunk in _chunks(msg.text, _TEXT_CHUNK):
                 await self._send_raw(msg.chat_id, 'text', {'text': chunk})
 
@@ -419,15 +453,32 @@ class FeishuAdapter(ChannelAdapter):
             message = event.message
             sender = event.sender
 
-            if sender.sender_type == 'app':
-                return  # 跳过机器人自己的消息
+            sender_id_obj = getattr(sender, 'sender_id', None)
+            sender_id = (
+                getattr(sender_id_obj, 'open_id', '')
+                or getattr(sender_id_obj, 'user_id', '')
+                or ''
+            )
+            mentions = []
+            for mention in (getattr(message, 'mentions', None) or []):
+                mention_id = getattr(mention, 'id', None)
+                mentions.append({
+                    'key': getattr(mention, 'key', '') or '',
+                    'open_id': getattr(mention_id, 'open_id', '') or '',
+                    'user_id': getattr(mention_id, 'user_id', '') or '',
+                    'name': getattr(mention, 'name', '') or '',
+                    'mentioned_type': getattr(mention, 'mentioned_type', '') or '',
+                })
 
             raw = {
                 'message_id': getattr(message, 'message_id', '') or '',
                 'message_type': getattr(message, 'message_type', '') or '',
                 'content': getattr(message, 'content', '') or '',
                 'chat_id': getattr(message, 'chat_id', '') or '',
-                'sender_id': (sender.sender_id.open_id or sender.sender_id.user_id or ''),
+                'chat_type': getattr(message, 'chat_type', '') or '',
+                'sender_id': sender_id,
+                'sender_type': getattr(sender, 'sender_type', '') or 'user',
+                'mentions': mentions,
             }
 
             self._last_event_ts = time.time()
@@ -459,6 +510,24 @@ class FeishuAdapter(ChannelAdapter):
     async def _process_event(self, raw: dict) -> None:
         """在主 loop 上解析消息、下载附件、回调 manager。"""
         try:
+            sender_type = raw.get('sender_type', 'user')
+            is_bot = sender_type in ('bot', 'app')
+            if is_bot:
+                if not self.config.get('bot_to_bot_enabled'):
+                    return
+                if raw.get('chat_type') != 'group':
+                    return
+                if not self._bot_open_id:
+                    print('[feishu] bot event dropped: own bot open_id unavailable')
+                    return
+                if raw.get('sender_id') == self._bot_open_id:
+                    return
+                if not any(
+                    mention.get('open_id') == self._bot_open_id
+                    for mention in raw.get('mentions', [])
+                ):
+                    return
+
             if self._is_duplicate(raw['message_id']):
                 print(f'[feishu] duplicate message dropped: {raw["message_id"]}')
                 return
@@ -466,6 +535,23 @@ class FeishuAdapter(ChannelAdapter):
             text, attachments = await self._parse_content(raw)
             if not text and not attachments:
                 return
+
+            expect_reply = None
+            if is_bot:
+                if text.startswith(_BOT_REQUEST_LABEL):
+                    expect_reply = True
+                    text = text[len(_BOT_REQUEST_LABEL):].lstrip()
+                elif text.startswith(_BOT_FINAL_LABEL):
+                    expect_reply = False
+                    text = text[len(_BOT_FINAL_LABEL):].lstrip()
+                else:
+                    # 兼容其他机器人：明确 @ 当前机器人视作一次协作请求。
+                    expect_reply = True
+
+            mentions = [
+                {**mention, 'is_self': mention.get('open_id') == self._bot_open_id}
+                for mention in raw.get('mentions', [])
+            ]
 
             msg = InboundMessage(
                 platform='feishu',
@@ -476,6 +562,10 @@ class FeishuAdapter(ChannelAdapter):
                 text=text,
                 message_id=raw['message_id'],
                 attachments=attachments,
+                sender_type=sender_type,
+                chat_type=raw.get('chat_type', ''),
+                mentions=mentions,
+                expect_reply=expect_reply,
             )
             await self._on_message(msg)
         except Exception as e:

@@ -57,7 +57,8 @@ def get_channel_config(channel_id: str) -> dict | None:
     return None
 
 
-def add_channel_config(channel_id: str, platform: str, cfg: dict, enabled: bool = False) -> dict:
+def add_channel_config(channel_id: str, platform: str, cfg: dict,
+                       enabled: bool = False, bot_to_bot_enabled: bool = False) -> dict:
     configs = _get_channel_configs()
     # 检查 ID 唯一
     if any(c['id'] == channel_id for c in configs):
@@ -66,6 +67,7 @@ def add_channel_config(channel_id: str, platform: str, cfg: dict, enabled: bool 
         'id': channel_id,
         'platform': platform,
         'enabled': enabled,
+        'bot_to_bot_enabled': bot_to_bot_enabled if platform == 'feishu' else False,
         'config': cfg,
         'status': 'disconnected',
         'updated_at': time.time(),
@@ -80,7 +82,7 @@ def update_channel_config(channel_id: str, **updates) -> dict | None:
     for ch in configs:
         if ch['id'] == channel_id:
             for k, v in updates.items():
-                if k in ('platform', 'config', 'enabled'):
+                if k in ('platform', 'config', 'enabled', 'bot_to_bot_enabled'):
                     ch[k] = v
             ch['updated_at'] = time.time()
             _save_channel_configs(configs)
@@ -128,14 +130,24 @@ class ChannelManager:
         """Get all channel contexts from persistent storage."""
         return config.main.get('channel_last_context', {})
 
-    def _set_last_context(self, channel_id: str, chat_id: str, user_id: str):
+    def _set_last_context(self, channel_id: str, chat_id: str, user_id: str, *,
+                          message_id: str = '', sender_type: str = 'user',
+                          chat_type: str = '', expect_reply: bool | None = None):
         """Persist conversation context for a channel.
 
         带 ts —— 「最近一次会话」必须靠时间戳判断：dict 就地更新不改插入顺序，
         用 list(ctx)[-1] 取到的是最早写入的那个 channel。
         """
         ctx = config.main.get('channel_last_context', {})
-        ctx[channel_id] = {'chat_id': chat_id, 'user_id': user_id, 'ts': time.time()}
+        ctx[channel_id] = {
+            'chat_id': chat_id,
+            'user_id': user_id,
+            'message_id': message_id,
+            'sender_type': sender_type,
+            'chat_type': chat_type,
+            'expect_reply': expect_reply,
+            'ts': time.time(),
+        }
         config.main['channel_last_context'] = ctx
 
     def _latest_context_channel(self) -> str:
@@ -364,10 +376,12 @@ class ChannelManager:
             await self._push_error(msg)
             return
 
+        adapter_config = dict(ch_cfg.get('config', {}))
+        adapter_config['bot_to_bot_enabled'] = ch_cfg.get('bot_to_bot_enabled', False)
         adapter = cls(
             channel_id=channel_id,
             platform=platform,
-            config=ch_cfg.get('config', {}),
+            config=adapter_config,
             on_message=self._on_inbound_message,
         )
 
@@ -429,30 +443,41 @@ class ChannelManager:
             return
         self._inactive_logged.discard(msg.channel_id)
 
-        # 2. ACL — ensure user exists, otherwise auto-register
-        user = acl.get_user(msg.platform, msg.user_id)
-        if user is None:
-            channel_settings = self._get_channel_settings()
-            default_role = channel_settings.get('default_role', 'viewer')
-            auto_approve = channel_settings.get('auto_approve', True)
-            if auto_approve:
-                acl.upsert_user(msg.platform, msg.user_id, msg.display_name, role=default_role)
-                user = acl.get_user(msg.platform, msg.user_id)
-            else:
-                adapter = self._adapters.get(msg.channel_id)
-                if adapter:
-                    await adapter.send_message(OutboundMessage(
-                        chat_id=msg.chat_id,
-                        text='Pending approval. An admin has been notified.'
-                    ))
-                return
+        is_bot = msg.sender_type in ('bot', 'app')
+        if is_bot:
+            # 机器人不是通讯录用户，不写入人员 ACL，也绝不能继承 owner/operator 权限。
+            user = {'role': 'viewer'}
+        else:
+            # 2. ACL — ensure user exists, otherwise auto-register
+            user = acl.get_user(msg.platform, msg.user_id)
+            if user is None:
+                channel_settings = self._get_channel_settings()
+                default_role = channel_settings.get('default_role', 'viewer')
+                auto_approve = channel_settings.get('auto_approve', True)
+                if auto_approve:
+                    acl.upsert_user(msg.platform, msg.user_id, msg.display_name, role=default_role)
+                    user = acl.get_user(msg.platform, msg.user_id)
+                else:
+                    adapter = self._adapters.get(msg.channel_id)
+                    if adapter:
+                        await adapter.send_message(OutboundMessage(
+                            chat_id=msg.chat_id,
+                            text='Pending approval. An admin has been notified.'
+                        ))
+                    return
 
-        # 3. ACL — 检查是否 blocked
-        if user['role'] == 'blocked':
-            return  # 静默丢弃
+            # 3. ACL — 检查是否 blocked
+            if user['role'] == 'blocked':
+                return  # 静默丢弃
 
         # 4. Store last conversation context for reply routing (persisted)
-        self._set_last_context(msg.channel_id, msg.chat_id, msg.user_id)
+        self._set_last_context(
+            msg.channel_id, msg.chat_id, msg.user_id,
+            message_id=msg.message_id,
+            sender_type=msg.sender_type,
+            chat_type=msg.chat_type,
+            expect_reply=msg.expect_reply,
+        )
 
         # 5. Publish to topic for dashboard and canvas data flow
         #    附件已由 adapter 落盘到持久化目录，这里只带容器内本地路径给 LLM
@@ -468,6 +493,10 @@ class ChannelManager:
             'chat_id': msg.chat_id,
             'text': msg.text,
             'user_role': user['role'],
+            'sender_type': msg.sender_type,
+            'chat_type': msg.chat_type,
+            'mentions': msg.mentions,
+            'expect_reply': msg.expect_reply,
         }
         if files:
             payload['files'] = files
@@ -483,6 +512,12 @@ class ChannelManager:
                 'text': msg.text,
                 'platform': msg.platform,
                 'user': msg.display_name,
+                'message_id': msg.message_id,
+                'chat_id': msg.chat_id,
+                'sender_type': msg.sender_type,
+                'chat_type': msg.chat_type,
+                'mentions': msg.mentions,
+                'expect_reply': msg.expect_reply,
                 'files': files,
             }
         })
@@ -490,7 +525,10 @@ class ChannelManager:
     # ── Outbound (Reply Routing) ─────────────────────────────────────────────
 
     async def send_to_channel(self, channel_id: str, text: str = '',
-                              files: list | None = None) -> str:
+                              files: list | None = None, *,
+                              mention_open_id: str = '',
+                              source_message_id: str = '',
+                              expect_reply: bool = False) -> str:
         """Send text and/or attachments to a channel using its last chat context.
         Called by channel_reply tool dispatch."""
         ctx = self._get_last_context().get(channel_id)
@@ -510,6 +548,37 @@ class ChannelManager:
                 f'Solution: Go to Settings → Channels and click Restart for this channel.'
             )
 
+        if mention_open_id:
+            ch_cfg = get_channel_config(channel_id) or {}
+            if adapter.platform != 'feishu':
+                return 'Error: mention_open_id is only supported by Feishu channels.'
+            if not ch_cfg.get('bot_to_bot_enabled', False):
+                return (
+                    'Error: Feishu bot-to-bot is disabled for this channel.\n'
+                    'Solution: enable "Bot @ Bot" in Settings → Channels and restart the channel.'
+                )
+            if not source_message_id or source_message_id != ctx.get('message_id'):
+                return (
+                    'Error: stale or missing source_message_id; no message was sent.\n'
+                    'Cause: bot mentions must stay bound to the exact triggering message.'
+                )
+            if ctx.get('chat_type') != 'group':
+                return 'Error: bot mentions are only allowed in Feishu group chats.'
+            if ctx.get('sender_type') in ('bot', 'app'):
+                if ctx.get('expect_reply') is False:
+                    return (
+                        'Error: this bot message is marked as a final answer (expect_reply=false); '
+                        'do not @ another bot.'
+                    )
+                if mention_open_id != ctx.get('user_id'):
+                    return 'Error: a bot-triggered reply may only @ the bot that sent the request.'
+            if files:
+                return 'Error: bot mentions currently support text only; no files were sent.'
+            if not text.strip():
+                return 'Error: a bot mention requires a concrete text request or result.'
+        elif expect_reply:
+            return 'Error: expect_reply=true requires mention_open_id.'
+
         # 出站附件：路径白名单 + 大小/类别校验（失败的逐条回报，不当作发送成功）
         attachments = []
         file_errors: list[str] = []
@@ -526,14 +595,21 @@ class ChannelManager:
 
         chat_id = ctx['chat_id']
         try:
-            await adapter.send_message(OutboundMessage(chat_id=chat_id, text=text,
-                                                       files=attachments))
+            await adapter.send_message(OutboundMessage(
+                chat_id=chat_id,
+                text=text,
+                files=attachments,
+                mention_open_id=mention_open_id,
+                expect_reply=expect_reply,
+            ))
             parts = []
             if text:
                 parts.append(f'{len(text)} chars')
             if attachments:
                 parts.append(f'{len(attachments)} file(s): ' +
                              ', '.join(a.name for a in attachments))
+            if mention_open_id:
+                parts.append('bot mention; ' + ('reply expected' if expect_reply else 'final answer'))
             result = f'Reply sent to {channel_id} ({"; ".join(parts) or "empty"})'
             if file_errors:
                 result += '\nSome files were NOT sent:\n' + '\n'.join(file_errors)
@@ -566,7 +642,8 @@ class ChannelManager:
             return result
 
     async def send_reply(self, instance_id: str = '', text: str = '',
-                         files: list | None = None) -> str:
+                         files: list | None = None, *, mention_open_id: str = '',
+                         source_message_id: str = '', expect_reply: bool = False) -> str:
         """channel_reply 的统一出口：先按卡片实例配置解析目标 channel，再发送。
 
         画布上给输出卡片选的 channel 必须真正决定回复去向——之前两条 dispatch
@@ -575,7 +652,14 @@ class ChannelManager:
         channel_id, err = self.resolve_target_channel(instance_id)
         if err:
             return err
-        return await self.send_to_channel(channel_id, text=text, files=files)
+        return await self.send_to_channel(
+            channel_id,
+            text=text,
+            files=files,
+            mention_open_id=mention_open_id,
+            source_message_id=source_message_id,
+            expect_reply=expect_reply,
+        )
 
     # ── Status ───────────────────────────────────────────────────────────────
 
@@ -590,6 +674,7 @@ class ChannelManager:
                 'id': channel_id,
                 'platform': ch_cfg['platform'],
                 'enabled': ch_cfg.get('enabled', False),
+                'bot_to_bot_enabled': ch_cfg.get('bot_to_bot_enabled', False),
                 'status': adapter.status() if adapter else 'disconnected',
                 'health_error': '' if not health or health[0] else health[1],
                 'active_input': channel_id in self.active_input_channels,
