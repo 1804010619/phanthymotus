@@ -131,6 +131,21 @@ def _trigger_channel_ids(trigger_event: dict) -> list[str]:
     return ids
 
 
+def _channel_tool_retry_message(trigger_event: dict, round_idx: int, text: str) -> str:
+    """首轮渠道回复漏掉工具调用时，给模型一次纠正机会。"""
+    channel_ids = _trigger_channel_ids(trigger_event)
+    if round_idx != 0 or not channel_ids or not text.strip():
+        return ''
+    return (
+        '[system correction]\n'
+        f'This turn came from messaging channel(s): {", ".join(channel_ids)}. '
+        'You produced reply text but called no tool, so nothing was delivered. '
+        'If a reply is warranted, call the bound channel_reply tool now with action="send" '
+        'and the reply text. If no reply is warranted, call finish. '
+        'Do not return content-only text again.'
+    )
+
+
 def _estimate_chars(turns: list[list[dict]]) -> int:
     """粗估 turns 的总字符数（用于判断是否需要压缩）。"""
     total = 0
@@ -1151,13 +1166,22 @@ class Event:
                 # 本轮由某个消息渠道触发，却一个工具都没调 → 用户那边是纯沉默：
                 # content 不会送达任何人。曾经因为这个丢过回复，而日志里只有
                 # 「turn complete: 1 rounds」看不出异常，只能去翻 llm_recent_request。
-                if round_idx == 0 and _trigger_channel_ids(trigger_event):
+                retry_message = _channel_tool_retry_message(trigger_event, round_idx, text)
+                if retry_message:
+                    turn_messages.append({'role': 'user', 'content': retry_message})
+                    print('[decision] channel-triggered turn produced content without a tool call; retrying once')
+                    await push_event({'type': 'llm_retry', 'payload': {
+                        'reason': 'channel_reply_tool_missing',
+                    }})
+                elif _trigger_channel_ids(trigger_event):
                     warn = (f'[decision] WARNING: channel-triggered turn produced no tool call — '
                             f'nothing was delivered to {", ".join(_trigger_channel_ids(trigger_event))}. '
                             f'content was: {(text or "")[:200]}')
                     print(warn)
                     await push_event({'type': 'error', 'payload': {'message': warn}})
-                break
+                    break
+                else:
+                    break
 
             # ── finish 检测 ───────────────────────────────────────────────
             if finish_tool in [c['function']['name'] for c in tool_calls]:
