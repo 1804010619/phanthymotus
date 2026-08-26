@@ -19,7 +19,7 @@ plugins:
     # the process never returns. On a 7.4 GB Orin already running vop + OCR +
     # TTS that is enough to run the box out of memory, so cpu is the default
     # even on images that could use the GPU. Numbers in utils/onnx_provider.py.
-    device: cpu
+    device: gpu
     num_threads: 2   # cpu only; 4 buys ~1.2-1.5x. Ignored on gpu.
     # Decode 1 s of silence after the model loads. On gpu the first inference
     # costs ~1.7 s (lazy kernels, cuDNN autotune, memory pool) against a 58 ms
@@ -38,7 +38,7 @@ plugins:
         - "x iǎo f àn x iǎo f àn @小范小范"
 
   tts:
-    enabled: true
+    enabled: false
     engine: vits2_trt
     backend: trt
     model_dir: /models/vits2
@@ -52,7 +52,7 @@ plugins:
     device: cpu
 
   vop:
-    enabled: true
+    enabled: false
     namespace: ""       # auto-detect from hostname if empty
     model: "yolov8s-worldv2"
     confidence: 0.3
@@ -60,7 +60,7 @@ plugins:
     fps: 5
 
   ocr:
-    enabled: true
+    enabled: false
     provider: rapidocr
     model_dir: /models/ocr/ppocrv6-small-trt
     device_id: 0
