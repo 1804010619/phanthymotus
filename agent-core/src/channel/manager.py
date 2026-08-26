@@ -5,7 +5,7 @@ channel/manager.py — Channel 生命周期管理器。
 - 管理 channel_configs（CRUD）
 - 启动/停止 adapters，并用 watchdog 周期探测健康度、自动重连
 - 入站消息 → ACL 检查 → topic 发布（附件已落盘，随事件带本地路径）
-- 出站回复路由：卡片实例配置的 channel → 最近会话上下文
+- 出站回复路由：卡片实例配置的 channel + 触发消息 ID → 原会话
 """
 
 import asyncio
@@ -23,6 +23,7 @@ from channel import acl
 
 _CONFIG_KEY = 'channel_configs'
 _TOPIC_COMPONENT_MAX = 80
+_REPLY_CONTEXT_LIMIT = 100
 
 
 def channel_request_topic(channel_id: str) -> str:
@@ -138,8 +139,7 @@ class ChannelManager:
         带 ts —— 「最近一次会话」必须靠时间戳判断：dict 就地更新不改插入顺序，
         用 list(ctx)[-1] 取到的是最早写入的那个 channel。
         """
-        ctx = config.main.get('channel_last_context', {})
-        ctx[channel_id] = {
+        entry = {
             'chat_id': chat_id,
             'user_id': user_id,
             'message_id': message_id,
@@ -148,7 +148,20 @@ class ChannelManager:
             'expect_reply': expect_reply,
             'ts': time.time(),
         }
+        ctx = config.main.get('channel_last_context', {})
+        ctx[channel_id] = entry
         config.main['channel_last_context'] = ctx
+
+        if message_id:
+            all_messages = config.main.get('channel_message_contexts', {})
+            channel_messages = all_messages.get(channel_id, {})
+            channel_messages[message_id] = entry
+            if len(channel_messages) > _REPLY_CONTEXT_LIMIT:
+                channel_messages = dict(sorted(
+                    channel_messages.items(), key=lambda item: item[1].get('ts', 0)
+                )[-_REPLY_CONTEXT_LIMIT:])
+            all_messages[channel_id] = channel_messages
+            config.main['channel_message_contexts'] = all_messages
 
     def _latest_context_channel(self) -> str:
         """返回最近有过会话的 channel_id（按 ts 最大），无则空串。"""
@@ -529,15 +542,25 @@ class ChannelManager:
                               mention_open_id: str = '',
                               source_message_id: str = '',
                               expect_reply: bool = False) -> str:
-        """Send text and/or attachments to a channel using its last chat context.
+        """Send text and/or attachments to the source message's exact chat context.
         Called by channel_reply tool dispatch."""
-        ctx = self._get_last_context().get(channel_id)
+        if not source_message_id:
+            return (
+                'Error: missing source_message_id; no message was sent.\n'
+                'Cause: channel replies must identify the exact triggering message.'
+            )
+
+        ctx = (config.main.get('channel_message_contexts', {})
+               .get(channel_id, {}).get(source_message_id))
+        if not ctx:
+            # 兼容升级前只保存的最后一条上下文。
+            last_ctx = self._get_last_context().get(channel_id)
+            if last_ctx and last_ctx.get('message_id') == source_message_id:
+                ctx = last_ctx
         if not ctx:
             return (
-                f'Error: No conversation context for channel "{channel_id}".\n'
-                f'Cause: The bot has not received any message from a user yet in this channel.\n'
-                f'Solution: Ask a user to send a message to the bot in Feishu (private chat or @bot in group), '
-                f'then the bot can reply to that conversation.'
+                'Error: unknown or expired source_message_id; no message was sent.\n'
+                'Cause: no reply context exists for that triggering message.'
             )
 
         adapter = self._adapters.get(channel_id)
@@ -546,12 +569,6 @@ class ChannelManager:
                 f'Error: Channel "{channel_id}" is not running.\n'
                 f'Cause: The channel adapter failed to start, was stopped, or the connection dropped.\n'
                 f'Solution: Go to Settings → Channels and click Restart for this channel.'
-            )
-
-        if not source_message_id or source_message_id != ctx.get('message_id'):
-            return (
-                'Error: stale or missing source_message_id; no message was sent.\n'
-                'Cause: channel replies must stay bound to the exact triggering message.'
             )
 
         if mention_open_id:

@@ -222,6 +222,7 @@ class ChannelManagerBotReplyTest(unittest.IsolatedAsyncioTestCase):
             'config': {},
         }]
         config.main['channel_last_context'] = {}
+        config.main['channel_message_contexts'] = {}
         self.manager = ChannelManager()
         self.adapter = DummyAdapter()
         self.manager._adapters['feishu_test'] = self.adapter
@@ -243,7 +244,7 @@ class ChannelManagerBotReplyTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn('final answer', result)
         self.assertEqual(self.adapter.sent, [])
 
-    async def test_bot_request_can_only_reply_to_sender_and_stale_context_is_rejected(self):
+    async def test_bot_request_can_only_reply_to_sender_and_unknown_context_is_rejected(self):
         self.manager._set_last_context(
             'feishu_test', 'oc_group', 'ou_peer',
             message_id='om_request', sender_type='bot', chat_type='group',
@@ -264,30 +265,35 @@ class ChannelManagerBotReplyTest(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertIn('only @ the bot that sent', wrong_target)
-        self.assertIn('stale or missing', stale)
+        self.assertIn('unknown or expired', stale)
         self.assertIn('final answer', sent)
         self.assertEqual(len(self.adapter.sent), 1)
 
-    async def test_human_reply_stays_bound_to_trigger_context(self):
+    async def test_human_reply_routes_by_trigger_message_not_latest_chat(self):
         self.manager._set_last_context(
-            'feishu_test', 'oc_human', 'ou_human',
-            message_id='om_current', sender_type='user', chat_type='p2p',
+            'feishu_test', 'oc_private', 'ou_human',
+            message_id='om_private', sender_type='user', chat_type='p2p',
+        )
+        self.manager._set_last_context(
+            'feishu_test', 'oc_group', 'ou_other',
+            message_id='om_newer', sender_type='user', chat_type='group',
         )
 
         missing = await self.manager.send_to_channel(
-            'feishu_test', text='旧回复',
+            'feishu_test', text='私聊回复',
         )
-        stale = await self.manager.send_to_channel(
-            'feishu_test', text='旧回复', source_message_id='om_old',
+        unknown = await self.manager.send_to_channel(
+            'feishu_test', text='私聊回复', source_message_id='om_unknown',
         )
         sent = await self.manager.send_to_channel(
-            'feishu_test', text='当前回复', source_message_id='om_current',
+            'feishu_test', text='私聊回复', source_message_id='om_private',
         )
 
-        self.assertIn('stale or missing', missing)
-        self.assertIn('stale or missing', stale)
+        self.assertIn('missing source_message_id', missing)
+        self.assertIn('unknown or expired', unknown)
         self.assertIn('Reply sent', sent)
         self.assertEqual(len(self.adapter.sent), 1)
+        self.assertEqual(self.adapter.sent[0].chat_id, 'oc_private')
 
     async def test_bot_inbound_bypasses_people_acl_as_viewer(self):
         config.main['canvas_layout'] = {'cards': [{
