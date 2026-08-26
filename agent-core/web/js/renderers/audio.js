@@ -36,7 +36,10 @@ export const AudioRenderer = {
   _nextStartTime: 0,
   _prebufCount:   0,
   _prebufQueue:   null,
-  _PREBUF_CHUNKS: 3,    // 首包预载：攒够 3 个 chunk 再开始播放
+  _PREBUF_CHUNKS: 5,     // 首包预载：攒够 5 个 chunk (~500ms) 再开始播放
+  _UNDERRUN_LEAD: 0.20,  // 欠载重启时给出的余量，秒
+  _MAX_LEAD:      1.5,   // 允许领先播放头的上限，秒
+  _drawnPos:      -1,
 
   mount(container) {
     this._el = document.createElement('div');
@@ -68,6 +71,7 @@ export const AudioRenderer = {
     this._ctx2d = this._canvas.getContext('2d');
     this._ring = new Float32Array(this._ringLen);
     this._writePos = 0;
+    this._drawnPos = -1;
 
     this._raf = requestAnimationFrame(() => this._draw());
   },
@@ -78,6 +82,20 @@ export const AudioRenderer = {
       // Protocol frame, not samples. Keep the tail of the waveform on screen and
       // say what happened instead of reporting a 0 ms frame.
       if (this._label) this._label.textContent = '○ 音频流  本句结束';
+      // An utterance boundary is exactly when the jitter buffer has to be
+      // re-armed. The prebuffer used to be spent on the first utterance and
+      // never rebuilt, so every later one started from _scheduleChunk's
+      // underrun branch — a fixed, tiny lead — and gapped on the first hiccup.
+      // Flush first: an utterance shorter than _PREBUF_CHUNKS never fills the
+      // prebuffer, and re-arming without flushing would discard it unplayed.
+      // _nextStartTime is deliberately left alone: it is the end of the audio
+      // already handed to the audio thread, and resetting it would schedule the
+      // next utterance on top of this one's still-playing tail.
+      if (this._playing) {
+        this._flushPrebuf();
+        this._prebufQueue = [];
+        this._prebufCount = 0;
+      }
       return;
     }
     const pcm = new Int16Array(buffer);
@@ -111,6 +129,7 @@ export const AudioRenderer = {
   clear() {
     if (this._ring) this._ring.fill(0);
     this._writePos = 0;
+    this._drawnPos = -1;
     if (this._label) this._label.textContent = '等待音频流…';
   },
 
@@ -160,6 +179,16 @@ export const AudioRenderer = {
     }
   },
 
+  _flushPrebuf() {
+    if (!this._prebufQueue || this._prebufQueue.length === 0) return;
+    const queue = this._prebufQueue;
+    this._prebufQueue = null;
+    this._prebufCount = 0;
+    for (const buf of queue) {
+      this._scheduleChunk(buf);
+    }
+  },
+
   _feedPlayback(buffer) {
     if (!this._audioCtx || !this._playing) return;
 
@@ -168,12 +197,7 @@ export const AudioRenderer = {
       this._prebufQueue.push(buffer);
       this._prebufCount++;
       if (this._prebufCount >= this._PREBUF_CHUNKS) {
-        // Flush all prebuffered chunks
-        const queue = this._prebufQueue;
-        this._prebufQueue = null;
-        for (const buf of queue) {
-          this._scheduleChunk(buf);
-        }
+        this._flushPrebuf();
       }
       return;
     }
@@ -206,8 +230,18 @@ export const AudioRenderer = {
     // Schedule playback time
     const currentTime = ctx.currentTime;
     if (this._nextStartTime < currentTime) {
-      // Buffer underrun — restart from current time + small delay
-      this._nextStartTime = currentTime + 0.05;
+      // Underrun. The old +0.05 here left a 50ms lead as the *permanent*
+      // steady-state margin against a producer that sends 100ms of audio per
+      // 100ms of wall clock, so the next delay over 50ms gapped again — and
+      // again. _UNDERRUN_LEAD gives the recovery something to work with.
+      this._nextStartTime = currentTime + this._UNDERRUN_LEAD;
+    } else if (this._nextStartTime - currentTime > this._MAX_LEAD) {
+      // Too far ahead. The relay queues frames (agent-core keeps a very deep
+      // per-consumer queue), so a stall followed by a flush arrives as a burst
+      // and every chunk gets appended contiguously into the future — latency
+      // that grows monotonically and is never recovered. Drop back rather than
+      // drift; one seam here beats playing minutes behind live.
+      this._nextStartTime = currentTime + this._MAX_LEAD;
     }
 
     source.start(this._nextStartTime);
@@ -221,13 +255,26 @@ export const AudioRenderer = {
 
     const cw = this._canvas.offsetWidth;
     const ch = this._canvas.offsetHeight;
-    // Compare against the backing-store size, not the CSS size: after a resize
+
+    // The waveform shares the main thread with _scheduleChunk, which has only a
+    // few hundred ms of scheduling lead to work with. A full redraw is a
+    // per-column fillRect plus a scan of the whole ring, so skip the ones that
+    // cannot change anything the user sees: a hidden tab, and frames where
+    // neither new samples nor a resize arrived (audio is 10 fps, this is 60).
+    const wantW = Math.round(cw * devicePixelRatio);
+    const wantH = Math.round(ch * devicePixelRatio);
+    const resized = this._canvas.width !== wantW || this._canvas.height !== wantH;
+    if (document.hidden || (!resized && this._writePos === this._drawnPos)) {
+      this._raf = requestAnimationFrame(() => this._draw());
+      return;
+    }
+    this._drawnPos = this._writePos;
+
+    // Assign the backing-store size, not the CSS size: after a resize
     // canvas.width is cw * devicePixelRatio, so `canvas.width !== cw` is always
     // true on a HiDPI display and this reallocated the canvas and reset the
     // transform on every animation frame.
-    const wantW = Math.round(cw * devicePixelRatio);
-    const wantH = Math.round(ch * devicePixelRatio);
-    if (cw > 0 && (this._canvas.width !== wantW || this._canvas.height !== wantH)) {
+    if (cw > 0 && resized) {
       this._canvas.width  = wantW;
       this._canvas.height = wantH;
       this._canvas.style.width  = cw + 'px';
