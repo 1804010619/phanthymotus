@@ -548,6 +548,12 @@ class ChannelManager:
                 f'Solution: Go to Settings → Channels and click Restart for this channel.'
             )
 
+        if not source_message_id or source_message_id != ctx.get('message_id'):
+            return (
+                'Error: stale or missing source_message_id; no message was sent.\n'
+                'Cause: channel replies must stay bound to the exact triggering message.'
+            )
+
         if mention_open_id:
             ch_cfg = get_channel_config(channel_id) or {}
             if adapter.platform != 'feishu':
@@ -556,11 +562,6 @@ class ChannelManager:
                 return (
                     'Error: Feishu bot-to-bot is disabled for this channel.\n'
                     'Solution: enable "Bot @ Bot" in Settings → Channels and restart the channel.'
-                )
-            if not source_message_id or source_message_id != ctx.get('message_id'):
-                return (
-                    'Error: stale or missing source_message_id; no message was sent.\n'
-                    'Cause: bot mentions must stay bound to the exact triggering message.'
                 )
             if ctx.get('chat_type') != 'group':
                 return 'Error: bot mentions are only allowed in Feishu group chats.'

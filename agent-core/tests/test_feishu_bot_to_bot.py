@@ -268,6 +268,27 @@ class ChannelManagerBotReplyTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn('final answer', sent)
         self.assertEqual(len(self.adapter.sent), 1)
 
+    async def test_human_reply_stays_bound_to_trigger_context(self):
+        self.manager._set_last_context(
+            'feishu_test', 'oc_human', 'ou_human',
+            message_id='om_current', sender_type='user', chat_type='p2p',
+        )
+
+        missing = await self.manager.send_to_channel(
+            'feishu_test', text='旧回复',
+        )
+        stale = await self.manager.send_to_channel(
+            'feishu_test', text='旧回复', source_message_id='om_old',
+        )
+        sent = await self.manager.send_to_channel(
+            'feishu_test', text='当前回复', source_message_id='om_current',
+        )
+
+        self.assertIn('stale or missing', missing)
+        self.assertIn('stale or missing', stale)
+        self.assertIn('Reply sent', sent)
+        self.assertEqual(len(self.adapter.sent), 1)
+
     async def test_bot_inbound_bypasses_people_acl_as_viewer(self):
         config.main['canvas_layout'] = {'cards': [{
             'mcpId': 'channel',

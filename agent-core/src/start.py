@@ -265,8 +265,8 @@ def _register_core_mcp(silent=False):
                         'source_message_id': {
                             'type': 'string',
                             'description': (
-                                'Trigger event message_id. Required with mention_open_id to prevent '
-                                'sending into a stale or different conversation.'
+                                'Trigger event message_id. Required for every reply so a concurrent '
+                                'message cannot redirect it into a different conversation.'
                             ),
                         },
                         'expect_reply': {
@@ -292,7 +292,7 @@ def _register_core_mcp(silent=False):
                             },
                         },
                     },
-                    'required': ['action'],
+                    'required': ['action', 'source_message_id'],
                 },
                 'configSchema': {
                     'type': 'object',
