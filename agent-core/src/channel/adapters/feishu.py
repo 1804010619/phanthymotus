@@ -57,6 +57,7 @@ _TEXT_CHUNK = 3500
 
 # 探测结果缓存时长（秒）——status() 可能被前端高频轮询
 _PROBE_TTL = 15
+_BOT_ID_LOG_INTERVAL = 60
 
 # 去重窗口：飞书可能重投递同一事件
 _DEDUP_MAX = 512
@@ -74,6 +75,19 @@ _FILE_TYPE_BY_EXT = {
 
 # SDK 把事件循环存在模块级变量里，多个飞书 channel 同时启动会互相覆盖
 _ws_loop_lock = threading.Lock()
+
+
+def _enable_sdk_env_proxy(ws_mod) -> None:
+    """Remove the SDK's explicit proxy disable once per imported module."""
+    current = getattr(ws_mod, '_ws_connect_kwargs', None)
+    if current is None or getattr(current, '_phanthy_env_proxy', False) is True:
+        return
+
+    def connect_kwargs():
+        return {key: value for key, value in current().items() if key != 'proxy'}
+
+    connect_kwargs._phanthy_env_proxy = True
+    ws_mod._ws_connect_kwargs = connect_kwargs
 
 
 class FeishuError(RuntimeError):
@@ -110,6 +124,8 @@ class FeishuAdapter(ChannelAdapter):
         self._seen_ids: list[str] = []
         self._seen_set: set[str] = set()
         self._bot_open_id = ''
+        self._missing_bot_id_drops = 0
+        self._missing_bot_id_log_ts = 0.0
 
     # ── 基础设施：token / REST ────────────────────────────────────────────────
 
@@ -240,12 +256,7 @@ class FeishuAdapter(ChannelAdapter):
         asyncio.set_event_loop(new_loop)
         with _ws_loop_lock:
             ws_mod.loop = new_loop
-            if hasattr(ws_mod, '_ws_connect_kwargs'):
-                sdk_ws_connect_kwargs = ws_mod._ws_connect_kwargs
-                ws_mod._ws_connect_kwargs = lambda: {
-                    key: value for key, value in sdk_ws_connect_kwargs().items()
-                    if key != 'proxy'
-                }
+            _enable_sdk_env_proxy(ws_mod)
         try:
             self._client.start()
         except Exception as e:
@@ -290,6 +301,9 @@ class FeishuAdapter(ChannelAdapter):
         try:
             body = await self._request('GET', '/open-apis/bot/v3/info', return_body=True)
             self._bot_open_id = ((body.get('bot') or {}).get('open_id') or '')
+            if self._bot_open_id:
+                self._missing_bot_id_drops = 0
+                self._missing_bot_id_log_ts = 0.0
             if self.config.get('bot_to_bot_enabled') and not self._bot_open_id:
                 self._probe_ok = False
                 self._probe_err = 'bot-to-bot is enabled but /bot/v3/info returned no bot.open_id'
@@ -484,7 +498,7 @@ class FeishuAdapter(ChannelAdapter):
                 'chat_id': getattr(message, 'chat_id', '') or '',
                 'chat_type': getattr(message, 'chat_type', '') or '',
                 'sender_id': sender_id,
-                'sender_type': getattr(sender, 'sender_type', '') or 'user',
+                'sender_type': getattr(sender, 'sender_type', '') or '',
                 'mentions': mentions,
             }
 
@@ -517,7 +531,9 @@ class FeishuAdapter(ChannelAdapter):
     async def _process_event(self, raw: dict) -> None:
         """在主 loop 上解析消息、下载附件、回调 manager。"""
         try:
-            sender_type = raw.get('sender_type', 'user')
+            sender_type = raw.get('sender_type', '')
+            if sender_type not in ('user', 'bot', 'app'):
+                return
             is_bot = sender_type in ('bot', 'app')
             if is_bot:
                 if not self.config.get('bot_to_bot_enabled'):
@@ -525,7 +541,13 @@ class FeishuAdapter(ChannelAdapter):
                 if raw.get('chat_type') != 'group':
                     return
                 if not self._bot_open_id:
-                    print('[feishu] bot event dropped: own bot open_id unavailable')
+                    self._missing_bot_id_drops += 1
+                    now = time.time()
+                    if now - self._missing_bot_id_log_ts >= _BOT_ID_LOG_INTERVAL:
+                        print('[feishu] bot events dropped: own bot open_id unavailable '
+                              f'(count={self._missing_bot_id_drops})')
+                        self._missing_bot_id_drops = 0
+                        self._missing_bot_id_log_ts = now
                     return
                 if raw.get('sender_id') == self._bot_open_id:
                     return

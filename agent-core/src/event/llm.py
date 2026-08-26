@@ -146,6 +146,29 @@ def _channel_tool_retry_message(trigger_event: dict, round_idx: int, text: str) 
     )
 
 
+_BOT_READ_ONLY_SYSTEM_TOOLS = frozenset({'finish'})
+
+
+def _bot_channel_tool_allowed(name: str) -> bool:
+    """Bot-triggered turns may read state and reply, but may not mutate or actuate."""
+    if not name.startswith('mcp__'):
+        return name in _BOT_READ_ONLY_SYSTEM_TOOLS
+    if name == 'mcp__channel__channel_reply':
+        return True
+    parts = name.split('__')
+    entry = mcp_client.registry.get(parts[1] if len(parts) > 1 else '', {})
+    meta = entry.get('tool_meta', {}).get(name)
+    return bool(meta and meta.get('type') in ('sensor', 'resource'))
+
+
+def _bot_channel_reply_allowed(args: dict, source_message_ids: set[str]) -> bool:
+    """Keep bot replies on the current inbound message and text-only."""
+    return (
+        args.get('source_message_id') in source_message_ids
+        and not args.get('files')
+    )
+
+
 def _estimate_chars(turns: list[list[dict]]) -> int:
     """粗估 turns 的总字符数（用于判断是否需要压缩）。"""
     total = 0
@@ -677,8 +700,9 @@ class Event:
             except Exception as e:
                 print(f'[decision] error in _one_turn: {e}')
                 # Fire on_error hook (LED feedback etc.)
-                import hooks
-                asyncio.create_task(hooks.fire('on_error'))
+                if not ev.get('_bot_channel_event'):
+                    import hooks
+                    asyncio.create_task(hooks.fire('on_error'))
                 # 把错误也记入本轮消息
                 self._current_turn.append({
                     'role': 'assistant',
@@ -689,10 +713,11 @@ class Event:
                 collector.set_cancel_event(None)
                 collector.set_busy(False)
                 # Fire on_idle hook (LED state reset etc.)
-                import hooks as _hooks_idle
-                asyncio.create_task(_hooks_idle.fire('on_idle'))
-                # 无论成功失败，只要有消息就持久化
-                if self._current_turn:
+                if not ev.get('_bot_channel_event'):
+                    import hooks as _hooks_idle
+                    asyncio.create_task(_hooks_idle.fire('on_idle'))
+                # Bot 输入不进入共享历史，避免在后续人工 turn 中延迟执行。
+                if self._current_turn and not ev.get('_bot_channel_event'):
                     self._save_current_turn(ev)
 
     def _save_current_turn(self, trigger_event: dict):
@@ -788,6 +813,8 @@ class Event:
         import time as _time
         from uuid import uuid4
         _turn_t0 = _time.perf_counter()
+        bot_restricted = bool(trigger_event.get('_bot_channel_event'))
+        bot_reply_source_ids = set(trigger_event.get('_bot_channel_message_ids', []))
 
         # Reset Python sandbox namespace for this turn
         self._desktop_tools.reset_python_namespace()
@@ -817,10 +844,11 @@ class Event:
 
         # Fire on_thinking hook (non-blocking LED feedback etc.)
         import hooks
-        asyncio.create_task(hooks.fire('on_thinking'))
+        if not bot_restricted:
+            asyncio.create_task(hooks.fire('on_thinking'))
 
         # ── Auto-interrupt: 新用户 turn 开始时清除旧的 pending ACP ──
-        if mcp_client.get_pending_actions():
+        if mcp_client.get_pending_actions() and not bot_restricted:
             _int_results = await hooks.fire('on_interrupt_all')
             if _int_results:
                 for aid in list(mcp_client._pending_actions.keys()):
@@ -850,8 +878,18 @@ class Event:
 
         # 合并工具表：系统工具 + 画布上绑定的 MCP 工具（通过 executor connections）
         bound_schemas = self._get_bound_tool_schemas()
+        system_tools = list(self._sys_tools.values())
+        if bot_restricted:
+            system_tools = [
+                tool for tool in system_tools
+                if _bot_channel_tool_allowed(tool['schema']['name'])
+            ]
+            bound_schemas = [
+                schema for schema in bound_schemas
+                if _bot_channel_tool_allowed(schema['name'])
+            ]
         all_tool_list = (
-            [{'type': 'function', 'function': t['schema']} for t in self._sys_tools.values()]
+            [{'type': 'function', 'function': t['schema']} for t in system_tools]
             + [{'type': 'function', 'function': s} for s in bound_schemas]
         )
         # 绑定工具全名集合，用于 L2 环境快照过滤
@@ -895,7 +933,7 @@ class Event:
                 _compact_turn_messages(turn_messages, compact_keep_recent)
 
             # ── 构建分层 prompt ────────────────────────────────────────────
-            history = self._build_history()
+            history = [] if bot_restricted else self._build_history()
             # 本轮已产生的消息也要加入历史（多轮工具调用场景）
             current_history = history + _sanitize(turn_messages)
 
@@ -958,7 +996,7 @@ class Event:
                 if kind == LLMErrorKind.CONTEXT_OVERFLOW and round_idx == 0:
                     # 上下文溢出：强制压缩后重试一次
                     print(f'[decision] context overflow — force compressing history')
-                    if len(self._turns) > 2:
+                    if len(self._turns) > 2 and not bot_restricted:
                         old = self._turns[:-2]
                         summary = await _compress_turns(old)
                         if self._summary:
@@ -1066,7 +1104,18 @@ class Event:
                     'payload': {'tool': name, 'args': args},
                 })
 
-                if name in self._sys_tools:
+                if bot_restricted and not _bot_channel_tool_allowed(name):
+                    result = (
+                        'Error: bot-triggered channel turns cannot call mutating, actuator, '
+                        'processor, or delegated execution tools.'
+                    )
+                elif (bot_restricted and name == 'mcp__channel__channel_reply'
+                      and not _bot_channel_reply_allowed(args, bot_reply_source_ids)):
+                    result = (
+                        'Error: bot-triggered replies must use the current source_message_id '
+                        'and cannot send files.'
+                    )
+                elif name in self._sys_tools:
                     result = await self._sys_tools[name]['object'](**args)
                 elif name.startswith('mcp__'):
                     # ACP barrier: 有 pending 时，非 sensor/resource 工具等待所有 pending 完成
@@ -1195,18 +1244,26 @@ class Event:
             # ── Steering: 检查是否有用户消息需要注入 ─────────────────────────
             steered = await collector.drain_steering()
             if steered:
-                for sev in steered:
-                    s_text = sev.get('text', '')
-                    s_source = sev.get('source', '')
-                    turn_messages.append({
-                        'role': 'user',
-                        'content': f'[system notification source={s_source}]\n{s_text}',
-                    })
-                await push_event({'type': 'turn_steered', 'payload': {
-                    'count': len(steered),
-                    'sources': [s.get('source', '') for s in steered],
-                }})
-                print(f'[decision] steered {len(steered)} user message(s) into current turn')
+                deferred = [
+                    sev for sev in steered
+                    if bot_restricted or collector.has_bot_channel_event([sev])
+                ]
+                if deferred:
+                    collector.defer_priority(deferred)
+                    steered = [sev for sev in steered if sev not in deferred]
+                if steered:
+                    for sev in steered:
+                        s_text = sev.get('text', '')
+                        s_source = sev.get('source', '')
+                        turn_messages.append({
+                            'role': 'user',
+                            'content': f'[system notification source={s_source}]\n{s_text}',
+                        })
+                    await push_event({'type': 'turn_steered', 'payload': {
+                        'count': len(steered),
+                        'sources': [s.get('source', '') for s in steered],
+                    }})
+                    print(f'[decision] steered {len(steered)} user message(s) into current turn')
 
             # ── 取消检查点：工具执行完毕后，下一轮 LLM 调用前 ────────────────
             if cancel_event and cancel_event.is_set():

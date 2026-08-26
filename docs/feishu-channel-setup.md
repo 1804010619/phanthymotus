@@ -66,15 +66,15 @@ App Secret 只应保存在设备的 Agent Core 配置中，不要写入仓库、
   → 飞书用户
 ```
 
-`channel_reply` 默认回复最近一次从该 Channel 收到消息的会话，因此必须先由用户向机器人发送一条消息，Agent 才能获得目标会话上下文。
+`channel_reply` 使用触发消息的 `source_message_id` 找回对应会话，不会被后到的群聊或私聊改写目标。因此必须先收到一条消息，并在回复时带上它的 `message_id`。
 
 ## 4. 机器人什么时候才会 @
 
-Bot @ Bot 开启后，任意群中的任意机器人都可以通过明确 `@当前机器人` 触发 Agent。机器人单聊不会触发；bot 身份也不会加入人员 ACL，只按 `viewer` 处理。
+Bot @ Bot 开启后，任意群中的任意机器人都可以通过明确 `@当前机器人` 触发 Agent。机器人单聊不会触发；bot 身份也不会加入人员 ACL。该 turn 只能调用 Canvas 已绑定的 sensor/resource，并通过 `channel_reply` 给当前消息发纯文本回复；不能读取本地文件/历史、访问网页、执行 actuator/processor/Shell、写文件或委派执行。
 
 Agent 只有在以下情况才应使用 `channel_reply.mention_open_id`：
 
-- 当前任务确实需要目标机器人提供信息、执行动作或审查结果；
+- 当前任务确实需要目标机器人提供信息或审查结果；
 - 把对方请求的最终结果返回给对方。
 
 以下消息不得继续 `@`：收到确认、感谢、复述、没有新增信息的状态，或已取得完成任务所需的信息。不能用“收到”“谢谢”“请确认收到我的确认”制造新一轮。
@@ -86,7 +86,7 @@ Agent 只有在以下情况才应使用 `channel_reply.mention_open_id`：
 | `【机器人协作请求·需要回复】` | `true` | 对方有一个具体的未完成任务，可以完成后回复，或确有新问题时继续询问 |
 | `【机器人协作答复·无需回复】` | `false`（默认） | 最终结果；接收方在代码层不能再 `@` 机器人 |
 
-`mention_open_id` 必须与触发事件的 `source_message_id` 一起使用。机器人触发的回复只能 `@` 原发送机器人；这样并发新消息不会把结果发到错误会话。其他机器人没有上述标记时，明确 `@` 当前机器人的消息按一次“需要回复”的请求处理。
+`mention_open_id` 必须与当前触发事件的 `source_message_id` 一起使用。机器人不能选用历史消息 ID、跨会话发送或发送附件；回复只能 `@` 原发送机器人。其他机器人没有上述标记时，明确 `@` 当前机器人的消息按一次“需要回复”的请求处理。
 
 本实现不设置轮次或时间熔断。对话何时继续由 Agent 根据是否还有具体未决任务决定；一旦使用默认的 `expect_reply=false` 返回最终结果，后续机器人 `@` 会被代码拒绝。
 
@@ -128,18 +128,18 @@ Agent 只有在以下情况才应使用 `channel_reply.mention_open_id`：
 | 飞书里找不到机器人 | 用户不在应用可用范围 | 在新版本中加入该用户并发布 |
 | 群聊中没有事件 | 缺群聊 `@机器人` 权限，或机器人未加入群 | 开通 `im:message.group_at_msg:readonly`、发布版本并把机器人加入群 |
 | 用户 @ 可以收到，机器人 @ 收不到 | 缺少 include-bot 权限，或 `Bot @ Bot` 仍为 Off | 开通 `im:message.group_at_msg.include_bot:readonly`、发布版本并在 **设置 → 渠道** 开启开关 |
-| `stale or missing source_message_id` | 回复使用的触发消息已经被新的入站消息替换 | 不发送；重新基于当前 Activity 事件决定是否回复 |
+| `unknown or expired source_message_id` | 该消息 ID 不存在，或已超出每个 Channel 保留的最近 100 条上下文 | 不发送；基于当前 Activity 事件重新处理 |
 | `final answer ... do not @ another bot` | 收到的是 `expect_reply=false` 最终答复 | 正常结束，不再 @ |
-| bot 群消息的 `user_role` 显示为 `viewer` | bot 不会写入人员 ACL | 正常；该字段用于来源标记，不替代各工具自身的确认与安全策略 |
+| bot 群消息的 `user_role` 显示为 `viewer` | bot 不会写入人员 ACL | 正常；bot turn 会在 Decision Core 调用前强制 sensor/resource 与当前消息回复白名单 |
 
 ## 7. 最小安全边界
 
 - 默认只开单聊所需权限；群聊和外部共享按需增加。
 - 不把 App Secret、tenant token、WebSocket ticket 或用户消息写入 Git。
 - 机器人可用范围只包含实际使用者；扩大到全员前先确认数据与行为边界。
-- `channel_reply` 是 Agent 向飞书发送消息的唯一出口；其它工具仍按各自已有的确认与安全策略执行。
+- `channel_reply` 是 Agent 向飞书发送消息的唯一出口；bot 触发的 turn 在工具调用前强制只读，普通人工消息行为不变。
 - `Bot @ Bot` 默认关闭。开启后接受机器人所在任意群中的任意机器人；不需要该信任范围时应保持关闭。
-- 按当前策略，任意群机器人都能触发 Agent 及 Canvas 已绑定工具；`viewer` 只是来源标记，不是工具调用沙箱。开启前必须确认这一信任范围。
+- 任意群机器人都能触发 Agent，但 bot turn 只能调用 Canvas 已绑定的 sensor/resource、`finish` 和精确绑定当前原消息的纯文本 `channel_reply`；其内容不写入共享对话历史，物理动作必须由人工来源单独触发。
 - Bot @ Bot 消息只允许在来源群中回复，禁止机器人单聊、跨群回复、自 @ 和 bot 身份写入人员 ACL。
 
 ## 官方参考

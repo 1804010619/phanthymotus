@@ -11,6 +11,7 @@ channel/manager.py — Channel 生命周期管理器。
 import asyncio
 import hashlib
 import json
+import math
 import re
 import time
 
@@ -24,6 +25,19 @@ from channel import acl
 _CONFIG_KEY = 'channel_configs'
 _TOPIC_COMPONENT_MAX = 80
 _REPLY_CONTEXT_LIMIT = 100
+
+
+def _valid_reply_context(value) -> bool:
+    if not isinstance(value, dict):
+        return False
+    ts = value.get('ts')
+    return (
+        isinstance(value.get('chat_id'), str) and bool(value['chat_id'])
+        and isinstance(value.get('user_id'), str)
+        and isinstance(value.get('message_id'), str)
+        and isinstance(ts, (int, float)) and not isinstance(ts, bool)
+        and math.isfinite(ts)
+    )
 
 
 def channel_request_topic(channel_id: str) -> str:
@@ -129,7 +143,10 @@ class ChannelManager:
 
     def _get_last_context(self) -> dict:
         """Get all channel contexts from persistent storage."""
-        return config.main.get('channel_last_context', {})
+        ctx = config.main.get('channel_last_context', {})
+        if not isinstance(ctx, dict):
+            return {}
+        return {key: value for key, value in ctx.items() if _valid_reply_context(value)}
 
     def _set_last_context(self, channel_id: str, chat_id: str, user_id: str, *,
                           message_id: str = '', sender_type: str = 'user',
@@ -148,13 +165,21 @@ class ChannelManager:
             'expect_reply': expect_reply,
             'ts': time.time(),
         }
-        ctx = config.main.get('channel_last_context', {})
+        ctx = self._get_last_context()
         ctx[channel_id] = entry
         config.main['channel_last_context'] = ctx
 
         if message_id:
             all_messages = config.main.get('channel_message_contexts', {})
+            if not isinstance(all_messages, dict):
+                all_messages = {}
             channel_messages = all_messages.get(channel_id, {})
+            if not isinstance(channel_messages, dict):
+                channel_messages = {}
+            channel_messages = {
+                key: value for key, value in channel_messages.items()
+                if isinstance(key, str) and _valid_reply_context(value)
+            }
             channel_messages[message_id] = entry
             if len(channel_messages) > _REPLY_CONTEXT_LIMIT:
                 channel_messages = dict(sorted(
@@ -550,8 +575,15 @@ class ChannelManager:
                 'Cause: channel replies must identify the exact triggering message.'
             )
 
-        ctx = (config.main.get('channel_message_contexts', {})
-               .get(channel_id, {}).get(source_message_id))
+        all_messages = config.main.get('channel_message_contexts', {})
+        if not isinstance(all_messages, dict):
+            all_messages = {}
+        channel_messages = all_messages.get(channel_id, {})
+        if not isinstance(channel_messages, dict):
+            channel_messages = {}
+        ctx = channel_messages.get(source_message_id)
+        if not _valid_reply_context(ctx) or ctx.get('message_id') != source_message_id:
+            ctx = None
         if not ctx:
             # 兼容升级前只保存的最后一条上下文。
             last_ctx = self._get_last_context().get(channel_id)

@@ -89,21 +89,18 @@ class FeishuProxyTest(unittest.TestCase):
         self.assertTrue(seen)
         self.assertIs(seen[0]['trust_env'], True)
 
-    def test_websocket_sdk_does_not_disable_environment_proxy(self):
+    def test_websocket_sdk_proxy_patch_is_idempotent(self):
         import lark_oapi.ws.client as ws_mod
-
-        adapter = _adapter()
-        seen = []
-        adapter._client = mock.Mock(
-            start=lambda: seen.append(ws_mod._ws_connect_kwargs())
-        )
 
         with mock.patch.object(
             ws_mod, '_ws_connect_kwargs', return_value={'proxy': None, 'ping_interval': 30}
         ):
-            adapter._thread_target()
+            feishu._enable_sdk_env_proxy(ws_mod)
+            patched = ws_mod._ws_connect_kwargs
+            feishu._enable_sdk_env_proxy(ws_mod)
 
-        self.assertEqual(seen, [{'ping_interval': 30}])
+            self.assertIs(ws_mod._ws_connect_kwargs, patched)
+            self.assertEqual(patched(), {'ping_interval': 30})
 
 
 if __name__ == '__main__':

@@ -182,6 +182,11 @@ async def drain_steering() -> list[dict]:
     return items
 
 
+def defer_priority(events: list[dict]) -> None:
+    """Queue events for isolated follow-up turns after the current turn."""
+    _priority_pending.extend(events)
+
+
 async def next_trigger() -> dict:
     """阻塞等待下一批 P>0 事件（main agent 消费端）。"""
     # Fallback: 每次等待前再检查一次 pending 队列，防止遗漏
@@ -202,6 +207,63 @@ def get_available_sources() -> list[str]:
     return list(_source_ring.keys())
 
 
+def _bot_channel_payloads(events: list[dict]) -> list[dict]:
+    payloads = []
+    for ev in events:
+        if '/channel/request/' not in str(ev.get('source', '')):
+            continue
+        text = ev.get('text', '')
+        if not isinstance(text, str) or not text.startswith('{'):
+            continue
+        try:
+            payload = _json.loads(text)
+            if isinstance(payload, dict) and payload.get('sender_type') in ('bot', 'app'):
+                payloads.append(payload)
+        except (ValueError, TypeError):
+            continue
+    return payloads
+
+
+def bot_channel_message_ids(events: list[dict]) -> list[str]:
+    """Return bot/app message IDs from trusted Channel event payloads."""
+    return [payload['message_id'] for payload in _bot_channel_payloads(events)
+            if isinstance(payload.get('message_id'), str) and payload['message_id']]
+
+
+def has_bot_channel_event(events: list[dict]) -> bool:
+    """Return whether a batch contains a trusted Channel bot/app marker."""
+    return bool(_bot_channel_payloads(events))
+
+
+def _split_by_bot_trust(events: list[dict]) -> list[list[dict]]:
+    """Keep bot and non-bot inputs out of the same LLM turn."""
+    batches = []
+    for ev in events:
+        is_bot = has_bot_channel_event([ev])
+        if not batches or has_bot_channel_event([batches[-1][0]]) != is_bot:
+            batches.append([])
+        batches[-1].append(ev)
+    return batches
+
+
+def _build_trigger(batch: list[dict], urgent: bool) -> dict:
+    trigger = {
+        'source': 'collector',
+        'text': _format_priority_batch(batch),
+        'payload': {'event_count': len(batch), 'sources': [e['source'] for e in batch]},
+        'ts': batch[-1]['ts'],
+        '_perf_trigger_emit_ts': time.time(),
+        '_urgent': urgent,
+        '_bot_channel_event': has_bot_channel_event(batch),
+        '_bot_channel_message_ids': bot_channel_message_ids(batch),
+    }
+    for ev in reversed(batch):
+        if '_perf_spans' in ev:
+            trigger['_perf_spans'] = ev['_perf_spans']
+            break
+    return trigger
+
+
 # ── 内部：P>0 管道 ────────────────────────────────────────────────────────────
 
 def _flush_all_pending():
@@ -215,26 +277,14 @@ def _flush_all_pending():
             break
     # 再把 _priority_pending 全部 emit 到 _output
     if _priority_pending:
-        batch = list(_priority_pending)
+        pending = list(_priority_pending)
         _priority_pending.clear()
         # 同步放入 _output（非 async，避免 fire-and-forget 丢失）
-        formatted = _format_priority_batch(batch)
-        trigger = {
-            'source': 'collector',
-            'text': formatted,
-            'payload': {'event_count': len(batch), 'sources': [e['source'] for e in batch]},
-            'ts': batch[-1]['ts'],
-            '_perf_trigger_emit_ts': time.time(),
-            '_urgent': True,
-        }
-        for ev in reversed(batch):
-            if '_perf_spans' in ev:
-                trigger['_perf_spans'] = ev['_perf_spans']
-                break
-        try:
-            _output.put_nowait(trigger)
-        except asyncio.QueueFull:
-            print('[collector] WARNING: _output queue full, pending messages dropped')
+        for batch in _split_by_bot_trust(pending):
+            try:
+                _output.put_nowait(_build_trigger(batch, urgent=True))
+            except asyncio.QueueFull:
+                print('[collector] WARNING: _output queue full, pending messages dropped')
 
 
 async def _emit_priority():
@@ -248,20 +298,8 @@ async def _emit_priority():
 
 async def _emit_batch(batch: list[dict], urgent: bool = False):
     """将 P>0 事件格式化并放入 output。"""
-    formatted = _format_priority_batch(batch)
-    trigger = {
-        'source': 'collector',
-        'text': formatted,
-        'payload': {'event_count': len(batch), 'sources': [e['source'] for e in batch]},
-        'ts': batch[-1]['ts'],
-        '_perf_trigger_emit_ts': time.time(),
-        '_urgent': urgent,
-    }
-    for ev in reversed(batch):
-        if '_perf_spans' in ev:
-            trigger['_perf_spans'] = ev['_perf_spans']
-            break
-    await _output.put(trigger)
+    for trusted_batch in _split_by_bot_trust(batch):
+        await _output.put(_build_trigger(trusted_batch, urgent))
 
 
 # 对 LLM 决策无意义的 perf/trace 字段（已独立存入 perf_spans 表）
@@ -497,6 +535,9 @@ async def _drain_loop():
 
                 # 按模式处理
                 if _interrupt_mode == 'steer':
+                    if has_bot_channel_event([ev]):
+                        _priority_pending.append(ev)
+                        continue
                     # Scheduler 去重：如果 steering_queue 中已有相同 source 的 scheduler 事件，跳过
                     if 'scheduler:' in source.lower():
                         _dedup = False
@@ -515,12 +556,13 @@ async def _drain_loop():
                 elif _interrupt_mode == 'interrupt':
                     # Interrupt: 缓存事件并触发 cancel
                     _priority_pending.append(ev)
-                    if _cancel_event:
+                    if _cancel_event and not has_bot_channel_event([ev]):
                         _cancel_event.set()
                 else:
                     # Followup: 暂存，等 turn 结束后 drain（原有行为）
                     _priority_pending.append(ev)
-                    if priority > _current_turn_priority and _cancel_event:
+                    if (priority > _current_turn_priority and _cancel_event
+                            and not has_bot_channel_event([ev])):
                         _cancel_event.set()
         else:
             # ── P=0: 送 bg buffer ──

@@ -118,6 +118,29 @@ class FeishuAdapterBotEventTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.received[0].sender_type, 'user')
         self.assertIsNone(self.received[0].expect_reply)
 
+    async def test_unknown_sender_type_is_dropped(self):
+        unknown = _raw_bot_event('om_unknown_sender')
+        unknown['sender_type'] = ''
+
+        await self.adapter._process_event(unknown)
+
+        self.assertEqual(self.received, [])
+
+    async def test_missing_bot_id_log_is_throttled_with_drop_count(self):
+        self.adapter._bot_open_id = ''
+
+        with mock.patch('channel.adapters.feishu.time.time', side_effect=[100, 110, 161]), \
+                mock.patch('builtins.print') as printed:
+            await self.adapter._process_event(_raw_bot_event('om_missing_1'))
+            await self.adapter._process_event(_raw_bot_event('om_missing_2'))
+            await self.adapter._process_event(_raw_bot_event('om_missing_3'))
+
+        logs = [str(call.args[0]) for call in printed.call_args_list
+                if 'bot events dropped' in str(call.args[0])]
+        self.assertEqual(len(logs), 2)
+        self.assertIn('count=1', logs[0])
+        self.assertIn('count=2', logs[1])
+
     async def test_probe_reads_root_bot_open_id(self):
         self.adapter._request = mock.AsyncMock(return_value={
             'code': 0,
@@ -294,6 +317,40 @@ class ChannelManagerBotReplyTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn('Reply sent', sent)
         self.assertEqual(len(self.adapter.sent), 1)
         self.assertEqual(self.adapter.sent[0].chat_id, 'oc_private')
+
+    async def test_malformed_persisted_context_is_replaced(self):
+        config.main['channel_last_context'] = {
+            'broken': {
+                'chat_id': 'oc_bad', 'user_id': 'ou_bad',
+                'message_id': 'om_bad', 'ts': 'not-a-number',
+            },
+        }
+        config.main['channel_message_contexts'] = {
+            'feishu_test': {
+                'om_broken': 'not-a-context',
+                'om_bad_ts': {
+                    'chat_id': 'oc_bad', 'user_id': 'ou_bad',
+                    'message_id': 'om_bad_ts', 'ts': 'not-a-number',
+                },
+                'om_no_chat': {
+                    'user_id': 'ou_bad', 'message_id': 'om_no_chat', 'ts': 1,
+                },
+            },
+        }
+
+        self.assertEqual(self.manager.resolve_target_channel()[0], '')
+
+        self.manager._set_last_context(
+            'feishu_test', 'oc_private', 'ou_human',
+            message_id='om_valid', sender_type='user', chat_type='p2p',
+        )
+        result = await self.manager.send_to_channel(
+            'feishu_test', text='回复', source_message_id='om_valid',
+        )
+
+        self.assertIn('Reply sent', result)
+        saved = config.main.get('channel_message_contexts', {})['feishu_test']
+        self.assertEqual(set(saved), {'om_valid'})
 
     async def test_bot_inbound_bypasses_people_acl_as_viewer(self):
         config.main['canvas_layout'] = {'cards': [{
