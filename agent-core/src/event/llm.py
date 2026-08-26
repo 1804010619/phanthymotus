@@ -131,10 +131,11 @@ def _trigger_channel_ids(trigger_event: dict) -> list[str]:
     return ids
 
 
-def _channel_tool_retry_message(trigger_event: dict, round_idx: int, text: str) -> str:
+def _channel_tool_retry_message(trigger_event: dict, round_idx: int, text: str,
+                                retry_consumed: bool = False) -> str:
     """首轮渠道回复漏掉工具调用时，给模型一次纠正机会。"""
     channel_ids = _trigger_channel_ids(trigger_event)
-    if round_idx != 0 or not channel_ids or not text.strip():
+    if retry_consumed or round_idx != 0 or not channel_ids or not text.strip():
         return ''
     return (
         '[system correction]\n'
@@ -910,6 +911,7 @@ class Event:
 
         round_idx = 0
         total_rounds = 0
+        channel_reply_retry_consumed = False
         while True:
             # ── 绝对上限检查 ──────────────────────────────────────────────
             if total_rounds >= absolute_max:
@@ -1215,8 +1217,11 @@ class Event:
                 # 本轮由某个消息渠道触发，却一个工具都没调 → 用户那边是纯沉默：
                 # content 不会送达任何人。曾经因为这个丢过回复，而日志里只有
                 # 「turn complete: 1 rounds」看不出异常，只能去翻 llm_recent_request。
-                retry_message = _channel_tool_retry_message(trigger_event, round_idx, text)
+                retry_message = _channel_tool_retry_message(
+                    trigger_event, round_idx, text, channel_reply_retry_consumed,
+                )
                 if retry_message:
+                    channel_reply_retry_consumed = True
                     turn_messages.append({'role': 'user', 'content': retry_message})
                     print('[decision] channel-triggered turn produced content without a tool call; retrying once')
                     await push_event({'type': 'llm_retry', 'payload': {

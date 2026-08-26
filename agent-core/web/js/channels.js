@@ -3,6 +3,7 @@
  */
 
 let _overlay, _channelList, _addBtn;
+let _channels = [];
 
 export function initChannels() {
   _overlay = document.getElementById('channel-overlay');
@@ -15,6 +16,7 @@ export function initChannels() {
   document.getElementById('channel-close').addEventListener('click', _close);
   _overlay.addEventListener('click', (e) => { if (e.target === _overlay) _close(); });
   _addBtn.addEventListener('click', _showAddForm);
+  _channelList.addEventListener('click', _handleChannelAction);
 }
 
 function _open() {
@@ -40,6 +42,7 @@ async function _loadChannels() {
 }
 
 function _renderChannels(channels) {
+  _channels = channels;
   if (!channels.length) {
     _channelList.innerHTML = `
       <div class="channel-empty">
@@ -49,24 +52,24 @@ function _renderChannels(channels) {
     return;
   }
 
-  _channelList.innerHTML = channels.map(ch => `
-    <div class="channel-item" data-id="${_esc(ch.id)}">
+  _channelList.innerHTML = channels.map((ch, index) => `
+    <div class="channel-item" data-channel-index="${index}">
       <div class="channel-item-header">
         <span class="channel-item-icon">${_platformIcon(ch.platform)}</span>
         <span class="channel-item-name">${_esc(ch.id)}</span>
         <span class="channel-item-platform">${_esc(ch.platform)}</span>
         <span class="channel-item-status ${ch.status === 'connected' ? 'online' : 'offline'}"
-              title="${_esc(ch.health_error || '')}">${_esc(ch.status)}</span>
+              title="${_escAttr(ch.health_error || '')}">${_esc(ch.status)}</span>
       </div>
       ${ch.health_error ? `<div class="channel-item-error">${_esc(ch.health_error)}</div>` : ''}
       <div class="channel-item-actions">
         ${ch.platform === 'feishu' ? `
-          <button class="btn-ghost btn-sm" onclick="window._channelSetBotToBot('${_esc(ch.id)}', ${!ch.bot_to_bot_enabled})">
+          <button class="btn-ghost btn-sm" data-channel-action="bot-to-bot">
             Bot @ Bot: ${ch.bot_to_bot_enabled ? 'On' : 'Off'}
           </button>` : ''}
-        <button class="btn-ghost btn-sm" onclick="window._channelStop('${_esc(ch.id)}')">Stop</button>
-        <button class="btn-ghost btn-sm" onclick="window._channelRestart('${_esc(ch.id)}')">Restart</button>
-        <button class="btn-ghost btn-sm btn-danger" onclick="window._channelDelete('${_esc(ch.id)}')">Delete</button>
+        <button class="btn-ghost btn-sm" data-channel-action="stop">Stop</button>
+        <button class="btn-ghost btn-sm" data-channel-action="restart">Restart</button>
+        <button class="btn-ghost btn-sm btn-danger" data-channel-action="delete">Delete</button>
       </div>
     </div>
   `).join('');
@@ -211,18 +214,32 @@ async function _submitAdd(formEl) {
 
 // ── Actions ───────────────────────────────────────────────────────────────────
 
-window._channelSetBotToBot = async function(id, enabled) {
+function _handleChannelAction(e) {
+  const btn = e.target.closest?.('button[data-channel-action]');
+  if (!btn || !_channelList.contains(btn)) return;
+  const item = btn.closest('.channel-item');
+  const channel = _channels[Number(item?.dataset.channelIndex)];
+  if (!channel) return;
+
+  switch (btn.dataset.channelAction) {
+    case 'bot-to-bot': _channelSetBotToBot(channel.id, !channel.bot_to_bot_enabled, btn); break;
+    case 'stop':       _channelStop(channel.id, btn); break;
+    case 'restart':    _channelRestart(channel.id, btn); break;
+    case 'delete':     _channelDelete(channel.id); break;
+  }
+}
+
+async function _channelSetBotToBot(id, enabled, btn) {
   if (enabled && !confirm(
     'Enable Bot @ Bot for this Feishu channel?\n\n'
     + 'Any bot in any group containing this app can trigger the Agent and its bound tools '
     + 'by explicitly @mentioning it.'
   )) return;
 
-  const btn = event.target;
   btn.disabled = true;
   btn.textContent = 'Saving…';
   try {
-    const res = await fetch(`/api/channel/${id}`, {
+    const res = await fetch(`/api/channel/${encodeURIComponent(id)}`, {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ bot_to_bot_enabled: enabled }),
@@ -236,14 +253,13 @@ window._channelSetBotToBot = async function(id, enabled) {
   } finally {
     setTimeout(_loadChannels, 500);
   }
-};
+}
 
-window._channelStop = async function(id) {
-  const btn = event.target;
+async function _channelStop(id, btn) {
   btn.disabled = true;
   btn.textContent = 'Stopping…';
   try {
-    const res = await fetch(`/api/channel/${id}/stop`, { method: 'POST' });
+    const res = await fetch(`/api/channel/${encodeURIComponent(id)}/stop`, { method: 'POST' });
     if (!res.ok) {
       const j = await res.json().catch(() => ({}));
       alert(j.detail || `Stop failed (${res.status})`);
@@ -253,14 +269,13 @@ window._channelStop = async function(id) {
   } finally {
     setTimeout(_loadChannels, 300);
   }
-};
+}
 
-window._channelRestart = async function(id) {
-  const btn = event.target;
+async function _channelRestart(id, btn) {
   btn.disabled = true;
   btn.textContent = 'Restarting…';
   try {
-    const res = await fetch(`/api/channel/${id}/restart`, { method: 'POST' });
+    const res = await fetch(`/api/channel/${encodeURIComponent(id)}/restart`, { method: 'POST' });
     if (!res.ok) {
       const j = await res.json().catch(() => ({}));
       alert(j.detail || `Restart failed (${res.status})`);
@@ -270,12 +285,12 @@ window._channelRestart = async function(id) {
   } finally {
     setTimeout(_loadChannels, 500);
   }
-};
+}
 
-window._channelDelete = async function(id) {
+async function _channelDelete(id) {
   if (!confirm(`Delete channel "${id}"?`)) return;
   try {
-    const res = await fetch(`/api/channel/${id}`, { method: 'DELETE' });
+    const res = await fetch(`/api/channel/${encodeURIComponent(id)}`, { method: 'DELETE' });
     if (!res.ok) {
       const j = await res.json().catch(() => ({}));
       alert(j.detail || `Delete failed (${res.status})`);
@@ -284,7 +299,7 @@ window._channelDelete = async function(id) {
   } catch (e) {
     alert('Delete failed: ' + e.message);
   }
-};
+}
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -302,4 +317,8 @@ function _esc(s) {
   const d = document.createElement('div');
   d.textContent = s || '';
   return d.innerHTML;
+}
+
+function _escAttr(s) {
+  return _esc(s).replace(/"/g, '&quot;').replace(/'/g, '&#39;');
 }
