@@ -13,6 +13,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / 'src'))
 os.environ['DB_PATH'] = os.path.join(tempfile.mkdtemp(), 'test.db')
 
 import config  # noqa: E402
+import mcp_client  # noqa: E402
 from channel.adapter import ChannelAdapter, InboundMessage, OutboundMessage  # noqa: E402
 from channel.adapters.feishu import (  # noqa: E402
     FeishuAdapter,
@@ -180,6 +181,35 @@ class FeishuAdapterBotSendTest(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(ValueError):
                 await self.adapter.send_message(msg)
         self.assertEqual(self.sent, [])
+
+
+class InternalChannelReplyDispatchTest(unittest.IsolatedAsyncioTestCase):
+    async def test_forwards_bot_mention_arguments(self):
+        send_reply = mock.AsyncMock(return_value='sent')
+
+        with mock.patch('channel.manager.manager.send_reply', send_reply):
+            result = await mcp_client._dispatch_internal(
+                'channel',
+                'channel_reply',
+                {
+                    'action': 'send',
+                    'instance_id': 'reply_1',
+                    'text': '请检查',
+                    'mention_open_id': 'ou_peer',
+                    'source_message_id': 'om_request',
+                    'expect_reply': True,
+                },
+            )
+
+        self.assertEqual(result, 'sent')
+        send_reply.assert_awaited_once_with(
+            instance_id='reply_1',
+            text='请检查',
+            files=[],
+            mention_open_id='ou_peer',
+            source_message_id='om_request',
+            expect_reply=True,
+        )
 
 
 class ChannelManagerBotReplyTest(unittest.IsolatedAsyncioTestCase):
