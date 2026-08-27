@@ -1355,6 +1355,10 @@ class _ASRNode(Node):
         self._vad_stop = None
 
     def _audio_cb(self, msg):
+        # 添加调试日志：如果这行打印了，说明收到了数据
+        log.info("===" * 20)
+        log.info(f"[asr] 🔵 _audio_cb called! format={getattr(msg, 'format', 'NO_FORMAT')}, data_size={len(getattr(msg, 'data', []))}")
+
         if self._stop_event.is_set():
             return
         # Signal first chunk arrival to unblock start()
