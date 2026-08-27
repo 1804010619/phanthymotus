@@ -2,7 +2,7 @@ mcp_port: 15720
 
 plugins:
   asr:
-    enabled: true
+    enabled: false
     asr_model: paraformer-zh-en   # paraformer-zh-en | zipformer-en | sensevoice-small
     model_dir: /models/sherpa-onnx/asr
     hw_provider: cpu
@@ -61,3 +61,10 @@ plugins:
     url: ""          # API URL (empty = default endpoint)
     key: ""          # API Key
     model: ""        # model name
+
+  face:
+    enabled: true
+    provider: local    # openai | qwen | local
+    url: ""            # API URL (empty = default endpoint)
+    key: ""            # API Key
+    model: ""          # model name

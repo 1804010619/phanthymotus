@@ -123,6 +123,11 @@ class PerceptionBundle:
             self._plugins.append(ObstacleDistancePlugin(plugins_cfg["obstacle"], executor))
             log.info("ObstacleDistancePlugin loaded")
 
+        if plugins_cfg.get("face", {}).get("enabled", False):
+            from plugins.face import FaceRecognitionPlugin
+            self._plugins.append(FaceRecognitionPlugin(plugins_cfg["face"], executor))
+            log.info("FaceRecognitionPlugin loaded")
+
     def get_all_tools(self) -> list:
         tools = []
         for p in self._plugins:
