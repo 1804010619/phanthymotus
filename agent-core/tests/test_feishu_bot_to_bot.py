@@ -141,6 +141,24 @@ class FeishuAdapterBotEventTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn('count=1', logs[0])
         self.assertIn('count=2', logs[1])
 
+    async def test_duplicate_log_is_sampled_and_message_id_is_bounded(self):
+        message_id = 'om_\n' + 'x' * 200
+        event = _raw_bot_event(message_id)
+        await self.adapter._process_event(event)
+
+        with mock.patch('builtins.print') as printed:
+            for _ in range(100):
+                await self.adapter._process_event(event)
+
+        logs = [str(call.args[0]) for call in printed.call_args_list
+                if 'duplicate messages dropped' in str(call.args[0])]
+        self.assertEqual(len(logs), 2)
+        self.assertIn('count=1', logs[0])
+        self.assertIn('count=100', logs[1])
+        self.assertIn(r'om_\n', logs[0])
+        self.assertNotIn('\n', logs[0])
+        self.assertNotIn('x' * 129, logs[0])
+
     async def test_probe_reads_root_bot_open_id(self):
         self.adapter._request = mock.AsyncMock(return_value={
             'code': 0,

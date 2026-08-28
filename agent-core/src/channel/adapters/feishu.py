@@ -123,6 +123,7 @@ class FeishuAdapter(ChannelAdapter):
         self._last_event_ts = 0.0
         self._seen_ids: list[str] = []
         self._seen_set: set[str] = set()
+        self._duplicate_drops = 0
         self._bot_open_id = ''
         self._missing_bot_id_drops = 0
         self._missing_bot_id_log_ts = 0.0
@@ -521,6 +522,11 @@ class FeishuAdapter(ChannelAdapter):
         if not message_id:
             return False
         if message_id in self._seen_set:
+            self._duplicate_drops += 1
+            if self._duplicate_drops == 1 or self._duplicate_drops % 100 == 0:
+                safe_id = str(message_id)[:128]
+                print('[feishu] duplicate messages dropped: '
+                      f'count={self._duplicate_drops} latest_id={safe_id!r}')
             return True
         self._seen_set.add(message_id)
         self._seen_ids.append(message_id)
@@ -558,7 +564,6 @@ class FeishuAdapter(ChannelAdapter):
                     return
 
             if self._is_duplicate(raw['message_id']):
-                print(f'[feishu] duplicate message dropped: {raw["message_id"]}')
                 return
 
             text, attachments = await self._parse_content(raw)
