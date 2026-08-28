@@ -36,6 +36,10 @@ export const AudioRenderer = {
   _nextStartTime: 0,
   _prebufCount:   0,
   _prebufQueue:   null,
+  // Scheduled buffers, so ⏸ can actually stop them. Created per instance in
+  // mount(): renderers are cloned with Object.assign, so a Set built here on
+  // the prototype would be shared and pausing one card would cut another's audio.
+  _sources:       null,
   _PREBUF_CHUNKS: 5,     // 首包预载：攒够 5 个 chunk (~500ms) 再开始播放
   _UNDERRUN_LEAD: 0.20,  // 欠载重启时给出的余量，秒
   _MAX_LEAD:      1.5,   // 允许领先播放头的上限，秒
@@ -72,6 +76,7 @@ export const AudioRenderer = {
     this._ring = new Float32Array(this._ringLen);
     this._writePos = 0;
     this._drawnPos = -1;
+    this._sources = new Set();
 
     this._raf = requestAnimationFrame(() => this._draw());
   },
@@ -172,6 +177,17 @@ export const AudioRenderer = {
     this._playing = false;
     this._prebufQueue = null;
     this._prebufCount = 0;
+    // Stop the buffers already handed to the audio thread. Setting _playing
+    // false only stops *scheduling* new ones; everything queued ahead of the
+    // playhead kept sounding, so ⏸ appeared to do nothing and only closing the
+    // panel (which calls unmount → audioCtx.close) actually silenced it.
+    // Raising _MAX_LEAD to 1.5s made a long-standing bug obvious: with the old
+    // ~50ms of lead there was barely anything queued to keep playing.
+    for (const source of this._sources || []) {
+      try { source.onended = null; source.stop(); } catch { /* already ended */ }
+    }
+    this._sources?.clear();
+    this._nextStartTime = 0;
     if (this._playBtn) {
       this._playBtn.textContent = '▶';
       this._playBtn.title = '播放实时音频';
@@ -246,6 +262,10 @@ export const AudioRenderer = {
 
     source.start(this._nextStartTime);
     this._nextStartTime += audioBuffer.duration;
+    // Track it so _stopPlay can actually silence what is already queued.
+    // Self-removing on end, so the set only ever holds pending buffers.
+    this._sources?.add(source);
+    source.onended = () => this._sources?.delete(source);
   },
 
   // ── Waveform drawing ──────────────────────────────────────────────────────
