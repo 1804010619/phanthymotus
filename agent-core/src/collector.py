@@ -235,18 +235,35 @@ def has_bot_channel_event(events: list[dict]) -> bool:
     return bool(_bot_channel_payloads(events))
 
 
+def _trusted_bot_channel_payloads(events: list[dict]) -> list[dict]:
+    from channel.manager import manager as channel_manager
+    return [payload for payload in _bot_channel_payloads(events)
+            if channel_manager.is_trusted_bot_message(payload)]
+
+
+def has_trusted_bot_channel_event(events: list[dict]) -> bool:
+    return bool(_trusted_bot_channel_payloads(events))
+
+
+def _bot_trust_class(events: list[dict]) -> int:
+    if has_trusted_bot_channel_event(events):
+        return 2
+    return 1 if has_bot_channel_event(events) else 0
+
+
 def _split_by_bot_trust(events: list[dict]) -> list[list[dict]]:
-    """Keep bot and non-bot inputs out of the same LLM turn."""
+    """Keep trusted bots, other bots, and people in separate LLM turns."""
     batches = []
     for ev in events:
-        is_bot = has_bot_channel_event([ev])
-        if not batches or has_bot_channel_event([batches[-1][0]]) != is_bot:
+        if not batches or _bot_trust_class([batches[-1][0]]) != _bot_trust_class([ev]):
             batches.append([])
         batches[-1].append(ev)
     return batches
 
 
 def _build_trigger(batch: list[dict], urgent: bool) -> dict:
+    bot_payloads = _bot_channel_payloads(batch)
+    trusted_payloads = _trusted_bot_channel_payloads(batch)
     trigger = {
         'source': 'collector',
         'text': _format_priority_batch(batch),
@@ -254,9 +271,14 @@ def _build_trigger(batch: list[dict], urgent: bool) -> dict:
         'ts': batch[-1]['ts'],
         '_perf_trigger_emit_ts': time.time(),
         '_urgent': urgent,
-        '_bot_channel_event': has_bot_channel_event(batch),
-        '_bot_channel_message_ids': bot_channel_message_ids(batch),
+        '_bot_channel_event': bool(bot_payloads),
+        '_trusted_bot_channel_event': bool(bot_payloads) and len(trusted_payloads) == len(bot_payloads),
+        '_bot_channel_message_ids': [p['message_id'] for p in bot_payloads
+                                     if isinstance(p.get('message_id'), str) and p['message_id']],
     }
+    from channel.manager import manager as channel_manager
+    for payload in trusted_payloads:
+        channel_manager.consume_trusted_bot_message(payload.get('message_id', ''))
     for ev in reversed(batch):
         if '_perf_spans' in ev:
             trigger['_perf_spans'] = ev['_perf_spans']

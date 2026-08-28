@@ -162,6 +162,12 @@ def _bot_channel_tool_allowed(name: str) -> bool:
     return bool(meta and meta.get('type') in ('sensor', 'resource'))
 
 
+def _bot_channel_restricted(trigger_event: dict) -> bool:
+    return bool(trigger_event.get('_bot_channel_event')) and not bool(
+        trigger_event.get('_trusted_bot_channel_event')
+    )
+
+
 def _bot_channel_reply_allowed(args: dict, source_message_ids: set[str]) -> bool:
     """Keep bot replies on the current inbound message and text-only."""
     return (
@@ -814,7 +820,7 @@ class Event:
         import time as _time
         from uuid import uuid4
         _turn_t0 = _time.perf_counter()
-        bot_restricted = bool(trigger_event.get('_bot_channel_event'))
+        bot_restricted = _bot_channel_restricted(trigger_event)
         bot_reply_source_ids = set(trigger_event.get('_bot_channel_message_ids', []))
 
         # Reset Python sandbox namespace for this turn

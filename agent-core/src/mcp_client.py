@@ -577,6 +577,7 @@ async def _dispatch_internal(mcp_id: str, tool_name: str, args: dict) -> str:
                 mention_open_id=args.get('mention_open_id', ''),
                 source_message_id=args.get('source_message_id', ''),
                 expect_reply=args.get('expect_reply', False),
+                trusted_bot_id=args.get('trusted_bot_id', ''),
             )
         return f'Error: Unknown action "{action}". Use action="send" with "text" and/or "files".'
 

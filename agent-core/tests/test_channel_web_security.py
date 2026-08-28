@@ -14,7 +14,7 @@ class ChannelWebSecurityTest(unittest.TestCase):
         self.assertNotIn('onclick=', source)
         self.assertNotIn('window._channel', source)
         self.assertIn("_channelList.addEventListener('click', _handleChannelAction)", source)
-        for action in ('bot-to-bot', 'stop', 'restart', 'delete'):
+        for action in ('bot-to-bot', 'trusted-bots', 'stop', 'restart', 'delete'):
             self.assertIn(f'data-channel-action="{action}"', source)
 
     def test_channel_ids_are_encoded_only_at_the_request_boundary(self):

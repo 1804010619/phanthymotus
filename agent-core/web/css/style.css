@@ -6259,6 +6259,7 @@ html, body {
 }
 .channel-form-row input[type="text"],
 .channel-form-row input[type="password"],
+.channel-form-row textarea,
 .channel-form-row select {
   width: 100%;
   padding: 6px 10px;

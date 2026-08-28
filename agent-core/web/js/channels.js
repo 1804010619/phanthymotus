@@ -66,6 +66,9 @@ function _renderChannels(channels) {
         ${ch.platform === 'feishu' ? `
           <button class="btn-ghost btn-sm" data-channel-action="bot-to-bot">
             Bot @ Bot: ${ch.bot_to_bot_enabled ? 'On' : 'Off'}
+          </button>
+          <button class="btn-ghost btn-sm" data-channel-action="trusted-bots">
+            Trusted Bots: ${(ch.trusted_bots || []).length}
           </button>` : ''}
         <button class="btn-ghost btn-sm" data-channel-action="stop">Stop</button>
         <button class="btn-ghost btn-sm" data-channel-action="restart">Restart</button>
@@ -223,6 +226,7 @@ function _handleChannelAction(e) {
 
   switch (btn.dataset.channelAction) {
     case 'bot-to-bot': _channelSetBotToBot(channel.id, !channel.bot_to_bot_enabled, btn); break;
+    case 'trusted-bots': _showTrustedBots(channel, item); break;
     case 'stop':       _channelStop(channel.id, btn); break;
     case 'restart':    _channelRestart(channel.id, btn); break;
     case 'delete':     _channelDelete(channel.id); break;
@@ -232,8 +236,8 @@ function _handleChannelAction(e) {
 async function _channelSetBotToBot(id, enabled, btn) {
   if (enabled && !confirm(
     'Enable Bot @ Bot for this Feishu channel?\n\n'
-    + 'Any bot in any group containing this app can trigger the Agent and its bound tools '
-    + 'by explicitly @mentioning it.'
+    + 'Any bot in a shared group can explicitly @mention this Agent, but only Bots listed '
+    + 'under Trusted Bots can activate Skills or invoke bound tools.'
   )) return;
 
   btn.disabled = true;
@@ -252,6 +256,61 @@ async function _channelSetBotToBot(id, enabled, btn) {
     alert('Update failed: ' + e.message);
   } finally {
     setTimeout(_loadChannels, 500);
+  }
+}
+
+function _showTrustedBots(channel, item) {
+  document.querySelectorAll('.channel-trusted-form').forEach((el) => el.remove());
+  item.insertAdjacentHTML('beforeend', `
+    <div class="channel-add-form channel-trusted-form">
+      <div class="channel-form-row">
+        <label>Trusted Bots (JSON)</label>
+        <textarea rows="7" data-trusted-bots-json
+          placeholder='[{"id":"peer","name":"Peer Bot","chat_id":"oc_...","open_id":"ou_..."}]'>${_esc(JSON.stringify(channel.trusted_bots || [], null, 2))}</textarea>
+      </div>
+      <div class="channel-item-error">Trusted Bots have full access to Skills and every Canvas-bound tool. Configure only exact Bot open_id + group chat_id pairs.</div>
+      <div class="channel-form-actions">
+        <button class="btn-primary" data-trusted-bots-save>Save</button>
+        <button class="btn-ghost" data-trusted-bots-cancel>Cancel</button>
+      </div>
+    </div>`);
+  const form = item.querySelector('.channel-trusted-form');
+  form.querySelector('[data-trusted-bots-save]').addEventListener('click', (e) => {
+    _saveTrustedBots(channel.id, form, e.currentTarget);
+  });
+  form.querySelector('[data-trusted-bots-cancel]').addEventListener('click', () => form.remove());
+}
+
+async function _saveTrustedBots(id, form, btn) {
+  let trustedBots;
+  try {
+    trustedBots = JSON.parse(form.querySelector('[data-trusted-bots-json]').value);
+    if (!Array.isArray(trustedBots)) throw new Error('value must be a JSON array');
+  } catch (e) {
+    alert('Invalid Trusted Bots JSON: ' + e.message);
+    return;
+  }
+  if (trustedBots.length && !confirm(
+    'Trust these Bots with full Agent execution access?\n\nOnly exact open_id + group chat_id pairs will match.'
+  )) return;
+
+  btn.disabled = true;
+  btn.textContent = 'Saving…';
+  try {
+    const res = await fetch(`/api/channel/${encodeURIComponent(id)}`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ trusted_bots: trustedBots }),
+    });
+    if (!res.ok) {
+      const json = await res.json().catch(() => ({}));
+      throw new Error(json.detail || `Update failed (${res.status})`);
+    }
+    _loadChannels();
+  } catch (e) {
+    alert('Update failed: ' + e.message);
+    btn.disabled = false;
+    btn.textContent = 'Save';
   }
 }
 

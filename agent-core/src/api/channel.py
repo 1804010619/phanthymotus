@@ -15,7 +15,7 @@ api/channel.py — Channel 管理 REST API。
 """
 
 import fastapi
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from channel.manager import (
     manager, get_channel_config, add_channel_config,
@@ -41,12 +41,15 @@ class AddChannelReq(BaseModel):
     config: dict = {}
     enabled: bool = False
     bot_to_bot_enabled: bool = False
+    trusted_bots: list[dict] = Field(default_factory=list)
 
 
 @router.post('/add')
 async def add_channel(req: AddChannelReq):
     if req.bot_to_bot_enabled and req.platform != 'feishu':
         raise fastapi.HTTPException(400, 'bot_to_bot_enabled is only supported by Feishu')
+    if req.trusted_bots and req.platform != 'feishu':
+        raise fastapi.HTTPException(400, 'trusted_bots is only supported by Feishu')
     try:
         entry = add_channel_config(
             req.id,
@@ -54,6 +57,7 @@ async def add_channel(req: AddChannelReq):
             req.config,
             req.enabled,
             req.bot_to_bot_enabled,
+            req.trusted_bots,
         )
     except ValueError as e:
         raise fastapi.HTTPException(400, str(e))
@@ -68,6 +72,7 @@ class UpdateChannelReq(BaseModel):
     config: dict | None = None
     enabled: bool | None = None
     bot_to_bot_enabled: bool | None = None
+    trusted_bots: list[dict] | None = None
 
 
 @router.put('/{channel_id}')
@@ -81,9 +86,15 @@ async def update_channel(channel_id: str, req: UpdateChannelReq):
     target_platform = updates.get('platform', current['platform'])
     if updates.get('bot_to_bot_enabled') and target_platform != 'feishu':
         raise fastapi.HTTPException(400, 'bot_to_bot_enabled is only supported by Feishu')
+    if updates.get('trusted_bots') and target_platform != 'feishu':
+        raise fastapi.HTTPException(400, 'trusted_bots is only supported by Feishu')
     if target_platform != 'feishu':
         updates['bot_to_bot_enabled'] = False
-    result = update_channel_config(channel_id, **updates)
+        updates['trusted_bots'] = []
+    try:
+        result = update_channel_config(channel_id, **updates)
+    except ValueError as e:
+        raise fastapi.HTTPException(400, str(e))
     # 重启 adapter 以应用新配置
     await manager.restart_adapter(channel_id)
     return {'channel': result}

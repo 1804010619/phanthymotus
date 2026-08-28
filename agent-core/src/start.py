@@ -245,8 +245,10 @@ def _register_core_mcp(silent=False):
                     'final result of its request. Never @ for acknowledgements, thanks, repetition, or '
                     'a final message that requires no action. Set expect_reply=true only when the target '
                     'has a concrete unresolved task; it defaults to false. A bot message with '
-                    'expect_reply=false must not be followed by another bot @. Copy source_message_id '
-                    'from the exact triggering event. Send text, and/or attach files through `files` — paths '
+                    'expect_reply=false must not be followed by another bot @. For a reply, copy '
+                    'source_message_id from the exact triggering event. For a proactive request to a '
+                    'configured peer, set trusted_bot_id instead. Send text, and/or attach files through '
+                    '`files` — paths '
                     'must be under /work or /tmp. Do not use it for on-body channels '
                     '(local_mic / remote_mic / remote_web); answer those with the robot\'s own output tools.'
                 ),
@@ -265,8 +267,15 @@ def _register_core_mcp(silent=False):
                         'source_message_id': {
                             'type': 'string',
                             'description': (
-                                'Trigger event message_id. Required for every reply so a concurrent '
-                                'message cannot redirect it into a different conversation.'
+                                'Trigger event message_id for an exact reply. Mutually exclusive with '
+                                'trusted_bot_id.'
+                            ),
+                        },
+                        'trusted_bot_id': {
+                            'type': 'string',
+                            'description': (
+                                'Configured trusted Bot id for a proactive Feishu group @. Mutually '
+                                'exclusive with source_message_id.'
                             ),
                         },
                         'expect_reply': {
@@ -292,7 +301,7 @@ def _register_core_mcp(silent=False):
                             },
                         },
                     },
-                    'required': ['action', 'source_message_id'],
+                    'required': ['action'],
                 },
                 'configSchema': {
                     'type': 'object',

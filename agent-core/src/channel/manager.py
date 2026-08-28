@@ -25,6 +25,10 @@ from channel import acl
 _CONFIG_KEY = 'channel_configs'
 _TOPIC_COMPONENT_MAX = 80
 _REPLY_CONTEXT_LIMIT = 100
+_TRUSTED_MESSAGE_LIMIT = 256
+_TRUSTED_BOT_ID_RE = re.compile(r'[A-Za-z0-9][A-Za-z0-9_-]{0,63}')
+_FEISHU_CHAT_ID_RE = re.compile(r'oc_[A-Za-z0-9]+')
+_FEISHU_OPEN_ID_RE = re.compile(r'ou_[A-Za-z0-9]+')
 
 
 def _valid_reply_context(value) -> bool:
@@ -57,6 +61,47 @@ def channel_request_topic(channel_id: str) -> str:
     return f'/channel/request/{slug}_{digest}'
 
 
+def normalize_trusted_bots(value) -> list[dict]:
+    """Validate and normalize direction-specific Feishu trusted bot routes."""
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise ValueError('trusted_bots must be a list')
+
+    result = []
+    ids = set()
+    routes = set()
+    for item in value:
+        if not isinstance(item, dict):
+            raise ValueError('each trusted bot must be an object')
+        bot_id = str(item.get('id', '')).strip()
+        name = str(item.get('name', '')).strip() or bot_id
+        chat_id = str(item.get('chat_id', '')).strip()
+        open_id = str(item.get('open_id', '')).strip()
+        if not _TRUSTED_BOT_ID_RE.fullmatch(bot_id):
+            raise ValueError(
+                'trusted bot id must be 1-64 characters using letters, numbers, _ or -'
+            )
+        if not _FEISHU_CHAT_ID_RE.fullmatch(chat_id):
+            raise ValueError('trusted bot chat_id must be a valid Feishu oc_... ID')
+        if not _FEISHU_OPEN_ID_RE.fullmatch(open_id):
+            raise ValueError('trusted bot open_id must be a valid Feishu ou_... ID')
+        route = (chat_id, open_id)
+        if bot_id in ids:
+            raise ValueError(f'duplicate trusted bot id: {bot_id}')
+        if route in routes:
+            raise ValueError(f'duplicate trusted bot route: {chat_id}/{open_id}')
+        ids.add(bot_id)
+        routes.add(route)
+        result.append({
+            'id': bot_id,
+            'name': name,
+            'chat_id': chat_id,
+            'open_id': open_id,
+        })
+    return result
+
+
 def _get_channel_configs() -> list[dict]:
     return config.main.get(_CONFIG_KEY, [])
 
@@ -73,7 +118,8 @@ def get_channel_config(channel_id: str) -> dict | None:
 
 
 def add_channel_config(channel_id: str, platform: str, cfg: dict,
-                       enabled: bool = False, bot_to_bot_enabled: bool = False) -> dict:
+                       enabled: bool = False, bot_to_bot_enabled: bool = False,
+                       trusted_bots: list[dict] | None = None) -> dict:
     configs = _get_channel_configs()
     # 检查 ID 唯一
     if any(c['id'] == channel_id for c in configs):
@@ -83,6 +129,7 @@ def add_channel_config(channel_id: str, platform: str, cfg: dict,
         'platform': platform,
         'enabled': enabled,
         'bot_to_bot_enabled': bot_to_bot_enabled if platform == 'feishu' else False,
+        'trusted_bots': normalize_trusted_bots(trusted_bots) if platform == 'feishu' else [],
         'config': cfg,
         'status': 'disconnected',
         'updated_at': time.time(),
@@ -96,8 +143,13 @@ def update_channel_config(channel_id: str, **updates) -> dict | None:
     configs = _get_channel_configs()
     for ch in configs:
         if ch['id'] == channel_id:
+            target_platform = updates.get('platform', ch['platform'])
+            if target_platform != 'feishu':
+                updates['trusted_bots'] = []
+            elif 'trusted_bots' in updates:
+                updates['trusted_bots'] = normalize_trusted_bots(updates['trusted_bots'])
             for k, v in updates.items():
-                if k in ('platform', 'config', 'enabled', 'bot_to_bot_enabled'):
+                if k in ('platform', 'config', 'enabled', 'bot_to_bot_enabled', 'trusted_bots'):
                     ch[k] = v
             ch['updated_at'] = time.time()
             _save_channel_configs(configs)
@@ -138,6 +190,33 @@ class ChannelManager:
         self._retry_at: dict[str, float] = {}            # channel_id → 下次重连时间
         self._retry_backoff: dict[str, float] = {}       # channel_id → 当前退避秒数
         self._inactive_logged: set[str] = set()
+        self._trusted_bot_messages: dict[str, dict] = {}
+
+    def _trusted_bot_id(self, msg: InboundMessage) -> str:
+        """Return the configured alias for an exact Feishu bot/group principal."""
+        ch_cfg = get_channel_config(msg.channel_id) or {}
+        if ch_cfg.get('platform') != 'feishu' or msg.chat_type != 'group':
+            return ''
+        for bot in ch_cfg.get('trusted_bots', []):
+            if bot.get('chat_id') == msg.chat_id and bot.get('open_id') == msg.user_id:
+                return bot.get('id', '')
+        return ''
+
+    def _record_trusted_bot_message(self, payload: dict):
+        message_id = payload.get('message_id', '')
+        if not message_id or not payload.get('trusted_bot_id'):
+            return
+        self._trusted_bot_messages[message_id] = dict(payload)
+        while len(self._trusted_bot_messages) > _TRUSTED_MESSAGE_LIMIT:
+            self._trusted_bot_messages.pop(next(iter(self._trusted_bot_messages)))
+
+    def is_trusted_bot_message(self, payload: dict) -> bool:
+        """Trust only messages registered from an adapter-verified inbound event."""
+        entry = self._trusted_bot_messages.get(payload.get('message_id', ''))
+        return bool(entry and payload == entry)
+
+    def consume_trusted_bot_message(self, message_id: str):
+        self._trusted_bot_messages.pop(message_id, None)
 
     # ── Persistent conversation context ──────────────────────────────────────
 
@@ -195,7 +274,8 @@ class ChannelManager:
             return ''
         return max(ctx.items(), key=lambda kv: (kv[1] or {}).get('ts', 0))[0]
 
-    def resolve_target_channel(self, instance_id: str = '') -> tuple[str, str]:
+    def resolve_target_channel(self, instance_id: str = '', *,
+                               allow_fallback: bool = True) -> tuple[str, str]:
         """解析回复目标 channel，返回 (channel_id, error)。
 
         优先级：
@@ -214,9 +294,10 @@ class ChannelManager:
                     )
                 return channel_id, ''
 
-        channel_id = self._latest_context_channel()
-        if channel_id:
-            return channel_id, ''
+        if allow_fallback:
+            channel_id = self._latest_context_channel()
+            if channel_id:
+                return channel_id, ''
         return '', (
             'Error: No target channel.\n'
             'Cause: the output card has no channel selected and no user has messaged the bot yet.\n'
@@ -455,6 +536,10 @@ class ChannelManager:
 
     async def restart_adapter(self, channel_id: str, retries: int = 3):
         """重启指定 adapter（配置更新后调用）。"""
+        self._trusted_bot_messages = {
+            key: value for key, value in self._trusted_bot_messages.items()
+            if value.get('channel_id') != channel_id
+        }
         # Stop existing
         if channel_id in self._adapters:
             await self._adapters[channel_id].stop()
@@ -482,9 +567,10 @@ class ChannelManager:
         self._inactive_logged.discard(msg.channel_id)
 
         is_bot = msg.sender_type in ('bot', 'app')
+        trusted_bot_id = self._trusted_bot_id(msg) if is_bot else ''
         if is_bot:
-            # 机器人不是通讯录用户，不写入人员 ACL，也绝不能继承 owner/operator 权限。
-            user = {'role': 'viewer'}
+            # Bot 不写入人员 ACL；只有精确匹配配置的可信 Bot 继承普通输入权限。
+            user = {'role': 'operator' if trusted_bot_id else 'viewer'}
         else:
             # 2. ACL — ensure user exists, otherwise auto-register
             user = acl.get_user(msg.platform, msg.user_id)
@@ -516,7 +602,6 @@ class ChannelManager:
             chat_type=msg.chat_type,
             expect_reply=msg.expect_reply,
         )
-
         # 5. Publish to topic for dashboard and canvas data flow
         #    附件已由 adapter 落盘到持久化目录，这里只带容器内本地路径给 LLM
         from api.inspection import publish_to_topic
@@ -535,9 +620,12 @@ class ChannelManager:
             'chat_type': msg.chat_type,
             'mentions': msg.mentions,
             'expect_reply': msg.expect_reply,
+            'trusted_bot_id': trusted_bot_id,
         }
         if files:
             payload['files'] = files
+        if trusted_bot_id:
+            self._record_trusted_bot_message(payload)
         await publish_to_topic(topic, json.dumps(payload, ensure_ascii=False))
 
         # 5. Broadcast to frontend activity stream
@@ -556,6 +644,7 @@ class ChannelManager:
                 'chat_type': msg.chat_type,
                 'mentions': msg.mentions,
                 'expect_reply': msg.expect_reply,
+                'trusted_bot_id': trusted_bot_id,
                 'files': files,
             }
         })
@@ -566,34 +655,65 @@ class ChannelManager:
                               files: list | None = None, *,
                               mention_open_id: str = '',
                               source_message_id: str = '',
-                              expect_reply: bool = False) -> str:
+                              expect_reply: bool = False,
+                              trusted_bot_id: str = '') -> str:
         """Send text and/or attachments to the source message's exact chat context.
         Called by channel_reply tool dispatch."""
-        if not source_message_id:
+        if source_message_id and trusted_bot_id:
+            return 'Error: provide source_message_id or trusted_bot_id, not both; no message was sent.'
+
+        ctx = None
+        if trusted_bot_id:
+            ch_cfg = get_channel_config(channel_id) or {}
+            trusted_bot = next((bot for bot in ch_cfg.get('trusted_bots', [])
+                                if bot.get('id') == trusted_bot_id), None)
+            if not trusted_bot:
+                return f'Error: unknown trusted_bot_id "{trusted_bot_id}"; no message was sent.'
+            if ch_cfg.get('platform') != 'feishu':
+                return 'Error: trusted_bot_id is only supported by Feishu channels.'
+            if not ch_cfg.get('bot_to_bot_enabled', False):
+                return (
+                    'Error: Feishu bot-to-bot is disabled for this channel.\n'
+                    'Solution: enable "Bot @ Bot" in Settings → Channels and restart the channel.'
+                )
+            if mention_open_id and mention_open_id != trusted_bot['open_id']:
+                return 'Error: mention_open_id does not match trusted_bot_id; no message was sent.'
+            mention_open_id = trusted_bot['open_id']
+            ctx = {
+                'chat_id': trusted_bot['chat_id'],
+                'user_id': trusted_bot['open_id'],
+                'message_id': '',
+                'sender_type': 'bot',
+                'chat_type': 'group',
+                'expect_reply': True,
+                'ts': time.time(),
+            }
+        elif not source_message_id:
             return (
                 'Error: missing source_message_id; no message was sent.\n'
-                'Cause: channel replies must identify the exact triggering message.'
+                'Cause: replies need the exact triggering message; proactive bot messages need '
+                'trusted_bot_id.'
             )
-
-        all_messages = config.main.get('channel_message_contexts', {})
-        if not isinstance(all_messages, dict):
-            all_messages = {}
-        channel_messages = all_messages.get(channel_id, {})
-        if not isinstance(channel_messages, dict):
-            channel_messages = {}
-        ctx = channel_messages.get(source_message_id)
-        if not _valid_reply_context(ctx) or ctx.get('message_id') != source_message_id:
-            ctx = None
-        if not ctx:
-            # 兼容升级前只保存的最后一条上下文。
-            last_ctx = self._get_last_context().get(channel_id)
-            if last_ctx and last_ctx.get('message_id') == source_message_id:
-                ctx = last_ctx
-        if not ctx:
-            return (
-                'Error: unknown or expired source_message_id; no message was sent.\n'
-                'Cause: no reply context exists for that triggering message.'
-            )
+        else:
+            all_messages = config.main.get('channel_message_contexts', {})
+            if not isinstance(all_messages, dict):
+                all_messages = {}
+            channel_messages = all_messages.get(channel_id, {})
+            if not isinstance(channel_messages, dict):
+                channel_messages = {}
+            ctx = channel_messages.get(source_message_id)
+            if not _valid_reply_context(ctx) or ctx.get('message_id') != source_message_id:
+                ctx = None
+            if not ctx:
+                # 兼容升级前只保存的最后一条上下文。
+                last_ctx = self._get_last_context().get(channel_id)
+                if last_ctx and last_ctx.get('message_id') == source_message_id:
+                    ctx = last_ctx
+            if not ctx:
+                return (
+                    'Error: unknown or expired source_message_id; no message was sent.\n'
+                    'Cause: no reply context exists for that triggering message.'
+                )
 
         adapter = self._adapters.get(channel_id)
         if not adapter:
@@ -693,13 +813,16 @@ class ChannelManager:
 
     async def send_reply(self, instance_id: str = '', text: str = '',
                          files: list | None = None, *, mention_open_id: str = '',
-                         source_message_id: str = '', expect_reply: bool = False) -> str:
+                         source_message_id: str = '', expect_reply: bool = False,
+                         trusted_bot_id: str = '') -> str:
         """channel_reply 的统一出口：先按卡片实例配置解析目标 channel，再发送。
 
         画布上给输出卡片选的 channel 必须真正决定回复去向——之前两条 dispatch
         路径都用「最后一个有上下文的 channel」猜目标，卡片配置形同装饰。
         """
-        channel_id, err = self.resolve_target_channel(instance_id)
+        channel_id, err = self.resolve_target_channel(
+            instance_id, allow_fallback=not trusted_bot_id,
+        )
         if err:
             return err
         return await self.send_to_channel(
@@ -709,6 +832,7 @@ class ChannelManager:
             mention_open_id=mention_open_id,
             source_message_id=source_message_id,
             expect_reply=expect_reply,
+            trusted_bot_id=trusted_bot_id,
         )
 
     # ── Status ───────────────────────────────────────────────────────────────
@@ -725,6 +849,7 @@ class ChannelManager:
                 'platform': ch_cfg['platform'],
                 'enabled': ch_cfg.get('enabled', False),
                 'bot_to_bot_enabled': ch_cfg.get('bot_to_bot_enabled', False),
+                'trusted_bots': ch_cfg.get('trusted_bots', []),
                 'status': adapter.status() if adapter else 'disconnected',
                 'health_error': '' if not health or health[0] else health[1],
                 'active_input': channel_id in self.active_input_channels,

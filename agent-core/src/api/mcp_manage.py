@@ -937,6 +937,7 @@ async def mcp_call_tool(mcp_id: str, req: MCPCallRequest):
                 files = req.arguments.get('files', []) or []
                 mention_open_id = req.arguments.get('mention_open_id', '')
                 source_message_id = req.arguments.get('source_message_id', '')
+                trusted_bot_id = req.arguments.get('trusted_bot_id', '')
                 expect_reply = req.arguments.get('expect_reply', False)
                 if not text and not files:
                     return {'code': 200, 'data': {'error': 'text or files is required'}}
@@ -947,6 +948,7 @@ async def mcp_call_tool(mcp_id: str, req: MCPCallRequest):
                     mention_open_id=mention_open_id,
                     source_message_id=source_message_id,
                     expect_reply=expect_reply,
+                    trusted_bot_id=trusted_bot_id,
                 )
                 return {'code': 200, 'data': {'result': result}}
             return {'code': 200, 'data': None}

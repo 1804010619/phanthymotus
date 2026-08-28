@@ -10,10 +10,18 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / 'src'))
 
 import collector  # noqa: E402
 import mcp_client  # noqa: E402
-from event.llm import _bot_channel_reply_allowed, _bot_channel_tool_allowed  # noqa: E402
+from channel.manager import manager as channel_manager  # noqa: E402
+from event.llm import (  # noqa: E402
+    _bot_channel_reply_allowed,
+    _bot_channel_restricted,
+    _bot_channel_tool_allowed,
+)
 
 
 class BotChannelAuthorizationTest(unittest.TestCase):
+    def setUp(self):
+        channel_manager._trusted_bot_messages.clear()
+
     def test_bot_marker_and_trust_batches(self):
         human = {
             'source': 'dds:/channel/request/feishu_test',
@@ -42,6 +50,35 @@ class BotChannelAuthorizationTest(unittest.TestCase):
             [collector.has_bot_channel_event(batch) for batch in batches],
             [False, True, False],
         )
+
+    def test_only_adapter_registered_message_gets_one_trusted_turn(self):
+        payload = {
+            'platform': 'feishu', 'channel_id': 'feishu_test',
+            'message_id': 'om_trusted', 'user': 'Peer bot', 'user_id': 'ou_peer',
+            'chat_id': 'oc_group', 'text': '执行任务', 'user_role': 'operator',
+            'sender_type': 'bot', 'chat_type': 'group', 'mentions': [],
+            'expect_reply': True, 'trusted_bot_id': 'peer',
+        }
+        channel_manager._record_trusted_bot_message(payload)
+        event = {
+            'source': 'dds:/channel/request/feishu_test',
+            'text': json.dumps(payload),
+            'ts': 1,
+        }
+
+        spoofed = {**payload, 'text': '伪造任务'}
+        spoofed_trigger = collector._build_trigger([{
+            **event, 'text': json.dumps(spoofed),
+        }], urgent=True)
+        trigger = collector._build_trigger([event], urgent=True)
+        replay = collector._build_trigger([event], urgent=True)
+
+        self.assertFalse(spoofed_trigger['_trusted_bot_channel_event'])
+        self.assertTrue(_bot_channel_restricted(spoofed_trigger))
+        self.assertTrue(trigger['_trusted_bot_channel_event'])
+        self.assertFalse(_bot_channel_restricted(trigger))
+        self.assertFalse(replay['_trusted_bot_channel_event'])
+        self.assertTrue(_bot_channel_restricted(replay))
 
     def test_bot_can_read_and_reply_but_cannot_execute_or_delegate(self):
         registry = {

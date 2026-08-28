@@ -232,6 +232,7 @@ class InternalChannelReplyDispatchTest(unittest.IsolatedAsyncioTestCase):
             mention_open_id='ou_peer',
             source_message_id='om_request',
             expect_reply=True,
+            trusted_bot_id='',
         )
 
 
@@ -242,6 +243,7 @@ class ChannelManagerBotReplyTest(unittest.IsolatedAsyncioTestCase):
             'platform': 'feishu',
             'enabled': True,
             'bot_to_bot_enabled': True,
+            'trusted_bots': [],
             'config': {},
         }]
         config.main['channel_last_context'] = {}
@@ -317,6 +319,28 @@ class ChannelManagerBotReplyTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn('Reply sent', sent)
         self.assertEqual(len(self.adapter.sent), 1)
         self.assertEqual(self.adapter.sent[0].chat_id, 'oc_private')
+
+    async def test_trusted_bot_id_routes_a_proactive_group_mention(self):
+        configs = config.main['channel_configs']
+        configs[0]['trusted_bots'] = [{
+            'id': 'peer', 'name': 'Peer bot',
+            'chat_id': 'oc_group', 'open_id': 'ou_peer',
+        }]
+        config.main['channel_configs'] = configs
+
+        result = await self.manager.send_to_channel(
+            'feishu_test', text='请执行接待任务', trusted_bot_id='peer', expect_reply=True,
+        )
+        unknown = await self.manager.send_to_channel(
+            'feishu_test', text='请执行', trusted_bot_id='unknown',
+        )
+
+        self.assertIn('Reply sent', result)
+        self.assertIn('unknown trusted_bot_id', unknown)
+        self.assertEqual(len(self.adapter.sent), 1)
+        self.assertEqual(self.adapter.sent[0].chat_id, 'oc_group')
+        self.assertEqual(self.adapter.sent[0].mention_open_id, 'ou_peer')
+        self.assertTrue(self.adapter.sent[0].expect_reply)
 
     async def test_malformed_persisted_context_is_replaced(self):
         config.main['channel_last_context'] = {
@@ -394,6 +418,41 @@ class ChannelManagerBotReplyTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payload['user_role'], 'viewer')
         self.assertEqual(payload['sender_type'], 'bot')
         self.assertTrue(payload['expect_reply'])
+
+    async def test_exact_trusted_bot_inbound_is_registered_as_operator(self):
+        configs = config.main['channel_configs']
+        configs[0]['trusted_bots'] = [{
+            'id': 'peer', 'name': 'Peer bot',
+            'chat_id': 'oc_group', 'open_id': 'ou_peer',
+        }]
+        config.main['channel_configs'] = configs
+        config.main['canvas_layout'] = {'cards': [{
+            'mcpId': 'channel', 'toolName': 'channel_request', 'id': 'input_1',
+        }]}
+        config.main['tool_config:channel:channel_request:input_1'] = {
+            'channel_id': 'feishu_test',
+        }
+        published = mock.AsyncMock()
+        inspection = types.ModuleType('api.inspection')
+        inspection.publish_to_topic = published
+        motus_stream = types.ModuleType('api.motus_stream')
+        motus_stream.push_event = mock.AsyncMock()
+        msg = InboundMessage(
+            platform='feishu', channel_id='feishu_test', user_id='ou_peer',
+            chat_id='oc_group', display_name='Peer bot', text='执行任务',
+            message_id='om_trusted', sender_type='bot', chat_type='group',
+            mentions=[{'open_id': 'ou_self', 'is_self': True}], expect_reply=True,
+        )
+
+        with mock.patch.dict(sys.modules, {
+            'api.inspection': inspection, 'api.motus_stream': motus_stream,
+        }):
+            await self.manager._on_inbound_message(msg)
+
+        payload = json.loads(published.await_args.args[1])
+        self.assertEqual(payload['user_role'], 'operator')
+        self.assertEqual(payload['trusted_bot_id'], 'peer')
+        self.assertTrue(self.manager.is_trusted_bot_message(payload))
 
 
 if __name__ == '__main__':
