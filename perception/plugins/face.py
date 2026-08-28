@@ -339,14 +339,31 @@ class LocalFaceAdapter(FaceAdapter):
 
     基于简单的图像特征进行粗略人脸识别。
     实际部署时应替换为深度学习模型（如 InsightFace、FaceNet 等）。
+
+    使用单例模式，同一 face_db_dir 共享同一个游标，确保持续轮询。
     """
 
+    _instances: Dict[str, "LocalFaceAdapter"] = {}
+    _lock = threading.Lock()
+
+    def __new__(cls, face_db_dir: str):
+        with cls._lock:
+            if face_db_dir not in cls._instances:
+                instance = super().__new__(cls)
+                cls._instances[face_db_dir] = instance
+            return cls._instances[face_db_dir]
+
     def __init__(self, face_db_dir: str):
+        # 防止重复初始化
+        if hasattr(self, "_loaded") and self._loaded:
+            return
         self.face_db = FaceDatabase(face_db_dir)
         self._person_ids = self.face_db.get_person_ids()
         self._data_entries = self._load_data_json(face_db_dir)
         self._cursor = 0  # 按顺序轮询 data.json 条目
+        self._cursor_lock = threading.Lock()
         log.info(f"[face] local adapter initialized: face_db_dir={face_db_dir}")
+        self._loaded = True
 
     @staticmethod
     def _load_data_json(face_db_dir: str) -> list:
@@ -373,9 +390,10 @@ class LocalFaceAdapter(FaceAdapter):
                 "identity": None,
             }
 
-        # 按顺序返回 data.json 中的条目，轮询循环
-        entry = self._data_entries[self._cursor]
-        self._cursor = (self._cursor + 1) % len(self._data_entries)
+        # 按顺序返回 data.json 中的条目，轮询循环（线程安全）
+        with self._cursor_lock:
+            entry = self._data_entries[self._cursor]
+            self._cursor = (self._cursor + 1) % len(self._data_entries)
 
         bbox_rel = entry.get("bbox_relative", {})
         bbox_relative = [
