@@ -299,8 +299,11 @@ function _refreshRenderer(topicPath) {
   const renderer = _createRenderer(card.format, card.mode);
   renderer.mount(body, _topicMcpMap[topicPath] || 'dashboard');
   card.renderer = renderer;
-  // Re-wire WS
-  card.ws.onmessage = (ev) => _handleWsMessage(ev, card.renderer, card.format);
+  // Re-wire WS. Optional: _connectWs returns null for a card whose topic is
+  // not resolved yet, and a mode switch on such a card must not throw.
+  if (card.ws) {
+    card.ws.onmessage = (ev) => _handleWsMessage(ev, card.renderer, card.format);
+  }
 }
 
 function _switchMode(topicPath, newMode, modeBtns) {
