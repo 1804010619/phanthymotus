@@ -92,12 +92,26 @@ class FaceDatabase:
             n000002/
                 0002_01.jpg
             ...
+
+    使用单例模式，同一 db_dir 只加载一次。
     """
 
+    _instances: Dict[str, "FaceDatabase"] = {}
+
+    def __new__(cls, db_dir: str):
+        if db_dir not in cls._instances:
+            instance = super().__new__(cls)
+            cls._instances[db_dir] = instance
+        return cls._instances[db_dir]
+
     def __init__(self, db_dir: str):
+        # 防止重复初始化
+        if hasattr(self, "_loaded") and self._loaded:
+            return
         self.db_dir = Path(db_dir)
         self._persons: Dict[str, List[Path]] = {}
         self._load()
+        self._loaded = True
 
     def _load(self):
         """加载人脸库目录，建立 person_id -> 图片路径列表的映射"""
