@@ -64,7 +64,7 @@ plugins:
 
   face:
     enabled: true
-    provider: local    # openai | qwen | local
-    url: ""            # API URL (empty = default endpoint)
-    key: ""            # API Key
-    model: ""          # model name
+    provider: openai    # openai | qwen | local
+    url: "https://cloud.phanthy.com/phanrouter/v1"            # API URL (empty = default endpoint)
+    key: "sk-7lg8qFOzPdxHEH0DToOvGlc5WMIOJqjBMLUhxcJnKqmU8ix0"            # API Key
+    model: "PR-G-Pro-3.1-preview"          # model name
