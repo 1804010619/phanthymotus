@@ -330,27 +330,55 @@ class LocalFaceAdapter(FaceAdapter):
     def __init__(self, face_db_dir: str):
         self.face_db = FaceDatabase(face_db_dir)
         self._person_ids = self.face_db.get_person_ids()
+        self._data_entries = self._load_data_json(face_db_dir)
+        self._cursor = 0  # 按顺序轮询 data.json 条目
+        log.info(f"[face] local adapter initialized: face_db_dir={face_db_dir}")
+
+    @staticmethod
+    def _load_data_json(face_db_dir: str) -> list:
+        """加载人脸库目录下的 data.json 文件"""
+        data_path = Path(face_db_dir) / "data.json"
+        if not data_path.exists():
+            return []
+        try:
+            with open(data_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                if isinstance(data, list):
+                    return data
+                return []
+        except (json.JSONDecodeError, OSError) as e:
+            log.warning(f"[face] failed to load data.json: {e}")
+            return []
 
     def recognize(self, image_bytes: bytes) -> dict:
-        """返回随机识别结果（占位实现，后续替换为真实人脸识别模型）"""
-        import random
-
-        if not self._person_ids:
+        # 此处为测试代码，线上需有模型识别返回
+        if not self._data_entries:
             return {
                 "detect_confidence": 0.0,
                 "bbox_relative": None,
                 "identity": None,
             }
 
-        # 占位：随机选择一个人脸库中的 person_id
-        pred_person_id = random.choice(self._person_ids)
+        # 按顺序返回 data.json 中的条目，轮询循环
+        entry = self._data_entries[self._cursor]
+        self._cursor = (self._cursor + 1) % len(self._data_entries)
+
+        bbox_rel = entry.get("bbox_relative", {})
+        bbox_relative = [
+            float(bbox_rel.get("x", 0.0)),
+            float(bbox_rel.get("y", 0.0)),
+            float(bbox_rel.get("w", 0.0)),
+            float(bbox_rel.get("h", 0.0)),
+        ] if bbox_rel else None
+
+        person_id = entry.get("person_id")
         return {
-            "detect_confidence": round(random.uniform(0.8, 0.99), 4),
-            "bbox_relative": [0.1, 0.1, 0.8, 0.8],
+            "detect_confidence": round(entry.get("detect_confidence", 0.9), 4),
+            "bbox_relative": bbox_relative,
             "identity": {
-                "person_id": pred_person_id,
-                "confidence": round(random.uniform(0.7, 0.99), 4),
-            },
+                "person_id": person_id,
+                "confidence": round(entry.get("confidence", 0.9), 4),
+            } if person_id else None,
         }
 
 
