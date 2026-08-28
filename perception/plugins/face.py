@@ -367,7 +367,7 @@ class LocalFaceAdapter(FaceAdapter):
 
     @staticmethod
     def _load_data_json(face_db_dir: str) -> list:
-        """加载人脸库目录下的 data.json 文件"""
+        """此处为测试代码，data.json为测试mock数据，线上人脸库中无data.json文件，需有模型识别返回结果"""
         data_path = Path(face_db_dir) / "data.json"
         if not data_path.exists():
             return []
