@@ -57,14 +57,21 @@ def _env_int(name: str, default: int, low: int, high: int) -> int:
     return value
 
 
-FRAME_INTERVAL_MS = _env_int("MIX_VITS_FRAME_INTERVAL_MS", 70, 0, 1000)
+# Pace at exactly the audio duration each frame carries. It used to be 70ms for
+# a 100ms frame, which over-delivers by 1.43x *forever*: that was this engine's
+# way of slowly accruing a downstream cushion at 30ms/frame back when it had no
+# prebuffer, and it cost an unbounded lead. PREBUFFER_FRAMES now hands the
+# consumer its whole cushion up front, so the accrual is pure surplus — and
+# surplus with no end has no safe landing. A consumer can only absorb it by
+# buffering without bound or by discarding audio; the browser player tried to
+# cap its lead instead and rewound its own schedule into audio it had already
+# queued, which played back overlapped and 1.43x too fast.
+FRAME_INTERVAL_MS = _env_int("MIX_VITS_FRAME_INTERVAL_MS", int(PCM_FRAME_MS), 0, 1000)
 FIRST_FRAME_DELAY_MS = _env_int("MIX_VITS_FIRST_FRAME_DELAY_MS", 0, 0, 1000)
 # Frames held back before pacing starts, then published in one burst so every
-# consumer begins with a real cushion instead of zero. Without it the only
-# margin downstream ever has is the (PCM_FRAME_MS - FRAME_INTERVAL_MS) = 30ms
-# per frame that the schedule accrues, so the opening of every utterance is
-# one jitter spike away from an audible gap. The sherpa engine has always done
-# this (plugins/tts.py PREBUF_FRAMES); this is the same idea on this engine.
+# consumer begins with a real cushion instead of zero. This — not the pacing
+# interval — is where the downstream margin comes from. The sherpa engine has
+# always done this (plugins/tts.py PREBUF_FRAMES); same idea on this engine.
 PREBUFFER_FRAMES = _env_int("MIX_VITS_PREBUFFER_FRAMES", 5, 0, 100)
 # Depth of the synthesis→publish handoff queue, in frames. Bounds memory while
 # still letting TensorRT run a whole text chunk ahead of the paced publisher.
@@ -77,12 +84,18 @@ MAX_BURST_FRAMES = _env_int("MIX_VITS_MAX_BURST_FRAMES", 20, 1, 200)
 SUBSCRIBER_WAIT_MS = _env_int("MIX_VITS_SUBSCRIBER_WAIT_MS", 5000, 0, 60000)
 SUBSCRIBER_POLL_MS = _env_int("MIX_VITS_SUBSCRIBER_POLL_MS", 10, 1, 1000)
 SUBSCRIBER_SETTLE_MS = _env_int("MIX_VITS_SUBSCRIBER_SETTLE_MS", 500, 0, 5000)
-ALLOW_FAST_DELIVERY = os.getenv("MIX_VITS_ALLOW_FAST_DELIVERY", "1") == "1"
+# Off by default: sending faster than realtime has no safe landing on a live
+# consumer. It either buffers without bound or has to discard audio, and the
+# browser player's attempt to bound its lead instead produced overlapped,
+# 1.43x-fast playback. Only useful for an offline benchmark that drains as fast
+# as it can, so it must be asked for explicitly.
+ALLOW_FAST_DELIVERY = os.getenv("MIX_VITS_ALLOW_FAST_DELIVERY", "0") == "1"
 if FRAME_INTERVAL_MS < PCM_FRAME_MS and not ALLOW_FAST_DELIVERY:
     log.warning(
         "[vits2_tts_trt] MIX_VITS_FRAME_INTERVAL_MS=%d sends %.0fms PCM frames "
-        "faster than realtime; pacing at %.0fms instead (set "
-        "MIX_VITS_ALLOW_FAST_DELIVERY=1 for an offline benchmark)",
+        "faster than realtime, which a live consumer cannot absorb; pacing at "
+        "%.0fms instead (set MIX_VITS_ALLOW_FAST_DELIVERY=1 for an offline "
+        "benchmark)",
         FRAME_INTERVAL_MS, PCM_FRAME_MS, PCM_FRAME_MS,
     )
     FRAME_INTERVAL_MS = int(PCM_FRAME_MS)
