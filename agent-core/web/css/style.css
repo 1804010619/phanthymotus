@@ -1987,7 +1987,8 @@ html, body {
 .svc-row-version-line {
   display: flex;
   align-items: center;
-  gap: 6px;
+  flex-wrap: wrap;          /* 版本太长时「→ 新版本」整块换行，而不是把当前版本挤没 */
+  gap: 2px 6px;
   min-width: 0;
 }
 .svc-row-version {
@@ -1999,6 +2000,14 @@ html, body {
   white-space: nowrap;
   min-width: 0;
 }
+/* 箭头和新版本号必须同进同退，否则换行会把「→」单独留在上一行 */
+.svc-row-update {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  max-width: 100%;
+}
 .svc-row-arrow {
   font-size: 12px;
   color: var(--text-dim);
@@ -2009,7 +2018,10 @@ html, body {
   font-family: var(--font-mono);
   color: var(--accent);
   font-weight: 600;
-  flex-shrink: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
 }
 
 .svc-row-actions {
