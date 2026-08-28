@@ -28,15 +28,16 @@ PCM_FRAME_S = CHUNK_BYTES / (SAMPLE_RATE * 2)  # 0.1s of audio per frame
 
 # Frames held back before pacing starts, then published in one burst, so the
 # consumer begins with a real cushion. 5 frames = 500ms, matching the
-# vits2_tts_trt engine's MIX_VITS_PREBUFFER_FRAMES default.
+# vits2_tts_trt engine's MIX_VITS_PREBUFFER_FRAMES default. This — not the pacing
+# interval — is where the downstream margin comes from.
 PREBUF_FRAMES = 5
-# Deliberately shorter than PCM_FRAME_S: sending 100ms frames every 70ms accrues
-# 30ms of cushion per frame, so downstream keeps building margin instead of
-# living on whatever it started with. Pacing at exactly PCM_FRAME_S — what this
-# engine used to do — means the cushion never grows and every jitter spike above
-# it is an audible gap. Safe here because this adapter synthesizes the whole
-# utterance before publishing anything, so there is no risk of outrunning it.
-FRAME_INTERVAL_S = 0.07
+# Pace at exactly the audio each frame carries. Anything shorter over-delivers
+# forever, and over-delivery has no safe landing on a live consumer: it either
+# buffers without bound or has to discard audio. Briefly setting this to 0.07s
+# (matching what the vits2 engine then did) accrued 30ms of surplus per frame
+# until the browser player hit its lead cap, rewound its own schedule into audio
+# it had already queued, and played back overlapped and 1.43x too fast.
+FRAME_INTERVAL_S = PCM_FRAME_S
 if FRAME_INTERVAL_S > PCM_FRAME_S:
     log.warning(
         "[tts] FRAME_INTERVAL_S=%.3fs is slower than the %.3fs of audio each "

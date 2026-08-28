@@ -42,7 +42,8 @@ export const AudioRenderer = {
   _sources:       null,
   _PREBUF_CHUNKS: 5,     // 首包预载：攒够 5 个 chunk (~500ms) 再开始播放
   _UNDERRUN_LEAD: 0.20,  // 欠载重启时给出的余量，秒
-  _MAX_LEAD:      1.5,   // 允许领先播放头的上限，秒
+  _MAX_LEAD:      1.5,   // 允许领先播放头的上限，超过则丢帧（绝不回拨时间轴）
+  _dropped:       0,     // 因超前而丢弃的帧数
   _drawnPos:      -1,
 
   mount(container) {
@@ -77,6 +78,7 @@ export const AudioRenderer = {
     this._writePos = 0;
     this._drawnPos = -1;
     this._sources = new Set();
+    this._dropped = 0;
 
     this._raf = requestAnimationFrame(() => this._draw());
   },
@@ -246,18 +248,25 @@ export const AudioRenderer = {
     // Schedule playback time
     const currentTime = ctx.currentTime;
     if (this._nextStartTime < currentTime) {
-      // Underrun. The old +0.05 here left a 50ms lead as the *permanent*
-      // steady-state margin against a producer that sends 100ms of audio per
-      // 100ms of wall clock, so the next delay over 50ms gapped again — and
-      // again. _UNDERRUN_LEAD gives the recovery something to work with.
+      // Underrun — every scheduled buffer has already finished, so this only
+      // ever moves the schedule *forward*. The old +0.05 here left a 50ms lead
+      // as the permanent steady-state margin, so the next delay over 50ms
+      // gapped again, and again. _UNDERRUN_LEAD gives the recovery something to
+      // work with.
       this._nextStartTime = currentTime + this._UNDERRUN_LEAD;
     } else if (this._nextStartTime - currentTime > this._MAX_LEAD) {
-      // Too far ahead. The relay queues frames (agent-core keeps a very deep
-      // per-consumer queue), so a stall followed by a flush arrives as a burst
-      // and every chunk gets appended contiguously into the future — latency
-      // that grows monotonically and is never recovered. Drop back rather than
-      // drift; one seam here beats playing minutes behind live.
-      this._nextStartTime = currentTime + this._MAX_LEAD;
+      // Too far ahead. Drop this chunk rather than reschedule: _nextStartTime is
+      // the end of audio already handed to the audio thread, so assigning
+      // `currentTime + _MAX_LEAD` here — which is what this used to do — placed
+      // the next buffer *inside* the previous one. That is what made playback
+      // overlap and run fast: once the lead was pinned at the cap, every frame
+      // was rewound onto the one before it, so 100ms of audio played every 70ms.
+      // Advancing only by `+= duration` makes contiguity structural.
+      this._dropped = (this._dropped || 0) + 1;
+      if (this._label) {
+        this._label.textContent = `● 音频流  丢帧 ${this._dropped}（缓冲超前）`;
+      }
+      return;
     }
 
     source.start(this._nextStartTime);
