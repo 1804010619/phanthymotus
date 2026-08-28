@@ -241,6 +241,15 @@ function _applyPlacement(el, col, row, colSpan, rowSpan) {
 }
 
 function _connectWs(topicPath, format, renderer) {
+  // An unresolved topic used to build `/ws/bus` with nothing after it. That
+  // matches no route (the endpoint is `/ws/bus/{topic:path}`), so Starlette
+  // failed the handshake and uvicorn logged `ASGI callable returned without
+  // completing handshake` + a 500 — noise that reads like a server fault when
+  // the real state is simply "this card has no topic yet".
+  if (!topicPath || topicPath === '/') {
+    console.debug('[monitor] no topic yet, not opening a bus WS');
+    return null;
+  }
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
   const wsUrl = `${proto}://${location.host}/ws/bus${topicPath}`;
 
