@@ -30,6 +30,19 @@ _TRUSTED_BOT_ID_RE = re.compile(r'[A-Za-z0-9][A-Za-z0-9_-]{0,63}')
 _FEISHU_CHAT_ID_RE = re.compile(r'oc_[A-Za-z0-9]+')
 _FEISHU_OPEN_ID_RE = re.compile(r'ou_[A-Za-z0-9]+')
 
+# 单个 chat 自己的最近往来回顾——独立于全局共享的 `self._turns`（event/llm.py）。
+# agent-core 的对话历史是进程级单例，不区分 channel/chat_id/user；飞书本身也不
+# 替应用保留多轮上下文语义。没有这一层，两个人几乎同时私聊/群聊时，模型看到的
+# 历史会把不同人的对话混在一起，可能把 A 的上下文答给 B。
+_CHAT_HISTORY_LIMIT = 12
+_CHAT_HISTORY_TEXT_MAX = 500
+
+# Bot-to-Bot 主动发起（trusted_bot_id 路径）的粗粒度频率熔断。PR #134 的设计里
+# 明确没有轮次/时间熔断，靠双方"是否还有具体任务"自觉停止——这里加一层兜底，
+# 避免可信 Bot 之间因为逻辑错误互相无限 @ 下去，把 LLM 拖入死循环。
+_MENTION_RATE_WINDOW = 300.0
+_MENTION_RATE_MAX = 5
+
 
 def _valid_reply_context(value) -> bool:
     if not isinstance(value, dict):
@@ -191,6 +204,7 @@ class ChannelManager:
         self._retry_backoff: dict[str, float] = {}       # channel_id → 当前退避秒数
         self._inactive_logged: set[str] = set()
         self._trusted_bot_messages: dict[str, dict] = {}
+        self._mention_rate: dict[tuple, list[float]] = {}
 
     def _trusted_bot_id(self, msg: InboundMessage) -> str:
         """Return the configured alias for an exact Feishu bot/group principal."""
@@ -217,6 +231,66 @@ class ChannelManager:
 
     def consume_trusted_bot_message(self, message_id: str):
         self._trusted_bot_messages.pop(message_id, None)
+
+    def _trusted_bot_mention_allowed(self, channel_id: str, chat_id: str, open_id: str) -> bool:
+        """Rolling rate limit for proactive A2A @ requests (trusted_bot_id path only).
+
+        A reactive reply (source_message_id) is bounded by an actual inbound message and
+        doesn't need this; a proactive @ has nothing upstream bounding how often it fires.
+        """
+        now = time.time()
+        key = (channel_id, chat_id, open_id)
+        window = [ts for ts in self._mention_rate.get(key, []) if now - ts < _MENTION_RATE_WINDOW]
+        if len(window) >= _MENTION_RATE_MAX:
+            self._mention_rate[key] = window
+            return False
+        window.append(now)
+        self._mention_rate[key] = window
+        return True
+
+    # ── Per-chat context recap ───────────────────────────────────────────────
+    #
+    # 独立于 event/llm.py 里进程级共享的 `self._turns`：那条历史线不区分
+    # channel/chat_id/user，这里额外维护"这个会话自己的最近往来"，随 trigger
+    # 一起喂给模型，降低不同会话上下文被混用的风险（详见模块顶部注释）。
+
+    def _record_chat_exchange(self, channel_id: str, chat_id: str, role: str, text: str, *,
+                              user_label: str = ''):
+        if not channel_id or not chat_id or not text:
+            return
+        all_history = config.main.get('channel_chat_history', {})
+        if not isinstance(all_history, dict):
+            all_history = {}
+        channel_history = all_history.get(channel_id, {})
+        if not isinstance(channel_history, dict):
+            channel_history = {}
+        entries = channel_history.get(chat_id, [])
+        if not isinstance(entries, list):
+            entries = []
+        entries = entries + [{
+            'role': role,
+            'text': text[:_CHAT_HISTORY_TEXT_MAX],
+            'user_label': user_label,
+            'ts': time.time(),
+        }]
+        channel_history[chat_id] = entries[-_CHAT_HISTORY_LIMIT:]
+        all_history[channel_id] = channel_history
+        config.main['channel_chat_history'] = all_history
+
+    def get_chat_history(self, channel_id: str, chat_id: str, limit: int = 6) -> list[dict]:
+        """Return this chat's own recent exchanges (oldest first), independent of the
+        shared global turn history."""
+        all_history = config.main.get('channel_chat_history', {})
+        if not isinstance(all_history, dict):
+            return []
+        channel_history = all_history.get(channel_id, {})
+        if not isinstance(channel_history, dict):
+            return []
+        entries = channel_history.get(chat_id, [])
+        if not isinstance(entries, list):
+            return []
+        valid = [e for e in entries if isinstance(e, dict) and isinstance(e.get('text'), str)]
+        return valid[-limit:]
 
     # ── Persistent conversation context ──────────────────────────────────────
 
@@ -590,8 +664,10 @@ class ChannelManager:
                         ))
                     return
 
-            # 3. ACL — 检查是否 blocked
-            if user['role'] == 'blocked':
+            # 3. ACL — 检查是否 blocked。用 acl.check_permission 而不是手写 role 比较，
+            #    这样"角色分级"这件事只有一处定义（同一函数后面也会被工具分发层复用）。
+            allowed, _reason = acl.check_permission(msg.platform, msg.user_id, required_role='viewer')
+            if not allowed:
                 return  # 静默丢弃
 
         # 4. Store last conversation context for reply routing (persisted)
@@ -602,6 +678,8 @@ class ChannelManager:
             chat_type=msg.chat_type,
             expect_reply=msg.expect_reply,
         )
+        self._record_chat_exchange(msg.channel_id, msg.chat_id, 'user', msg.text,
+                                   user_label=msg.display_name or msg.user_id)
         # 5. Publish to topic for dashboard and canvas data flow
         #    附件已由 adapter 落盘到持久化目录，这里只带容器内本地路径给 LLM
         from api.inspection import publish_to_topic
@@ -679,6 +757,16 @@ class ChannelManager:
             if mention_open_id and mention_open_id != trusted_bot['open_id']:
                 return 'Error: mention_open_id does not match trusted_bot_id; no message was sent.'
             mention_open_id = trusted_bot['open_id']
+            if not self._trusted_bot_mention_allowed(
+                channel_id, trusted_bot['chat_id'], trusted_bot['open_id'],
+            ):
+                return (
+                    f'Error: proactive @ rate limit reached for trusted bot "{trusted_bot_id}" '
+                    f'(max {_MENTION_RATE_MAX} per {int(_MENTION_RATE_WINDOW)}s); no message was sent.\n'
+                    'Cause: repeated proactive A2A requests to the same peer look like a ping-pong '
+                    'loop. Wait before retrying, or confirm the peer actually still has an unresolved '
+                    'task.'
+                )
             ctx = {
                 'chat_id': trusted_bot['chat_id'],
                 'user_id': trusted_bot['open_id'],
@@ -781,6 +869,10 @@ class ChannelManager:
             result = f'Reply sent to {channel_id} ({"; ".join(parts) or "empty"})'
             if file_errors:
                 result += '\nSome files were NOT sent:\n' + '\n'.join(file_errors)
+            if not mention_open_id:
+                # Bot-to-bot mentions aren't this chat's own human-facing conversation —
+                # keep the recap scoped to the human/channel side of the exchange.
+                self._record_chat_exchange(channel_id, chat_id, 'assistant', text)
             return result
         except PartialSendError as e:
             # 部分成功：必须让 LLM 知道哪部分已经到了，否则它会把文本重发一遍

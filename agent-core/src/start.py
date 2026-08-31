@@ -250,7 +250,14 @@ def _register_core_mcp(silent=False):
                     'configured peer, set trusted_bot_id instead. Send text, and/or attach files through '
                     '`files` — paths '
                     'must be under /work or /tmp. Do not use it for on-body channels '
-                    '(local_mic / remote_mic / remote_web); answer those with the robot\'s own output tools.'
+                    '(local_mic / remote_mic / remote_web); answer those with the robot\'s own output tools. '
+                    'If the trigger includes a <chat_history channel="..." chat_id="..."> block, that is '
+                    'this specific conversation\'s own recent recap — trust it over the shared history for '
+                    'what this particular person/chat actually said; other people\'s chats may appear '
+                    'elsewhere in your shared history and must not be attributed to this one. '
+                    'If the triggering user_role is "viewer" (read-only), you will only be offered '
+                    'sensor/resource tools plus this one — actuator/processor/delegated tools are rejected; '
+                    'reply with what you can read, and say so if the request needs an action you cannot take.'
                 ),
                 'inputSchema': {
                     'type': 'object',

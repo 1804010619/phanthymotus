@@ -14,7 +14,7 @@ from channel.manager import manager as channel_manager  # noqa: E402
 from event.llm import (  # noqa: E402
     _bot_channel_reply_allowed,
     _bot_channel_restricted,
-    _bot_channel_tool_allowed,
+    _restricted_channel_tool_allowed,
 )
 
 
@@ -92,17 +92,17 @@ class BotChannelAuthorizationTest(unittest.TestCase):
             },
         }
         with mock.patch.dict(mcp_client.registry, registry, clear=True):
-            self.assertTrue(_bot_channel_tool_allowed('finish'))
-            self.assertTrue(_bot_channel_tool_allowed('mcp__channel__channel_reply'))
-            self.assertTrue(_bot_channel_tool_allowed('mcp__device__camera'))
-            self.assertTrue(_bot_channel_tool_allowed('mcp__device__map'))
-            self.assertFalse(_bot_channel_tool_allowed('mcp__device__navigate'))
-            self.assertFalse(_bot_channel_tool_allowed('mcp__device__load_map'))
-            self.assertFalse(_bot_channel_tool_allowed('mcp__device__unknown'))
-            self.assertFalse(_bot_channel_tool_allowed('Bash'))
-            self.assertFalse(_bot_channel_tool_allowed('Write'))
-            self.assertFalse(_bot_channel_tool_allowed('WebFetch'))
-            self.assertFalse(_bot_channel_tool_allowed('subagent_spawn'))
+            self.assertTrue(_restricted_channel_tool_allowed('finish'))
+            self.assertTrue(_restricted_channel_tool_allowed('mcp__channel__channel_reply'))
+            self.assertTrue(_restricted_channel_tool_allowed('mcp__device__camera'))
+            self.assertTrue(_restricted_channel_tool_allowed('mcp__device__map'))
+            self.assertFalse(_restricted_channel_tool_allowed('mcp__device__navigate'))
+            self.assertFalse(_restricted_channel_tool_allowed('mcp__device__load_map'))
+            self.assertFalse(_restricted_channel_tool_allowed('mcp__device__unknown'))
+            self.assertFalse(_restricted_channel_tool_allowed('Bash'))
+            self.assertFalse(_restricted_channel_tool_allowed('Write'))
+            self.assertFalse(_restricted_channel_tool_allowed('WebFetch'))
+            self.assertFalse(_restricted_channel_tool_allowed('subagent_spawn'))
 
     def test_bot_reply_is_bound_to_current_message_and_text_only(self):
         current = {'om_current'}

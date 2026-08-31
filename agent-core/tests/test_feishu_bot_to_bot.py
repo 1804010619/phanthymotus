@@ -495,6 +495,50 @@ class ChannelManagerBotReplyTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.adapter.sent[0].mention_open_id, 'ou_peer')
         self.assertTrue(self.adapter.sent[0].expect_reply)
 
+    async def test_proactive_trusted_bot_mentions_are_rate_limited(self):
+        """No turn/time circuit breaker exists for A2A pings by design (see PR
+        docs) — this is the coarse backstop: a misbehaving or looping trusted
+        peer can't drive unbounded LLM turns via repeated proactive @s."""
+        configs = config.main['channel_configs']
+        configs[0]['trusted_bots'] = [{
+            'id': 'peer', 'name': 'Peer bot',
+            'chat_id': 'oc_group', 'open_id': 'ou_peer',
+        }]
+        config.main['channel_configs'] = configs
+
+        from channel.manager import _MENTION_RATE_MAX
+        results = [
+            await self.manager.send_to_channel(
+                'feishu_test', text=f'请执行任务 {i}', trusted_bot_id='peer', expect_reply=True,
+            )
+            for i in range(_MENTION_RATE_MAX + 1)
+        ]
+
+        self.assertEqual(sum('Reply sent' in r for r in results), _MENTION_RATE_MAX)
+        self.assertIn('rate limit', results[-1])
+        self.assertEqual(len(self.adapter.sent), _MENTION_RATE_MAX)
+
+    async def test_mention_rate_limit_is_scoped_per_chat_and_peer(self):
+        configs = config.main['channel_configs']
+        configs[0]['trusted_bots'] = [
+            {'id': 'peer_a', 'name': 'A', 'chat_id': 'oc_group', 'open_id': 'ou_peer_a'},
+            {'id': 'peer_b', 'name': 'B', 'chat_id': 'oc_other', 'open_id': 'ou_peer_b'},
+        ]
+        config.main['channel_configs'] = configs
+
+        from channel.manager import _MENTION_RATE_MAX
+        for i in range(_MENTION_RATE_MAX):
+            r = await self.manager.send_to_channel(
+                'feishu_test', text=f'task {i}', trusted_bot_id='peer_a', expect_reply=True,
+            )
+            self.assertIn('Reply sent', r)
+
+        # A different (chat, peer) pair still has its own untouched budget.
+        other = await self.manager.send_to_channel(
+            'feishu_test', text='task', trusted_bot_id='peer_b', expect_reply=True,
+        )
+        self.assertIn('Reply sent', other)
+
     async def test_malformed_persisted_context_is_replaced(self):
         config.main['channel_last_context'] = {
             'broken': {

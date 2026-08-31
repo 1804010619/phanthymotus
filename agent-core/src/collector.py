@@ -229,6 +229,32 @@ def _bot_channel_payloads(events: list[dict]) -> list[dict]:
             if payload.get('sender_type') in ('bot', 'app')]
 
 
+def _human_channel_payloads(events: list[dict]) -> list[dict]:
+    return [payload for payload in _channel_payloads(events)
+            if payload.get('sender_type') not in ('bot', 'app')]
+
+
+def has_viewer_only_channel_event(events: list[dict]) -> bool:
+    """Return whether a batch has human Channel message(s) but none from an
+    operator/owner-role user — i.e. every human sender here is read-only.
+
+    ACL role has historically only ever been passed to the LLM as informational
+    text (see channel/acl.py); nothing gated the tool set on it. This flag lets
+    event/llm.py actually restrict a viewer-only turn the same way it already
+    restricts untrusted-bot turns.
+    """
+    human_payloads = _human_channel_payloads(events)
+    if not human_payloads:
+        return False
+    return not any(p.get('user_role') in ('operator', 'owner') for p in human_payloads)
+
+
+def channel_message_ids(events: list[dict]) -> list[str]:
+    """Return message IDs for every Channel payload (human + bot) in a batch."""
+    return [payload['message_id'] for payload in _channel_payloads(events)
+            if isinstance(payload.get('message_id'), str) and payload['message_id']]
+
+
 def bot_channel_message_ids(events: list[dict]) -> list[str]:
     """Return bot/app message IDs from trusted Channel event payloads."""
     return [payload['message_id'] for payload in _bot_channel_payloads(events)
@@ -266,6 +292,40 @@ def _split_by_bot_trust(events: list[dict]) -> list[list[dict]]:
     return batches
 
 
+def _chat_history_blocks(batch: list[dict]) -> str:
+    """Prepend each distinct (channel_id, chat_id)'s own recent recap (see
+    channel/manager.py:get_chat_history) ahead of this batch's <event> blocks.
+
+    The shared global turn history (event/llm.py:self._turns) doesn't separate
+    by chat — this gives the model an explicit, scoped reminder of what this
+    exact conversation said, so it's less likely to answer person A with
+    context that only came from person B.
+    """
+    from channel.manager import manager as channel_manager
+    seen = set()
+    blocks = []
+    for payload in _channel_payloads(batch):
+        channel_id = payload.get('channel_id')
+        chat_id = payload.get('chat_id')
+        if not isinstance(channel_id, str) or not isinstance(chat_id, str):
+            continue
+        if not channel_id or not chat_id or (channel_id, chat_id) in seen:
+            continue
+        seen.add((channel_id, chat_id))
+        history = channel_manager.get_chat_history(channel_id, chat_id)
+        if not history:
+            continue
+        lines = []
+        for entry in history:
+            label = f' ({entry["user_label"]})' if entry.get('user_label') else ''
+            lines.append(f'{entry.get("role", "user")}{label}: {entry.get("text", "")}')
+        blocks.append(
+            f'<chat_history channel="{channel_id}" chat_id="{chat_id}">\n'
+            + '\n'.join(lines) + '\n</chat_history>'
+        )
+    return '\n'.join(blocks)
+
+
 def _build_trigger(batch: list[dict], urgent: bool) -> dict:
     channel_ids = []
     for payload in _channel_payloads(batch):
@@ -274,9 +334,11 @@ def _build_trigger(batch: list[dict], urgent: bool) -> dict:
             channel_ids.append(channel_id)
     bot_payloads = _bot_channel_payloads(batch)
     trusted_payloads = _trusted_bot_channel_payloads(batch)
+    history_text = _chat_history_blocks(batch)
+    formatted = _format_priority_batch(batch)
     trigger = {
         'source': 'collector',
-        'text': _format_priority_batch(batch),
+        'text': f'{history_text}\n{formatted}' if history_text else formatted,
         'payload': {
             'event_count': len(batch),
             'sources': [e['source'] for e in batch],
@@ -287,6 +349,8 @@ def _build_trigger(batch: list[dict], urgent: bool) -> dict:
         '_urgent': urgent,
         '_bot_channel_event': bool(bot_payloads),
         '_trusted_bot_channel_event': bool(bot_payloads) and len(trusted_payloads) == len(bot_payloads),
+        '_viewer_channel_event': has_viewer_only_channel_event(batch),
+        '_channel_message_ids': channel_message_ids(batch),
         '_bot_channel_message_ids': [p['message_id'] for p in bot_payloads
                                      if isinstance(p.get('message_id'), str) and p['message_id']],
     }

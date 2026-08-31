@@ -148,11 +148,30 @@ def _channel_tool_retry_message(trigger_event: dict, round_idx: int, text: str,
     )
 
 
+def _missed_channel_reply_warning(trigger_event: dict, replied_message_ids: set[str]) -> str:
+    """本轮触发涉及的 Channel 消息里，有没有一条都没被 channel_reply 覆盖到。
+
+    只检测「整轮零工具调用」（_channel_tool_retry_message）覆盖不了多人合批的场景：
+    一批里有 A、B 两条消息，模型只回复了 A，日志里看不出 B 被漏了。这里只产出一条
+    告警文本，不强制重试——模型判断"B 这条不需要回复"也是合法结果。
+    """
+    channel_ids = trigger_event.get('_channel_message_ids')
+    if not isinstance(channel_ids, list):
+        return ''
+    missed = [mid for mid in channel_ids if mid not in replied_message_ids]
+    if not missed:
+        return ''
+    return (f'{len(missed)} channel message(s) in this batch got no channel_reply: '
+            f'{json.dumps(missed, ensure_ascii=False)}')
+
+
 _BOT_READ_ONLY_SYSTEM_TOOLS = frozenset({'finish'})
 
 
-def _bot_channel_tool_allowed(name: str) -> bool:
-    """Bot-triggered turns may read state and reply, but may not mutate or actuate."""
+def _restricted_channel_tool_allowed(name: str) -> bool:
+    """Shared allow-list for turns that must not mutate or actuate: untrusted-bot
+    Channel turns, and (see _viewer_channel_restricted) viewer-role human Channel
+    turns. May read state and reply, nothing else."""
     if not name.startswith('mcp__'):
         return name in _BOT_READ_ONLY_SYSTEM_TOOLS
     if name == 'mcp__channel__channel_reply':
@@ -167,6 +186,23 @@ def _bot_channel_restricted(trigger_event: dict) -> bool:
     return bool(trigger_event.get('_bot_channel_event')) and not bool(
         trigger_event.get('_trusted_bot_channel_event')
     )
+
+
+def _viewer_channel_restricted(trigger_event: dict) -> bool:
+    """True when every human Channel message in this turn's batch came from a
+    'viewer' (or role-less) ACL user — no operator/owner present to justify
+    unlocking actuator/processor tools.
+
+    Before this, channel/acl.py's role levels were never enforced anywhere in
+    the dispatch path — `user_role` was only informational text handed to the
+    LLM. Any auto-approved Channel user could ask the model to call any bound
+    tool, actuators included, regardless of their recorded ACL role.
+    """
+    return bool(trigger_event.get('_viewer_channel_event'))
+
+
+def _channel_tool_restricted(trigger_event: dict) -> bool:
+    return _bot_channel_restricted(trigger_event) or _viewer_channel_restricted(trigger_event)
 
 
 def _bot_channel_reply_allowed(args: dict, source_message_ids: set[str]) -> bool:
@@ -822,7 +858,10 @@ class Event:
         from uuid import uuid4
         _turn_t0 = _time.perf_counter()
         bot_restricted = _bot_channel_restricted(trigger_event)
+        viewer_restricted = _viewer_channel_restricted(trigger_event)
+        tool_restricted = bot_restricted or viewer_restricted
         bot_reply_source_ids = set(trigger_event.get('_bot_channel_message_ids', []))
+        replied_message_ids: set[str] = set()
 
         # Reset Python sandbox namespace for this turn
         self._desktop_tools.reset_python_namespace()
@@ -887,14 +926,14 @@ class Event:
         # 合并工具表：系统工具 + 画布上绑定的 MCP 工具（通过 executor connections）
         bound_schemas = self._get_bound_tool_schemas()
         system_tools = list(self._sys_tools.values())
-        if bot_restricted:
+        if tool_restricted:
             system_tools = [
                 tool for tool in system_tools
-                if _bot_channel_tool_allowed(tool['schema']['name'])
+                if _restricted_channel_tool_allowed(tool['schema']['name'])
             ]
             bound_schemas = [
                 schema for schema in bound_schemas
-                if _bot_channel_tool_allowed(schema['name'])
+                if _restricted_channel_tool_allowed(schema['name'])
             ]
         all_tool_list = (
             [{'type': 'function', 'function': t['schema']} for t in system_tools]
@@ -1113,10 +1152,11 @@ class Event:
                     'payload': {'tool': name, 'args': args},
                 })
 
-                if bot_restricted and not _bot_channel_tool_allowed(name):
+                if tool_restricted and not _restricted_channel_tool_allowed(name):
+                    reason = 'an untrusted bot source' if bot_restricted else 'a viewer-role source'
                     result = (
-                        'Error: bot-triggered channel turns cannot call mutating, actuator, '
-                        'processor, or delegated execution tools.'
+                        f'Error: this turn is tool-restricted ({reason}) and cannot call '
+                        'mutating, actuator, processor, or delegated execution tools.'
                     )
                 elif (bot_restricted and name == 'mcp__channel__channel_reply'
                       and not _bot_channel_reply_allowed(args, bot_reply_source_ids)):
@@ -1159,6 +1199,10 @@ class Event:
                             print(f'[acp] interrupt: cancelled pending + fired {_hook_id} (source: {_tool}.{_act})')
                 else:
                     result = f'未知工具: {name}'
+
+                if (name == 'mcp__channel__channel_reply' and args.get('source_message_id')
+                        and isinstance(result, str) and not result.startswith('Error')):
+                    replied_message_ids.add(args['source_message_id'])
 
                 # 性能追踪：记录工具完成
                 _t_after = time.time()
@@ -1284,6 +1328,15 @@ class Event:
 
             round_idx += 1
             total_rounds += 1
+
+        # ── 漏回复检测：这一批触发里有 Channel 消息，但没被任何一次 channel_reply
+        # 覆盖到 —— 之前只检测「整轮零工具调用」，多人合批时漏回复其中一人完全
+        # 无法从日志看出来，这里补一条可见的告警（不强制重试，避免误伤「确实不
+        # 需要回复」的场景）。
+        _missed_warn = _missed_channel_reply_warning(trigger_event, replied_message_ids)
+        if _missed_warn:
+            print(f'[decision] WARNING: {_missed_warn}')
+            await push_event({'type': 'error', 'payload': {'message': f'[decision] {_missed_warn}'}})
 
         # 检查是否需要压缩（保存由 run_forever 的 finally 统一处理）
         await self._maybe_compress()

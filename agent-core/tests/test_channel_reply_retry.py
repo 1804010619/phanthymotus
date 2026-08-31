@@ -1,14 +1,17 @@
 """Channel turns get one retry when the model writes text without a tool call."""
 
 import json
+import os
 import pathlib
 import sys
+import tempfile
 import unittest
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / 'src'))
+os.environ.setdefault('DB_PATH', os.path.join(tempfile.mkdtemp(), 'test.db'))
 
 import collector  # noqa: E402
-from event.llm import _channel_tool_retry_message  # noqa: E402
+from event.llm import _channel_tool_retry_message, _missed_channel_reply_warning  # noqa: E402
 
 
 class ChannelReplyRetryTest(unittest.TestCase):
@@ -62,6 +65,36 @@ class ChannelReplyRetryTest(unittest.TestCase):
         self.assertEqual(trigger['payload']['channel_ids'], ['上海 G1'])
         self.assertIn('上海 G1', retry)
         self.assertNotIn('G1_0123456789', retry)
+
+
+class MissedChannelReplyWarningTest(unittest.TestCase):
+    def test_warns_when_one_of_two_messages_in_a_batch_is_unanswered(self):
+        trigger = {'_channel_message_ids': ['om_a', 'om_b']}
+
+        warning = _missed_channel_reply_warning(trigger, {'om_a'})
+
+        self.assertIn('om_b', warning)
+        self.assertNotIn('om_a', warning)
+
+    def test_no_warning_when_every_message_got_a_reply(self):
+        trigger = {'_channel_message_ids': ['om_a', 'om_b']}
+        self.assertEqual(_missed_channel_reply_warning(trigger, {'om_a', 'om_b'}), '')
+
+    def test_no_warning_without_channel_message_ids(self):
+        self.assertEqual(_missed_channel_reply_warning({}, set()), '')
+        self.assertEqual(
+            _missed_channel_reply_warning({'_channel_message_ids': []}, set()), '')
+
+    def test_build_trigger_exposes_all_channel_message_ids_human_and_bot(self):
+        trigger = collector._build_trigger([
+            {
+                'source': 'dds:/channel/request/feishu_test',
+                'text': json.dumps({'sender_type': 'user', 'message_id': 'om_human'}),
+                'ts': 1,
+            },
+        ], urgent=True)
+
+        self.assertEqual(trigger['_channel_message_ids'], ['om_human'])
 
 
 if __name__ == '__main__':
