@@ -4,6 +4,7 @@
 
 let _overlay, _channelList, _addBtn;
 let _channels = [];
+let _usersPanel, _usersBtn, _usersList;
 
 export function initChannels() {
   _overlay = document.getElementById('channel-overlay');
@@ -11,12 +12,19 @@ export function initChannels() {
 
   _channelList = document.getElementById('channel-list');
   _addBtn = document.getElementById('channel-add-btn');
+  _usersPanel = document.getElementById('channel-users-panel');
+  _usersBtn = document.getElementById('channel-users-btn');
+  _usersList = document.getElementById('channel-users-list');
 
   document.getElementById('btn-channels').addEventListener('click', _open);
   document.getElementById('channel-close').addEventListener('click', _close);
   _overlay.addEventListener('click', (e) => { if (e.target === _overlay) _close(); });
   _addBtn.addEventListener('click', _showAddForm);
   _channelList.addEventListener('click', _handleChannelAction);
+  _usersBtn.addEventListener('click', _toggleUsersPanel);
+  _usersList.addEventListener('click', _handleUserAction);
+  _usersList.addEventListener('change', _handleUserRoleChange);
+  document.getElementById('channel-user-form-add').addEventListener('click', _submitUser);
 }
 
 function _open() {
@@ -415,6 +423,138 @@ async function _channelDelete(id) {
     _loadChannels();
   } catch (e) {
     alert('Delete failed: ' + e.message);
+  }
+}
+
+// ── Users (ACL role management) ─────────────────────────────────────────────
+//
+// Channel messages get auto-registered with channel_settings.default_role
+// (viewer by default). Viewer-triggered turns are now hard-restricted to
+// sensor/resource tools + channel_reply/finish (see event/llm.py
+// _viewer_channel_restricted) — this panel is the only place to promote a
+// specific user to operator/owner, since the backend never did more than
+// carry the role as text before that enforcement existed.
+
+const _ROLE_ORDER = ['owner', 'operator', 'viewer', 'blocked'];
+
+function _toggleUsersPanel() {
+  const hidden = _usersPanel.classList.toggle('hidden');
+  if (!hidden) _loadUsers();
+}
+
+async function _loadUsers() {
+  _usersList.innerHTML = '<div class="channel-empty">Loading...</div>';
+  try {
+    const res = await fetch('/api/channel/users');
+    const json = await res.json();
+    _renderUsers(json.users || []);
+  } catch (e) {
+    _usersList.innerHTML = '<div class="channel-empty">Failed to load users</div>';
+  }
+}
+
+function _renderUsers(users) {
+  if (!users.length) {
+    _usersList.innerHTML = '<div class="channel-empty">No users yet — they auto-register on first message, or add one below.</div>';
+    return;
+  }
+  _usersList.innerHTML = `
+    <div class="channel-users-row channel-users-row-head">
+      <span>Platform</span><span>User ID</span><span>Name</span><span>Role</span><span></span>
+    </div>
+    ${users.map((u) => `
+      <div class="channel-users-row" data-user-platform="${_escAttr(u.platform)}" data-user-id="${_escAttr(u.user_id)}" data-user-name="${_escAttr(u.display_name || '')}">
+        <span>${_esc(u.platform)}</span>
+        <span class="channel-users-id" title="${_escAttr(u.user_id)}">${_esc(u.user_id)}</span>
+        <span>${_esc(u.display_name || '—')}</span>
+        <select data-user-role>
+          ${_ROLE_ORDER.map((r) => `<option value="${r}" ${r === u.role ? 'selected' : ''}>${r}</option>`).join('')}
+        </select>
+        <button class="btn-ghost btn-sm btn-danger" data-user-delete title="Remove user">×</button>
+      </div>
+    `).join('')}`;
+}
+
+async function _handleUserRoleChange(e) {
+  const select = e.target.closest('[data-user-role]');
+  if (!select) return;
+  const row = select.closest('[data-user-platform]');
+  const platform = row.dataset.userPlatform;
+  const userId = row.dataset.userId;
+  const displayName = row.dataset.userName || '';
+  select.disabled = true;
+  try {
+    const res = await fetch('/api/channel/users', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ platform, user_id: userId, display_name: displayName, role: select.value }),
+    });
+    if (!res.ok) {
+      const j = await res.json().catch(() => ({}));
+      alert(j.detail || `Update failed (${res.status})`);
+      _loadUsers();
+      return;
+    }
+  } catch (err) {
+    alert('Update failed: ' + err.message);
+    _loadUsers();
+    return;
+  } finally {
+    select.disabled = false;
+  }
+}
+
+async function _handleUserAction(e) {
+  const btn = e.target.closest?.('[data-user-delete]');
+  if (!btn) return;
+  const row = btn.closest('[data-user-platform]');
+  const platform = row.dataset.userPlatform;
+  const userId = row.dataset.userId;
+  if (!confirm(`Remove user "${userId}" (${platform})? They will auto-register again with the default role on their next message.`)) return;
+  try {
+    const res = await fetch('/api/channel/users', {
+      method: 'DELETE',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ platform, user_id: userId }),
+    });
+    if (!res.ok) {
+      const j = await res.json().catch(() => ({}));
+      alert(j.detail || `Delete failed (${res.status})`);
+    }
+  } catch (err) {
+    alert('Delete failed: ' + err.message);
+  } finally {
+    _loadUsers();
+  }
+}
+
+async function _submitUser() {
+  const platform = document.getElementById('channel-user-form-platform').value;
+  const userId = document.getElementById('channel-user-form-id').value.trim();
+  const displayName = document.getElementById('channel-user-form-name').value.trim();
+  const role = document.getElementById('channel-user-form-role').value;
+  if (!userId) { alert('User ID is required'); return; }
+
+  const btn = document.getElementById('channel-user-form-add');
+  btn.disabled = true;
+  try {
+    const res = await fetch('/api/channel/users', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ platform, user_id: userId, display_name: displayName, role }),
+    });
+    if (!res.ok) {
+      const j = await res.json().catch(() => ({}));
+      alert(j.detail || `Failed to add user (${res.status})`);
+      return;
+    }
+    document.getElementById('channel-user-form-id').value = '';
+    document.getElementById('channel-user-form-name').value = '';
+    _loadUsers();
+  } catch (e) {
+    alert('Error: ' + e.message);
+  } finally {
+    btn.disabled = false;
   }
 }
 

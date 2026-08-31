@@ -6312,6 +6312,75 @@ html, body {
   line-height: 1;
 }
 
+.channel-users-panel {
+  margin-top: 16px;
+  padding-top: 16px;
+  border-top: 1px solid var(--border);
+}
+.channel-users-header {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  margin-bottom: 10px;
+}
+.channel-users-title {
+  font-weight: 600;
+  font-size: 0.9rem;
+}
+.channel-users-hint {
+  font-size: 0.7rem;
+  color: var(--text-muted);
+}
+.channel-users-list {
+  margin-bottom: 12px;
+}
+.channel-users-row {
+  display: grid;
+  grid-template-columns: 0.8fr 1.6fr 1fr 0.8fr 28px;
+  gap: 8px;
+  align-items: center;
+  padding: 6px 4px;
+  border-bottom: 1px solid var(--border);
+  font-size: 0.8rem;
+}
+.channel-users-row-head {
+  color: var(--text-muted);
+  font-size: 0.7rem;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  border-bottom: 1px solid var(--border);
+}
+.channel-users-id {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: var(--font-mono, monospace);
+}
+.channel-users-row select {
+  padding: 4px 6px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg-input, var(--bg-body));
+  color: var(--text);
+  font-size: 0.78rem;
+}
+.channel-users-add-row {
+  display: grid;
+  grid-template-columns: 0.7fr 1.4fr 1fr 0.7fr auto;
+  gap: 8px;
+  align-items: center;
+}
+.channel-users-add-row input,
+.channel-users-add-row select {
+  width: 100%;
+  padding: 6px 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg-input, var(--bg-body));
+  color: var(--text);
+  font-size: 0.8rem;
+}
+
 /* ── Login Screen ───────────────────────────────────────────────────────────── */
 
 .login-screen {
