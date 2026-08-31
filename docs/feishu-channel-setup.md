@@ -14,7 +14,8 @@
 | 接收用户发给机器人的单聊消息 | 读取用户发给机器人的单聊消息 | `im:message.p2p_msg:readonly` | 是 |
 | 接收用户在群里的 @ | 接收群聊中提及机器人的消息 | `im:message.group_at_msg:readonly` | 不使用 Bot @ Bot 时的最小群聊权限 |
 | 接收其他机器人和用户在群里的 @ | 获取群组中其他机器人和用户 @ 当前机器人的消息 | `im:message.group_at_msg.include_bot:readonly` | 使用 Bot @ Bot 时替代上一项 |
-| 收发图片、音频、视频和文件 | 获取与上传图片或文件资源 | `im:resource` | 使用附件时必需 |
+| 下载收到的图片、音频、视频和文件 | 读取消息 | `im:message:readonly` | 使用入站附件时必需 |
+| 上传并发送图片、音频、视频和文件 | 获取与上传图片或文件资源 | `im:resource` | 发送附件时必需 |
 
 `im:message.group_at_msg.include_bot:readonly` 仅适用于企业自建应用。不要申请 `im:message.group_msg.include_bot:read`；本功能只需要收到明确 `@` 当前机器人的消息，不需要读取群内所有消息。
 
@@ -32,10 +33,10 @@
 
 1. 进入 **权限管理 → 批量处理 → 批量导入/导出权限 → 导入**。
 2. 复制权限清单的完整 JSON，粘贴到编辑器中，点击 **格式化 JSON → 下一步，确认新增权限**。飞书当前采用粘贴 JSON，不是上传文件；导入只会新增权限，不会关闭已有权限。
-3. 确认 4 项均为 **应用身份** 权限，然后进入 **版本管理与发布**，创建并发布新版本。
-4. 发布后回到 **批量导入/导出权限 → 导出**，确认 `tenant` 列表包含清单中的 4 个 Scope，`user` 为空。
+3. 确认 5 项均为 **应用身份** 权限，然后进入 **版本管理与发布**，创建并发布新版本。
+4. 发布后回到 **批量导入/导出权限 → 导出**，确认 `tenant` 列表包含清单中的 5 个 Scope，`user` 为空。
 
-只做纯文本且不收发附件时，可从导入内容中删除 `im:resource`；不使用 Bot @ Bot 时，则用权限表中的 `im:message.group_at_msg:readonly` 替换 `im:message.group_at_msg.include_bot:readonly`。
+只做纯文本且不收发附件时，可从导入内容中删除 `im:message:readonly` 和 `im:resource`；不使用 Bot @ Bot 时，则用权限表中的 `im:message.group_at_msg:readonly` 替换 `im:message.group_at_msg.include_bot:readonly`。
 
 ## 2. 在 Agent Core 中添加飞书 Channel
 
@@ -130,7 +131,7 @@ Bot @ Bot 支持 `channel_reply.files` 的现有附件能力：图片和视频�
 2. 向机器人单聊发送：`请只回复：飞书链路测试成功`。
 3. 在 Agent Core Activity 中确认收到来自 `channel:feishu` 的触发事件。
 4. 确认机器人回复 `飞书链路测试成功`。
-5. 若开通了 `im:resource`，再发送一张小图片，确认 Agent 能看到附件并可回复图片或文件。
+5. 若开通了 `im:message:readonly` 和 `im:resource`，再发送一张小图片，确认 Agent 能看到附件并可回复图片或文件。
 
 验收通过需要同时满足：Channel 为 `connected`、Activity 有真实入站事件、Decision Core 实际运行、飞书客户端收到真实回复。只看到容器运行或 WebSocket 连接不算完整收发闭环。
 
@@ -154,7 +155,7 @@ Bot @ Bot 支持 `channel_reply.files` 的现有附件能力：图片和视频�
 |--------------|------|------|
 | `11205: app do not have bot` | 机器人能力未添加，或添加后未发布新版本 | 添加机器人能力并发布版本 |
 | `230006: Bot ability is not activated` | 当前线上版本未启用机器人能力 | 发布包含机器人能力的新版本 |
-| `99991672: Permission denied` | 缺少消息或资源权限，或权限变更尚未发布 | 对照权限表开通并发布；附件失败重点检查 `im:resource` |
+| `99991672: Permission denied` | 缺少消息或资源权限，或权限变更尚未发布 | 对照权限表开通并发布；入站附件下载检查 `im:message:readonly`，出站附件上传检查 `im:resource` |
 | `Invalid topic name` | 旧版 Core 把含中文、空格或连字符的 Channel ID 直接拼入 ROS topic | 升级到已修复版本；升级前可把 Channel 重建为 `shanghai_g1` 这类 ASCII ID |
 | Channel 已连接但消息无反应 | 未订阅 `im.message.receive_v1`，或 Canvas 没有配置 `channel_request` | 检查事件订阅、卡片配置和智能控制状态 |
 | Agent 能收到但不能回复 | `decision_core` 未绑定 `channel_reply`，或尚无会话上下文 | 补执行器连接，并先由用户发送消息 |
