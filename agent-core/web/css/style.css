@@ -6274,6 +6274,43 @@ html, body {
   gap: 8px;
   margin-top: 12px;
 }
+.trusted-bot-header {
+  display: grid;
+  grid-template-columns: 1fr 1fr 1.3fr 1.3fr 28px;
+  gap: 8px;
+  padding: 0 2px;
+  margin-bottom: 4px;
+  font-size: 0.7rem;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+.trusted-bot-row {
+  display: grid;
+  grid-template-columns: 1fr 1fr 1.3fr 1.3fr 28px;
+  gap: 8px;
+  align-items: end;
+  margin-bottom: 8px;
+}
+.trusted-bot-field label {
+  display: none;
+}
+.trusted-bot-row input {
+  width: 100%;
+  padding: 6px 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg-input, var(--bg-body));
+  color: var(--text);
+  font-size: 0.8rem;
+  font-family: var(--font-mono, monospace);
+}
+.trusted-bot-remove {
+  height: 30px;
+  padding: 0;
+  font-size: 1rem;
+  line-height: 1;
+}
 
 /* ── Login Screen ───────────────────────────────────────────────────────────── */
 

@@ -259,35 +259,93 @@ async function _channelSetBotToBot(id, enabled, btn) {
   }
 }
 
+function _trustedBotRowHtml(bot = {}) {
+  return `
+    <div class="trusted-bot-row" data-trusted-bot-row>
+      <div class="trusted-bot-field">
+        <label>Name</label>
+        <input type="text" data-field="name" placeholder="Peer Bot" value="${_escAttr(bot.name || '')}" />
+      </div>
+      <div class="trusted-bot-field">
+        <label>ID</label>
+        <input type="text" data-field="id" placeholder="peer" value="${_escAttr(bot.id || '')}" />
+      </div>
+      <div class="trusted-bot-field">
+        <label>Group chat_id</label>
+        <input type="text" data-field="chat_id" placeholder="oc_..." value="${_escAttr(bot.chat_id || '')}" />
+      </div>
+      <div class="trusted-bot-field">
+        <label>Bot open_id</label>
+        <input type="text" data-field="open_id" placeholder="ou_..." value="${_escAttr(bot.open_id || '')}" />
+      </div>
+      <button class="btn-ghost btn-sm btn-danger trusted-bot-remove" type="button"
+              data-trusted-bot-remove title="Remove this Bot">×</button>
+    </div>`;
+}
+
 function _showTrustedBots(channel, item) {
   document.querySelectorAll('.channel-trusted-form').forEach((el) => el.remove());
+  const bots = channel.trusted_bots || [];
   item.insertAdjacentHTML('beforeend', `
     <div class="channel-add-form channel-trusted-form">
       <div class="channel-form-row">
-        <label>Trusted Bots (JSON)</label>
-        <textarea rows="7" data-trusted-bots-json
-          placeholder='[{"id":"peer","name":"Peer Bot","chat_id":"oc_...","open_id":"ou_..."}]'>${_esc(JSON.stringify(channel.trusted_bots || [], null, 2))}</textarea>
+        <label>Trusted Bots</label>
+        <div class="trusted-bot-header">
+          <span>Name</span><span>ID</span><span>Group chat_id</span><span>Bot open_id</span><span></span>
+        </div>
+        <div data-trusted-bots-rows>${bots.map(_trustedBotRowHtml).join('') || _trustedBotRowHtml()}</div>
+        <button class="btn-ghost btn-sm" type="button" data-trusted-bots-add>+ Add Bot</button>
       </div>
-      <div class="channel-item-error">Trusted Bots have full access to Skills and every Canvas-bound tool. Configure only exact Bot open_id + group chat_id pairs.</div>
+      <div class="channel-item-error">Trusted Bots have full access to Skills and every Canvas-bound tool. Configure only exact Bot open_id + group chat_id pairs — find them in the group's Activity log after the peer bot first @s you, or in Feishu's own bot info API.</div>
       <div class="channel-form-actions">
         <button class="btn-primary" data-trusted-bots-save>Save</button>
         <button class="btn-ghost" data-trusted-bots-cancel>Cancel</button>
       </div>
     </div>`);
   const form = item.querySelector('.channel-trusted-form');
+  const rows = form.querySelector('[data-trusted-bots-rows]');
+  rows.addEventListener('click', (e) => {
+    if (e.target.closest('[data-trusted-bot-remove]')) {
+      e.target.closest('[data-trusted-bot-row]').remove();
+    }
+  });
+  form.querySelector('[data-trusted-bots-add]').addEventListener('click', () => {
+    rows.insertAdjacentHTML('beforeend', _trustedBotRowHtml());
+  });
   form.querySelector('[data-trusted-bots-save]').addEventListener('click', (e) => {
     _saveTrustedBots(channel.id, form, e.currentTarget);
   });
   form.querySelector('[data-trusted-bots-cancel]').addEventListener('click', () => form.remove());
 }
 
+function _readTrustedBotRows(form) {
+  const rows = [...form.querySelectorAll('[data-trusted-bot-row]')];
+  const bots = [];
+  for (const row of rows) {
+    const get = (field) => row.querySelector(`[data-field="${field}"]`).value.trim();
+    const bot = { name: get('name'), id: get('id'), chat_id: get('chat_id'), open_id: get('open_id') };
+    // 空行（用户加了但没填）直接跳过，不当成一条无效配置去校验
+    if (!bot.id && !bot.chat_id && !bot.open_id && !bot.name) continue;
+    if (!/^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/.test(bot.id)) {
+      throw new Error(`"${bot.id || '(empty)'}" 不是合法的 ID（1-64 位字母/数字/_/-，且首字符不能是 - 或 _）`);
+    }
+    if (!/^oc_[A-Za-z0-9]+$/.test(bot.chat_id)) {
+      throw new Error(`Bot "${bot.id}" 的 chat_id 必须是飞书 oc_... 格式的群 ID`);
+    }
+    if (!/^ou_[A-Za-z0-9]+$/.test(bot.open_id)) {
+      throw new Error(`Bot "${bot.id}" 的 open_id 必须是飞书 ou_... 格式的机器人 ID`);
+    }
+    bots.push(bot);
+  }
+  return bots;
+}
+
 async function _saveTrustedBots(id, form, btn) {
   let trustedBots;
   try {
-    trustedBots = JSON.parse(form.querySelector('[data-trusted-bots-json]').value);
-    if (!Array.isArray(trustedBots)) throw new Error('value must be a JSON array');
+    trustedBots = _readTrustedBotRows(form);
   } catch (e) {
-    alert('Invalid Trusted Bots JSON: ' + e.message);
+    alert(e.message);
     return;
   }
   if (trustedBots.length && !confirm(
