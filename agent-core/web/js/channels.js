@@ -4,7 +4,7 @@
 
 let _overlay, _channelList, _addBtn;
 let _channels = [];
-let _usersPanel, _usersBtn, _usersList;
+let _usersList;
 
 export function initChannels() {
   _overlay = document.getElementById('channel-overlay');
@@ -12,8 +12,6 @@ export function initChannels() {
 
   _channelList = document.getElementById('channel-list');
   _addBtn = document.getElementById('channel-add-btn');
-  _usersPanel = document.getElementById('channel-users-panel');
-  _usersBtn = document.getElementById('channel-users-btn');
   _usersList = document.getElementById('channel-users-list');
 
   document.getElementById('btn-channels').addEventListener('click', _open);
@@ -21,7 +19,6 @@ export function initChannels() {
   _overlay.addEventListener('click', (e) => { if (e.target === _overlay) _close(); });
   _addBtn.addEventListener('click', _showAddForm);
   _channelList.addEventListener('click', _handleChannelAction);
-  _usersBtn.addEventListener('click', _toggleUsersPanel);
   _usersList.addEventListener('click', _handleUserAction);
   _usersList.addEventListener('change', _handleUserRoleChange);
   document.getElementById('channel-user-form-add').addEventListener('click', _submitUser);
@@ -30,6 +27,7 @@ export function initChannels() {
 function _open() {
   _overlay.classList.remove('hidden');
   _loadChannels();
+  _loadUsers();
 }
 
 function _close() {
@@ -435,11 +433,6 @@ async function _channelDelete(id) {
 // carry the role as text before that enforcement existed.
 
 const _ROLE_ORDER = ['owner', 'operator', 'viewer', 'blocked'];
-
-function _toggleUsersPanel() {
-  const hidden = _usersPanel.classList.toggle('hidden');
-  if (!hidden) _loadUsers();
-}
 
 async function _loadUsers() {
   _usersList.innerHTML = '<div class="channel-empty">Loading...</div>';

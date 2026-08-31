@@ -6176,6 +6176,7 @@ html, body {
 .channel-toolbar {
   display: flex;
   justify-content: flex-end;
+  gap: 8px;
   margin-bottom: 12px;
 }
 .channel-list {
@@ -6246,6 +6247,12 @@ html, body {
   border-radius: 8px;
   padding: 16px;
   margin-bottom: 12px;
+}
+/* Appended straight after .channel-item-actions with insertAdjacentHTML —
+   .channel-add-form's own margin is margin-bottom only, so without this the
+   button row above sits flush against this box's border. */
+.channel-trusted-form {
+  margin-top: 12px;
 }
 .channel-form-row {
   margin-bottom: 10px;
