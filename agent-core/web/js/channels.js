@@ -269,25 +269,26 @@ async function _channelSetBotToBot(id, enabled, btn) {
 
 function _trustedBotRowHtml(bot = {}) {
   return `
-    <div class="trusted-bot-row" data-trusted-bot-row>
-      <div class="trusted-bot-field">
-        <label>Name</label>
-        <input type="text" data-field="name" placeholder="Peer Bot" value="${_escAttr(bot.name || '')}" />
+    <div class="trusted-bot-card" data-trusted-bot-row>
+      <button class="trusted-bot-remove" type="button" data-trusted-bot-remove title="Remove this Bot">×</button>
+      <div class="trusted-bot-fields">
+        <label class="tb-field">
+          <span>Name</span>
+          <input type="text" data-field="name" placeholder="Peer Bot" value="${_escAttr(bot.name || '')}" />
+        </label>
+        <label class="tb-field">
+          <span>ID</span>
+          <input type="text" data-field="id" placeholder="peer" value="${_escAttr(bot.id || '')}" />
+        </label>
+        <label class="tb-field tb-field-wide">
+          <span>Group chat_id</span>
+          <input type="text" class="mono" data-field="chat_id" placeholder="oc_..." value="${_escAttr(bot.chat_id || '')}" />
+        </label>
+        <label class="tb-field tb-field-wide">
+          <span>Bot open_id</span>
+          <input type="text" class="mono" data-field="open_id" placeholder="ou_..." value="${_escAttr(bot.open_id || '')}" />
+        </label>
       </div>
-      <div class="trusted-bot-field">
-        <label>ID</label>
-        <input type="text" data-field="id" placeholder="peer" value="${_escAttr(bot.id || '')}" />
-      </div>
-      <div class="trusted-bot-field">
-        <label>Group chat_id</label>
-        <input type="text" data-field="chat_id" placeholder="oc_..." value="${_escAttr(bot.chat_id || '')}" />
-      </div>
-      <div class="trusted-bot-field">
-        <label>Bot open_id</label>
-        <input type="text" data-field="open_id" placeholder="ou_..." value="${_escAttr(bot.open_id || '')}" />
-      </div>
-      <button class="btn-ghost btn-sm btn-danger trusted-bot-remove" type="button"
-              data-trusted-bot-remove title="Remove this Bot">×</button>
     </div>`;
 }
 
@@ -298,9 +299,6 @@ function _showTrustedBots(channel, item) {
     <div class="channel-add-form channel-trusted-form">
       <div class="channel-form-row">
         <label>Trusted Bots</label>
-        <div class="trusted-bot-header">
-          <span>Name</span><span>ID</span><span>Group chat_id</span><span>Bot open_id</span><span></span>
-        </div>
         <div data-trusted-bots-rows>${bots.map(_trustedBotRowHtml).join('') || _trustedBotRowHtml()}</div>
         <button class="btn-ghost btn-sm" type="button" data-trusted-bots-add>+ Add Bot</button>
       </div>
@@ -319,6 +317,7 @@ function _showTrustedBots(channel, item) {
   });
   form.querySelector('[data-trusted-bots-add]').addEventListener('click', () => {
     rows.insertAdjacentHTML('beforeend', _trustedBotRowHtml());
+    rows.lastElementChild.querySelector('[data-field="name"]').focus();
   });
   form.querySelector('[data-trusted-bots-save]').addEventListener('click', (e) => {
     _saveTrustedBots(channel.id, form, e.currentTarget);
@@ -458,21 +457,22 @@ function _renderUsers(users) {
     _usersList.innerHTML = '<div class="channel-empty">No users yet — they auto-register on first message, or add one below.</div>';
     return;
   }
-  _usersList.innerHTML = `
-    <div class="channel-users-row channel-users-row-head">
-      <span>Platform</span><span>User ID</span><span>Name</span><span>Role</span><span></span>
-    </div>
-    ${users.map((u) => `
-      <div class="channel-users-row" data-user-platform="${_escAttr(u.platform)}" data-user-id="${_escAttr(u.user_id)}" data-user-name="${_escAttr(u.display_name || '')}">
-        <span>${_esc(u.platform)}</span>
-        <span class="channel-users-id" title="${_escAttr(u.user_id)}">${_esc(u.user_id)}</span>
-        <span>${_esc(u.display_name || '—')}</span>
-        <select data-user-role>
-          ${_ROLE_ORDER.map((r) => `<option value="${r}" ${r === u.role ? 'selected' : ''}>${r}</option>`).join('')}
+  _usersList.innerHTML = users.map((u) => {
+    const hasName = u.display_name && u.display_name !== u.user_id;
+    const identity = hasName
+      ? `<span class="user-name">${_esc(u.display_name)}</span><span class="user-id">${_esc(u.user_id)}</span>`
+      : `<span class="user-name mono">${_esc(u.user_id)}</span>`;
+    return `
+      <div class="user-row" data-user-platform="${_escAttr(u.platform)}" data-user-id="${_escAttr(u.user_id)}" data-user-name="${_escAttr(u.display_name || '')}">
+        <span class="user-role-dot" data-role="${_escAttr(u.role)}" title="${_escAttr(u.role)}"></span>
+        <span class="user-platform-badge">${_esc(u.platform)}</span>
+        <span class="user-identity" title="${_escAttr(u.user_id)}">${identity}</span>
+        <select class="user-role-select" data-user-role>
+          ${_ROLE_ORDER.map((r) => `<option value="${r}" ${r === u.role ? 'selected' : ''}>${r[0].toUpperCase()}${r.slice(1)}</option>`).join('')}
         </select>
-        <button class="btn-ghost btn-sm btn-danger" data-user-delete title="Remove user">×</button>
-      </div>
-    `).join('')}`;
+        <button class="user-remove" data-user-delete title="Remove user">×</button>
+      </div>`;
+  }).join('');
 }
 
 async function _handleUserRoleChange(e) {
