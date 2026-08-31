@@ -366,8 +366,6 @@ class FeishuAdapter(ChannelAdapter):
                 raise ValueError('Cannot @ this Feishu bot itself')
             if not msg.text.strip():
                 raise ValueError('Bot mention requires a concrete text request or result')
-            if files:
-                raise ValueError('Bot mentions currently support text only; files were not sent')
             label = _BOT_REQUEST_LABEL if msg.expect_reply else _BOT_FINAL_LABEL
             wire_text = f'{label}\n<at user_id="{msg.mention_open_id}"></at> {msg.text}'
             if len(wire_text) > _TEXT_CHUNK:
@@ -375,6 +373,52 @@ class FeishuAdapter(ChannelAdapter):
                     f'Bot mention is too long ({len(wire_text)} chars); shorten it below '
                     f'{_TEXT_CHUNK} chars so the @ is delivered in one message'
                 )
+            if files:
+                content = [[
+                    {'tag': 'text', 'text': f'{label}\n'},
+                    {'tag': 'at', 'user_id': msg.mention_open_id},
+                    {'tag': 'text', 'text': f' {msg.text}'},
+                ]]
+                sent_files = []
+                failures = []
+                standalone = []
+                for att in files:
+                    if att.kind not in (KIND_IMAGE, KIND_VIDEO):
+                        standalone.append(att)
+                        continue
+                    try:
+                        if att.kind == KIND_IMAGE:
+                            element = {
+                                'tag': 'img',
+                                'image_key': await self._upload_image(att.path),
+                            }
+                        else:
+                            element = {
+                                'tag': 'media',
+                                'file_key': await self._upload_file(att.path, att.name),
+                            }
+                        content.append([element])
+                        if att.caption:
+                            content.append([{'tag': 'text', 'text': att.caption}])
+                        sent_files.append(att.name or att.path)
+                    except Exception as e:
+                        print(f'[feishu] send attachment failed ({att.name or att.path}): {e}')
+                        failures.append(f'- {att.name or att.path}: {e}')
+
+                await self._send_raw(msg.chat_id, 'post', {
+                    'zh_cn': {'title': '', 'content': content},
+                })
+                sent = ['文本', *sent_files]
+                for att in standalone:
+                    try:
+                        await self._send_attachment(msg.chat_id, att)
+                        sent.append(att.name or att.path)
+                    except Exception as e:
+                        print(f'[feishu] send attachment failed ({att.name or att.path}): {e}')
+                        failures.append(f'- {att.name or att.path}: {e}')
+                if failures:
+                    raise PartialSendError(sent, failures)
+                return
             await self._send_raw(msg.chat_id, 'text', {'text': wire_text})
         elif msg.text:
             for chunk in _chunks(msg.text, _TEXT_CHUNK):
@@ -655,6 +699,13 @@ class FeishuAdapter(ChannelAdapter):
                         if att:
                             attachments.append(att)
                             parts.append('[图片]')
+                    elif tag == 'media':
+                        att = await self._download(message_id, el.get('file_key', ''),
+                                                   'file', KIND_VIDEO,
+                                                   name='media.mp4', fallback_ext='.mp4')
+                        if att:
+                            attachments.append(att)
+                            parts.append('[视频]')
                 parts.append('\n')
             title = content.get('title', '')
             text = (f'{title}\n' if title else '') + ''.join(parts).strip()

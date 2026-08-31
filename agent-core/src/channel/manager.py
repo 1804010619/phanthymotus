@@ -742,8 +742,6 @@ class ChannelManager:
                     )
                 if mention_open_id != ctx.get('user_id'):
                     return 'Error: a bot-triggered reply may only @ the bot that sent the request.'
-            if files:
-                return 'Error: bot mentions currently support text only; no files were sent.'
             if not text.strip():
                 return 'Error: a bot mention requires a concrete text request or result.'
         elif expect_reply:

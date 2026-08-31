@@ -14,7 +14,11 @@ os.environ['DB_PATH'] = os.path.join(tempfile.mkdtemp(), 'test.db')
 
 import config  # noqa: E402
 import mcp_client  # noqa: E402
-from channel.adapter import ChannelAdapter, InboundMessage, OutboundMessage  # noqa: E402
+from channel import media  # noqa: E402
+from channel.adapter import (  # noqa: E402
+    Attachment, ChannelAdapter, InboundMessage, OutboundMessage, PartialSendError,
+    KIND_AUDIO, KIND_FILE, KIND_IMAGE, KIND_VIDEO,
+)
 from channel.adapters.feishu import (  # noqa: E402
     FeishuAdapter,
     _BOT_FINAL_LABEL,
@@ -25,6 +29,8 @@ from channel.manager import ChannelManager  # noqa: E402
 
 
 class DummyAdapter(ChannelAdapter):
+    SUPPORTED_FILE_KINDS = (KIND_IMAGE, KIND_VIDEO, KIND_AUDIO, KIND_FILE)
+
     def __init__(self):
         super().__init__('feishu_test', 'feishu', {}, mock.AsyncMock())
         self.sent = []
@@ -171,6 +177,29 @@ class FeishuAdapterBotEventTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(ok, reason)
         self.assertEqual(self.adapter._bot_open_id, 'ou_from_probe')
 
+    async def test_post_image_and_video_are_parsed_as_attachments(self):
+        self.adapter._download = mock.AsyncMock(side_effect=[
+            Attachment(kind=KIND_IMAGE, path='/tmp/image.jpg', name='image.jpg'),
+            Attachment(kind=KIND_VIDEO, path='/tmp/media.mp4', name='media.mp4'),
+        ])
+        raw = _raw_bot_event()
+        raw['message_type'] = 'post'
+        raw['content'] = json.dumps({
+            'title': '结果',
+            'content': [
+                [{'tag': 'text', 'text': '现场材料'}],
+                [{'tag': 'img', 'image_key': 'img_1'}],
+                [{'tag': 'media', 'file_key': 'file_1'}],
+            ],
+        })
+
+        text, attachments = await self.adapter._parse_content(raw)
+
+        self.assertIn('[图片]', text)
+        self.assertIn('[视频]', text)
+        self.assertEqual([att.kind for att in attachments], [KIND_IMAGE, KIND_VIDEO])
+        self.assertEqual(self.adapter._download.await_args_list[1].args[2], 'file')
+
 
 class FeishuAdapterBotSendTest(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
@@ -222,6 +251,64 @@ class FeishuAdapterBotSendTest(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(ValueError):
                 await self.adapter.send_message(msg)
         self.assertEqual(self.sent, [])
+
+    async def test_mentions_send_inline_media_and_standalone_attachments(self):
+        self.adapter._upload_image = mock.AsyncMock(return_value='img_1')
+        self.adapter._upload_file = mock.AsyncMock(
+            side_effect=['video_1', 'audio_1', 'file_1'],
+        )
+        files = [
+            Attachment(KIND_IMAGE, '/tmp/photo.jpg', 'photo.jpg', caption='照片'),
+            Attachment(KIND_AUDIO, '/tmp/voice.opus', 'voice.opus'),
+            Attachment(KIND_VIDEO, '/tmp/clip.mp4', 'clip.mp4'),
+            Attachment(KIND_FILE, '/tmp/result.pdf', 'result.pdf'),
+        ]
+
+        await self.adapter.send_message(OutboundMessage(
+            chat_id='oc_group', text='面试资料', files=files,
+            mention_open_id='ou_peer', expect_reply=True,
+        ))
+
+        self.assertEqual([item[1] for item in self.sent], ['post', 'audio', 'file'])
+        content = self.sent[0][2]['zh_cn']['content']
+        self.assertEqual([el['tag'] for el in content[0]], ['text', 'at', 'text'])
+        self.assertEqual(content[0][1]['user_id'], 'ou_peer')
+        self.assertEqual(content[1][0], {'tag': 'img', 'image_key': 'img_1'})
+        self.assertEqual(content[2][0], {'tag': 'text', 'text': '照片'})
+        self.assertEqual(content[3][0], {'tag': 'media', 'file_key': 'video_1'})
+
+    async def test_mention_attachment_failure_reports_partial_success(self):
+        self.adapter._upload_image = mock.AsyncMock(side_effect=RuntimeError('bad image'))
+        self.adapter._upload_file = mock.AsyncMock(return_value='file_1')
+
+        with self.assertRaises(PartialSendError) as caught:
+            await self.adapter.send_message(OutboundMessage(
+                chat_id='oc_group', text='面试资料', mention_open_id='ou_peer',
+                files=[
+                    Attachment(KIND_IMAGE, '/tmp/photo.jpg', 'photo.jpg'),
+                    Attachment(KIND_FILE, '/tmp/result.pdf', 'result.pdf'),
+                ],
+            ))
+
+        self.assertEqual([item[1] for item in self.sent], ['post', 'file'])
+        self.assertEqual(caught.exception.sent, ['文本', 'result.pdf'])
+        self.assertIn('photo.jpg', str(caught.exception))
+
+
+class RuntimePathMappingTest(unittest.TestCase):
+    def test_deployed_data_alias_is_narrow_and_rejects_traversal(self):
+        self.assertEqual(
+            media._map_runtime_path('/opt/phanthy-motus/data/photos/a.jpg'),
+            '/work/resource/photos/a.jpg',
+        )
+        self.assertEqual(
+            media._map_runtime_path('/opt/phanthy-motus/database/a.jpg'),
+            '/opt/phanthy-motus/database/a.jpg',
+        )
+        traversal = '/opt/phanthy-motus/data/../secret.txt'
+        self.assertEqual(media._map_runtime_path(traversal), traversal)
+        _, errors = media.resolve_outbound([traversal], 'feishu')
+        self.assertIn('Access denied', errors[0])
 
 
 class InternalChannelReplyDispatchTest(unittest.IsolatedAsyncioTestCase):
@@ -311,6 +398,29 @@ class ChannelManagerBotReplyTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn('unknown or expired', stale)
         self.assertIn('final answer', sent)
         self.assertEqual(len(self.adapter.sent), 1)
+
+    async def test_bot_mention_forwards_all_existing_attachment_kinds(self):
+        self.manager._set_last_context(
+            'feishu_test', 'oc_group', 'ou_peer',
+            message_id='om_request', sender_type='bot', chat_type='group',
+            expect_reply=True,
+        )
+        attachments = [
+            Attachment(KIND_IMAGE, '/tmp/a.jpg', 'a.jpg'),
+            Attachment(KIND_VIDEO, '/tmp/a.mp4', 'a.mp4'),
+            Attachment(KIND_AUDIO, '/tmp/a.opus', 'a.opus'),
+            Attachment(KIND_FILE, '/tmp/a.pdf', 'a.pdf'),
+        ]
+
+        with mock.patch('channel.media.resolve_outbound', return_value=(attachments, [])):
+            result = await self.manager.send_to_channel(
+                'feishu_test', text='请查看附件',
+                files=[att.path for att in attachments],
+                mention_open_id='ou_peer', source_message_id='om_request',
+            )
+
+        self.assertIn('4 file(s)', result)
+        self.assertEqual(self.adapter.sent[0].files, attachments)
 
     async def test_human_reply_routes_by_trigger_message_not_latest_chat(self):
         self.manager._set_last_context(
