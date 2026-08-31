@@ -207,7 +207,7 @@ def get_available_sources() -> list[str]:
     return list(_source_ring.keys())
 
 
-def _bot_channel_payloads(events: list[dict]) -> list[dict]:
+def _channel_payloads(events: list[dict]) -> list[dict]:
     payloads = []
     for ev in events:
         if '/channel/request/' not in str(ev.get('source', '')):
@@ -217,11 +217,16 @@ def _bot_channel_payloads(events: list[dict]) -> list[dict]:
             continue
         try:
             payload = _json.loads(text)
-            if isinstance(payload, dict) and payload.get('sender_type') in ('bot', 'app'):
+            if isinstance(payload, dict):
                 payloads.append(payload)
         except (ValueError, TypeError):
             continue
     return payloads
+
+
+def _bot_channel_payloads(events: list[dict]) -> list[dict]:
+    return [payload for payload in _channel_payloads(events)
+            if payload.get('sender_type') in ('bot', 'app')]
 
 
 def bot_channel_message_ids(events: list[dict]) -> list[str]:
@@ -262,12 +267,21 @@ def _split_by_bot_trust(events: list[dict]) -> list[list[dict]]:
 
 
 def _build_trigger(batch: list[dict], urgent: bool) -> dict:
+    channel_ids = []
+    for payload in _channel_payloads(batch):
+        channel_id = payload.get('channel_id')
+        if isinstance(channel_id, str) and channel_id and channel_id not in channel_ids:
+            channel_ids.append(channel_id)
     bot_payloads = _bot_channel_payloads(batch)
     trusted_payloads = _trusted_bot_channel_payloads(batch)
     trigger = {
         'source': 'collector',
         'text': _format_priority_batch(batch),
-        'payload': {'event_count': len(batch), 'sources': [e['source'] for e in batch]},
+        'payload': {
+            'event_count': len(batch),
+            'sources': [e['source'] for e in batch],
+            'channel_ids': channel_ids,
+        },
         'ts': batch[-1]['ts'],
         '_perf_trigger_emit_ts': time.time(),
         '_urgent': urgent,

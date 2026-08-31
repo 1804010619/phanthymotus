@@ -1,18 +1,23 @@
 """Channel turns get one retry when the model writes text without a tool call."""
 
+import json
 import pathlib
 import sys
 import unittest
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / 'src'))
 
+import collector  # noqa: E402
 from event.llm import _channel_tool_retry_message  # noqa: E402
 
 
 class ChannelReplyRetryTest(unittest.TestCase):
     def setUp(self):
         self.trigger = {
-            'payload': {'sources': ['dds:/channel/request/wlcb_23']},
+            'payload': {
+                'sources': ['dds:/channel/request/wlcb_23'],
+                'channel_ids': ['wlcb_23'],
+            },
         }
 
     def test_retries_only_first_channel_round_with_text(self):
@@ -41,6 +46,22 @@ class ChannelReplyRetryTest(unittest.TestCase):
                 consumed = True
 
         self.assertEqual(retries, 1)
+
+    def test_retry_uses_original_non_ascii_channel_id(self):
+        trigger = collector._build_trigger([{
+            'source': 'dds:/channel/request/G1_0123456789',
+            'text': json.dumps({
+                'channel_id': '上海 G1',
+                'sender_type': 'user',
+            }, ensure_ascii=False),
+            'ts': 1,
+        }], urgent=True)
+
+        retry = _channel_tool_retry_message(trigger, 0, '在的')
+
+        self.assertEqual(trigger['payload']['channel_ids'], ['上海 G1'])
+        self.assertIn('上海 G1', retry)
+        self.assertNotIn('G1_0123456789', retry)
 
 
 if __name__ == '__main__':

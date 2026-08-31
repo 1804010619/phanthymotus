@@ -16,7 +16,6 @@ event/llm.py — 事件驱动的 Agent Loop。
 import asyncio
 import json
 import pathlib
-import re
 import time
 import typing
 
@@ -119,15 +118,16 @@ def _trim(message_list: list[dict], max_messages: int = 100, max_images: int = 5
 def _trigger_channel_ids(trigger_event: dict) -> list[str]:
     """本轮触发事件里涉及的 channel_id 列表（消息平台来源）。
 
-    collector 组装的 trigger 带 payload.sources，形如 ['dds:/channel/request/feishu_r1']
-    （见 collector._emit_batch）。用于判断「这一轮有人在某个渠道等回复」。
+    collector 从原始 Channel 事件 JSON 携带真实 ID；不能从 ROS-safe topic
+    反推，因为中文、空格等字符会被 slug/hash 转换。
     """
-    sources = (trigger_event.get('payload') or {}).get('sources') or []
+    channel_ids = (trigger_event.get('payload') or {}).get('channel_ids')
+    if not isinstance(channel_ids, list):
+        return []
     ids = []
-    for s in sources:
-        m = re.search(r'/channel/request/([^/\s]+)', str(s))
-        if m and m.group(1) not in ids:
-            ids.append(m.group(1))
+    for channel_id in channel_ids:
+        if isinstance(channel_id, str) and channel_id and channel_id not in ids:
+            ids.append(channel_id)
     return ids
 
 
@@ -139,7 +139,8 @@ def _channel_tool_retry_message(trigger_event: dict, round_idx: int, text: str,
         return ''
     return (
         '[system correction]\n'
-        f'This turn came from messaging channel(s): {", ".join(channel_ids)}. '
+        f'This turn came from messaging channel(s): '
+        f'{json.dumps(channel_ids, ensure_ascii=False)}. '
         'You produced reply text but called no tool, so nothing was delivered. '
         'If a reply is warranted, call the bound channel_reply tool now with action="send" '
         'and the reply text. If no reply is warranted, call finish. '
@@ -1233,9 +1234,10 @@ class Event:
                     await push_event({'type': 'llm_retry', 'payload': {
                         'reason': 'channel_reply_tool_missing',
                     }})
-                elif _trigger_channel_ids(trigger_event):
+                elif (channel_ids := _trigger_channel_ids(trigger_event)):
                     warn = (f'[decision] WARNING: channel-triggered turn produced no tool call — '
-                            f'nothing was delivered to {", ".join(_trigger_channel_ids(trigger_event))}. '
+                            f'nothing was delivered to '
+                            f'{json.dumps(channel_ids, ensure_ascii=False)}. '
                             f'content was: {(text or "")[:200]}')
                     print(warn)
                     await push_event({'type': 'error', 'payload': {'message': warn}})
