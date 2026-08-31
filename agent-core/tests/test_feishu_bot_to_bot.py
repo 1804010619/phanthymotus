@@ -294,6 +294,31 @@ class FeishuAdapterBotSendTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(caught.exception.sent, ['文本', 'result.pdf'])
         self.assertIn('photo.jpg', str(caught.exception))
 
+    def test_attachment_failure_log_is_sampled_bounded_and_escaped(self):
+        attachment = Attachment(
+            KIND_IMAGE,
+            '/tmp/photo.jpg',
+            'bad\n' + 'x' * 200,
+        )
+
+        with mock.patch('builtins.print') as printed:
+            for _ in range(100):
+                failure = self.adapter._attachment_failure(
+                    attachment,
+                    RuntimeError('secret\ncontrol'),
+                )
+
+        logs = [str(call.args[0]) for call in printed.call_args_list
+                if 'attachment sends failed' in str(call.args[0])]
+        self.assertEqual(len(logs), 2)
+        self.assertIn('count=1', logs[0])
+        self.assertIn('count=100', logs[1])
+        self.assertIn(r'bad\n', logs[0])
+        self.assertNotIn('\n', logs[0])
+        self.assertNotIn('x' * 129, logs[0])
+        self.assertNotIn('secret', logs[0])
+        self.assertIn(r'secret\ncontrol', failure)
+
 
 class RuntimePathMappingTest(unittest.TestCase):
     def test_deployed_data_alias_is_narrow_and_rejects_traversal(self):

@@ -14,6 +14,8 @@ api/channel.py — Channel 管理 REST API。
 - PUT  /api/channel/settings      — 更新 channel 全局设置
 """
 
+import asyncio
+
 import fastapi
 from pydantic import BaseModel, Field
 
@@ -31,7 +33,7 @@ router = fastapi.APIRouter(prefix='/channel', tags=['channel'])
 # ── Channel CRUD ─────────────────────────────────────────────────────────────
 
 @router.get('/list')
-async def list_channels():
+def list_channels():
     return {'channels': manager.get_status()}
 
 
@@ -51,7 +53,8 @@ async def add_channel(req: AddChannelReq):
     if req.trusted_bots and req.platform != 'feishu':
         raise fastapi.HTTPException(400, 'trusted_bots is only supported by Feishu')
     try:
-        entry = add_channel_config(
+        entry = await asyncio.to_thread(
+            add_channel_config,
             req.id,
             req.platform,
             req.config,
@@ -80,7 +83,7 @@ async def update_channel(channel_id: str, req: UpdateChannelReq):
     updates = {k: v for k, v in req.model_dump().items() if v is not None}
     if not updates:
         raise fastapi.HTTPException(400, 'No fields to update')
-    current = get_channel_config(channel_id)
+    current = await asyncio.to_thread(get_channel_config, channel_id)
     if current is None:
         raise fastapi.HTTPException(404, f'Channel not found: {channel_id}')
     target_platform = updates.get('platform', current['platform'])
@@ -92,7 +95,7 @@ async def update_channel(channel_id: str, req: UpdateChannelReq):
         updates['bot_to_bot_enabled'] = False
         updates['trusted_bots'] = []
     try:
-        result = update_channel_config(channel_id, **updates)
+        result = await asyncio.to_thread(update_channel_config, channel_id, **updates)
     except ValueError as e:
         raise fastapi.HTTPException(400, str(e))
     # 重启 adapter 以应用新配置
@@ -106,32 +109,32 @@ async def delete_channel(channel_id: str):
     if channel_id in manager._adapters:
         await manager._adapters[channel_id].stop()
         del manager._adapters[channel_id]
-    if not delete_channel_config(channel_id):
+    if not await asyncio.to_thread(delete_channel_config, channel_id):
         raise fastapi.HTTPException(404, f'Channel not found: {channel_id}')
     return {'deleted': channel_id}
 
 
 @router.post('/{channel_id}/restart')
 async def restart_channel(channel_id: str):
-    ch = get_channel_config(channel_id)
+    ch = await asyncio.to_thread(get_channel_config, channel_id)
     if ch is None:
         raise fastapi.HTTPException(404, f'Channel not found: {channel_id}')
     # Restart implies "I want this running" — otherwise restart_adapter is a no-op
     # for a previously stopped (disabled) channel.
     if not ch.get('enabled'):
-        update_channel_config(channel_id, enabled=True)
+        await asyncio.to_thread(update_channel_config, channel_id, enabled=True)
     await manager.restart_adapter(channel_id)
     return {'status': 'ok'}
 
 
 @router.post('/{channel_id}/stop')
 async def stop_channel(channel_id: str):
-    ch = get_channel_config(channel_id)
+    ch = await asyncio.to_thread(get_channel_config, channel_id)
     if ch is None:
         raise fastapi.HTTPException(404, f'Channel not found: {channel_id}')
     # Persist the intent: the manager watchdog reconnects any *enabled* channel,
     # so without this a stopped channel would come back within 30s.
-    update_channel_config(channel_id, enabled=False)
+    await asyncio.to_thread(update_channel_config, channel_id, enabled=False)
     if channel_id in manager._adapters:
         await manager._adapters[channel_id].stop()
         del manager._adapters[channel_id]
@@ -143,7 +146,7 @@ async def stop_channel(channel_id: str):
 # ── User Management ──────────────────────────────────────────────────────────
 
 @router.get('/users')
-async def list_users(platform: str = None):
+def list_users(platform: str = None):
     return {'users': acl.list_users(platform)}
 
 
@@ -156,7 +159,7 @@ class UpsertUserReq(BaseModel):
 
 
 @router.post('/users')
-async def upsert_user(req: UpsertUserReq):
+def upsert_user(req: UpsertUserReq):
     try:
         user = acl.upsert_user(req.platform, req.user_id, req.display_name, req.role, req.tool_filter)
     except ValueError as e:
@@ -170,7 +173,7 @@ class DeleteUserReq(BaseModel):
 
 
 @router.delete('/users')
-async def delete_user(req: DeleteUserReq):
+def delete_user(req: DeleteUserReq):
     if not acl.delete_user(req.platform, req.user_id):
         raise fastapi.HTTPException(404, 'User not found')
     return {'deleted': True}
@@ -179,7 +182,7 @@ async def delete_user(req: DeleteUserReq):
 # ── Channel Settings ─────────────────────────────────────────────────────────
 
 @router.get('/settings')
-async def get_settings():
+def get_settings():
     settings = config.main.get('channel_settings', {
         'default_role': 'viewer',
         'auto_approve': True,
@@ -189,6 +192,6 @@ async def get_settings():
 
 
 @router.put('/settings')
-async def update_settings(settings: dict):
+def update_settings(settings: dict):
     config.main['channel_settings'] = settings
     return {'settings': settings}

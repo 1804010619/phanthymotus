@@ -124,6 +124,7 @@ class FeishuAdapter(ChannelAdapter):
         self._seen_ids: list[str] = []
         self._seen_set: set[str] = set()
         self._duplicate_drops = 0
+        self._attachment_send_failures = 0
         self._bot_open_id = ''
         self._missing_bot_id_drops = 0
         self._missing_bot_id_log_ts = 0.0
@@ -340,6 +341,17 @@ class FeishuAdapter(ChannelAdapter):
 
     # ── 发送 ─────────────────────────────────────────────────────────────────
 
+    def _attachment_failure(self, att: Attachment, error: Exception) -> str:
+        """Return a bounded error and sample repeated attachment failure logs."""
+        self._attachment_send_failures += 1
+        identifier = str(att.name or att.path)[:128]
+        error_text = str(error)[:256]
+        if self._attachment_send_failures == 1 or self._attachment_send_failures % 100 == 0:
+            print('[feishu] attachment sends failed: '
+                  f'count={self._attachment_send_failures} latest={identifier!r} '
+                  f'error_type={type(error).__name__}')
+        return f'- {identifier!r}: {error_text!r}'
+
     async def send_message(self, msg: OutboundMessage) -> None:
         """Send text and/or attachments via Feishu Open API."""
         if not self._running:
@@ -402,8 +414,7 @@ class FeishuAdapter(ChannelAdapter):
                             content.append([{'tag': 'text', 'text': att.caption}])
                         sent_files.append(att.name or att.path)
                     except Exception as e:
-                        print(f'[feishu] send attachment failed ({att.name or att.path}): {e}')
-                        failures.append(f'- {att.name or att.path}: {e}')
+                        failures.append(self._attachment_failure(att, e))
 
                 await self._send_raw(msg.chat_id, 'post', {
                     'zh_cn': {'title': '', 'content': content},
@@ -414,8 +425,7 @@ class FeishuAdapter(ChannelAdapter):
                         await self._send_attachment(msg.chat_id, att)
                         sent.append(att.name or att.path)
                     except Exception as e:
-                        print(f'[feishu] send attachment failed ({att.name or att.path}): {e}')
-                        failures.append(f'- {att.name or att.path}: {e}')
+                        failures.append(self._attachment_failure(att, e))
                 if failures:
                     raise PartialSendError(sent, failures)
                 return
@@ -435,8 +445,7 @@ class FeishuAdapter(ChannelAdapter):
                 await self._send_attachment(msg.chat_id, att)
                 sent.append(att.name or att.path)
             except Exception as e:
-                print(f'[feishu] send attachment failed ({att.name or att.path}): {e}')
-                failures.append(f'- {att.name or att.path}: {e}')
+                failures.append(self._attachment_failure(att, e))
         if failures:
             raise PartialSendError(sent, failures)
 
