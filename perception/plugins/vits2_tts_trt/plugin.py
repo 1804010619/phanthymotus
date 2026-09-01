@@ -121,8 +121,10 @@ def _error_chain(error: BaseException) -> str:
 
     The interesting part is usually the cause, not the wrapper: "TensorRT is not
     available in this runtime" says nothing, while
-    "... : libnvdla_compiler.so: file too short" points straight at a container
-    started without the nvidia runtime.
+    "... : libnvdla_compiler.so: cannot open shared object file" narrows it to two
+    container-level causes — no `runtime: nvidia` (see deploy/service.yml), or a
+    host BSP missing nvidia-l4t-dla-compiler. The image's dla-fallback covers the
+    second, so in practice this error now means the first.
     """
     parts = []
     seen = set()
