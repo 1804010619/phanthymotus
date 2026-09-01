@@ -14,12 +14,22 @@ LOG_PATH = pathlib.Path('./resource/log')
 
 
 async def _log_request(request: httpx.Request):
-    """httpx event hook: dump the real HTTP request body to disk for debugging."""
-    if request.content:
+    """httpx event hook: dump the real HTTP request body to disk for debugging.
+
+    这个钩子在请求发出前执行，任何异常都会中断发送；而 openai SDK 把非超时异常
+    一律包成 APIConnectionError('Connection error.')，于是一个写文件失败会伪装成
+    「网络不通」并触发三次重试。所以这里既要保证文件名合法（模型名可能带厂商前缀
+    的斜杠，如 zai-org/glm-5.2），也要整体吞掉异常——调试日志不该拖垮真实请求。
+    """
+    try:
+        if not request.content:
+            return
         body = json.loads(request.content)
-        model = body.get('model', 'unknown')
+        model = str(body.get('model', 'unknown')).replace('/', '_')
         path = LOG_PATH / f'llm_request_{model}.json'
         path.write_text(json.dumps(body, ensure_ascii=False, indent=2))
+    except Exception as e:
+        print(f'[llm] request log failed (ignored): {type(e).__name__}: {e}')
 
 
 # ── 错误分类 ──────────────────────────────────────────────────────────────────
