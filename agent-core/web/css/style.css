@@ -7503,6 +7503,29 @@ html, body {
   font-size: 11px;
   cursor: pointer;
 }
+.account-token-card {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+.account-token-value {
+  flex: 1;
+  min-width: 0;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.account-token-actions {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-shrink: 0;
+}
+.account-token-reset { color: var(--red); }
 
 .account-form {
   display: flex;
