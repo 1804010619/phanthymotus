@@ -6,6 +6,7 @@ network.py — 网络配置管理（WiFi 扫描/连接/断开，接口状态）�
 """
 
 import asyncio
+import socket
 import sys
 import urllib.parse
 import zlib
@@ -348,13 +349,13 @@ def _policy_route_table_for(device: str) -> int:
     return 200 + (zlib.crc32(device.encode()) % 50)
 
 
-def _subnet_cidr(ip: str, prefix: int) -> str:
-    """Network address (not host address) for `ip`/`prefix`, e.g. 10.100.129.141/19 -> 10.100.128.0/19."""
+def _subnet_network(ip: str, prefix: int) -> str:
+    """Network address (not host address) for `ip`/`prefix`, e.g. 10.100.129.141/19 -> 10.100.128.0."""
     a, b, c, d = (int(p) for p in ip.split('.'))
     ip_int = (a << 24) | (b << 16) | (c << 8) | d
     mask = (0xFFFFFFFF << (32 - prefix)) & 0xFFFFFFFF if prefix else 0
     network = ip_int & mask
-    return f'{(network >> 24) & 0xFF}.{(network >> 16) & 0xFF}.{(network >> 8) & 0xFF}.{network & 0xFF}/{prefix}'
+    return f'{(network >> 24) & 0xFF}.{(network >> 16) & 0xFF}.{(network >> 8) & 0xFF}.{network & 0xFF}'
 
 
 def _find_device_path_sync(bus, device: str) -> str | None:
@@ -406,13 +407,24 @@ def _set_policy_route_sync(device: str, enable: bool):
         addresses = _get_all_props(bus, ip4_path, NM_IP4_IFACE).get('AddressData', [])
         if not addresses:
             raise RuntimeError(f'设备 "{device}" 当前没有 IP 地址')
-        subnet = _subnet_cidr(str(addresses[0].get('address', '')), int(addresses[0].get('prefix', 32)))
+        prefix = int(addresses[0].get('prefix', 32))
+        network = _subnet_network(str(addresses[0].get('address', '')), prefix)
         ipv4['route-table'] = dbus.UInt32(table)
-        ipv4['routing-rules'] = dbus.Array(
-            [f'priority {table} from {subnet} table {table}'], signature='s')
+        # Wire format is aa{sv}, not a plain string list — confirmed by round-tripping
+        # a rule set via `nmcli ... +ipv4.routing-rules "priority ... from ... table ..."`
+        # through GetSettings() and inspecting the actual dbus.Dictionary it produced.
+        ipv4['routing-rules'] = dbus.Array([
+            dbus.Dictionary({
+                'family': dbus.Int32(socket.AF_INET),
+                'priority': dbus.UInt32(table),
+                'from': dbus.String(network),
+                'from-len': dbus.Byte(prefix),
+                'table': dbus.UInt32(table),
+            }, signature='sv'),
+        ], signature='a{sv}')
     else:
         ipv4['route-table'] = dbus.UInt32(0)
-        ipv4['routing-rules'] = dbus.Array([], signature='s')
+        ipv4['routing-rules'] = dbus.Array([], signature='a{sv}')
 
     conn_iface.Update(settings)
 
