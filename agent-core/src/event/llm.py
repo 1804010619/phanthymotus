@@ -79,6 +79,36 @@ def _build_system_tools(named_functions: list[tuple[str, callable]]) -> dict:
 
 # ── History helpers ────────────────────────────────────────────────────────────
 
+def _scrub(message_list: list[dict]) -> list[dict]:
+    """丢弃结构非法的 tool_call，以及随之失去归属的 tool 结果。
+
+    glm 偶发在正常 tool_call 后追加一条 id/name 均为空串的条目。它一旦落盘，
+    历史续跑会把它一路带回去，之后每次请求都被服务端 400
+    （messages[N].tool_calls[M].function missing required field "name"），
+    直到那一轮从 tier1/tier2 里滚出去为止——表现就是「这台机器总是报错」。
+    """
+    from client.llm import _valid_tool_call
+    orphaned: set = set()
+    out: list[dict] = []
+    for msg in message_list:
+        if msg.get('role') == 'assistant' and msg.get('tool_calls'):
+            good = [tc for tc in msg['tool_calls'] if _valid_tool_call(tc)]
+            if len(good) != len(msg['tool_calls']):
+                orphaned.update(
+                    tc.get('id') for tc in msg['tool_calls']
+                    if isinstance(tc, dict) and not _valid_tool_call(tc)
+                )
+                msg = {k: v for k, v in msg.items() if k != 'tool_calls'}
+                if good:
+                    msg['tool_calls'] = good
+                elif not msg.get('content'):
+                    continue  # 既无文本也无有效调用，整条丢掉
+        elif msg.get('role') == 'tool' and msg.get('tool_call_id') in orphaned:
+            continue
+        out.append(msg)
+    return out
+
+
 def _sanitize(message_list: list[dict]) -> list[dict]:
     """移除末尾未被 tool 结果回应的 tool_calls（避免 API 报错）。"""
     responded_ids: set[str] = set()
@@ -818,7 +848,7 @@ class Event:
             history.extend(_degrade_turn(turn))
         for turn in recent:
             history.extend(turn)
-        return _sanitize(history)
+        return _sanitize(_scrub(history))
 
     async def _maybe_compress(self):
         """检查历史是否需要压缩（基于轮数或字符数），压缩旧轮次为 rolling summary。"""
@@ -983,7 +1013,7 @@ class Event:
             # ── 构建分层 prompt ────────────────────────────────────────────
             history = [] if bot_restricted else self._build_history()
             # 本轮已产生的消息也要加入历史（多轮工具调用场景）
-            current_history = history + _sanitize(turn_messages)
+            current_history = history + _sanitize(_scrub(turn_messages))
 
             if round_idx == 0:
                 # 首轮：加入 L4 触发事件（含 L2 动态快照）
@@ -1055,7 +1085,7 @@ class Event:
                         self._turns = self._turns[-2:]
                         # 重建 history 并重试（复用冻结的 system）
                         history = self._build_history()
-                        current_history = history + _sanitize(turn_messages)
+                        current_history = history + _sanitize(_scrub(turn_messages))
                         messages = prompt_mod.build(
                             system_msg    = frozen_system,
                             message_list  = current_history,
