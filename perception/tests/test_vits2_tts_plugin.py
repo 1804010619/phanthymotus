@@ -407,7 +407,10 @@ def test_load_error_keeps_the_underlying_cause(monkeypatch):
 
     def explode(model_dir, family=None):
         try:
-            raise ImportError("libnvdla_compiler.so: file too short")
+            raise ImportError(
+                "libnvdla_compiler.so: cannot open shared object file: "
+                "No such file or directory"
+            )
         except ImportError as cause:
             raise RuntimeError("TensorRT is not available in this runtime") from cause
 
