@@ -105,6 +105,9 @@ if ${PUSH_ENABLED} && [ -n "${RESOURCE_CENTER_API_KEY:-}" ]; then
     fi
     if [[ ! "${SYNC_CONFIRM}" =~ ^[Nn] ]]; then
         echo "Registering image to resource-center (${RESOURCE_CENTER_URL})..."
+        # cards 目前为空：actucore/plugins/ 还没有任何已注册的卡片（见
+        # actucore/main.py 的卡片注册区注释和 actucore/README.md）。第一个卡片落地时
+        # 把它加进这个数组，不要漏掉。
         HTTP_STATUS=$(curl -s -o /tmp/rc_register_resp.json -w "%{http_code}" \
             -X POST "${RESOURCE_CENTER_URL}/api/admin/register" \
             -H "Content-Type: application/json" \
@@ -118,7 +121,8 @@ if ${PUSH_ENABLED} && [ -n "${RESOURCE_CENTER_API_KEY:-}" ]; then
                 \"cpu_arch\": \"${CPU_ARCH}\",
                 \"name\": \"ActuCore\",
                 \"port\": 15730,
-                \"description\": \"执行模型层 — VLA 策略 / 导航 / 抓取 / locomotion / 全身控制，以 processor 卡片接入\"
+                \"description\": \"执行模型层 — VLA 策略 / 导航 / 抓取 / locomotion / 全身控制，以 processor 卡片接入\",
+                \"cards\": []
             }")
 
         if [ "${HTTP_STATUS}" = "200" ] || [ "${HTTP_STATUS}" = "201" ]; then
