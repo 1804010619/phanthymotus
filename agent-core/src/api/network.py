@@ -8,6 +8,7 @@ network.py — 网络配置管理（WiFi 扫描/连接/断开，接口状态）�
 import asyncio
 import sys
 import urllib.parse
+import zlib
 
 import fastapi
 from pydantic import BaseModel
@@ -105,6 +106,14 @@ def _get_all_props(bus, obj_path, iface):
     return props.GetAll(iface)
 
 
+def _get_connection_settings(bus, settings_path: str) -> dict:
+    """GetSettings() of a Settings.Connection object, as a plain dict."""
+    import dbus
+    conn_obj = bus.get_object(NM_IFACE, settings_path)
+    conn_iface = dbus.Interface(conn_obj, NM_CONN_IFACE)
+    return conn_iface.GetSettings()
+
+
 def _bytes_to_ssid(ssid_bytes) -> str:
     """Convert dbus byte array to string."""
     return bytes(ssid_bytes).decode('utf-8', errors='replace')
@@ -135,11 +144,23 @@ def _get_devices_sync() -> list[dict]:
 
         # Get active connection name
         connection_name = ''
+        settings_path = ''
         active_conn_path = str(props.get('ActiveConnection', ''))
         if active_conn_path and active_conn_path != '/':
             try:
                 conn_props = _get_all_props(bus, active_conn_path, NM_ACTIVE_IFACE)
                 connection_name = str(conn_props.get('Id', ''))
+                settings_path = str(conn_props.get('Connection', ''))
+            except Exception:
+                pass
+
+        # Policy routing (ipv4.route-table) — whether replies from this device
+        # are forced back out the same device instead of the lowest-metric default route
+        route_table = 0
+        if settings_path and settings_path != '/':
+            try:
+                route_table = int(_get_connection_settings(bus, settings_path)
+                                   .get('ipv4', {}).get('route-table', 0))
             except Exception:
                 pass
 
@@ -172,6 +193,7 @@ def _get_devices_sync() -> list[dict]:
             'ip': ip,
             'mask': mask,
             'gateway': gateway,
+            'policy_route': route_table != 0,
         })
     return results
 
@@ -319,6 +341,88 @@ def _disconnect_wifi_sync():
     nm_iface.DeactivateConnection(
         _get_prop(bus, wifi_path, NM_DEVICE_IFACE, 'ActiveConnection')
     )
+
+
+def _policy_route_table_for(device: str) -> int:
+    """Deterministic private routing table number for a device (200-249)."""
+    return 200 + (zlib.crc32(device.encode()) % 50)
+
+
+def _subnet_cidr(ip: str, prefix: int) -> str:
+    """Network address (not host address) for `ip`/`prefix`, e.g. 10.100.129.141/19 -> 10.100.128.0/19."""
+    a, b, c, d = (int(p) for p in ip.split('.'))
+    ip_int = (a << 24) | (b << 16) | (c << 8) | d
+    mask = (0xFFFFFFFF << (32 - prefix)) & 0xFFFFFFFF if prefix else 0
+    network = ip_int & mask
+    return f'{(network >> 24) & 0xFF}.{(network >> 16) & 0xFF}.{(network >> 8) & 0xFF}.{network & 0xFF}/{prefix}'
+
+
+def _find_device_path_sync(bus, device: str) -> str | None:
+    devices_paths = _get_prop(bus, NM_PATH, NM_IFACE, 'Devices')
+    for dev_path in devices_paths:
+        if str(_get_prop(bus, dev_path, NM_DEVICE_IFACE, 'Interface')) == device:
+            return str(dev_path)
+    return None
+
+
+def _set_policy_route_sync(device: str, enable: bool):
+    """Enable/disable policy routing on a device's active connection so replies
+    to addresses outside its own subnet are still sent back out through it,
+    instead of following another interface's lower-metric default route
+    (asymmetric routing on multi-homed hosts).
+
+    `ipv4.route-table` alone only moves the connection's routes into a private
+    table — confirmed against a live multi-homed host that it does NOT also
+    install the matching `ip rule`. The rule has to be added explicitly via
+    `ipv4.routing-rules`. It's keyed on the device's current *subnet* rather
+    than its exact address so it keeps working across a DHCP renewal that
+    hands out a different address in the same subnet (the common case); a
+    renewal into a different subnet requires re-toggling this setting.
+
+    Applying either property requires a full deactivate+reactivate (not
+    Device.Reapply) to take effect, which briefly drops the device's link."""
+    import dbus
+    import time
+    bus = _get_bus()
+    dev_path = _find_device_path_sync(bus, device)
+    if not dev_path:
+        raise RuntimeError(f'未找到设备 "{device}"')
+
+    active_conn_path = str(_get_prop(bus, dev_path, NM_DEVICE_IFACE, 'ActiveConnection'))
+    if not active_conn_path or active_conn_path == '/':
+        raise RuntimeError(f'设备 "{device}" 当前未连接')
+    settings_path = str(_get_prop(bus, active_conn_path, NM_ACTIVE_IFACE, 'Connection'))
+
+    table = _policy_route_table_for(device)
+    conn_obj = bus.get_object(NM_IFACE, settings_path)
+    conn_iface = dbus.Interface(conn_obj, NM_CONN_IFACE)
+    settings = conn_iface.GetSettings()
+    ipv4 = settings.setdefault('ipv4', dbus.Dictionary({}, signature='sv'))
+
+    if enable:
+        ip4_path = str(_get_prop(bus, dev_path, NM_DEVICE_IFACE, 'Ip4Config'))
+        if not ip4_path or ip4_path == '/':
+            raise RuntimeError(f'设备 "{device}" 当前没有 IP 地址')
+        addresses = _get_all_props(bus, ip4_path, NM_IP4_IFACE).get('AddressData', [])
+        if not addresses:
+            raise RuntimeError(f'设备 "{device}" 当前没有 IP 地址')
+        subnet = _subnet_cidr(str(addresses[0].get('address', '')), int(addresses[0].get('prefix', 32)))
+        ipv4['route-table'] = dbus.UInt32(table)
+        ipv4['routing-rules'] = dbus.Array(
+            [f'priority {table} from {subnet} table {table}'], signature='s')
+    else:
+        ipv4['route-table'] = dbus.UInt32(0)
+        ipv4['routing-rules'] = dbus.Array([], signature='s')
+
+    conn_iface.Update(settings)
+
+    nm_obj = bus.get_object(NM_IFACE, NM_PATH)
+    nm_iface = dbus.Interface(nm_obj, NM_IFACE)
+    nm_iface.DeactivateConnection(dbus.ObjectPath(active_conn_path))
+    time.sleep(1)
+    nm_iface.ActivateConnection(
+        dbus.ObjectPath(settings_path), dbus.ObjectPath(dev_path), dbus.ObjectPath('/'))
+
 
 
 def _get_saved_wifi_sync() -> list[dict]:
@@ -500,3 +604,19 @@ async def wifi_forget(name: str):
     # 同时从数据库删除
     _remove_wifi_entry(name)
     return {'code': 200, 'data': {'success': True, 'message': f'已删除 {name}'}}
+
+
+class PolicyRouteRequest(BaseModel):
+    device: str
+    enable: bool
+
+
+@router.post('/policy-route')
+async def set_policy_route(req: PolicyRouteRequest):
+    """开启/关闭指定接口的策略路由（防止多网卡时回包走了错误的默认路由）。"""
+    try:
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, _set_policy_route_sync, req.device, req.enable)
+        return {'code': 200, 'data': {'success': True}}
+    except Exception as e:
+        return {'code': 500, 'data': {'error': str(e), 'success': False}}
