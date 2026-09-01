@@ -167,13 +167,23 @@ def _missed_channel_reply_warning(trigger_event: dict, replied_message_ids: set[
 
 _BOT_READ_ONLY_SYSTEM_TOOLS = frozenset({'finish'})
 
+# viewer 是已注册的合法 ACL 用户（不是可以随便伪造身份的群里 Bot），"只读" 的定义
+# 可以松一档：纯信息检索、没有副作用的系统工具（联网搜索、历史/记忆检索、原始输入
+# 查询）都算读，不算 mutate。Bot 门禁维持只给 finish，因为群里任何人都能顶一个
+# Bot 身份，是更弱的信任边界。
+_VIEWER_READ_ONLY_SYSTEM_TOOLS = _BOT_READ_ONLY_SYSTEM_TOOLS | frozenset({
+    'WebSearch', 'search_history', 'memory_recall', 'raw_input_info',
+})
 
-def _restricted_channel_tool_allowed(name: str) -> bool:
+
+def _restricted_channel_tool_allowed(name: str, *, bot_restricted: bool = True) -> bool:
     """Shared allow-list for turns that must not mutate or actuate: untrusted-bot
     Channel turns, and (see _viewer_channel_restricted) viewer-role human Channel
-    turns. May read state and reply, nothing else."""
+    turns. May read state and reply, nothing else — viewer additionally gets the
+    read-only system tools (search, history/memory recall)."""
     if not name.startswith('mcp__'):
-        return name in _BOT_READ_ONLY_SYSTEM_TOOLS
+        allowed = _BOT_READ_ONLY_SYSTEM_TOOLS if bot_restricted else _VIEWER_READ_ONLY_SYSTEM_TOOLS
+        return name in allowed
     if name == 'mcp__channel__channel_reply':
         return True
     parts = name.split('__')
@@ -929,11 +939,11 @@ class Event:
         if tool_restricted:
             system_tools = [
                 tool for tool in system_tools
-                if _restricted_channel_tool_allowed(tool['schema']['name'])
+                if _restricted_channel_tool_allowed(tool['schema']['name'], bot_restricted=bot_restricted)
             ]
             bound_schemas = [
                 schema for schema in bound_schemas
-                if _restricted_channel_tool_allowed(schema['name'])
+                if _restricted_channel_tool_allowed(schema['name'], bot_restricted=bot_restricted)
             ]
         all_tool_list = (
             [{'type': 'function', 'function': t['schema']} for t in system_tools]
@@ -1152,7 +1162,7 @@ class Event:
                     'payload': {'tool': name, 'args': args},
                 })
 
-                if tool_restricted and not _restricted_channel_tool_allowed(name):
+                if tool_restricted and not _restricted_channel_tool_allowed(name, bot_restricted=bot_restricted):
                     reason = 'an untrusted bot source' if bot_restricted else 'a viewer-role source'
                     result = (
                         f'Error: this turn is tool-restricted ({reason}) and cannot call '
