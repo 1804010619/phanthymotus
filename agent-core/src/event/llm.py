@@ -195,6 +195,38 @@ def _missed_channel_reply_warning(trigger_event: dict, replied_message_ids: set[
             f'{json.dumps(missed, ensure_ascii=False)}')
 
 
+def _acp_barrier_log(name: str, acp_result: dict | None) -> None:
+    """记录 barrier 结果。timeout 与 completed 走同一条路（都清 pending 并放行），
+    所以不打这一行的话，一次静默超时看起来跟成功完全一样 —— ACP 回调发不出去
+    （自签证书、AGENT_CORE_URL 配错）时无从归因。"""
+    if not isinstance(acp_result, dict):
+        return
+    status = acp_result.get('status')
+    if status in ('timeout', 'cancelled'):
+        actions = acp_result.get('actions')
+        detail = f": {actions}" if actions else ''
+        print(f"[acp] barrier {status} before {name}{detail}")
+
+
+# finish 结束 turn 前必须等 pending 动作完成，否则 speak → finish 会在音频播完前
+# 结束本轮 —— 讲解被截断。其余系统工具不挡：task_update 等应能在播放期间调用，
+# 否则每站都要多等一整段音频。
+_ACP_BARRIER_SYSTEM_TOOLS = frozenset({'finish'})
+
+
+def _sys_tool_needs_barrier(name: str) -> bool:
+    return name in _ACP_BARRIER_SYSTEM_TOOLS
+
+
+async def _acp_barrier(name: str, cancel_event) -> dict | None:
+    """有 pending ACP 动作时等待其完成，并记录非正常结果。无 pending 则直接返回。"""
+    if not mcp_client.get_pending_actions():
+        return None
+    result = await mcp_client.await_pending(cancel_event, timeout=120)
+    _acp_barrier_log(name, result)
+    return result
+
+
 _BOT_READ_ONLY_SYSTEM_TOOLS = frozenset({'finish'})
 
 # viewer 是已注册的合法 ACL 用户（不是可以随便伪造身份的群里 Bot），"只读" 的定义
@@ -1205,11 +1237,14 @@ class Event:
                         'and cannot send files.'
                     )
                 elif name in self._sys_tools:
+                    # ACP barrier: finish 之前等音频播完（见 _ACP_BARRIER_SYSTEM_TOOLS）
+                    if _sys_tool_needs_barrier(name):
+                        await _acp_barrier(name, cancel_event)
                     result = await self._sys_tools[name]['object'](**args)
                 elif name.startswith('mcp__'):
                     # ACP barrier: 有 pending 时，非 sensor/resource 工具等待所有 pending 完成
-                    if mcp_client.get_pending_actions() and _needs_barrier(name, args):
-                        await mcp_client.await_pending(cancel_event, timeout=120)
+                    if _needs_barrier(name, args):
+                        await _acp_barrier(name, cancel_event)
                     args['_trace_id'] = _trace_id
                     args['_cancel_event'] = cancel_event
                     # Inject instance_id from canvas binding (multiInstance tools need it)
