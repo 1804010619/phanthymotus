@@ -234,6 +234,13 @@ def _run(args, cfg, groups, transport, resume_dir, meta) -> int:
             print(f'\n以下组预检失败: {", ".join(broken)}')
             print('继续跑会在这些组上浪费全部请求。')
             if not args.yes:
+                # 后台跑（docker exec -d / nohup）时 stdin 是关的，问不出来。
+                # 默认取「不继续」——白跑一轮几十分钟和真金白银，比多打一个
+                # 参数贵得多。但必须说清为什么停了，否则看起来像是启动就没动。
+                if not sys.stdin.isatty():
+                    print('当前是非交互环境（后台运行），无法询问 —— 已中止。')
+                    print('确认要带着失败的组继续，请加 --yes。')
+                    return 2
                 try:
                     ans = input('仍要继续吗？[y/N] ').strip().lower()
                 except EOFError:

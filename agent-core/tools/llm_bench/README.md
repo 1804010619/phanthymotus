@@ -43,6 +43,24 @@ docker exec phanthy-motus-agent-core-1 tail -f /tmp/bench.log
 
 `-e DB_PATH=` 只有用 `include_current` 时才需要。用 `/work/.venv/bin/python` 是为了走 httpx（连接复用，更贴近生产）；系统 `python3` 也能跑，自动退回 urllib。
 
+### 命令行 vs YAML
+
+**所有测量参数在 `bench.yaml` 里都有**，命令行只是「不改配置文件临时试一下」用的覆盖：
+
+| 命令行 | YAML |
+|---|---|
+| `--count` | `corpus.count` |
+| `--repeats` / `--warmup` | `run.repeats` / `run.warmup` |
+| `--sampling` | `corpus.sampling` |
+| `--corpus` | `corpus.dir` |
+| `--max-tokens` / `--timeout` | `request.max_tokens` / `request.timeout_s` |
+| `--include-current` / `--no-include-current` | `include_current` |
+| `--yes` | 无 |
+
+所以日常跑不用带参数，配置写好就行。`--count 3` 这种适合快速验证，`--no-include-current` 适合只比候选。
+
+`--yes` 是唯一没有 YAML 对应的，因为它不是测量参数：**只在预检失败时才起作用**（预检通过时它什么都不做）。后台跑（`docker exec -d`）时 stdin 是关的问不出来，默认取「不继续」并说明原因——白跑一轮几十分钟和真金白银，比多打一个参数贵得多。确认要带着失败的组继续，才需要 `--yes`。
+
 **总请求数 = `count × 组数 × (warmup + repeats)`**，启动时会打印出来，看一眼再决定要不要跑。
 
 输出在 `resource/llm_bench/<时间戳>/`，宿主机上是 `/opt/phanthy-motus/data/llm_bench/<时间戳>/`，可以直接 `cat`，不用进容器：

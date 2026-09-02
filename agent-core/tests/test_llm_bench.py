@@ -205,6 +205,43 @@ groups:
     assert [g.name for g in groups] == ['g']
 
 
+def test_cli_overrides_only_apply_when_given(tmp_path):
+    """命令行不给的项必须沿用 YAML，不能被 None 覆盖成空。
+
+    这是「所有参数 YAML 里都有、命令行只是临时覆盖」的前提。
+    """
+    body = """
+corpus: {count: 50, sampling: recent}
+run: {repeats: 3, warmup: 2}
+request: {max_tokens: 4096}
+groups:
+  - {name: g, url: https://u/v1, key: sk-x, model: m}
+"""
+    # 全部不指定
+    cfg = cfgmod.load(_yaml(tmp_path, body), {
+        'corpus': {'count': None, 'sampling': None},
+        'run': {'repeats': None, 'warmup': None},
+        'request': {'max_tokens': None},
+        'include_current': None,
+    })
+    assert cfg['corpus']['count'] == 50
+    assert cfg['corpus']['sampling'] == 'recent'
+    assert cfg['run']['repeats'] == 3
+    assert cfg['run']['warmup'] == 2
+    assert cfg['request']['max_tokens'] == 4096
+
+    # 指定的才覆盖
+    cfg2 = cfgmod.load(_yaml(tmp_path, body), {
+        'corpus': {'count': 3, 'sampling': None},
+        'run': {'repeats': None, 'warmup': 0},
+        'request': {'max_tokens': None},
+    })
+    assert cfg2['corpus']['count'] == 3
+    assert cfg2['corpus']['sampling'] == 'recent'   # 没给，保持 YAML
+    assert cfg2['run']['repeats'] == 3              # 没给，保持 YAML
+    assert cfg2['run']['warmup'] == 0               # 给了 0，必须生效（假值陷阱）
+
+
 # ── baseline 开关 ─────────────────────────────────────────────────────────────
 
 def _db_with_client(tmp_path) -> str:
