@@ -146,6 +146,40 @@ python3 tools/llm_bench --config ... --probe 30 --probe-interval 2
 
 抽样默认 `even`（跨越整个文件均匀取）。只取开头会让样本集中在某一段会话上，那段的 prompt 长度和缓存形态不具代表性。
 
+## 语料从哪来
+
+语料是 **agent-core 自己跑出来的**：`src/llm_logger.py` 每次 LLM 调用都把请求落盘到 `resource/llm_data/llm_request_*.jsonl`。
+
+**只有真正跑过 agent-core 的机器上才有语料。** 本地 checkout 从没跑过服务，`resource/llm_data/` 不存在，完整回测会直接报 `语料路径不存在`（在预检之前就失败，不会发出任何请求，不花钱）。
+
+`--probe` 不需要语料——它只发 `hi` + `max_tokens=8`，所以在任何地方都能跑。
+
+想在本地跑完整回测，从机器人捞一份：
+
+```bash
+# 挑一个小的（另外几个可能 20MB+），别整目录拷
+ssh nvidia@10.100.121.16 \
+    'docker exec phanthy-motus-agent-core-1 ls -laS /work/resource/llm_data/'
+scp nvidia@10.100.121.16:/opt/phanthy-motus/data/llm_data/llm_request_XXX.jsonl /tmp/corpus.jsonl
+
+python3 tools/llm_bench --config my-bench.yaml --corpus /tmp/corpus.jsonl --count 20
+```
+
+`--corpus` 收目录（扫全部 `llm_request_*.jsonl`）也收单个文件。
+
+> 这些是**真实对话日志**，含用户原话。往开发机上拷之前想清楚要不要，别久放。
+
+各场景对数据的需求：
+
+| 想干什么 | 在哪跑 | 需要语料 |
+|---|---|---|
+| 这个入口现在通不通 | 任何地方，`--probe` | 否 |
+| **选型：该用哪个入口** | **目标机器人上** | 用它本机的 |
+| 改工具本身 / 看报告格式 | 本地 + 捞来的 jsonl | 是 |
+| 跑单元测试 | 本地 `pytest` | 否（合成数据） |
+
+选型**必须**在目标机器人上做。本地测的是你办公网到入口的延迟，和机器人的网络路径不是一回事——这正是这套工具存在的理由。
+
 ## 依赖
 
 stdlib + 可选 httpx + PyYAML（`pyproject.toml` 已含）。**无新增依赖。**
