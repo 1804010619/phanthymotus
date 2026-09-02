@@ -159,6 +159,40 @@ def test_barge_in_cancels_the_wait():
     assert not mcp_client._pending_actions
 
 
+def test_barge_in_leaves_no_task_pending():
+    """The barge-in path must reap the tasks it cancels, not just request it.
+
+    `Task.cancel()` only schedules the CancelledError. `_acp_barrier` cancels its
+    `await_pending` task the moment a steering message wins the race, and
+    `await_pending` had no cleanup of its own for that case — so CancelledError
+    propagated straight out of it and left its two inner tasks orphaned. Every
+    barge-in on R1 logged:
+
+        Task was destroyed but it is pending!
+        task: <Task pending ... coro=<Event.wait() ...>>
+        task: <Task pending ... coro=<await_pending.<locals>._wait_all() ...>>
+
+    Note this needs the *steering* path, not `cancel_event`: with cancel_event set
+    `await_pending` returns 'cancelled' under its own control and cleans up on the
+    way out.
+    """
+    async def scenario():
+        _arm(timeout=30.0)
+        barrier = asyncio.create_task(_finish_barrier())
+
+        await asyncio.sleep(0.05)
+        collector._steering_queue.put_nowait({'source': 'asr', 'text': '别说了'})
+        result = await asyncio.wait_for(barrier, timeout=2)
+        # all_tasks() is the set of *unfinished* tasks, so anything left here
+        # besides this coroutine is a task the barrier abandoned mid-cancel.
+        leaked = asyncio.all_tasks() - {asyncio.current_task()}
+        return result, sorted(t.get_coro().__qualname__ for t in leaked)
+
+    result, leaked = asyncio.run(scenario())
+    assert result['status'] == 'barge_in'
+    assert leaked == [], f'barrier abandoned cancelled tasks: {leaked}'
+
+
 def test_missing_acp_callback_times_out_and_releases():
     """A completion that never arrives must not wedge the turn forever.
 
