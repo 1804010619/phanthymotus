@@ -23,9 +23,7 @@ def _table(rows: list[list[str]], header: list[str]) -> str:
 
 
 def build(run_meta: dict, summaries: dict, paired: dict,
-          shapes: dict, verdict: dict,
-          cold_summaries: dict | None = None,
-          cold_paired: dict | None = None) -> str:
+          shapes: dict, verdict: dict) -> str:
     L = []
     A = L.append
 
@@ -36,8 +34,8 @@ def build(run_meta: dict, summaries: dict, paired: dict,
       f'（镜像 `{run_meta.get("image_tag", "?")}`）')
     A(f'- 时间: {run_meta.get("started_at", "?")} → {run_meta.get("finished_at", "?")}')
     A(f'- 语料: {run_meta["corpus"]["count"]} 条，指纹 `{run_meta["corpus"]["fingerprint"]}`')
-    A(f'- 遍数：{"冷轮 + 热轮" if run_meta["run"].get("warmup") else "只有热轮"}'
-      f'，组顺序 {run_meta["run"].get("order", "rotate")}')
+    A(f'- 抽样 `{run_meta["corpus"].get("sampling")}`，'
+      f'组顺序 {run_meta["run"].get("order", "rotate")}，单轮')
     A(f'- HTTP 后端: {run_meta.get("transport", "?")}')
     if run_meta.get('incomplete'):
         A('')
@@ -133,44 +131,6 @@ def build(run_meta: dict, summaries: dict, paired: dict,
           '长尾，不构成差异。')
     A('')
 
-    # ── 冷轮 vs 热轮 ──────────────────────────────────────────────────────
-    A('## 冷轮 vs 热轮')
-    A('')
-    cold = verdict.get('cold')
-    if not cold:
-        A('本轮没跑冷轮（`warmup: 0`），只有热态数据。'
-          '冷态延迟和真实缓存率读不出来——机器人经常长时间空闲后冷启动，'
-          '那一次的体验只有冷轮能反映。')
-    else:
-        A('**冷轮不是丢掉的预热**：它是唯一一次每条 payload 都没被自己热过的'
-          '完整测量，所以冷态延迟和真实缓存率只能从它读。热轮量的是稳定态下的'
-          '公平对比。')
-        A('')
-        rows = []
-        for name in sorted(cold.get('p50', {})):
-            warm_p50 = summaries.get(name, {}).get('p50')
-            cp = cold['p50'][name]
-            rows.append([
-                name, f'{cp:.2f}s',
-                f'{warm_p50:.2f}s' if warm_p50 is not None else '—',
-                f'{cp - warm_p50:+.2f}s' if warm_p50 is not None else '—',
-                _fmt_pct(cold.get('cache_overall', {}).get(name, 0)),
-                cold.get('success', {}).get(name, '—'),
-            ])
-        A(_table(rows, ['组', '冷轮 p50', '热轮 p50', '冷−热',
-                        '冷轮缓存命中', '冷轮成功']))
-        A('')
-        if cold.get('indistinguishable'):
-            A('冷轮各组之间**未达显著差异**。')
-        elif cold.get('ranking'):
-            A(f'冷轮最快：**{cold["ranking"][0]}**。')
-        if verdict.get('regimes_disagree'):
-            A('')
-            A('> ⚠ **冷热两态结论不一致。** 一个入口只有热了才快，'
-              '对会长时间空闲、经常冷启动的机器人是实质缺点。按你的实际负载'
-              '形态选：持续对话为主看热轮，零星唤醒为主看冷轮。')
-    A('')
-
     # ── 失败分析 ──────────────────────────────────────────────────────────
     A('## 失败分析')
     A('')
@@ -208,39 +168,33 @@ def build(run_meta: dict, summaries: dict, paired: dict,
     # ── 缓存 ──────────────────────────────────────────────────────────────
     A('## 缓存')
     A('')
-    cold = verdict.get('cold') or {}
     rows = []
     for name in sorted(summaries):
-        s = summaries[name]
-        if not s.get('ok'):
+        s_ = summaries[name]
+        if not s_.get('ok'):
             continue
-        cold_hit = cold.get('cache_overall', {}).get(name)
-        rows.append([name,
-                     _fmt_pct(cold_hit) if cold_hit is not None else '—',
-                     _fmt_pct(s['cache_overall']), _fmt_pct(s['cache_median']),
-                     f'{s["cache_hit_count"]}/{s["ok"]}',
-                     f'{s["cached_tokens"]}/{s["prompt_tokens"]}'])
-    A(_table(rows, ['组', '冷轮命中（真实口径）', '热轮总体命中',
-                    '热轮逐条中位', '热轮有命中的请求', '热轮 cached/prompt']))
+        rows.append([name, _fmt_pct(s_['cache_overall']),
+                     _fmt_pct(s_['cache_median']),
+                     f'{s_["cache_hit_count"]}/{s_["ok"]}',
+                     f'{s_["cached_tokens"]}/{s_["prompt_tokens"]}'])
+    A(_table(rows, ['组', '总体命中(按token加权)', '逐条命中中位',
+                    '有命中的请求', 'cached/prompt tokens']))
     A('')
 
     sampling = run_meta['corpus'].get('sampling')
-    A('**这两列量的不是一回事：**')
-    A('')
-    A('- **冷轮命中**是接近生产的口径：每条 payload 第一次被请求，命中只能来自'
-      '它和**前面那条 payload 的公共前缀**——这正是生产里「每轮在上一轮 prompt '
-      '上追加」的形态。')
-    A('- **热轮命中**必然接近 100%，因为每条 payload 都是原样重放，'
-      '命中来自它自己。这个数只适合组间横向比，不能当生产缓存率读。')
-    A('')
     if sampling == 'trace':
-        A('抽样用的是 `trace`：按整条 trace 取并保留轮次顺序，复现了生产的前缀'
-          '增长形态，所以冷轮命中是可信的。')
-    elif sampling in ('even', 'recent', 'random'):
+        A('抽样用的是 `trace`（按整条 trace 取、保留轮次顺序），且**只跑一轮**，'
+          '所以每条请求的命中只能来自它和前一条 payload 的公共前缀——'
+          '这正是生产里「每轮在上一轮 prompt 上追加」的形态，这些数字可以当'
+          '生产缓存率读。')
+    else:
         A(f'> ⚠ 抽样用的是 `{sampling}`，它打散了 trace 内的连续性。实测语料里'
           '同 trace 相邻请求的消息前缀重叠中位是 **93.3%**，打散后只剩 **40.0%**'
-          '——**这种抽样下连冷轮命中也偏低，不代表生产**。要量缓存请用 '
-          '`sampling: trace`。')
+          '——**这种抽样下的缓存率不代表生产**。要量缓存请用 `sampling: trace`'
+          '（默认就是它）。')
+    A('')
+    A('两个口径都要看：总体命中反映实际省下的钱和 prefill 时间；逐条中位不被'
+      '个别超长 prompt 带偏。')
     A('')
 
     # ── 方法与局限 ────────────────────────────────────────────────────────
@@ -255,14 +209,12 @@ def build(run_meta: dict, summaries: dict, paired: dict,
          if run_meta['corpus'].get('bad_lines') else '') + '。')
     A(f'- `max_tokens={run_meta["request"]["max_tokens"]}`，串行发送（并发会让各组'
       '互相争带宽和配额，污染单请求延迟）。')
-    if run_meta['run'].get('warmup'):
-        A('- 跑了冷轮 + 热轮两遍。热轮用于组间公平对比（消除冷热不对称），'
-          '冷轮单独作为冷态延迟和真实缓存率的来源，两者都进结论。')
-    else:
-        A('- **只跑了热轮**（`warmup: 0`）：没有冷态数据，也读不出真实缓存率。')
-    A('- 不做重复轮。把同一条 payload 反复重放量的是「同一个请求重发」，'
-      '服务端前缀缓存必然命中，延迟分布和真实负载不是一回事；显著性由配对差的'
-      '置信区间 + 符号检验给出，不需要靠重复测量估噪声。')
+    A('- **只跑一轮**，每条 payload 每组各请求一次。不做预热轮也不做重复轮：'
+      '重放同一条 payload 量的是「同一个请求重发」，前缀缓存必然命中，'
+      '既不代表真实负载，也会把缓存数字污染成接近 100%。'
+      '谁先跑谁吃冷缓存的不对称由组顺序轮换消除。')
+    A('- 显著性由配对差的 95% bootstrap 置信区间 + 符号检验给出，'
+      '不靠重复测量估噪声。')
     if run_meta['run']['order'] == 'rotate':
         A('- 组顺序逐条轮换，抵消时段漂移。')
     else:
@@ -288,43 +240,27 @@ def write_meta(run_dir: pathlib.Path, run_meta: dict) -> pathlib.Path:
 
 
 def write(run_dir: pathlib.Path, run_meta: dict, records: list[dict]) -> pathlib.Path:
-    """从原始结果算出全部统计并落盘报告。
+    """从原始结果算出全部统计并落盘报告。"""
+    measured = [r for r in records if r.get('phase') == 'measure']
+    if not measured:
+        # 只跑了探活，或旧 run 目录里还有 warmup 阶段的记录
+        measured = [r for r in records
+                    if r.get('phase') in ('probe', 'warmup')]
 
-    冷轮（warmup）和热轮（measure）分别汇总 —— 冷轮不是废数据，它是唯一一次每条
-    payload 都没被自己热过的完整测量。
-    """
-    warm = [r for r in records if r.get('phase') == 'measure']
-    cold = [r for r in records if r.get('phase') == 'warmup']
-    if not warm:
-        # 只跑了探活，或只跑了冷轮就被打断
-        warm = [r for r in records if r.get('phase') == 'probe'] or cold
-        cold = [] if warm is cold else cold
-
-    def group_by(rs):
-        out: dict[str, list[dict]] = {}
-        for r in rs:
-            out.setdefault(r['group'], []).append(r)
-        return out
-
-    by_group = group_by(warm)
-    by_cold = group_by(cold)
+    by_group: dict[str, list[dict]] = {}
+    for r in measured:
+        by_group.setdefault(r['group'], []).append(r)
 
     summaries = {n: st.summarize_group(rs) for n, rs in by_group.items()}
     shapes = {n: st.failure_shape(rs) for n, rs in by_group.items()}
     paired = st.paired(by_group)
+    verdict = st.verdict(summaries, paired)
 
-    cold_summaries = {n: st.summarize_group(rs) for n, rs in by_cold.items()}
-    cold_paired = st.paired(by_cold) if by_cold else {}
-
-    verdict = st.verdict(summaries, paired, cold_summaries, cold_paired)
-
-    md = build(run_meta, summaries, paired, shapes, verdict,
-               cold_summaries, cold_paired)
+    md = build(run_meta, summaries, paired, shapes, verdict)
     (run_dir / 'report.md').write_text(md, encoding='utf-8')
 
     (run_dir / 'run.json').write_text(json.dumps({
         'meta': run_meta, 'summaries': summaries, 'paired': paired,
-        'cold_summaries': cold_summaries, 'cold_paired': cold_paired,
         'failure_shapes': shapes, 'verdict': verdict,
     }, ensure_ascii=False, indent=2), encoding='utf-8')
     return run_dir / 'report.md'

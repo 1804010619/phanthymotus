@@ -213,28 +213,16 @@ def paired(by_group: dict[str, list[dict]]) -> dict:
     return out
 
 
-def verdict(summaries: dict, paired_res: dict,
-            cold_summaries: dict | None = None,
-            cold_paired: dict | None = None) -> dict:
+def verdict(summaries: dict, paired_res: dict) -> dict:
     """生成结论。这段刻意保守——宁可说「测不出差别」也不编排名。
 
     优先级：可用性 > 延迟。一个入口再快，成功率不满就不是候选；这正是
     router/glm-5.3 那次的情况（35/50 成功，延迟却和对手持平）。
-
-    冷轮（预热轮）单独成一个结论维度。它不是废数据：预热轮是唯一一次「每条 payload
-    都没被自己热过」的完整测量，所以冷态延迟和真实缓存率只能从它这里读。热轮量的
-    是稳定态下的公平对比。两者结论不一致本身就是信息——一个入口只有热了才快，
-    对一个会长时间空闲、经常冷启动的机器人来说是实质缺点。
     """
     incomplete = {n: s for n, s in summaries.items() if not s.get('complete')}
     usable = {n: s for n, s in summaries.items() if s.get('complete') and s.get('ok')}
 
     res = {'incomplete': sorted(incomplete), 'reasons': []}
-
-    # 冷轮结论（如果跑了预热轮）
-    cold = _cold_verdict(cold_summaries, cold_paired)
-    if cold:
-        res['cold'] = cold
 
     if incomplete:
         res['primary'] = 'availability'
@@ -254,7 +242,6 @@ def verdict(summaries: dict, paired_res: dict,
     if not pairs:
         res['recommend'] = None
         res['reasons'].append('配对样本不足，无法比较')
-        _append_cold_reason(res, cold)
         return res
 
     sig = {k: v for k, v in pairs.items() if v.get('significant')}
@@ -272,14 +259,13 @@ def verdict(summaries: dict, paired_res: dict,
             ci_s = (f'95% CI [{ci[0]:+.2f}, {ci[1]:+.2f}]s'
                     if ci[0] is not None else 'CI 不可用')
             res['reasons'].append(
-                f'热轮没有一对达到显著：最大中位差 {worst["median_delta"]:+.2f}s，'
+                f'没有一对达到显著：最大中位差 {worst["median_delta"]:+.2f}s，'
                 f'{ci_s} 跨 0（符号检验 p={worst.get("p_sign", 1):.2f}）')
             flipped = [k for k, v in pairs.items() if v.get('sign_conflict')]
             if flipped:
                 res['reasons'].append(
                     '以下组对中位与均值符号相反（赢在多数、输在长尾），'
                     '不构成差异: ' + '; '.join(sorted(flipped)))
-        _append_cold_reason(res, cold)
         return res
 
     ranked = sorted(usable, key=lambda n: usable[n].get('p50', float('inf')))
@@ -295,47 +281,4 @@ def verdict(summaries: dict, paired_res: dict,
     if insig:
         res['reasons'].append(
             '以下组对未达显著，不应视为有差别: ' + '; '.join(sorted(insig)))
-    _append_cold_reason(res, cold)
     return res
-
-
-def _cold_verdict(cold_summaries, cold_paired) -> dict | None:
-    """冷轮（预热轮）自己的结论。"""
-    if not cold_summaries:
-        return None
-    usable = {n: s for n, s in cold_summaries.items() if s.get('ok')}
-    if not usable:
-        return None
-
-    out = {
-        'ranking': sorted(usable, key=lambda n: usable[n].get('p50', float('inf'))),
-        'p50': {n: s.get('p50') for n, s in usable.items()},
-        'cache_overall': {n: s.get('cache_overall') for n, s in usable.items()},
-        'success': {n: f'{s["ok"]}/{s["total"]}' for n, s in cold_summaries.items()},
-    }
-    pairs = (cold_paired or {}).get('pairs') or {}
-    out['pairs'] = pairs
-    if pairs:
-        out['indistinguishable'] = not any(v.get('significant') for v in pairs.values())
-        out['max_delta'] = max(abs(v.get('median_delta', 0)) for v in pairs.values())
-    return out
-
-
-def _append_cold_reason(res: dict, cold: dict | None) -> None:
-    """把冷轮结论并进 reasons，并在两个 regime 不一致时点出来。"""
-    if not cold or not cold.get('ranking'):
-        return
-    cold_best = cold['ranking'][0]
-    if cold.get('indistinguishable'):
-        res['reasons'].append(
-            f'冷轮（首次请求、缓存未热）测不出显著差异'
-            f'（最大中位差 {cold.get("max_delta", 0):.2f}s 在噪声内）')
-        return
-    res['reasons'].append(f'冷轮最快的是 {cold_best}（p50 {cold["p50"][cold_best]:.2f}s）')
-    warm_best = res.get('recommend')
-    if warm_best and warm_best != cold_best:
-        res['regimes_disagree'] = True
-        res['reasons'].append(
-            f'⚠ 冷热两态结论不一致：热轮 {warm_best} 更快，冷轮 {cold_best} 更快。'
-            '一个入口只有热了才快，对会长时间空闲、经常冷启动的机器人是实质缺点——'
-            '按你的实际负载形态选。')

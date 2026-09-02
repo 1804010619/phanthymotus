@@ -118,24 +118,35 @@ def sample(records: list[dict], count: int, strategy: str = 'even',
 def _sample_traces(records: list[dict], count: int) -> list[dict]:
     """按整条 trace 取，保留 trace 内顺序，直到凑够 count 条。
 
-    多轮 trace 优先——只有一条记录的 trace 根本不产生前缀增长，对缓存测量没有
-    贡献（实测语料里 51 条 trace 有 15 条是单条的）。同样大小的 trace 之间保持
-    文件里的先后顺序，避免引入额外的选择偏差。
+    按 trace 在文件里首次出现的顺序取（即时间顺序），不按大小排序——按大小降序
+    会过度偏向长对话，把 prompt 规模分布拉偏；时间顺序拿到的是一个跨时段的
+    trace 样本，每条内部又是连续的，两个性质都要。
+
+    多轮 trace 优先：只有一条记录的 trace 根本不产生前缀增长，对缓存测量没有
+    贡献（实测语料里 51 条 trace 有 15 条是单条的）。凑不够时才用单条 trace 补，
+    因为它们也是真实生产请求，不该完全排除。
     """
     order: dict = {}
+    first_pos: dict = {}
     for i, r in enumerate(records):
         tid = r.get('trace_id') or f'_no_trace_{i}'
-        order.setdefault(tid, []).append(r)
+        if tid not in order:
+            order[tid] = []
+            first_pos[tid] = i
+        order[tid].append(r)
 
-    # 先按长度降序（多轮的更有价值），同长度按首次出现位置升序
-    first_pos = {tid: records.index(rs[0]) for tid, rs in order.items()}
-    ranked = sorted(order.items(), key=lambda kv: (-len(kv[1]), first_pos[kv[0]]))
+    multi = [t for t in order if len(order[t]) > 1]
+    single = [t for t in order if len(order[t]) == 1]
+    ranked = sorted(multi, key=lambda t: first_pos[t]) + \
+        sorted(single, key=lambda t: first_pos[t])
 
     picked: list[dict] = []
-    for tid, rs in ranked:
+    for tid in ranked:
         if len(picked) >= count:
             break
-        # 整条收进来；最后一条 trace 允许截断以精确凑够 count
+        rs = order[tid]
+        # 整条收进来；最后一条 trace 允许截断以精确凑够 count（截断保留前缀，
+        # 所以剩下的部分仍然是一段连续的轮次）
         room = count - len(picked)
         picked.extend(rs[:room] if len(rs) > room else rs)
     return picked

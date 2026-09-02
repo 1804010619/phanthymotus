@@ -140,23 +140,22 @@ def probe(groups, transport: Transport, times: int, interval: float = 2.0,
 
 def run(groups, payloads, transport: Transport, cfg: dict,
         sink: ResultSink, done: set | None = None, log=print) -> None:
-    """冷轮 + 热轮。done 里的四元组会被跳过（续跑）。
-
-    冷轮不是「预热然后丢掉」——它是唯一一次每条 payload 都没被自己热过的完整
-    测量，冷态延迟和真实缓存率只能从它读出来。热轮量稳定态下的公平对比。
-    """
+    """跑一轮。done 里的四元组会被跳过（续跑）。"""
     done = done or set()
     req = cfg['request']
     run_cfg = cfg['run']
-    cold = int(run_cfg.get('warmup', 1))
     rotate = run_cfg.get('order', 'rotate') == 'rotate'
     stop_after = int(run_cfg.get('stop_after_consecutive_failures', 0) or 0)
 
-    # 两遍：冷轮（每条 payload 第一次被请求）+ 热轮（同一批再走一遍）。
-    # 刻意**不做重复轮**：把同一条 payload 反复重放量的是「同一个请求重发」，
-    # 服务端前缀缓存必然命中，延迟分布和真实负载不是一回事。显著性由配对差的
-    # 置信区间 + 符号检验给出（stats.significance），不需要靠重复测量估噪声。
-    rounds = [(Phase.WARMUP, 0)] * cold + [(Phase.MEASURE, 0)]
+    # 只跑一轮，每条 payload 每组各请求一次。
+    #
+    # 不做预热轮：预热会把每条 payload 变成「原样重放」，缓存命中必然接近 100%，
+    # 那量的是「同一个请求重发」而不是生产的前缀增长，反而污染缓存测量。谁先跑
+    # 谁吃冷缓存的不对称由组顺序轮换消除（见下面的 rotate）。
+    #
+    # 也不做重复轮：同理，重复重放不代表真实负载。显著性由配对差的置信区间 +
+    # 符号检验给出（stats.significance），不需要靠重复测量估噪声。
+    rounds = [(Phase.MEASURE, 0)]
     total = len(rounds) * len(payloads) * len(groups)
     n = 0
     consecutive = {g.name: 0 for g in groups}
@@ -193,7 +192,7 @@ def run(groups, payloads, transport: Transport, cfg: dict,
                                ('ok', 'kind', 'status', 'elapsed', 'prompt',
                                 'completion', 'cached', 'finish', 'err', 'detail')}})
 
-                tag = 'cold' if phase == Phase.WARMUP else 'warm'
+                tag = 'r0'
                 if r['ok']:
                     tps = r['completion'] / r['elapsed'] if r['elapsed'] else 0
                     log(f'  [{n}/{total}] {tag} {g.name:<24} ok  {r["elapsed"]:6.2f}s '

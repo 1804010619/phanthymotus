@@ -45,9 +45,6 @@ def parse_args(argv=None):
     ap.add_argument('--count', type=int, help='样本数（覆盖配置）')
     ap.add_argument('--sampling', choices=['even', 'trace', 'recent', 'random'],
                     help='抽样方式（覆盖配置）')
-    ap.add_argument('--warmup', type=int, metavar='0|1',
-                    help='冷轮跑不跑（默认 1）。冷轮结果计入报告的冷态部分，'
-                         '不是丢掉的预热')
     ap.add_argument('--max-tokens', type=int, help='max_tokens（覆盖配置）')
     ap.add_argument('--timeout', type=float, help='单请求超时秒数（覆盖配置）')
     ap.add_argument('--out', default='resource/llm_bench', help='输出根目录')
@@ -80,7 +77,7 @@ def _overrides(args) -> dict:
         'corpus': {'dir': args.corpus, 'count': args.count,
                    'sampling': args.sampling},
         'request': {'max_tokens': args.max_tokens, 'timeout_s': args.timeout},
-        'run': {'warmup': args.warmup},
+        'run': {},
         # None 表示命令行没指定 → 沿用配置文件；True/False 都是显式覆盖，
         # 所以这里不能用 `if args.include_current` 之类的真值判断。
         'include_current': args.include_current,
@@ -251,11 +248,8 @@ def _run(args, cfg, groups, transport, resume_dir, meta) -> int:
                     return 2
 
     # ── 正式跑 ────────────────────────────────────────────────────────────
-    passes = cfg['run']['warmup'] + 1
-    total = passes * len(payloads) * len(groups)
-    print(f'\n开始：{len(groups)} 组 × {len(payloads)} 条 × '
-          f'{passes} 遍（{"冷轮 + 热轮" if cfg["run"]["warmup"] else "只有热轮"}）'
-          f' = {total} 次请求')
+    total = len(payloads) * len(groups)
+    print(f'\n开始：{len(groups)} 组 × {len(payloads)} 条 = {total} 次请求')
     print(f'输出目录 {run_dir}\n')
 
     # 先把 meta 落盘：被 kill 打断时 run.json 必须已经存在，否则这次 run 既不能
@@ -274,7 +268,7 @@ def _run(args, cfg, groups, transport, resume_dir, meta) -> int:
 
     run_meta['finished_at'] = reportmod.now_iso()
     all_records = runner.load_results(run_dir / 'results.jsonl')
-    expected = (cfg['run']['warmup'] + 1) * len(payloads) * len(groups)
+    expected = len(payloads) * len(groups)
     got = len([r for r in all_records if r.get('phase') in ('warmup', 'measure')])
     if got < expected:
         run_meta['incomplete'] = f'{got}/{expected} 次请求'

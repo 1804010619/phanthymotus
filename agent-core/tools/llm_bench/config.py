@@ -21,11 +21,12 @@ class ConfigError(Exception):
 
 
 DEFAULTS = {
-    'corpus': {'dir': 'resource/llm_data', 'count': 50, 'sampling': 'even',
+    # sampling 默认 trace：它同时给出真实缓存率和连续的轮次形态。even 只在
+    # 「只关心延迟、想覆盖尽可能杂的 prompt 规模」时才更合适。
+    'corpus': {'dir': 'resource/llm_data', 'count': 50, 'sampling': 'trace',
                'seed': 42, 'min_messages': 2},
     'request': {'max_tokens': 10240, 'timeout_s': 180, 'extra_body': {}},
-    'run': {'warmup': 1, 'order': 'rotate',
-            'stop_after_consecutive_failures': 0},
+    'run': {'order': 'rotate', 'stop_after_consecutive_failures': 0},
     'include_current': False,
     'groups': [],
 }
@@ -131,6 +132,9 @@ _REMOVED_KEYS = {
     'repeats': '已移除：不再做重复轮（重复重放同一条 payload 量的是「同一个请求'
                '重发」，前缀缓存必然命中，不代表真实负载）。显著性改用配对差的'
                '置信区间 + 符号检验，不需要重复测量。',
+    'warmup': '已移除：只跑一轮。预热轮会把每条 payload 变成「原样重放」，'
+              '缓存命中必然接近 100%，反而污染了缓存测量；而组顺序轮换'
+              '（run.order: rotate）已经消除了谁先跑谁吃冷缓存的不对称。',
 }
 
 

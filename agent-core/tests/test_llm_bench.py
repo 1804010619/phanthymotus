@@ -28,8 +28,9 @@ from llm_bench.transport import Kind, Transport, classify  # noqa: E402
 
 # ── 语料 ──────────────────────────────────────────────────────────────────────
 
-def _rec(i, n_msgs=4):
-    return {'request_id': f'req-{i}', 'model': 'glm-5.2',
+def _rec(i, n_msgs=4, trace=None):
+    return {'request_id': f'req-{i}', 'trace_id': trace or f'tr-{i}',
+            'model': 'glm-5.2',
             'messages': [{'role': 'user', 'content': f'q{i}-{j}'} for j in range(n_msgs)],
             'tools': [{'type': 'function', 'function': {'name': 'finish'}}],
             'ts': 1788000000 + i}
@@ -96,6 +97,69 @@ def test_fingerprint_detects_different_payload_set():
     a = corpusmod.fingerprint([_rec(i) for i in range(10)])
     assert a == corpusmod.fingerprint([_rec(i) for i in range(10)])
     assert a != corpusmod.fingerprint([_rec(i) for i in range(1, 11)])
+
+
+# ── trace 抽样 ────────────────────────────────────────────────────────────────
+
+def test_trace_sampling_is_the_default():
+    """默认必须是 trace —— 它同时给出真实缓存率和连续的轮次形态。"""
+    assert cfgmod.DEFAULTS['corpus']['sampling'] == 'trace'
+
+
+def test_trace_sampling_keeps_turns_contiguous_and_ordered():
+    """同一条 trace 的记录必须连续且保持原顺序。
+
+    生产里 agent 一轮接一轮，每轮 prompt 在上一轮基础上追加。打散顺序就测不出
+    真实缓存率：实测同 trace 相邻请求前缀重叠 93.3%，打散后只剩 40.0%。
+    """
+    records = []
+    for t in range(6):
+        for k in range(4):
+            records.append(_rec(t * 10 + k, trace=f'T{t}'))
+
+    picked = corpusmod.sample(records, 8, 'trace')
+    assert len(picked) == 8
+    tids = [r['trace_id'] for r in picked]
+    # 连续成段
+    assert tids == sorted(tids, key=lambda t: tids.index(t)), '同 trace 记录必须连续'
+    # 每段内部保持原顺序
+    for t in set(tids):
+        seg = [r['request_id'] for r in picked if r['trace_id'] == t]
+        assert seg == sorted(seg, key=lambda x: int(x.split('-')[1])), f'{t} 顺序被打乱'
+
+
+def test_trace_sampling_prefers_multi_turn_but_falls_back_to_singles():
+    """单条 trace 不产生前缀增长，优先多轮；但凑不够时仍要用上。"""
+    records = [_rec(0, trace='SOLO1'), _rec(1, trace='SOLO2')]
+    records += [_rec(10, trace='M'), _rec(11, trace='M'), _rec(12, trace='M')]
+
+    # 只要 3 条 → 全部来自多轮 trace
+    assert {r['trace_id'] for r in corpusmod.sample(records, 3, 'trace')} == {'M'}
+    # 要 5 条 → 单条 trace 也得用上，不能凭空少给
+    picked = corpusmod.sample(records, 5, 'trace')
+    assert len(picked) == 5
+    assert {'SOLO1', 'SOLO2'} <= {r['trace_id'] for r in picked}
+
+
+def test_trace_sampling_is_not_biased_toward_long_traces():
+    """按时间顺序取，不按大小降序 —— 后者会过度偏向长对话，拉偏 prompt 规模分布。"""
+    records = []
+    # 前面若干条短 trace（各 2 条），最后一条超长 trace（20 条）
+    for t in range(5):
+        records += [_rec(t * 10, trace=f'S{t}'), _rec(t * 10 + 1, trace=f'S{t}')]
+    records += [_rec(900 + k, trace='LONG') for k in range(20)]
+
+    picked = corpusmod.sample(records, 10, 'trace')
+    tids = {r['trace_id'] for r in picked}
+    assert 'LONG' not in tids, '不该因为 LONG 最长就优先取它'
+    assert tids == {f'S{t}' for t in range(5)}
+
+
+def test_trace_sampling_truncation_keeps_a_prefix():
+    """最后一条 trace 被截断时保留前缀，剩下的仍是连续轮次。"""
+    records = [_rec(k, trace='T') for k in range(10)]
+    picked = corpusmod.sample(records, 4, 'trace')
+    assert [r['request_id'] for r in picked] == ['req-0', 'req-1', 'req-2', 'req-3']
 
 
 # ── 配置 ──────────────────────────────────────────────────────────────────────
@@ -212,7 +276,7 @@ def test_cli_overrides_only_apply_when_given(tmp_path):
     """
     body = """
 corpus: {count: 50, sampling: trace}
-run: {warmup: 1}
+run: {order: rotate}
 request: {max_tokens: 4096}
 groups:
   - {name: g, url: https://u/v1, key: sk-x, model: m}
@@ -220,25 +284,23 @@ groups:
     # 全部不指定
     cfg = cfgmod.load(_yaml(tmp_path, body), {
         'corpus': {'count': None, 'sampling': None},
-        'run': {'warmup': None},
+        'run': {},
         'request': {'max_tokens': None},
         'include_current': None,
     })
     assert cfg['corpus']['count'] == 50
     assert cfg['corpus']['sampling'] == 'trace'
-    assert cfg['run']['warmup'] == 1
     assert cfg['request']['max_tokens'] == 4096
 
     # 指定的才覆盖
     cfg2 = cfgmod.load(_yaml(tmp_path, body), {
-        'corpus': {'count': 3, 'sampling': None},
-        'run': {'warmup': 0},
+        'corpus': {'count': 3, 'sampling': None, 'min_messages': 0},
         'request': {'max_tokens': None},
     })
     assert cfg2['corpus']['count'] == 3
     assert cfg2['corpus']['sampling'] == 'trace'    # 没给，保持 YAML
     assert cfg2['request']['max_tokens'] == 4096    # 没给，保持 YAML
-    assert cfg2['run']['warmup'] == 0               # 给了 0，必须生效（假值陷阱）
+    assert cfg2['corpus']['min_messages'] == 0      # 给了 0，必须生效（假值陷阱）
 
 
 # ── 配置键校验 ────────────────────────────────────────────────────────────────
@@ -284,7 +346,7 @@ def test_valid_config_is_silent(tmp_path):
     cfgmod.load(_yaml(tmp_path, """
 corpus: {dir: x, count: 10, sampling: trace, seed: 1, min_messages: 2}
 request: {max_tokens: 100, timeout_s: 10, extra_body: {}}
-run: {warmup: 1, order: rotate, stop_after_consecutive_failures: 0}
+run: {order: rotate, stop_after_consecutive_failures: 0}
 include_current: false
 groups:
   - {name: g, url: https://u/v1, key: sk-x, models: [a, b], extra_body: {}}
@@ -425,7 +487,7 @@ def _res(group, idx, ok=True, elapsed=5.0, repeat=0, phase='measure',
             'detail': None if ok else 'boom', 'ts': 1788000000 + idx}
 
 
-def _meta(groups=None, warmup=1, count=4):
+def _meta(groups=None, count=4):
     return {
         'run_id': 'test', 'mode': 'bench', 'config': {},
         'groups': groups or [], 'hostname': 'test-host', 'image_tag': 'test',
@@ -433,7 +495,7 @@ def _meta(groups=None, warmup=1, count=4):
         'corpus': {'source': 'x', 'count': count, 'available': 100,
                    'sampling': 'even', 'fingerprint': 'abc123', 'bad_lines': 0},
         'request': {'max_tokens': 10240},
-        'run': {'warmup': warmup, 'order': 'rotate'},
+        'run': {'order': 'rotate'},
     }
 
 
@@ -512,35 +574,66 @@ def test_verdict_puts_availability_before_latency():
     assert v['recommend'] == 'solid_slow', '不能推荐一个成功率不满的组'
 
 
-def test_verdict_flags_cold_warm_disagreement():
-    """冷热两态结论不一致本身就是信息，必须点出来。
-
-    一个入口只有热了才快，对会长时间空闲、经常冷启动的机器人是实质缺点。
-    """
-    warm = {
-        'A': [_res('A', i, elapsed=4.0 + (i % 3) * 0.1) for i in range(12)],
-        'B': [_res('B', i, elapsed=6.0 + (i % 3) * 0.1) for i in range(12)],
-    }
-    cold = {  # 冷态反过来
-        'A': [_res('A', i, elapsed=9.0 + (i % 3) * 0.1, phase='warmup') for i in range(12)],
-        'B': [_res('B', i, elapsed=7.0 + (i % 3) * 0.1, phase='warmup') for i in range(12)],
-    }
-    summaries = {n: st.summarize_group(rs) for n, rs in warm.items()}
-    cold_sum = {n: st.summarize_group(rs) for n, rs in cold.items()}
-    v = st.verdict(summaries, st.paired(warm), cold_sum, st.paired(cold))
-
-    assert v['recommend'] == 'A', '热轮 A 更快'
-    assert v['cold']['ranking'][0] == 'B', '冷轮 B 更快'
-    assert v.get('regimes_disagree') is True
-    assert any('冷热两态结论不一致' in r for r in v['reasons'])
+def test_single_pass_is_the_default():
+    """默认只跑一轮 —— warmup 已从配置里移除。"""
+    assert 'warmup' not in cfgmod.DEFAULTS['run']
+    assert 'repeats' not in cfgmod.DEFAULTS['run']
 
 
-def test_cold_regime_absent_without_warmup():
-    warm = {'A': [_res('A', i) for i in range(5)],
-            'B': [_res('B', i, elapsed=6.0) for i in range(5)]}
-    summaries = {n: st.summarize_group(rs) for n, rs in warm.items()}
-    v = st.verdict(summaries, st.paired(warm), {}, {})
-    assert 'cold' not in v
+def test_warmup_key_is_reported_as_removed(tmp_path):
+    warnings = []
+    cfgmod.load(_yaml(tmp_path, """
+run: {warmup: 1}
+groups:
+  - {name: g, url: https://u/v1, key: sk-x, model: m}
+"""), warn=warnings.append)
+    assert any('warmup' in w and '只跑一轮' in w for w in warnings)
+
+
+def test_runner_makes_exactly_one_request_per_group_and_payload():
+    """总请求数必须是 组数 × payload 数，一次不多。"""
+    calls = []
+
+    class T:
+        def post_json(self, url, key, payload):
+            calls.append((url, payload['messages'][0]['content']))
+            return {'ok': True, 'kind': 'ok', 'status': 200, 'elapsed': 1.0,
+                    'prompt': 10, 'completion': 5, 'cached': 0,
+                    'finish': 'stop', 'err': None, 'detail': None}
+
+    class Sink:
+        def write(self, rec): pass
+
+    groups = [cfgmod.Group('A', 'https://a/v1', 'k', 'm'),
+              cfgmod.Group('B', 'https://b/v1', 'k', 'm')]
+    runner.run(groups, [_rec(i) for i in range(5)], T(),
+               {'request': {'max_tokens': 8}, 'run': {}}, Sink(),
+               log=lambda *a, **k: None)
+    assert len(calls) == 10, f'应为 2×5=10 次，实际 {len(calls)}'
+
+
+def test_group_order_rotates_across_payloads():
+    """轮换要真的换：否则固定排后面的组总吃到前面那组刚热好的缓存。"""
+    order = []
+
+    class T:
+        def post_json(self, url, key, payload):
+            order.append(url)
+            return {'ok': True, 'kind': 'ok', 'status': 200, 'elapsed': 1.0,
+                    'prompt': 10, 'completion': 5, 'cached': 0,
+                    'finish': 'stop', 'err': None, 'detail': None}
+
+    class Sink:
+        def write(self, rec): pass
+
+    groups = [cfgmod.Group('A', 'https://a/v1', 'k', 'm'),
+              cfgmod.Group('B', 'https://b/v1', 'k', 'm'),
+              cfgmod.Group('C', 'https://c/v1', 'k', 'm')]
+    runner.run(groups, [_rec(i) for i in range(3)], T(),
+               {'request': {'max_tokens': 8}, 'run': {'order': 'rotate'}}, Sink(),
+               log=lambda *a, **k: None)
+    firsts = [order[0], order[3], order[6]]
+    assert len(set(firsts)) == 3, f'每条 payload 的首发组应轮换，实际 {firsts}'
 
 
 def test_failure_shape_detects_clustering():
@@ -590,23 +683,11 @@ def test_report_flags_survivor_bias(tmp_path):
     assert '(7/10)' in md, '成功率不满时延迟分位必须带样本量'
 
 
-def test_report_notes_missing_cold_regime(tmp_path):
-    """只跑热轮时要说清冷态数据读不出来。"""
-    run_dir = tmp_path / 'run'
-    run_dir.mkdir()
-    recs = [_res(g, i) for g in ('A', 'B') for i in range(5)]
-    reportmod.write(run_dir, _meta(warmup=0), recs)
-    md = (run_dir / 'report.md').read_text(encoding='utf-8')
-    assert '冷轮 vs 热轮' in md
-    assert 'warmup: 0' in md
-
-
 def test_report_warns_when_sampling_breaks_cache_realism(tmp_path):
     """even 抽样打散了 trace 连续性，缓存率不代表生产 —— 必须警告。"""
     run_dir = tmp_path / 'run'
     run_dir.mkdir()
-    recs = [_res(g, i, phase=p) for g in ('A', 'B')
-            for i in range(5) for p in ('warmup', 'measure')]
+    recs = [_res(g, i) for g in ('A', 'B') for i in range(5)]
     meta = _meta()
     meta['corpus']['sampling'] = 'even'
     reportmod.write(run_dir, meta, recs)
@@ -618,13 +699,12 @@ def test_report_warns_when_sampling_breaks_cache_realism(tmp_path):
 def test_report_trusts_cache_under_trace_sampling(tmp_path):
     run_dir = tmp_path / 'run'
     run_dir.mkdir()
-    recs = [_res(g, i, phase=p) for g in ('A', 'B')
-            for i in range(5) for p in ('warmup', 'measure')]
+    recs = [_res(g, i) for g in ('A', 'B') for i in range(5)]
     meta = _meta()
     meta['corpus']['sampling'] = 'trace'
     reportmod.write(run_dir, meta, recs)
     md = (run_dir / 'report.md').read_text(encoding='utf-8')
-    assert '冷轮命中是可信的' in md
+    assert '可以当' in md and '生产缓存率' in md
 
 
 def test_report_marks_sign_conflict_per_pair(tmp_path):
@@ -662,12 +742,10 @@ def test_report_separates_request_and_payload_units(tmp_path):
     """失败计数混用「请求」和「payload」两种单位会让人读错严重程度。"""
     run_dir = tmp_path / 'run'
     run_dir.mkdir()
-    # 冷轮 + 热轮各 3 条失败 payload；热轮统计的是 3 次
     recs = []
-    for ph in ('warmup', 'measure'):
-        for i in range(10):
-            recs.append(_res('A', i, ok=(i < 7), phase=ph))
-            recs.append(_res('B', i, phase=ph))
+    for i in range(10):
+        recs.append(_res('A', i, ok=(i < 7)))
+        recs.append(_res('B', i))
     reportmod.write(run_dir, _meta(), recs)
     md = (run_dir / 'report.md').read_text(encoding='utf-8')
     assert '失败 3/10 次请求' in md
