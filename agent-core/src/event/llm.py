@@ -831,25 +831,49 @@ class Event:
             return
 
         # Fallback: hardcoded lookup (no hook registered)
+        #
+        # registry[mcp_id]['tools'] holds *bare* plugin names ('tts', 'loco') --
+        # mcp_client._connect_one does `tools.append(tool['name'])`. This used to
+        # hand those straight to call_tool(), which parses its argument as a full
+        # `mcp__<id>__<tool>` name: it split 'loco' into one segment, failed the
+        # `len(parts) != 3` check and returned the *string* '工具名格式错误: loco'.
+        # A returned string is not an exception, so the error check below never
+        # fired and the log still announced "interrupted N active output(s)" --
+        # while nothing had been interrupted, on any robot.
+        #
+        # call_tool_direct takes (mcp_id, bare_tool_name) and is the intended entry
+        # point for hooks: it also skips the ACP barrier, which an interrupt must.
+        #
+        # Deliberately not interrupting switch_mode: aborting a posture change
+        # partway is how a controlled descent becomes a fall, so a running
+        # stand-up/lie-down is left to finish.
         tasks = []
         for mcp_id, info in mcp_client.registry.items():
+            if not info.get('online'):
+                continue
             tools = info.get('tools', [])
-            for t in tools:
-                short_name = t.split('__')[-1] if '__' in t else t
-                if short_name == 'tts':
-                    tasks.append(mcp_client.call_tool(t, {'action': 'interrupt'}))
-                    break
-            for t in tools:
-                short_name = t.split('__')[-1] if '__' in t else t
-                if short_name == 'loco':
-                    tasks.append(mcp_client.call_tool(t, {'action': 'stop_move'}))
-                    break
-        if tasks:
-            results = await asyncio.gather(*tasks, return_exceptions=True)
-            for i, r in enumerate(results):
-                if isinstance(r, Exception):
-                    print(f'[decision] interrupt_active_outputs: task {i} failed: {r}')
-            print(f'[decision] interrupted {len(tasks)} active output(s) (fallback)')
+            for short_name, action in (('tts', 'interrupt'), ('loco', 'stop_move')):
+                if short_name in tools:
+                    tasks.append((f'{mcp_id}:{short_name}',
+                                  mcp_client.call_tool_direct(mcp_id, short_name,
+                                                              {'action': action})))
+        if not tasks:
+            print('[decision] interrupt_active_outputs: no tts/loco tool registered')
+            return
+
+        labels = [label for label, _ in tasks]
+        results = await asyncio.gather(*[coro for _, coro in tasks],
+                                       return_exceptions=True)
+        ok = 0
+        for label, r in zip(labels, results):
+            if isinstance(r, Exception):
+                print(f'[decision] interrupt_active_outputs: {label} raised: {r}')
+            elif isinstance(r, dict) and r.get('error'):
+                print(f'[decision] interrupt_active_outputs: {label} failed: {r["error"]}')
+            else:
+                ok += 1
+        print(f'[decision] interrupted {ok}/{len(tasks)} active output(s) (fallback)')
+
 
     # ── 主循环 ───────────────────────────────────────────────────────────────
 
