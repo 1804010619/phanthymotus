@@ -106,13 +106,12 @@ def _yaml(tmp_path, body: str) -> str:
     return str(p)
 
 
-def test_models_expand_into_groups(tmp_path, monkeypatch):
-    monkeypatch.setenv('K1', 'sk-secret-aaaa')
+def test_models_expand_into_groups(tmp_path):
     cfg = cfgmod.load(_yaml(tmp_path, """
 groups:
   - name: router
     url: https://r.example.com/v1
-    key_env: K1
+    key: sk-secret-aaaa
     models: [glm-5.2, zai-org/glm-5.3]
 """))
     groups = cfgmod.build_groups(cfg)
@@ -120,57 +119,57 @@ groups:
     assert all(g.key == 'sk-secret-aaaa' for g in groups)
 
 
-def test_single_model_keeps_plain_name(tmp_path, monkeypatch):
-    monkeypatch.setenv('K1', 'sk-x')
+def test_single_model_keeps_plain_name(tmp_path):
     cfg = cfgmod.load(_yaml(tmp_path, """
 groups:
-  - {name: solo, url: https://a/v1, key_env: K1, model: glm-5.3}
+  - {name: solo, url: https://a/v1, key: sk-x, model: glm-5.3}
 """))
     assert [g.name for g in cfgmod.build_groups(cfg)] == ['solo']
 
 
-def test_key_file_with_line_number(tmp_path):
-    """兼容一行一个值的密钥文件。"""
-    kf = tmp_path / '.a'
-    kf.write_text('https://u/v1\nsk-line-two\nglm-5.3\n', encoding='utf-8')
-    cfg = cfgmod.load(_yaml(tmp_path, f"""
-groups:
-  - name: g
-    url: https://u/v1
-    key_file: "{kf}#2"
-    model: glm-5.3
-"""))
-    assert cfgmod.build_groups(cfg)[0].key == 'sk-line-two'
-
-
-def test_key_file_bad_line_number_is_explicit(tmp_path):
-    kf = tmp_path / '.a'
-    kf.write_text('only-one-line\n', encoding='utf-8')
-    cfg = cfgmod.load(_yaml(tmp_path, f"""
-groups:
-  - {{name: g, url: https://u/v1, key_file: "{kf}#9", model: m}}
-"""))
-    with pytest.raises(cfgmod.ConfigError, match='只有 1 行'):
-        cfgmod.build_groups(cfg)
-
-
-def test_missing_env_key_fails_loudly(tmp_path, monkeypatch):
-    monkeypatch.delenv('NOPE', raising=False)
+def test_key_in_yaml_is_used(tmp_path):
+    """唯一的密钥来源：YAML 里的 key。"""
     cfg = cfgmod.load(_yaml(tmp_path, """
 groups:
-  - {name: g, url: https://u/v1, key_env: NOPE, model: m}
+  - {name: g, url: https://u/v1, key: sk-inline-key, model: glm-5.3}
 """))
-    with pytest.raises(cfgmod.ConfigError, match='NOPE'):
-        cfgmod.build_groups(cfg)
+    assert cfgmod.build_groups(cfg, str(tmp_path / 'none.db'))[0].key == 'sk-inline-key'
 
 
-def test_duplicate_group_names_are_disambiguated(tmp_path, monkeypatch):
+def test_missing_key_points_at_the_template(tmp_path):
+    cfg = cfgmod.load(_yaml(tmp_path, """
+groups:
+  - {name: g, url: https://u/v1, model: m}
+"""))
+    with pytest.raises(cfgmod.ConfigError, match='bench.yaml.example'):
+        cfgmod.build_groups(cfg, str(tmp_path / 'none.db'))
+
+
+@pytest.mark.parametrize('field', ['key_env', 'key_file', 'key_from_current'])
+def test_removed_key_fields_error_without_echoing_the_value(tmp_path, field):
+    """旧写法要给明确指引，且**绝不回显值**。
+
+    这些字段里往往填的就是密钥本身（照着 key_env 的位置直接贴 sk-... 是常见笔误），
+    把值打进报错就等于把密钥写进日志 —— 一个笔误变成一次泄露。
+    """
+    secret = 'sk-RjAbwdQbzU8eURU2ikUJJaXfB0wn50jPD54ssxU8fx1ojpt5'
+    cfg = cfgmod.load(_yaml(tmp_path, f"""
+groups:
+  - {{name: g, url: https://u/v1, {field}: {secret}, model: m}}
+"""))
+    with pytest.raises(cfgmod.ConfigError) as ei:
+        cfgmod.build_groups(cfg, str(tmp_path / 'none.db'))
+    msg = str(ei.value)
+    assert secret not in msg, f'{field} 的报错泄露了密钥原文'
+    assert field in msg and 'key:' in msg
+
+
+def test_duplicate_group_names_are_disambiguated(tmp_path):
     """重名会让报告里两行无法区分，也会让 resume 的三元组键冲突。"""
-    monkeypatch.setenv('K1', 'sk-x')
     cfg = cfgmod.load(_yaml(tmp_path, """
 groups:
-  - {name: same, url: https://a/v1, key_env: K1, model: m}
-  - {name: same, url: https://b/v1, key_env: K1, model: m}
+  - {name: same, url: https://a/v1, key: sk-x, model: m}
+  - {name: same, url: https://b/v1, key: sk-x, model: m}
 """))
     assert [g.name for g in cfgmod.build_groups(cfg)] == ['same', 'same#2']
 
@@ -196,12 +195,11 @@ def test_include_current_reads_configdb(tmp_path):
     assert g.extra_body['chat_template_kwargs'] == {'enable_thinking': False}
 
 
-def test_configdb_absent_is_not_fatal_when_groups_exist(tmp_path, monkeypatch):
-    monkeypatch.setenv('K1', 'sk-x')
+def test_configdb_absent_is_not_fatal_when_groups_exist(tmp_path):
     cfg = cfgmod.load(_yaml(tmp_path, """
 include_current: true
 groups:
-  - {name: g, url: https://u/v1, key_env: K1, model: m}
+  - {name: g, url: https://u/v1, key: sk-x, model: m}
 """))
     groups = cfgmod.build_groups(cfg, str(tmp_path / 'missing.db'))
     assert [g.name for g in groups] == ['g']
@@ -226,33 +224,30 @@ def _cfg_with_switch(tmp_path, yaml_value: str, override):
     cfg = cfgmod.load(_yaml(tmp_path, f"""
 include_current: {yaml_value}
 groups:
-  - {{name: g, url: https://u/v1, key_env: K1, model: m}}
+  - {{name: g, url: https://u/v1, key: sk-x, model: m}}
 """), {'include_current': override})
     return cfg
 
 
-def test_cli_switch_can_enable_baseline_over_yaml(tmp_path, monkeypatch):
-    monkeypatch.setenv('K1', 'sk-x')
+def test_cli_switch_can_enable_baseline_over_yaml(tmp_path):
     cfg = _cfg_with_switch(tmp_path, 'false', True)
     names = [g.name for g in cfgmod.build_groups(cfg, _db_with_client(tmp_path))]
     assert 'current/glm-5.3' in names
 
 
-def test_cli_switch_can_disable_baseline_over_yaml(tmp_path, monkeypatch):
+def test_cli_switch_can_disable_baseline_over_yaml(tmp_path):
     """--no-include-current 必须能关掉 YAML 里的 true。
 
     False 是个假值，用 `if override:` 之类的真值判断会把它当成「没指定」，
     于是这个开关在关闭方向上完全失效 —— 而关闭恰恰是它更常用的方向。
     """
-    monkeypatch.setenv('K1', 'sk-x')
     cfg = _cfg_with_switch(tmp_path, 'true', False)
     assert cfg['include_current'] is False
     names = [g.name for g in cfgmod.build_groups(cfg, _db_with_client(tmp_path))]
     assert names == ['g']
 
 
-def test_no_cli_switch_falls_back_to_yaml(tmp_path, monkeypatch):
-    monkeypatch.setenv('K1', 'sk-x')
+def test_no_cli_switch_falls_back_to_yaml(tmp_path):
     cfg = _cfg_with_switch(tmp_path, 'true', None)
     names = [g.name for g in cfgmod.build_groups(cfg, _db_with_client(tmp_path))]
     assert 'current/glm-5.3' in names

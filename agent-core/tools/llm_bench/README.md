@@ -8,29 +8,44 @@
 
 同一个入口在办公网和在 Orin 上的表现可以完全不同。这个工具随镜像进到 `/work/tools/`，所以哪台机器人上的疑问就在那台机器人上测。
 
-```bash
-# 在机器人上
-docker exec -e ROUTER_KEY=sk-... phanthy-motus-agent-core-1 \
-    python3 /work/tools/llm_bench --config /work/tools/llm_bench/bench.example.yaml --probe 10
-```
-
 ## 快速开始
 
+配置文件放机器人的 `/opt/phanthy-motus/data/`（容器内是 `/work/resource/`）。从仓库里的模板起手：
+
 ```bash
-cd agent-core
-export ROUTER_KEY=sk-...  PPIO_KEY=sk_-...
-
-# 1) 先探活：这些入口现在到底能不能用（秒级，几乎不花钱）
-python3 tools/llm_bench --config tools/llm_bench/bench.example.yaml --probe 10
-
-# 2) 小样本验证流程通顺
-python3 tools/llm_bench --config ... --count 3 --repeats 1 --warmup 0
-
-# 3) 正式一轮
-python3 tools/llm_bench --config ... --count 50 --repeats 2
+# 在机器人上
+cp /work/tools/llm_bench/bench.yaml.example /opt/phanthy-motus/data/bench.yaml
+chmod 600 /opt/phanthy-motus/data/bench.yaml
+vi /opt/phanthy-motus/data/bench.yaml      # 填 url / key / models
 ```
 
-输出在 `resource/llm_bench/<时间戳>/`：
+`bench.yaml.example` 在仓库里，`bench.yaml`（含明文密钥）被 `.gitignore` 挡住。
+
+然后：
+
+```bash
+# 1) 先探活：这些入口现在到底能不能用（秒级，几乎不花钱）
+docker exec -w /work -e DB_PATH=/work/resource/data.db phanthy-motus-agent-core-1 \
+    /work/.venv/bin/python /work/tools/llm_bench \
+    --config /work/resource/bench.yaml --probe 10
+
+# 2) 小样本验证流程通顺
+docker exec -w /work -e DB_PATH=/work/resource/data.db phanthy-motus-agent-core-1 \
+    /work/.venv/bin/python /work/tools/llm_bench \
+    --config /work/resource/bench.yaml --count 3 --repeats 1 --warmup 0 --yes
+
+# 3) 正式一轮，后台跑（SSH 断了前台会中断）
+docker exec -d -w /work -e DB_PATH=/work/resource/data.db phanthy-motus-agent-core-1 \
+    sh -c '/work/.venv/bin/python /work/tools/llm_bench \
+    --config /work/resource/bench.yaml --count 50 --repeats 2 --yes > /tmp/bench.log 2>&1'
+docker exec phanthy-motus-agent-core-1 tail -f /tmp/bench.log
+```
+
+`-e DB_PATH=` 只有用 `include_current` 时才需要。用 `/work/.venv/bin/python` 是为了走 httpx（连接复用，更贴近生产）；系统 `python3` 也能跑，自动退回 urllib。
+
+**总请求数 = `count × 组数 × (warmup + repeats)`**，启动时会打印出来，看一眼再决定要不要跑。
+
+输出在 `resource/llm_bench/<时间戳>/`，宿主机上是 `/opt/phanthy-motus/data/llm_bench/<时间戳>/`，可以直接 `cat`，不用进容器：
 
 | 文件 | 内容 |
 |---|---|
@@ -72,19 +87,23 @@ python3 tools/llm_bench --report-only resource/llm_bench/20260902_143000
    显式要了 baseline 但 ConfigDB 里读不到 LLM 配置时会打一行 `[!]` 警告 —— 静默跳过会让人以为「跟现在比过了」，而报告里其实没有那一行。
 
    记得带 `-e DB_PATH=/work/resource/data.db`，否则读的是默认的 `resource/data.db`。
-3. **`key_file: 路径#行号`** —— 从文件按行取密钥，兼容一行一个值的文件。
+## 配置与密钥
 
-密钥优先级 `key_env` > `key_file` > `key`。任何输出（报告、run.json、控制台）里密钥都只以 `sk-RjA…jpt5` 形式出现，保留头尾是为了让人认出用的是哪一把，而不泄露它。
+**所有配置都在 `bench.yaml` 这一个文件里，密钥也一样。** 没有环境变量、没有外部密钥文件——多一种取密钥的方式就多一类「为什么没生效」的排查。
 
-> **在容器里跑时用 `key_env`，别用 `key_file`。** `key_file` 的路径是在**容器内**解析的，宿主机上的 `/home/nvidia/.a` 容器看不见（`/work/resource` 才是挂进来的那个卷）。把密钥从宿主机文件读出来传成环境变量即可：
->
-> ```bash
-> docker exec -e ROUTER_KEY="$(sed -n 2p /home/nvidia/.a)" \
->     phanthy-motus-agent-core-1 \
->     /work/.venv/bin/python /work/tools/llm_bench --config ...
-> ```
->
-> 这样密钥只在宿主机的 shell 里展开，不会写进容器里的任何文件。
+```yaml
+groups:
+  - name: router
+    url: https://router.phanthy.com/v1
+    key: sk-...
+    models: [glm-5.3, zai-org/glm-5.3]   # 展开成 2 组，url/key 不用重复写
+```
+
+放在机器人的 `/opt/phanthy-motus/data/bench.yaml`（容器内 `/work/resource/bench.yaml`）——宿主机的运行时数据目录，不在仓库里。仓库里只有 `bench.yaml.example`，`bench.yaml` 被 `.gitignore` 挡住。建议 `chmod 600`。
+
+`include_current` 那一组的密钥从 ConfigDB 读，不用写在这里。
+
+**密钥永远不会出现在产物里**：报告、`run.json`、控制台输出里都只有 `sk-RjA…jpt5` 这种打码形式。保留头尾是为了让人认出用的是哪一把。测试里有断言明文 key 不出现在任何输出中；用了已废弃的 `key_env`/`key_file` 时报错也不回显值——因为那些字段里往往填的就是密钥本身。
 
 ## 为什么有这些"多余"步骤
 

@@ -1,17 +1,17 @@
-# llm_bench 示例配置
+# llm_bench 配置模板 —— 复制成 bench.yaml 再改
 #
-# 用法:
-#   export ROUTER_KEY=sk-...
-#   export PPIO_KEY=sk_-...
-#   python3 tools/llm_bench --config tools/llm_bench/bench.example.yaml --probe 10
-#   python3 tools/llm_bench --config tools/llm_bench/bench.example.yaml --count 50
+#   cp bench.yaml.example /opt/phanthy-motus/data/bench.yaml
+#   chmod 600 /opt/phanthy-motus/data/bench.yaml
 #
-# 密钥不要写在这个文件里。优先 key_env（环境变量），或 key_file（支持 `路径#行号`，
-# 兼容一行一个值的文件）。
+# 所有配置（含密钥）都在这一个文件里。bench.yaml 已被 .gitignore 挡住，
+# 只有本模板进库。
+#
+# 机器人上 /opt/phanthy-motus/data/ 就是容器内的 /work/resource/，所以运行时
+#   --config /work/resource/bench.yaml
 
 corpus:
   dir: resource/llm_data      # agent-core 自己的请求日志，由 src/llm_logger.py 写出
-  count: 50
+  count: 50                   # 样本条数
   sampling: even              # even = 跨越整个文件均匀取（推荐）| recent | random
   seed: 42                    # 仅 random 用，保证可复现
   min_messages: 2             # 过滤退化样本
@@ -30,28 +30,21 @@ run:
   order: rotate               # 逐条轮换组顺序，抵消时段漂移
   stop_after_consecutive_failures: 0   # 0 = 不早停；设 N 则某组连续失败 N 次后跳过该组
 
+# 每组一个 (url, key, model)。一个入口配多个 models 会自动展开成多组，
+# 组名 {name}/{model}，不必重复写 url 和 key。
 groups:
-  # 一个入口配多个模型名 → 自动展开成多组，组名为 {name}/{model}
   - name: router
     url: https://router.phanthy.com/v1
-    key_env: ROUTER_KEY
-    models:
-      - glm-5.3
-      - zai-org/glm-5.3
+    key: sk-换成真的密钥
+    models: [glm-5.3, zai-org/glm-5.3]
 
   - name: ppio
     url: https://api.ppio.com/openai
-    key_env: PPIO_KEY
-    models:
-      - zai-org/glm-5.3
+    key: sk_-换成真的密钥
+    models: [zai-org/glm-5.3]
 
-  # 也支持从文件按行取 key（`路径#行号`，1-based）
-  # - name: from-file
-  #   url: https://api.example.com/v1
-  #   key_file: /home/nvidia/.a#2
-  #   model: glm-5.3
-
-# 自动把 ConfigDB 里当前生产配置加为一组（组名 current/{model}），
-# 用来回答「换过去会不会比现在差」。读 $DB_PATH，只读打开。
-# 命令行 --include-current / --no-include-current 可以覆盖这里。
+# 把 ConfigDB 里当前生产配置也加为一组 baseline（组名 current/{model}），
+# 用来回答「换过去会不会比现在差」。它的密钥从 ConfigDB 读，不用写在这里。
+# 命令行 --include-current / --no-include-current 可覆盖这一项。
+# 用它时记得给容器带 -e DB_PATH=/work/resource/data.db
 include_current: true

@@ -44,40 +44,33 @@ def mask(secret: str) -> str:
     return f'{secret[:6]}…{secret[-4:]}'
 
 
+_OTHER_KEY_FIELDS = ('key_env', 'key_file', 'key_from_current')
+
+
 def _resolve_key(spec: dict, name: str) -> str:
-    """按 key_env > key_file > key 的优先级取密钥。
+    """取密钥。只有一种方式：YAML 里直接写 `key:`。
 
-    key_file 支持 `路径#行号`（1-based），直接兼容手头那种一行一个值的文件。
+    配置文件放在机器人的 /opt/phanthy-motus/data/bench.yaml —— 宿主机的运行时
+    数据目录，不在仓库里，`.gitignore` 也挡了 bench.yaml，所以明文放这儿是合适的。
+    刻意不支持环境变量/外部文件：多一种取密钥的方式就多一类「为什么没生效」的
+    排查，而这个工具的配置本来就该一眼看完。
     """
-    if spec.get('key_env'):
-        env = spec['key_env']
-        val = os.environ.get(env)
-        if not val:
-            raise ConfigError(f'组 {name}: 环境变量 {env} 未设置或为空')
-        return val.strip()
+    key = spec.get('key')
+    if key:
+        return str(key).strip()
 
-    if spec.get('key_file'):
-        raw = str(spec['key_file'])
-        path, _, line_no = raw.partition('#')
-        p = pathlib.Path(path).expanduser()
-        if not p.is_file():
-            raise ConfigError(f'组 {name}: key_file 不存在: {p}')
-        content = p.read_text(encoding='utf-8').splitlines()
-        if line_no:
-            try:
-                idx = int(line_no) - 1
-            except ValueError:
-                raise ConfigError(f'组 {name}: key_file 行号非法: {raw}')
-            if not 0 <= idx < len(content):
-                raise ConfigError(
-                    f'组 {name}: key_file 只有 {len(content)} 行，取不到第 {line_no} 行')
-            return content[idx].strip()
-        return content[0].strip() if content else ''
+    # 用了已经废弃的写法时给出明确指引，且**绝不回显值** —— 那些字段里往往就是
+    # 密钥本身，打进报错就等于写进日志。
+    used = [f for f in _OTHER_KEY_FIELDS if spec.get(f)]
+    if used:
+        raise ConfigError(
+            f'组 {name}: 不再支持 {"/".join(used)}，密钥直接写在 bench.yaml 里：\n'
+            '    key: sk-...\n'
+            '  （bench.yaml 已被 .gitignore 挡住，模板见 bench.yaml.example）')
 
-    if spec.get('key'):
-        return str(spec['key']).strip()
-
-    raise ConfigError(f'组 {name}: 必须提供 key_env / key_file / key 之一')
+    raise ConfigError(
+        f'组 {name}: 缺密钥。在 bench.yaml 里写 `key: sk-...`'
+        '（模板见 bench.yaml.example）。')
 
 
 class Group:
@@ -167,6 +160,7 @@ def build_groups(cfg: dict, db_path: str | None = None) -> list[Group]:
     groups: list[Group] = []
     default_extra = cfg.get('request', {}).get('extra_body') or {}
 
+
     for spec in cfg.get('groups') or []:
         if not isinstance(spec, dict):
             raise ConfigError(f'groups 里出现非 mapping 条目: {spec!r}')
@@ -187,6 +181,8 @@ def build_groups(cfg: dict, db_path: str | None = None) -> list[Group]:
             groups.append(Group(gname, url, key, m, extra, source='yaml'))
 
     if cfg.get('include_current'):
+        # 只在真的要 baseline 时才碰 ConfigDB：$DB_PATH 可能指向一个没有 config
+        # 表的库，不该让「压根不关心生产配置」的评测也被它挡死。
         db = db_path or os.environ.get('DB_PATH', 'resource/data.db')
         for item in _current_from_db(db):
             url, key, model = item.get('url'), item.get('key'), item.get('model')
