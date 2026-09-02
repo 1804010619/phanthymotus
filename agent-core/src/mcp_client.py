@@ -672,6 +672,9 @@ async def await_pending(cancel_event: asyncio.Event | None = None, timeout: floa
                 # pending and reports "timeout".
                 raise asyncio.TimeoutError()
         else:
+            # Not reached from the agent loop: it creates a cancel_event for every
+            # turn (event/llm.py:887), so the branch above is the live one. Kept
+            # for direct callers.
             await asyncio.wait_for(_wait_all(), timeout=effective_timeout)
 
         # 清理已完成的
