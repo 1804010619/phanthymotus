@@ -202,10 +202,15 @@ def _acp_barrier_log(name: str, acp_result: dict | None) -> None:
     if not isinstance(acp_result, dict):
         return
     status = acp_result.get('status')
-    if status in ('timeout', 'cancelled'):
+    if status in ('timeout', 'cancelled', 'barge_in'):
         actions = acp_result.get('actions')
         detail = f": {actions}" if actions else ''
         print(f"[acp] barrier {status} before {name}{detail}")
+
+
+# barrier 等待期间检查 steering_queue 的间隔。相对于它守护的动作时长（TTS 讲解
+# 数十秒、导航更久）足够细，又不会把事件循环打满。
+_STEERING_POLL_S = 0.1
 
 
 # finish 结束 turn 前必须等 pending 动作完成，否则 speak → finish 会在音频播完前
@@ -218,13 +223,71 @@ def _sys_tool_needs_barrier(name: str) -> bool:
     return name in _ACP_BARRIER_SYSTEM_TOOLS
 
 
-async def _acp_barrier(name: str, cancel_event) -> dict | None:
-    """有 pending ACP 动作时等待其完成，并记录非正常结果。无 pending 则直接返回。"""
+async def _acp_barrier(name: str, cancel_event, *, barge_in: bool = False,
+                       interrupt_fallback=None) -> dict | None:
+    """有 pending ACP 动作时等待其完成，并记录非正常结果。无 pending 则直接返回。
+
+    `barge_in=True` 时，等待还会被新的用户消息唤醒。这条路只给 finish 用，因为
+    只有 finish 的 barrier 会横跨整段播放：`cancel_event` 仅在 interrupt /
+    followup 模式下置位（collector.py 的 `_interrupt_mode` 分支），默认的 steer
+    模式把 busy 期间的用户消息塞进 steering_queue 就完事、不动 cancel_event，而
+    finish 检测在 steering drain（`:1377`）之前就 break 了 —— 队列里的消息在本轮
+    永远等不到消费，用户要一直等到讲解播完。唤醒后中止播放并放行，turn 正常结束，
+    消息由 `_flush_all_pending()` 转成下一轮的触发事件；这正是加 barrier 之前的打
+    断行为，只是不再依赖 "finish 提前返回" 这个副作用。
+
+    turn 中段的 mcp 工具 barrier 不走这条：那里 steering 的语义是注入当前 turn
+    （`:1377` 之后就会 drain），不是中止动作。
+    """
     if not mcp_client.get_pending_actions():
         return None
-    result = await mcp_client.await_pending(cancel_event, timeout=120)
+
+    if not barge_in:
+        result = await mcp_client.await_pending(cancel_event, timeout=120)
+        _acp_barrier_log(name, result)
+        return result
+
+    barrier = asyncio.create_task(mcp_client.await_pending(cancel_event, timeout=120))
+    steering = asyncio.create_task(_wait_for_steering())
+    try:
+        done, _ = await asyncio.wait(
+            [barrier, steering], return_when=asyncio.FIRST_COMPLETED)
+        if barrier in done:
+            result = barrier.result()
+        else:
+            result = await _abort_pending_for_barge_in(interrupt_fallback)
+    finally:
+        for t in (barrier, steering):
+            if not t.done():
+                t.cancel()
     _acp_barrier_log(name, result)
     return result
+
+
+async def _wait_for_steering(poll_s: float = _STEERING_POLL_S) -> None:
+    """轮询到 steering_queue 非空为止。asyncio.Queue 没有 "非破坏性等待"，
+    而 drain_steering() 会把消息取走 —— 取走了本轮 finish 之后就没人再放回去。"""
+    while not collector.has_steering():
+        await asyncio.sleep(poll_s)
+
+
+async def _abort_pending_for_barge_in(interrupt_fallback=None) -> dict:
+    """用户在播放期间说话：停掉正在进行的输出，清 pending，放 finish 过去。
+
+    `interrupt_fallback` 是没有 on_interrupt_all 绑定时的兜底（硬编码找 tts/loco），
+    与 run_forever 的 TurnCancelled 路径共用同一套逻辑。
+    """
+    import hooks
+    actions = mcp_client.get_pending_actions()
+    fired = await hooks.fire('on_interrupt_all')
+    if not fired and interrupt_fallback is not None:
+        await interrupt_fallback()
+    for aid in actions:
+        mcp_client._pending_actions.pop(aid, None)
+        mcp_client._pending_results.pop(aid, None)
+        mcp_client._pending_timeouts.pop(aid, None)
+        mcp_client._pending_tools.pop(aid, None)
+    return {"status": "barge_in", "actions": actions}
 
 
 _BOT_READ_ONLY_SYSTEM_TOOLS = frozenset({'finish'})
@@ -1237,9 +1300,12 @@ class Event:
                         'and cannot send files.'
                     )
                 elif name in self._sys_tools:
-                    # ACP barrier: finish 之前等音频播完（见 _ACP_BARRIER_SYSTEM_TOOLS）
+                    # ACP barrier: finish 之前等音频播完（见 _ACP_BARRIER_SYSTEM_TOOLS）。
+                    # 等待期间用户开口要能立刻打断 —— 故 barge_in=True。
                     if _sys_tool_needs_barrier(name):
-                        await _acp_barrier(name, cancel_event)
+                        await _acp_barrier(
+                            name, cancel_event, barge_in=True,
+                            interrupt_fallback=self._interrupt_active_outputs)
                     result = await self._sys_tools[name]['object'](**args)
                 elif name.startswith('mcp__'):
                     # ACP barrier: 有 pending 时，非 sensor/resource 工具等待所有 pending 完成
