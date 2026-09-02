@@ -535,6 +535,43 @@ def test_resume_skips_completed_triples(tmp_path):
     assert len(runner.load_results(p)) == 5
 
 
+def test_meta_is_written_before_any_request(tmp_path):
+    """run.json 必须在开跑前就存在。
+
+    真实故障：一次 450 请求的 run 被 kill -9 后，目录里只剩 results.jsonl。
+    --resume 和 --report-only 都从 run.json 取 meta，于是这次 run 既不能续跑也
+    不能出报告 —— 恰好是续跑存在的唯一场景。
+    """
+    run_dir = tmp_path / 'run'
+    run_dir.mkdir()
+    meta = _meta()
+    reportmod.write_meta(run_dir, meta)
+
+    assert (run_dir / 'run.json').is_file()
+    loaded = json.loads((run_dir / 'run.json').read_text(encoding='utf-8'))
+    assert loaded['meta']['corpus']['fingerprint'] == 'abc123'
+
+
+def test_partial_run_can_still_produce_a_report(tmp_path):
+    """被打断的 run 用 meta + 部分 results 就能出报告，并标注不完整。"""
+    run_dir = tmp_path / 'run'
+    run_dir.mkdir()
+    meta = _meta()
+    meta['incomplete'] = '172/450 次请求'
+    reportmod.write_meta(run_dir, meta)
+
+    sink = runner.ResultSink(run_dir / 'results.jsonl')
+    for g in ('A', 'B'):
+        for i in range(4):
+            sink.write(_res(g, i))
+    sink.close()
+
+    recs = runner.load_results(run_dir / 'results.jsonl')
+    md = reportmod.write(run_dir, meta, recs).read_text(encoding='utf-8')
+    assert '本次结果不完整' in md
+    assert '172/450' in md
+
+
 def test_resume_reselects_exact_payloads_from_grown_corpus():
     """语料是活的：agent-core 边跑边追加日志。
 

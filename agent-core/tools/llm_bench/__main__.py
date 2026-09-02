@@ -140,8 +140,11 @@ def _run(args, cfg, groups, transport, resume_dir, meta) -> int:
                        'sampling': 'n/a', 'fingerprint': 'n/a', 'bad_lines': 0},
             'request': cfg['request'], 'run': cfg['run'],
         }
+        reportmod.write_meta(run_dir, run_meta)
         try:
             runner.probe(groups, transport, args.probe, args.probe_interval, sink)
+        except KeyboardInterrupt:
+            print('\n[中断] 已完成的探活结果已落盘。')
         finally:
             sink.close()
         run_meta['finished_at'] = reportmod.now_iso()
@@ -226,6 +229,10 @@ def _run(args, cfg, groups, transport, resume_dir, meta) -> int:
     print(f'\n开始：{len(groups)} 组 × {len(payloads)} 条 × '
           f'(预热 {cfg["run"]["warmup"]} + 计分 {cfg["run"]["repeats"]}) = {total} 次请求')
     print(f'输出目录 {run_dir}\n')
+
+    # 先把 meta 落盘：被 kill 打断时 run.json 必须已经存在，否则这次 run 既不能
+    # --resume 也不能 --report-only，只剩一堆无从解释的 results.jsonl。
+    reportmod.write_meta(run_dir, run_meta)
 
     sink = runner.ResultSink(run_dir / 'results.jsonl')
     interrupted = False

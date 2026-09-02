@@ -227,6 +227,19 @@ def build(run_meta: dict, summaries: dict, paired: dict, noise: dict,
     return '\n'.join(L)
 
 
+def write_meta(run_dir: pathlib.Path, run_meta: dict) -> pathlib.Path:
+    """在开跑之前就把 run.json 落盘（只有 meta，没有统计量）。
+
+    --resume 和 --report-only 都靠 run.json 取 meta。如果只在跑完时才写，被
+    kill -9 / 断电 / 容器重启打断的 run 就只剩 results.jsonl，既不能续跑也不能
+    出报告 —— 恰好是续跑存在的唯一场景。所以先写一份，收尾时再用完整版覆盖。
+    """
+    path = run_dir / 'run.json'
+    path.write_text(json.dumps({'meta': run_meta}, ensure_ascii=False, indent=2),
+                    encoding='utf-8')
+    return path
+
+
 def write(run_dir: pathlib.Path, run_meta: dict, records: list[dict]) -> pathlib.Path:
     """从原始结果算出全部统计并落盘报告。"""
     measured = [r for r in records if r.get('phase') == 'measure']
