@@ -51,7 +51,7 @@ async function _loadInterfaces() {
           ${i.gateway ? `<div class="network-iface-cell"><span class="network-iface-label">网关</span><span class="network-iface-value">${_esc(i.gateway)}</span></div>` : ''}
           ${i.mac ? `<div class="network-iface-cell"><span class="network-iface-label">MAC</span><span class="network-iface-value">${_esc(i.mac)}</span></div>` : ''}
         </div>` : ''}
-        ${i.state === 'connected' && i.gateway ? `<div class="network-iface-policy-route" title="开启后，来自此网卡的连接会强制从此网卡回复，用于此网卡不是主上行网络时避免外部无法访问其 IP。切换时会短暂断开重连此网卡">
+        ${i.state === 'connected' && i.gateway ? `<div class="network-iface-policy-route" title="开启后，来自此网卡的连接会强制从此网卡回复，用于此网卡不是主上行网络时避免外部无法访问其 IP。不影响此网卡作为默认出口。旧版 NetworkManager 上切换时可能会短暂断开重连此网卡">
           <span class="network-iface-label">策略路由（防止回包走错网卡）</span>
           <label class="toggle-switch">
             <input type="checkbox" class="network-policy-route-toggle" data-device="${_attr(i.device)}" ${i.policy_route ? 'checked' : ''} />
@@ -72,7 +72,7 @@ async function _loadInterfaces() {
 async function _togglePolicyRoute(el) {
   const device = el.dataset.device;
   const enable = el.checked;
-  if (!confirm(`此操作会短暂断开并重连 ${device}，确认继续？`)) {
+  if (!confirm(`此操作会重新应用 ${device} 的网络配置，旧版 NetworkManager 上可能短暂断开重连，确认继续？`)) {
     el.checked = !enable;
     return;
   }

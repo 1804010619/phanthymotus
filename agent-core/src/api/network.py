@@ -155,13 +155,18 @@ def _get_devices_sync() -> list[dict]:
             except Exception:
                 pass
 
-        # Policy routing (ipv4.route-table) — whether replies from this device
-        # are forced back out the same device instead of the lowest-metric default route
-        route_table = 0
+        # Policy routing — whether replies from this device are forced back out the
+        # same device instead of following the lowest-metric default route. The
+        # source-based `ip rule` is what makes that happen, so that is what we key
+        # the state off. `route-table` is also accepted so profiles written by the
+        # older scheme (which relocated the routes instead of copying them, see
+        # `_set_policy_route_sync`) still read as on and can be toggled off to clean up.
+        policy_route = False
         if settings_path and settings_path != '/':
             try:
-                route_table = int(_get_connection_settings(bus, settings_path)
-                                   .get('ipv4', {}).get('route-table', 0))
+                ipv4_settings = _get_connection_settings(bus, settings_path).get('ipv4', {})
+                policy_route = (bool(ipv4_settings.get('routing-rules'))
+                                or int(ipv4_settings.get('route-table', 0)) != 0)
             except Exception:
                 pass
 
@@ -194,7 +199,7 @@ def _get_devices_sync() -> list[dict]:
             'ip': ip,
             'mask': mask,
             'gateway': gateway,
-            'policy_route': route_table != 0,
+            'policy_route': policy_route,
         })
     return results
 
@@ -366,22 +371,79 @@ def _find_device_path_sync(bus, device: str) -> str | None:
     return None
 
 
+def _policy_route_data(table: int, network: str, prefix: int, gateway: str) -> list:
+    """The routes to copy into private table `table` for a device on `network`/`prefix`.
+
+    Two entries, both pinned to the table via the per-route `table` attribute:
+
+    - the device's own subnet, kept on-link. Without it the default route below
+      would swallow same-subnet destinations too (a table with a default route
+      never falls through to main), so replies to a peer on this very subnet would
+      take a needless detour through the gateway — and break outright behind AP
+      client isolation.
+    - a default route via `gateway`, for replies to everything else.
+
+    NetworkManager adds the link route for `gateway` itself to the same table, so
+    the default route is self-sufficient; that is not our job here.
+    """
+    import dbus
+    entries = [
+        dbus.Dictionary({
+            'dest': dbus.String(network),
+            'prefix': dbus.UInt32(prefix),
+            'table': dbus.UInt32(table),
+        }, signature='sv'),
+    ]
+    if gateway:
+        entries.append(dbus.Dictionary({
+            'dest': dbus.String('0.0.0.0'),
+            'prefix': dbus.UInt32(0),
+            'next-hop': dbus.String(gateway),
+            'table': dbus.UInt32(table),
+        }, signature='sv'))
+    return entries
+
+
+def _without_policy_routes(route_data, table: int) -> list:
+    """`route_data` minus the entries we own, so a user's own static routes survive
+    both enabling and disabling."""
+    return [r for r in route_data if int(r.get('table', 0)) != table]
+
+
 def _set_policy_route_sync(device: str, enable: bool):
     """Enable/disable policy routing on a device's active connection so replies
     to addresses outside its own subnet are still sent back out through it,
     instead of following another interface's lower-metric default route
     (asymmetric routing on multi-homed hosts).
 
-    `ipv4.route-table` alone only moves the connection's routes into a private
-    table — confirmed against a live multi-homed host that it does NOT also
-    install the matching `ip rule`. The rule has to be added explicitly via
-    `ipv4.routing-rules`. It's keyed on the device's current *subnet* rather
-    than its exact address so it keeps working across a DHCP renewal that
-    hands out a different address in the same subnet (the common case); a
-    renewal into a different subnet requires re-toggling this setting.
+    Implemented by *copying* the device's routes into a private table and pointing
+    a source-based `ip rule` at it, leaving the main table alone.
 
-    Applying either property requires a full deactivate+reactivate (not
-    Device.Reapply) to take effect, which briefly drops the device's link."""
+    Do NOT reach for `ipv4.route-table` here, however natural it looks. It does not
+    copy the connection's routes into the private table, it *relocates* them — the
+    DHCP default route included. The device then stops being usable as a general
+    egress path at all, and NetworkManager additionally reports the link to
+    systemd-resolved as not-a-default-route, which silently drops its DNS servers
+    (`resolvectl status` shows `Current Scopes: none`). Bumi 2026-09-02: the toggle
+    was on for wifi, so every outbound connection fell to a dead 10.42.0.1 default
+    route on another NIC and resolution rode on that same dead link. `ip route add
+    default … dev wifi` could not even be added by hand — with the subnet route
+    relocated too, the main table had no route to the wifi gateway, so the kernel
+    rejected the nexthop as invalid.
+
+    `ipv4.routing-rules` is required and separate: setting a route table alone does
+    not install the matching `ip rule`. The rule is keyed on the device's current
+    *subnet* rather than its exact address so it survives a DHCP renewal handing out
+    a different address in the same subnet (the common case). The copied routes pin
+    the current gateway, so a renewal into a different subnet or gateway needs this
+    setting re-toggled; until then only reply symmetry is stale — the main table is
+    still whatever DHCP says, so the host keeps its connectivity.
+
+    Applied with Device.Reapply, which on NM 1.36.6 picks up routes, routing rules
+    and route-table without touching the link (verified on Bumi — an SSH session
+    over the very device being reconfigured survived). Older NM may not, so a full
+    deactivate+reactivate remains as fallback; that one does drop the link briefly.
+    """
     import dbus
     import time
     bus = _get_bus()
@@ -399,21 +461,24 @@ def _set_policy_route_sync(device: str, enable: bool):
     conn_iface = dbus.Interface(conn_obj, NM_CONN_IFACE)
     settings = conn_iface.GetSettings()
     ipv4 = settings.setdefault('ipv4', dbus.Dictionary({}, signature='sv'))
+    kept_routes = _without_policy_routes(ipv4.get('route-data', []), table)
 
     if enable:
         ip4_path = str(_get_prop(bus, dev_path, NM_DEVICE_IFACE, 'Ip4Config'))
         if not ip4_path or ip4_path == '/':
             raise RuntimeError(f'设备 "{device}" 当前没有 IP 地址')
-        addresses = _get_all_props(bus, ip4_path, NM_IP4_IFACE).get('AddressData', [])
+        ip4_props = _get_all_props(bus, ip4_path, NM_IP4_IFACE)
+        addresses = ip4_props.get('AddressData', [])
         if not addresses:
             raise RuntimeError(f'设备 "{device}" 当前没有 IP 地址')
         prefix = int(addresses[0].get('prefix', 32))
         network = _subnet_network(str(addresses[0].get('address', '')), prefix)
-        ipv4['route-table'] = dbus.UInt32(table)
+        gateway = str(ip4_props.get('Gateway', ''))
+        new_routes = kept_routes + _policy_route_data(table, network, prefix, gateway)
         # Wire format is aa{sv}, not a plain string list — confirmed by round-tripping
         # a rule set via `nmcli ... +ipv4.routing-rules "priority ... from ... table ..."`
         # through GetSettings() and inspecting the actual dbus.Dictionary it produced.
-        ipv4['routing-rules'] = dbus.Array([
+        new_rules = [
             dbus.Dictionary({
                 'family': dbus.Int32(socket.AF_INET),
                 'priority': dbus.UInt32(table),
@@ -421,12 +486,29 @@ def _set_policy_route_sync(device: str, enable: bool):
                 'from-len': dbus.Byte(prefix),
                 'table': dbus.UInt32(table),
             }, signature='sv'),
-        ], signature='a{sv}')
+        ]
     else:
-        ipv4['route-table'] = dbus.UInt32(0)
-        ipv4['routing-rules'] = dbus.Array([], signature='a{sv}')
+        new_routes = kept_routes
+        new_rules = []
+
+    # Always cleared, both to undo profiles written by the older scheme and to keep
+    # our own `table=` route attributes from being overridden by a connection-wide table.
+    ipv4['route-table'] = dbus.UInt32(0)
+    ipv4['route-data'] = dbus.Array(new_routes, signature='a{sv}')
+    ipv4['routing-rules'] = dbus.Array(new_rules, signature='a{sv}')
+    # Legacy alias for route-data; leaving a stale copy behind lets the two disagree.
+    ipv4.pop('routes', None)
 
     conn_iface.Update(settings)
+
+    try:
+        dev_iface = dbus.Interface(bus.get_object(NM_IFACE, dev_path), NM_DEVICE_IFACE)
+        # Empty connection + version_id 0 = "reapply the saved profile", which is what
+        # `nmcli device reapply` sends and what we just wrote via Update().
+        dev_iface.Reapply(dbus.Dictionary({}, signature='sa{sv}'), dbus.UInt64(0), dbus.UInt32(0))
+        return
+    except Exception:
+        pass
 
     nm_obj = bus.get_object(NM_IFACE, NM_PATH)
     nm_iface = dbus.Interface(nm_obj, NM_IFACE)
@@ -434,6 +516,7 @@ def _set_policy_route_sync(device: str, enable: bool):
     time.sleep(1)
     nm_iface.ActivateConnection(
         dbus.ObjectPath(settings_path), dbus.ObjectPath(dev_path), dbus.ObjectPath('/'))
+
 
 
 
