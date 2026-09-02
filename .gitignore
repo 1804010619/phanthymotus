@@ -19,6 +19,10 @@ build/
 resource/world/
 resource/log/
 resource/frame_rgb.jpg
+# llm_bench 的运行产物（报告 + 原始结果）。用 **/ 前缀是因为本文件在仓库根，
+# 而实际目录是 agent-core/resource/llm_bench/ —— 带斜杠的模式锚定在 .gitignore
+# 所在目录，不加 **/ 匹配不到子项目里的同名路径。
+**/resource/llm_bench/
 
 # Media (runtime captures)
 *.jpg

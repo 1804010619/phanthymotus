@@ -1,0 +1,56 @@
+# llm_bench 示例配置
+#
+# 用法:
+#   export ROUTER_KEY=sk-...
+#   export PPIO_KEY=sk_-...
+#   python3 tools/llm_bench --config tools/llm_bench/bench.example.yaml --probe 10
+#   python3 tools/llm_bench --config tools/llm_bench/bench.example.yaml --count 50
+#
+# 密钥不要写在这个文件里。优先 key_env（环境变量），或 key_file（支持 `路径#行号`，
+# 兼容一行一个值的文件）。
+
+corpus:
+  dir: resource/llm_data      # agent-core 自己的请求日志，由 src/llm_logger.py 写出
+  count: 50
+  sampling: even              # even = 跨越整个文件均匀取（推荐）| recent | random
+  seed: 42                    # 仅 random 用，保证可复现
+  min_messages: 2             # 过滤退化样本
+
+request:
+  max_tokens: 10240           # 与生产 src/client/llm.py 一致
+  timeout_s: 180
+  extra_body:
+    # 生产在 think_mode=false 时会带这个（src/client/llm.py:136-139）
+    chat_template_kwargs:
+      enable_thinking: false
+
+run:
+  warmup: 1                   # 预热轮数，不计入统计。别关，见 README「为什么要预热」
+  repeats: 2                  # 计分轮数。>=2 才能估出噪声基线，才敢下排名结论
+  order: rotate               # 逐条轮换组顺序，抵消时段漂移
+  stop_after_consecutive_failures: 0   # 0 = 不早停；设 N 则某组连续失败 N 次后跳过该组
+
+groups:
+  # 一个入口配多个模型名 → 自动展开成多组，组名为 {name}/{model}
+  - name: router
+    url: https://router.phanthy.com/v1
+    key_env: ROUTER_KEY
+    models:
+      - glm-5.3
+      - zai-org/glm-5.3
+
+  - name: ppio
+    url: https://api.ppio.com/openai
+    key_env: PPIO_KEY
+    models:
+      - zai-org/glm-5.3
+
+  # 也支持从文件按行取 key（`路径#行号`，1-based）
+  # - name: from-file
+  #   url: https://api.example.com/v1
+  #   key_file: /home/nvidia/.a#2
+  #   model: glm-5.3
+
+# 自动把 ConfigDB 里当前生产配置加为一组（组名 current/{model}），
+# 用来回答「换过去会不会比现在差」。读 $DB_PATH，只读打开。
+include_current: true
