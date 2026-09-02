@@ -1,8 +1,14 @@
-"""统计：配对比较、噪声基线、幸存者偏差、失败形态。
+"""统计：配对比较、显著性、幸存者偏差、失败形态、冷热两态。
 
 这个模块的职责一半是算数字，一半是**阻止过度解读**。手工评测时我犯过的每个
 解读错误都在这里有一条对应的约束。
+
+显著性用配对差的 bootstrap 置信区间 + 符号检验，不靠重复测量估噪声——重复重放
+同一条 payload 量的是「同一个请求重发」，服务端前缀缓存必然命中，用它去校准
+真实负载的波动逻辑上站不住。
 """
+import math
+import random
 import statistics
 
 
@@ -102,48 +108,74 @@ def failure_shape(records: list[dict]) -> dict:
     }
 
 
-def noise_floor(by_group: dict[str, list[dict]]) -> dict:
-    """用同一组不同轮次之间的差值估噪声。
+def _binom_two_sided_p(k: int, n: int) -> float:
+    """符号检验的双侧 p 值：n 次配对里 A 赢 k 次，零假设 p=0.5。"""
+    if n == 0:
+        return 1.0
+    total = 2.0 ** n
+    def tail(m):
+        return sum(math.comb(n, i) for i in range(0, m + 1)) / total
+    lo = min(k, n - k)
+    return min(1.0, 2.0 * tail(lo))
 
-    这是整个工具最重要的一条约束。手工评测时，同一个入口、同一个模型、同一批
-    payload 跑两遍，中位差是 0.93s；而被拿来做结论的两组之间的中位差只有 0.39s。
-    也就是说**重复测量自身的波动比组间差异还大**，任何排名都是读噪声。
+
+def _bootstrap_median_ci(deltas: list[float], seed: int = 42,
+                         iters: int = 2000, alpha: float = 0.05) -> tuple:
+    """配对差中位数的 bootstrap 置信区间。
+
+    固定 seed，保证同一份结果反复算出同样的区间——报告要可复现，
+    不能每次 --report-only 都给出不同的置信区间。
     """
-    per_group = {}
-    all_deltas = []
-    for name, recs in by_group.items():
-        # (payload_idx -> {repeat: elapsed})，只取成功样本
-        by_idx: dict[int, dict[int, float]] = {}
-        for r in recs:
-            if r.get('ok'):
-                by_idx.setdefault(r['payload_idx'], {})[r['repeat']] = r['elapsed']
+    n = len(deltas)
+    if n < 3:
+        return (None, None)
+    rnd = random.Random(seed)
+    meds = []
+    for _ in range(iters):
+        s = [deltas[rnd.randrange(n)] for _ in range(n)]
+        meds.append(statistics.median(s))
+    meds.sort()
+    lo = meds[int(iters * alpha / 2)]
+    hi = meds[min(iters - 1, int(iters * (1 - alpha / 2)))]
+    return (lo, hi)
 
-        deltas = []
-        for reps in by_idx.values():
-            if len(reps) < 2:
-                continue
-            vals = [reps[k] for k in sorted(reps)]
-            # 相邻轮次两两之差的绝对值
-            deltas += [abs(b - a) for a, b in zip(vals, vals[1:])]
 
-        if deltas:
-            per_group[name] = {
-                'n': len(deltas),
-                'median_abs_delta': statistics.median(deltas),
-                'p90_abs_delta': pct(deltas, .9),
-            }
-            all_deltas += deltas
+def significance(deltas: list[float], seed: int = 42) -> dict:
+    """判断一组配对差是否构成真实差异。
 
-    if not all_deltas:
-        return {'available': False, 'per_group': per_group,
-                'reason': 'repeats < 2 或成功样本不足，无法估计噪声'}
-    return {
-        'available': True,
-        'per_group': per_group,
-        'median_abs_delta': statistics.median(all_deltas),
-        'p90_abs_delta': pct(all_deltas, .9),
-        'n': len(all_deltas),
-    }
+    两条独立证据都要过：
+      1. 中位数的 95% bootstrap 置信区间不跨 0 —— 差异的方向稳定
+      2. 符号检验双侧 p < 0.05 —— 赢的次数不像抛硬币
+
+    只看「中位差 0.4s」这种点估计是不够的：手工评测时正是这种点估计让我把
+    0.39s 的差异当成了结论，而它其实完全在波动范围内。
+    """
+    n = len(deltas)
+    out = {'n': n}
+    if n == 0:
+        return {**out, 'available': False, 'reason': '没有配对样本'}
+
+    out['median_delta'] = statistics.median(deltas)
+    out['mean_delta'] = statistics.mean(deltas)
+    a_faster = sum(1 for d in deltas if d < 0)
+    b_faster = sum(1 for d in deltas if d > 0)
+    out['a_faster'], out['b_faster'] = a_faster, b_faster
+
+    if n < 3:
+        return {**out, 'available': False,
+                'reason': f'配对样本只有 {n} 条，无法判断显著性'}
+
+    lo, hi = _bootstrap_median_ci(deltas, seed)
+    out['ci95'] = (lo, hi)
+    out['p_sign'] = _binom_two_sided_p(min(a_faster, b_faster), a_faster + b_faster)
+    ci_excludes_zero = lo is not None and (lo > 0 or hi < 0)
+    out['available'] = True
+    out['significant'] = bool(ci_excludes_zero and out['p_sign'] < 0.05)
+    # 符号相反说明一方赢在多数、输在长尾，不该视为有差别
+    out['sign_conflict'] = out['median_delta'] * out['mean_delta'] < 0
+    if out['sign_conflict']:
+        out['significant'] = False
+    return out
 
 
 def paired(by_group: dict[str, list[dict]]) -> dict:
@@ -153,7 +185,7 @@ def paired(by_group: dict[str, list[dict]]) -> dict:
     直接比两组的 p50 会被抽到的样本构成左右。
     """
     names = sorted(by_group)
-    # payload_idx -> group -> 该组在各轮的中位延迟
+    # payload_idx -> group -> 延迟
     per_idx: dict[int, dict[str, float]] = {}
     for name, recs in by_group.items():
         acc: dict[int, list[float]] = {}
@@ -161,6 +193,7 @@ def paired(by_group: dict[str, list[dict]]) -> dict:
             if r.get('ok'):
                 acc.setdefault(r['payload_idx'], []).append(r['elapsed'])
         for idx, vals in acc.items():
+            # 正常每个 (组, payload) 只有一条；万一有多条（续跑重复写入）取中位
             per_idx.setdefault(idx, {})[name] = statistics.median(vals)
 
     common = sorted(i for i, d in per_idx.items() if len(d) == len(names))
@@ -176,26 +209,32 @@ def paired(by_group: dict[str, list[dict]]) -> dict:
         for b_i in range(a_i + 1, len(names)):
             a, b = names[a_i], names[b_i]
             d = [per_idx[i][a] - per_idx[i][b] for i in common]
-            out['pairs'][f'{a} vs {b}'] = {
-                'median_delta': statistics.median(d),
-                'mean_delta': statistics.mean(d),
-                'a_faster': sum(1 for x in d if x < 0),
-                'b_faster': sum(1 for x in d if x > 0),
-                'n': len(d),
-            }
+            out['pairs'][f'{a} vs {b}'] = significance(d)
     return out
 
 
-def verdict(summaries: dict, paired_res: dict, noise: dict) -> dict:
+def verdict(summaries: dict, paired_res: dict,
+            cold_summaries: dict | None = None,
+            cold_paired: dict | None = None) -> dict:
     """生成结论。这段刻意保守——宁可说「测不出差别」也不编排名。
 
     优先级：可用性 > 延迟。一个入口再快，成功率不满就不是候选；这正是
     router/glm-5.3 那次的情况（35/50 成功，延迟却和对手持平）。
+
+    冷轮（预热轮）单独成一个结论维度。它不是废数据：预热轮是唯一一次「每条 payload
+    都没被自己热过」的完整测量，所以冷态延迟和真实缓存率只能从它这里读。热轮量的
+    是稳定态下的公平对比。两者结论不一致本身就是信息——一个入口只有热了才快，
+    对一个会长时间空闲、经常冷启动的机器人来说是实质缺点。
     """
     incomplete = {n: s for n, s in summaries.items() if not s.get('complete')}
     usable = {n: s for n, s in summaries.items() if s.get('complete') and s.get('ok')}
 
     res = {'incomplete': sorted(incomplete), 'reasons': []}
+
+    # 冷轮结论（如果跑了预热轮）
+    cold = _cold_verdict(cold_summaries, cold_paired)
+    if cold:
+        res['cold'] = cold
 
     if incomplete:
         res['primary'] = 'availability'
@@ -215,30 +254,88 @@ def verdict(summaries: dict, paired_res: dict, noise: dict) -> dict:
     if not pairs:
         res['recommend'] = None
         res['reasons'].append('配对样本不足，无法比较')
+        _append_cold_reason(res, cold)
         return res
 
-    floor = noise.get('median_abs_delta') if noise.get('available') else None
-    # 所有两两差异都在噪声之内 → 不排名
-    deltas = [abs(v['median_delta']) for v in pairs.values()]
-    if floor is not None and max(deltas) <= floor:
+    sig = {k: v for k, v in pairs.items() if v.get('significant')}
+    if not sig:
         res['recommend'] = None
         res['indistinguishable'] = True
-        res['reasons'].append(
-            f'最大组间中位差 {max(deltas):.2f}s ≤ 噪声基线 {floor:.2f}s'
-            f'（同配置重复测量的波动），本轮测不出显著差异')
+        unavailable = [k for k, v in pairs.items() if not v.get('available')]
+        if unavailable and len(unavailable) == len(pairs):
+            res['reasons'].append(
+                f'配对样本太少（{pairs[unavailable[0]].get("n", 0)} 条），'
+                '无法判断显著性——加大 --count 再看')
+        else:
+            worst = max(pairs.values(), key=lambda v: abs(v.get('median_delta', 0)))
+            ci = worst.get('ci95') or (None, None)
+            ci_s = (f'95% CI [{ci[0]:+.2f}, {ci[1]:+.2f}]s'
+                    if ci[0] is not None else 'CI 不可用')
+            res['reasons'].append(
+                f'热轮没有一对达到显著：最大中位差 {worst["median_delta"]:+.2f}s，'
+                f'{ci_s} 跨 0（符号检验 p={worst.get("p_sign", 1):.2f}）')
+            flipped = [k for k, v in pairs.items() if v.get('sign_conflict')]
+            if flipped:
+                res['reasons'].append(
+                    '以下组对中位与均值符号相反（赢在多数、输在长尾），'
+                    '不构成差异: ' + '; '.join(sorted(flipped)))
+        _append_cold_reason(res, cold)
         return res
 
     ranked = sorted(usable, key=lambda n: usable[n].get('p50', float('inf')))
     res['recommend'] = ranked[0] if ranked else None
     res['ranking'] = ranked
-    if floor is not None:
-        res['reasons'].append(f'噪声基线 {floor:.2f}s（同配置重复测量的中位波动）')
-        near = [k for k, v in pairs.items() if abs(v['median_delta']) <= floor]
-        if near:
-            res['reasons'].append(
-                '以下组对的差异在噪声以内，不应视为有差别: ' + '; '.join(near))
-    else:
+    for k, v in sorted(sig.items()):
+        ci = v.get('ci95') or (None, None)
         res['reasons'].append(
-            '未估出噪声基线（repeats < 2）——单轮结果的排名可能只是波动，'
-            '建议用 --repeats 2 复核')
+            f'{k}: 中位差 {v["median_delta"]:+.2f}s，'
+            f'95% CI [{ci[0]:+.2f}, {ci[1]:+.2f}]s 不跨 0，'
+            f'符号检验 p={v["p_sign"]:.3f}（{v["a_faster"]}:{v["b_faster"]}）')
+    insig = [k for k in pairs if k not in sig]
+    if insig:
+        res['reasons'].append(
+            '以下组对未达显著，不应视为有差别: ' + '; '.join(sorted(insig)))
+    _append_cold_reason(res, cold)
     return res
+
+
+def _cold_verdict(cold_summaries, cold_paired) -> dict | None:
+    """冷轮（预热轮）自己的结论。"""
+    if not cold_summaries:
+        return None
+    usable = {n: s for n, s in cold_summaries.items() if s.get('ok')}
+    if not usable:
+        return None
+
+    out = {
+        'ranking': sorted(usable, key=lambda n: usable[n].get('p50', float('inf'))),
+        'p50': {n: s.get('p50') for n, s in usable.items()},
+        'cache_overall': {n: s.get('cache_overall') for n, s in usable.items()},
+        'success': {n: f'{s["ok"]}/{s["total"]}' for n, s in cold_summaries.items()},
+    }
+    pairs = (cold_paired or {}).get('pairs') or {}
+    out['pairs'] = pairs
+    if pairs:
+        out['indistinguishable'] = not any(v.get('significant') for v in pairs.values())
+        out['max_delta'] = max(abs(v.get('median_delta', 0)) for v in pairs.values())
+    return out
+
+
+def _append_cold_reason(res: dict, cold: dict | None) -> None:
+    """把冷轮结论并进 reasons，并在两个 regime 不一致时点出来。"""
+    if not cold or not cold.get('ranking'):
+        return
+    cold_best = cold['ranking'][0]
+    if cold.get('indistinguishable'):
+        res['reasons'].append(
+            f'冷轮（首次请求、缓存未热）测不出显著差异'
+            f'（最大中位差 {cold.get("max_delta", 0):.2f}s 在噪声内）')
+        return
+    res['reasons'].append(f'冷轮最快的是 {cold_best}（p50 {cold["p50"][cold_best]:.2f}s）')
+    warm_best = res.get('recommend')
+    if warm_best and warm_best != cold_best:
+        res['regimes_disagree'] = True
+        res['reasons'].append(
+            f'⚠ 冷热两态结论不一致：热轮 {warm_best} 更快，冷轮 {cold_best} 更快。'
+            '一个入口只有热了才快，对会长时间空闲、经常冷启动的机器人是实质缺点——'
+            '按你的实际负载形态选。')

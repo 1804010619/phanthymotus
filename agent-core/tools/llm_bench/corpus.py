@@ -88,8 +88,14 @@ def sample(records: list[dict], count: int, strategy: str = 'even',
            seed: int = 42) -> list[dict]:
     """抽样。
 
-    even 是默认：跨越整个文件均匀取，覆盖不同 prompt 规模和会话阶段。只取开头
-    会让样本集中在某一段会话上，那段的 prompt 长度和缓存形态都不具代表性。
+    even 是延迟对比的默认：跨越整个文件均匀取，覆盖不同 prompt 规模和会话阶段。
+    只取开头会让样本集中在某一段会话上，那段的 prompt 长度和缓存形态都不具代表性。
+
+    trace 是**缓存对比**该用的：按整条 trace 取，保留 trace 内的原始顺序。
+    生产里 agent 是一轮接一轮，每轮 prompt 在上一轮基础上追加，同 trace 相邻请求
+    的消息前缀重叠中位是 93.3%；而 even 抽样打散了这个连续性，抽完后相邻样本的
+    重叠只有 40.0%（实测于 orin6 的 133 条记录 / 51 条 trace）。用 even 测出来的
+    缓存率不代表生产。
     """
     if count >= len(records):
         return list(records)
@@ -98,6 +104,8 @@ def sample(records: list[dict], count: int, strategy: str = 'even',
         return records[-count:]
     if strategy == 'random':
         return random.Random(seed).sample(records, count)
+    if strategy == 'trace':
+        return _sample_traces(records, count)
     if strategy != 'even':
         raise CorpusError(f'未知抽样策略: {strategy}')
 
@@ -105,6 +113,32 @@ def sample(records: list[dict], count: int, strategy: str = 'even',
     # count 接近 len 时会退化成只取前面一段。
     n = len(records)
     return [records[i * n // count] for i in range(count)]
+
+
+def _sample_traces(records: list[dict], count: int) -> list[dict]:
+    """按整条 trace 取，保留 trace 内顺序，直到凑够 count 条。
+
+    多轮 trace 优先——只有一条记录的 trace 根本不产生前缀增长，对缓存测量没有
+    贡献（实测语料里 51 条 trace 有 15 条是单条的）。同样大小的 trace 之间保持
+    文件里的先后顺序，避免引入额外的选择偏差。
+    """
+    order: dict = {}
+    for i, r in enumerate(records):
+        tid = r.get('trace_id') or f'_no_trace_{i}'
+        order.setdefault(tid, []).append(r)
+
+    # 先按长度降序（多轮的更有价值），同长度按首次出现位置升序
+    first_pos = {tid: records.index(rs[0]) for tid, rs in order.items()}
+    ranked = sorted(order.items(), key=lambda kv: (-len(kv[1]), first_pos[kv[0]]))
+
+    picked: list[dict] = []
+    for tid, rs in ranked:
+        if len(picked) >= count:
+            break
+        # 整条收进来；最后一条 trace 允许截断以精确凑够 count
+        room = count - len(picked)
+        picked.extend(rs[:room] if len(rs) > room else rs)
+    return picked
 
 
 def request_ids(records: list[dict]) -> list:

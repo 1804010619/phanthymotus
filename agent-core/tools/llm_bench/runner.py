@@ -140,17 +140,23 @@ def probe(groups, transport: Transport, times: int, interval: float = 2.0,
 
 def run(groups, payloads, transport: Transport, cfg: dict,
         sink: ResultSink, done: set | None = None, log=print) -> None:
-    """预热轮 + 计分轮。done 里的三元组会被跳过（续跑）。"""
+    """冷轮 + 热轮。done 里的四元组会被跳过（续跑）。
+
+    冷轮不是「预热然后丢掉」——它是唯一一次每条 payload 都没被自己热过的完整
+    测量，冷态延迟和真实缓存率只能从它读出来。热轮量稳定态下的公平对比。
+    """
     done = done or set()
     req = cfg['request']
     run_cfg = cfg['run']
-    warmup = int(run_cfg.get('warmup', 1))
-    repeats = max(1, int(run_cfg.get('repeats', 1)))
+    cold = int(run_cfg.get('warmup', 1))
     rotate = run_cfg.get('order', 'rotate') == 'rotate'
     stop_after = int(run_cfg.get('stop_after_consecutive_failures', 0) or 0)
 
-    rounds = [(Phase.WARMUP, r) for r in range(warmup)] + \
-             [(Phase.MEASURE, r) for r in range(repeats)]
+    # 两遍：冷轮（每条 payload 第一次被请求）+ 热轮（同一批再走一遍）。
+    # 刻意**不做重复轮**：把同一条 payload 反复重放量的是「同一个请求重发」，
+    # 服务端前缀缓存必然命中，延迟分布和真实负载不是一回事。显著性由配对差的
+    # 置信区间 + 符号检验给出（stats.significance），不需要靠重复测量估噪声。
+    rounds = [(Phase.WARMUP, 0)] * cold + [(Phase.MEASURE, 0)]
     total = len(rounds) * len(payloads) * len(groups)
     n = 0
     consecutive = {g.name: 0 for g in groups}
@@ -187,7 +193,7 @@ def run(groups, payloads, transport: Transport, cfg: dict,
                                ('ok', 'kind', 'status', 'elapsed', 'prompt',
                                 'completion', 'cached', 'finish', 'err', 'detail')}})
 
-                tag = 'warm' if phase == Phase.WARMUP else f'r{rep}'
+                tag = 'cold' if phase == Phase.WARMUP else 'warm'
                 if r['ok']:
                     tps = r['completion'] / r['elapsed'] if r['elapsed'] else 0
                     log(f'  [{n}/{total}] {tag} {g.name:<24} ok  {r["elapsed"]:6.2f}s '

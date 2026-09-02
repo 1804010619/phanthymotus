@@ -211,8 +211,8 @@ def test_cli_overrides_only_apply_when_given(tmp_path):
     这是「所有参数 YAML 里都有、命令行只是临时覆盖」的前提。
     """
     body = """
-corpus: {count: 50, sampling: recent}
-run: {repeats: 3, warmup: 2}
+corpus: {count: 50, sampling: trace}
+run: {warmup: 1}
 request: {max_tokens: 4096}
 groups:
   - {name: g, url: https://u/v1, key: sk-x, model: m}
@@ -220,26 +220,76 @@ groups:
     # 全部不指定
     cfg = cfgmod.load(_yaml(tmp_path, body), {
         'corpus': {'count': None, 'sampling': None},
-        'run': {'repeats': None, 'warmup': None},
+        'run': {'warmup': None},
         'request': {'max_tokens': None},
         'include_current': None,
     })
     assert cfg['corpus']['count'] == 50
-    assert cfg['corpus']['sampling'] == 'recent'
-    assert cfg['run']['repeats'] == 3
-    assert cfg['run']['warmup'] == 2
+    assert cfg['corpus']['sampling'] == 'trace'
+    assert cfg['run']['warmup'] == 1
     assert cfg['request']['max_tokens'] == 4096
 
     # 指定的才覆盖
     cfg2 = cfgmod.load(_yaml(tmp_path, body), {
         'corpus': {'count': 3, 'sampling': None},
-        'run': {'repeats': None, 'warmup': 0},
+        'run': {'warmup': 0},
         'request': {'max_tokens': None},
     })
     assert cfg2['corpus']['count'] == 3
-    assert cfg2['corpus']['sampling'] == 'recent'   # 没给，保持 YAML
-    assert cfg2['run']['repeats'] == 3              # 没给，保持 YAML
+    assert cfg2['corpus']['sampling'] == 'trace'    # 没给，保持 YAML
+    assert cfg2['request']['max_tokens'] == 4096    # 没给，保持 YAML
     assert cfg2['run']['warmup'] == 0               # 给了 0，必须生效（假值陷阱）
+
+
+# ── 配置键校验 ────────────────────────────────────────────────────────────────
+
+def test_removed_key_is_reported(tmp_path):
+    """已移除的键必须给提示。
+
+    YAML 里多一个键默认静默忽略 —— 那意味着过期的键和写错的键名都没有任何反馈，
+    你以为设了其实没生效。刚移除 repeats 之后这一点尤其要紧。
+    """
+    warnings = []
+    cfgmod.load(_yaml(tmp_path, """
+run: {warmup: 1, repeats: 3}
+groups:
+  - {name: g, url: https://u/v1, key: sk-x, model: m}
+"""), warn=warnings.append)
+    assert any('repeats' in w for w in warnings)
+    assert any('置信区间' in w for w in warnings), '要说清为什么移除了'
+
+
+def test_typo_in_key_is_reported(tmp_path):
+    warnings = []
+    cfgmod.load(_yaml(tmp_path, """
+corpus: {conut: 50}
+groups:
+  - {name: g, url: https://u/v1, key: sk-x, model: m}
+"""), warn=warnings.append)
+    assert any('conut' in w for w in warnings)
+
+
+def test_unknown_group_field_is_reported(tmp_path):
+    warnings = []
+    cfgmod.load(_yaml(tmp_path, """
+groups:
+  - {name: g, url: https://u/v1, key: sk-x, model: m, modle: typo}
+"""), warn=warnings.append)
+    assert any('modle' in w for w in warnings)
+
+
+def test_valid_config_is_silent(tmp_path):
+    """正常配置不能刷警告，否则真警告会被淹没。"""
+    warnings = []
+    cfgmod.load(_yaml(tmp_path, """
+corpus: {dir: x, count: 10, sampling: trace, seed: 1, min_messages: 2}
+request: {max_tokens: 100, timeout_s: 10, extra_body: {}}
+run: {warmup: 1, order: rotate, stop_after_consecutive_failures: 0}
+include_current: false
+groups:
+  - {name: g, url: https://u/v1, key: sk-x, models: [a, b], extra_body: {}}
+"""), warn=warnings.append)
+    assert warnings == [], warnings
 
 
 # ── baseline 开关 ─────────────────────────────────────────────────────────────
@@ -375,65 +425,73 @@ def _res(group, idx, ok=True, elapsed=5.0, repeat=0, phase='measure',
             'detail': None if ok else 'boom', 'ts': 1788000000 + idx}
 
 
-def _meta(groups=None, warmup=1, repeats=2, count=4):
+def _meta(groups=None, warmup=1, count=4):
     return {
         'run_id': 'test', 'mode': 'bench', 'config': {},
         'groups': groups or [], 'hostname': 'test-host', 'image_tag': 'test',
         'transport': 'urllib', 'started_at': 'now', 'finished_at': 'now',
         'corpus': {'source': 'x', 'count': count, 'available': 100,
                    'sampling': 'even', 'fingerprint': 'abc123', 'bad_lines': 0},
-        'request': {'max_tokens': 10240}, 'run': {'warmup': warmup,
-                                                  'repeats': repeats,
-                                                  'order': 'rotate'},
+        'request': {'max_tokens': 10240},
+        'run': {'warmup': warmup, 'order': 'rotate'},
     }
 
 
-def test_noise_floor_from_repeats():
-    """同组不同轮次的差值就是噪声基线。"""
-    by_group = {'A': [_res('A', 0, elapsed=5.0, repeat=0),
-                      _res('A', 0, elapsed=6.0, repeat=1),
-                      _res('A', 1, elapsed=4.0, repeat=0),
-                      _res('A', 1, elapsed=4.5, repeat=1)]}
-    n = st.noise_floor(by_group)
-    assert n['available'] is True
-    assert n['median_abs_delta'] == pytest.approx(0.75)
+def test_significance_needs_ci_and_sign_test():
+    """显著性要两条证据都过：CI 不跨 0 且符号检验 p<0.05。
 
-
-def test_noise_floor_unavailable_with_single_repeat():
-    by_group = {'A': [_res('A', i, repeat=0) for i in range(5)]}
-    assert st.noise_floor(by_group)['available'] is False
-
-
-def test_verdict_refuses_to_rank_within_noise():
-    """核心约束：组间差异小于重复测量波动时不排名。
-
-    真实数据：别名对比的组间中位差 0.39s，而同配置重测波动 0.93s。
+    只看「中位差 0.4s」这种点估计不够 —— 手工评测时正是这种点估计让 0.39s 的
+    差异被当成了结论，而它完全在波动范围内。
     """
+    # A 稳定快 2s：方向一致、赢 12:0
+    clear = [-2.0, -1.9, -2.1, -2.0, -1.8, -2.2, -2.0, -1.9, -2.1, -2.0, -2.0, -1.95]
+    r = st.significance(clear)
+    assert r['significant'] is True
+    assert r['ci95'][1] < 0, 'CI 应完全在 0 以下'
+    assert r['p_sign'] < 0.05
+
+    # 有正有负、中位接近 0：不显著
+    noisy = [-2.0, 2.1, -0.3, 0.4, -1.8, 1.9, 0.2, -0.4, 1.1, -1.2, 0.6, -0.5]
+    r2 = st.significance(noisy)
+    assert r2['significant'] is False
+
+
+def test_significance_rejects_sign_conflict():
+    """中位与均值符号相反：赢在多数、输在长尾，不构成差异。"""
+    # 多数略负（A 快），但一条极端长尾把均值拉正
+    deltas = [-0.3] * 11 + [40.0]
+    r = st.significance(deltas)
+    assert r['sign_conflict'] is True
+    assert r['significant'] is False
+
+
+def test_significance_needs_enough_samples():
+    r = st.significance([-1.0, -1.0])
+    assert r['available'] is False
+    assert '2' in r['reason']
+
+
+def test_verdict_refuses_to_rank_when_not_significant():
+    """核心约束：未达显著就不排名、不给推荐。"""
     by_group = {
-        'A': [_res('A', i, elapsed=6.0 if r == 0 else 7.0, repeat=r)
-              for i in range(6) for r in (0, 1)],
-        'B': [_res('B', i, elapsed=5.8 if r == 0 else 6.9, repeat=r)
-              for i in range(6) for r in (0, 1)],
+        'A': [_res('A', i, elapsed=e) for i, e in enumerate(
+            [6.0, 5.0, 7.0, 4.0, 8.0, 6.5, 5.5, 7.5, 6.2, 5.8, 6.9, 4.9])],
+        'B': [_res('B', i, elapsed=e) for i, e in enumerate(
+            [5.9, 5.4, 6.7, 4.6, 7.6, 6.8, 5.2, 7.1, 6.6, 5.4, 7.2, 4.6])],
     }
     summaries = {n: st.summarize_group(rs) for n, rs in by_group.items()}
-    noise = st.noise_floor(by_group)
-    paired = st.paired(by_group)
-    v = st.verdict(summaries, paired, noise)
-
+    v = st.verdict(summaries, st.paired(by_group))
     assert v.get('indistinguishable') is True
     assert v['recommend'] is None
-    assert any('噪声基线' in r for r in v['reasons'])
 
 
-def test_verdict_ranks_when_gap_exceeds_noise():
+def test_verdict_ranks_when_significant():
     by_group = {
-        'slow': [_res('slow', i, elapsed=20.0 if r == 0 else 20.1, repeat=r)
-                 for i in range(6) for r in (0, 1)],
-        'fast': [_res('fast', i, elapsed=2.0 if r == 0 else 2.1, repeat=r)
-                 for i in range(6) for r in (0, 1)],
+        'slow': [_res('slow', i, elapsed=20.0 + i * 0.1) for i in range(12)],
+        'fast': [_res('fast', i, elapsed=2.0 + i * 0.1) for i in range(12)],
     }
     summaries = {n: st.summarize_group(rs) for n, rs in by_group.items()}
-    v = st.verdict(summaries, st.paired(by_group), st.noise_floor(by_group))
+    v = st.verdict(summaries, st.paired(by_group))
     assert v.get('indistinguishable') is not True
     assert v['recommend'] == 'fast'
 
@@ -449,9 +507,40 @@ def test_verdict_puts_availability_before_latency():
         'solid_slow': [_res('solid_slow', i, elapsed=9.0) for i in range(10)],
     }
     summaries = {n: st.summarize_group(rs) for n, rs in by_group.items()}
-    v = st.verdict(summaries, st.paired(by_group), st.noise_floor(by_group))
+    v = st.verdict(summaries, st.paired(by_group))
     assert v['primary'] == 'availability'
     assert v['recommend'] == 'solid_slow', '不能推荐一个成功率不满的组'
+
+
+def test_verdict_flags_cold_warm_disagreement():
+    """冷热两态结论不一致本身就是信息，必须点出来。
+
+    一个入口只有热了才快，对会长时间空闲、经常冷启动的机器人是实质缺点。
+    """
+    warm = {
+        'A': [_res('A', i, elapsed=4.0 + (i % 3) * 0.1) for i in range(12)],
+        'B': [_res('B', i, elapsed=6.0 + (i % 3) * 0.1) for i in range(12)],
+    }
+    cold = {  # 冷态反过来
+        'A': [_res('A', i, elapsed=9.0 + (i % 3) * 0.1, phase='warmup') for i in range(12)],
+        'B': [_res('B', i, elapsed=7.0 + (i % 3) * 0.1, phase='warmup') for i in range(12)],
+    }
+    summaries = {n: st.summarize_group(rs) for n, rs in warm.items()}
+    cold_sum = {n: st.summarize_group(rs) for n, rs in cold.items()}
+    v = st.verdict(summaries, st.paired(warm), cold_sum, st.paired(cold))
+
+    assert v['recommend'] == 'A', '热轮 A 更快'
+    assert v['cold']['ranking'][0] == 'B', '冷轮 B 更快'
+    assert v.get('regimes_disagree') is True
+    assert any('冷热两态结论不一致' in r for r in v['reasons'])
+
+
+def test_cold_regime_absent_without_warmup():
+    warm = {'A': [_res('A', i) for i in range(5)],
+            'B': [_res('B', i, elapsed=6.0) for i in range(5)]}
+    summaries = {n: st.summarize_group(rs) for n, rs in warm.items()}
+    v = st.verdict(summaries, st.paired(warm), {}, {})
+    assert 'cold' not in v
 
 
 def test_failure_shape_detects_clustering():
@@ -501,29 +590,58 @@ def test_report_flags_survivor_bias(tmp_path):
     assert '(7/10)' in md, '成功率不满时延迟分位必须带样本量'
 
 
-def test_report_warns_when_no_noise_baseline(tmp_path):
+def test_report_notes_missing_cold_regime(tmp_path):
+    """只跑热轮时要说清冷态数据读不出来。"""
     run_dir = tmp_path / 'run'
     run_dir.mkdir()
     recs = [_res(g, i) for g in ('A', 'B') for i in range(5)]
-    reportmod.write(run_dir, _meta(repeats=1), recs)
+    reportmod.write(run_dir, _meta(warmup=0), recs)
     md = (run_dir / 'report.md').read_text(encoding='utf-8')
-    assert '噪声基线' in md
-    assert 'repeats' in md
+    assert '冷轮 vs 热轮' in md
+    assert 'warmup: 0' in md
 
 
-def test_report_omits_sign_flip_note_when_signs_agree(tmp_path):
-    """无条件打印「中位与均值符号相反」会在两者同号时说一句假话。
-
-    报告里出现一句可验证为假的解读，读者就不会再相信其余部分。
-    """
+def test_report_warns_when_sampling_breaks_cache_realism(tmp_path):
+    """even 抽样打散了 trace 连续性，缓存率不代表生产 —— 必须警告。"""
     run_dir = tmp_path / 'run'
     run_dir.mkdir()
-    # 两组都是恒定延迟 → 中位与均值必然同号
-    recs = [_res('A', i, elapsed=6.0) for i in range(6)] + \
-           [_res('B', i, elapsed=5.0) for i in range(6)]
-    reportmod.write(run_dir, _meta(), recs)
+    recs = [_res(g, i, phase=p) for g in ('A', 'B')
+            for i in range(5) for p in ('warmup', 'measure')]
+    meta = _meta()
+    meta['corpus']['sampling'] = 'even'
+    reportmod.write(run_dir, meta, recs)
     md = (run_dir / 'report.md').read_text(encoding='utf-8')
-    assert '符号相反' not in md
+    assert '93.3%' in md and '40.0%' in md
+    assert 'sampling: trace' in md
+
+
+def test_report_trusts_cache_under_trace_sampling(tmp_path):
+    run_dir = tmp_path / 'run'
+    run_dir.mkdir()
+    recs = [_res(g, i, phase=p) for g in ('A', 'B')
+            for i in range(5) for p in ('warmup', 'measure')]
+    meta = _meta()
+    meta['corpus']['sampling'] = 'trace'
+    reportmod.write(run_dir, meta, recs)
+    md = (run_dir / 'report.md').read_text(encoding='utf-8')
+    assert '冷轮命中是可信的' in md
+
+
+def test_report_marks_sign_conflict_per_pair(tmp_path):
+    """符号冲突是逐对判定，不能对所有组对一概而论。"""
+    run_dir = tmp_path / 'run'
+    run_dir.mkdir()
+    recs = []
+    for i in range(12):
+        recs.append(_res('A', i, elapsed=5.0))
+        # B 多数略快，但一条极端长尾把均值拉过去
+        recs.append(_res('B', i, elapsed=4.7 if i < 11 else 45.0))
+    reportmod.write(run_dir, _meta(), recs)
+    data = json.loads((run_dir / 'run.json').read_text(encoding='utf-8'))
+    pair = data['paired']['pairs']['A vs B']
+    assert pair['sign_conflict'] is True
+    assert pair['significant'] is False
+    assert '符号冲突' in (run_dir / 'report.md').read_text(encoding='utf-8')
 
 
 def test_report_shows_sign_flip_note_when_it_happens(tmp_path):
@@ -544,15 +662,15 @@ def test_report_separates_request_and_payload_units(tmp_path):
     """失败计数混用「请求」和「payload」两种单位会让人读错严重程度。"""
     run_dir = tmp_path / 'run'
     run_dir.mkdir()
-    # 2 轮 × 3 条失败 payload = 6 次失败请求
+    # 冷轮 + 热轮各 3 条失败 payload；热轮统计的是 3 次
     recs = []
-    for r in (0, 1):
+    for ph in ('warmup', 'measure'):
         for i in range(10):
-            recs.append(_res('A', i, ok=(i < 7), repeat=r))
-            recs.append(_res('B', i, repeat=r))
+            recs.append(_res('A', i, ok=(i < 7), phase=ph))
+            recs.append(_res('B', i, phase=ph))
     reportmod.write(run_dir, _meta(), recs)
     md = (run_dir / 'report.md').read_text(encoding='utf-8')
-    assert '失败 6/20 次请求' in md
+    assert '失败 3/10 次请求' in md
     assert '受影响 payload 3 条' in md
 
 
@@ -617,7 +735,7 @@ def test_resume_skips_completed_triples(tmp_path):
     payloads = [_rec(i) for i in range(5)]
     sink = runner.ResultSink(p)
     runner.run([g], payloads, FakeTransport(),
-               {'request': {'max_tokens': 8}, 'run': {'warmup': 0, 'repeats': 1}},
+               {'request': {'max_tokens': 8}, 'run': {'warmup': 0}},
                sink, done, log=lambda *a, **k: None)
     sink.close()
 
@@ -727,7 +845,7 @@ def test_run_continues_after_a_failure(tmp_path):
     sink = runner.ResultSink(p)
     runner.run([cfgmod.Group('A', 'https://u/v1', 'sk-x', 'm')],
                [_rec(i) for i in range(4)], FlakyTransport(),
-               {'request': {'max_tokens': 8}, 'run': {'warmup': 0, 'repeats': 1}},
+               {'request': {'max_tokens': 8}, 'run': {'warmup': 0}},
                sink, log=lambda *a, **k: None)
     sink.close()
     recs = runner.load_results(p)
@@ -757,7 +875,7 @@ def test_stop_after_consecutive_failures_only_skips_that_group():
               cfgmod.Group('ok', 'https://ok/v1', 'k', 'm')]
     runner.run(groups, [_rec(i) for i in range(10)], DeadForA(),
                {'request': {'max_tokens': 8},
-                'run': {'warmup': 0, 'repeats': 1,
+                'run': {'warmup': 0,
                         'stop_after_consecutive_failures': 3}},
                Sink(), log=lambda *a, **k: None)
 

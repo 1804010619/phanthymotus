@@ -24,7 +24,7 @@ DEFAULTS = {
     'corpus': {'dir': 'resource/llm_data', 'count': 50, 'sampling': 'even',
                'seed': 42, 'min_messages': 2},
     'request': {'max_tokens': 10240, 'timeout_s': 180, 'extra_body': {}},
-    'run': {'warmup': 1, 'repeats': 2, 'order': 'rotate',
+    'run': {'warmup': 1, 'order': 'rotate',
             'stop_after_consecutive_failures': 0},
     'include_current': False,
     'groups': [],
@@ -127,7 +127,43 @@ def _current_from_db(db_path: str) -> list[dict]:
         return []
 
 
-def load(path: str | None, overrides: dict | None = None) -> dict:
+_REMOVED_KEYS = {
+    'repeats': '已移除：不再做重复轮（重复重放同一条 payload 量的是「同一个请求'
+               '重发」，前缀缓存必然命中，不代表真实负载）。显著性改用配对差的'
+               '置信区间 + 符号检验，不需要重复测量。',
+}
+
+
+def _check_keys(cfg: dict, loaded: dict, warn) -> None:
+    """对未知/已移除的配置键给出提示。
+
+    YAML 里多一个键默认是静默忽略的，那意味着写错的键名和过期的键都得不到任何
+    反馈 —— 你以为设了，其实没生效。刚移除 repeats 之后这一点尤其要紧。
+    """
+    for section in ('corpus', 'request', 'run'):
+        known = set(DEFAULTS[section])
+        for k in (loaded.get(section) or {}):
+            if k in _REMOVED_KEYS:
+                warn(f'[!] {section}.{k} {_REMOVED_KEYS[k]}')
+            elif k not in known:
+                warn(f'[!] {section}.{k} 不是已知配置项（可用: '
+                     f'{", ".join(sorted(known))}）—— 已忽略')
+
+    top_known = set(DEFAULTS) | {'groups', 'include_current'}
+    for k in loaded:
+        if k not in top_known:
+            warn(f'[!] 顶层配置项 {k} 未知 —— 已忽略')
+
+    group_known = {'name', 'url', 'key', 'model', 'models', 'extra_body'}
+    for g in (loaded.get('groups') or []):
+        if not isinstance(g, dict):
+            continue
+        for k in g:
+            if k not in group_known and k not in _OTHER_KEY_FIELDS:
+                warn(f'[!] 组 {g.get("name", "?")} 的 {k} 未知 —— 已忽略')
+
+
+def load(path: str | None, overrides: dict | None = None, warn=print) -> dict:
     """读 YAML 并与默认值合并（按段落深合并，不是整段覆盖）。"""
     cfg = {k: (dict(v) if isinstance(v, dict) else v) for k, v in DEFAULTS.items()}
     if path:
@@ -139,6 +175,7 @@ def load(path: str | None, overrides: dict | None = None) -> dict:
         loaded = yaml.safe_load(p.read_text(encoding='utf-8')) or {}
         if not isinstance(loaded, dict):
             raise ConfigError(f'{path} 顶层必须是一个 mapping')
+        _check_keys(cfg, loaded, warn)
         for k, v in loaded.items():
             if isinstance(v, dict) and isinstance(cfg.get(k), dict):
                 cfg[k].update(v)
