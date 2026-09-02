@@ -60,6 +60,18 @@ python3 tools/llm_bench --report-only resource/llm_bench/20260902_143000
 
 1. **YAML 显式列举** —— 一个 `url` + `key` 可带 `models: [a, b, c]`，自动展开成多组（组名 `{name}/{model}`），不用重复写 url 和 key。
 2. **`include_current: true`** —— 从 ConfigDB 读当前生产配置加为一组（`current/{model}`），回答「换过去会不会比现在差」。用 sqlite 只读打开，**不 import `src/config.py`**：那个模块 import 时就会建库并跑端口迁移，评测工具不该有这种副作用。
+
+   这一组测不测有命令行开关，优先于 YAML —— 「跟现在比一比」和「只比几个候选」是两种不同的问题，切换它不该去改配置文件：
+
+   ```bash
+   ... --include-current      # 强制带上 baseline
+   ... --no-include-current   # 强制不测 baseline
+   ...                        # 不给就沿用 YAML 里的 include_current
+   ```
+
+   显式要了 baseline 但 ConfigDB 里读不到 LLM 配置时会打一行 `[!]` 警告 —— 静默跳过会让人以为「跟现在比过了」，而报告里其实没有那一行。
+
+   记得带 `-e DB_PATH=/work/resource/data.db`，否则读的是默认的 `resource/data.db`。
 3. **`key_file: 路径#行号`** —— 从文件按行取密钥，兼容一行一个值的文件。
 
 密钥优先级 `key_env` > `key_file` > `key`。任何输出（报告、run.json、控制台）里密钥都只以 `sk-RjA…jpt5` 形式出现，保留头尾是为了让人认出用的是哪一把，而不泄露它。

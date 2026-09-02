@@ -51,6 +51,15 @@ def parse_args(argv=None):
     ap.add_argument('--timeout', type=float, help='单请求超时秒数（覆盖配置）')
     ap.add_argument('--out', default='resource/llm_bench', help='输出根目录')
     ap.add_argument('--db', help='ConfigDB 路径（include_current 用），默认取 $DB_PATH')
+    # 当前生产配置这一组测不测的开关。命令行优先于 YAML 的 include_current：
+    # 「跟现在比一比」和「只比几个候选」是两种不同的问题，切换它不该改配置文件。
+    cur = ap.add_mutually_exclusive_group()
+    cur.add_argument('--include-current', dest='include_current',
+                     action='store_true', default=None,
+                     help='把 ConfigDB 当前生产配置加为一组 baseline（覆盖配置文件）')
+    cur.add_argument('--no-include-current', dest='include_current',
+                     action='store_false',
+                     help='不测当前生产配置这一组（覆盖配置文件）')
     ap.add_argument('--probe', type=int, metavar='N',
                     help='只做探活：每组发 N 次最小请求，不跑语料')
     ap.add_argument('--probe-interval', type=float, default=2.0,
@@ -71,6 +80,9 @@ def _overrides(args) -> dict:
                    'sampling': args.sampling},
         'request': {'max_tokens': args.max_tokens, 'timeout_s': args.timeout},
         'run': {'repeats': args.repeats, 'warmup': args.warmup},
+        # None 表示命令行没指定 → 沿用配置文件；True/False 都是显式覆盖，
+        # 所以这里不能用 `if args.include_current` 之类的真值判断。
+        'include_current': args.include_current,
     }
 
 
@@ -112,6 +124,12 @@ def main(argv=None) -> int:
     print(f'评测组 {len(groups)} 个:')
     for g in groups:
         print(f'  - {g.name:<28} {g.host:<28} {g.model}  key={cfgmod.mask(g.key)}')
+    # 显式要了 baseline 却一组都没读到，必须说出来。静默跳过会让人以为
+    # 「跟现在比过了」，而报告里其实根本没有那一行。
+    if cfg.get('include_current') and not any(g.source == 'configdb' for g in groups):
+        print('  [!] 已要求测当前生产配置(baseline)，但 ConfigDB 里没读到 LLM 配置'
+              f'（{args.db or os.environ.get("DB_PATH", "resource/data.db")}）'
+              '—— 本轮不含 baseline 组')
     print()
 
     transport = Transport(timeout_s=cfg['request']['timeout_s'])

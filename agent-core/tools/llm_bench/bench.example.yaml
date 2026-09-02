@@ -53,4 +53,5 @@ groups:
 
 # 自动把 ConfigDB 里当前生产配置加为一组（组名 current/{model}），
 # 用来回答「换过去会不会比现在差」。读 $DB_PATH，只读打开。
+# 命令行 --include-current / --no-include-current 可以覆盖这里。
 include_current: true

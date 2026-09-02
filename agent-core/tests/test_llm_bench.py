@@ -207,6 +207,64 @@ groups:
     assert [g.name for g in groups] == ['g']
 
 
+# ── baseline 开关 ─────────────────────────────────────────────────────────────
+
+def _db_with_client(tmp_path) -> str:
+    db = tmp_path / 'data.db'
+    conn = sqlite3.connect(db)
+    conn.execute('CREATE TABLE config (key TEXT PRIMARY KEY, value TEXT)')
+    conn.execute("INSERT INTO config VALUES ('client', ?)", (json.dumps(
+        {'llm': [{'url': 'https://prod/v1', 'key': 'sk-prod',
+                  'model': 'glm-5.3'}]}),))
+    conn.commit()
+    conn.close()
+    return str(db)
+
+
+def _cfg_with_switch(tmp_path, yaml_value: str, override):
+    """override 模拟命令行：None=没指定，True/False=显式覆盖。"""
+    cfg = cfgmod.load(_yaml(tmp_path, f"""
+include_current: {yaml_value}
+groups:
+  - {{name: g, url: https://u/v1, key_env: K1, model: m}}
+"""), {'include_current': override})
+    return cfg
+
+
+def test_cli_switch_can_enable_baseline_over_yaml(tmp_path, monkeypatch):
+    monkeypatch.setenv('K1', 'sk-x')
+    cfg = _cfg_with_switch(tmp_path, 'false', True)
+    names = [g.name for g in cfgmod.build_groups(cfg, _db_with_client(tmp_path))]
+    assert 'current/glm-5.3' in names
+
+
+def test_cli_switch_can_disable_baseline_over_yaml(tmp_path, monkeypatch):
+    """--no-include-current 必须能关掉 YAML 里的 true。
+
+    False 是个假值，用 `if override:` 之类的真值判断会把它当成「没指定」，
+    于是这个开关在关闭方向上完全失效 —— 而关闭恰恰是它更常用的方向。
+    """
+    monkeypatch.setenv('K1', 'sk-x')
+    cfg = _cfg_with_switch(tmp_path, 'true', False)
+    assert cfg['include_current'] is False
+    names = [g.name for g in cfgmod.build_groups(cfg, _db_with_client(tmp_path))]
+    assert names == ['g']
+
+
+def test_no_cli_switch_falls_back_to_yaml(tmp_path, monkeypatch):
+    monkeypatch.setenv('K1', 'sk-x')
+    cfg = _cfg_with_switch(tmp_path, 'true', None)
+    names = [g.name for g in cfgmod.build_groups(cfg, _db_with_client(tmp_path))]
+    assert 'current/glm-5.3' in names
+
+
+def test_cli_switch_parses_both_directions():
+    from llm_bench.__main__ import parse_args
+    assert parse_args([]).include_current is None
+    assert parse_args(['--include-current']).include_current is True
+    assert parse_args(['--no-include-current']).include_current is False
+
+
 # ── 密钥打码 ──────────────────────────────────────────────────────────────────
 
 SECRET = 'sk-RjAbwdQbzU8eURU2ikUJJaXfB0wn50jPD54ssxU8fx1ojpt5'
