@@ -26,7 +26,10 @@ DEFAULTS = {
     'corpus': {'dir': 'resource/llm_data', 'count': 50, 'sampling': 'trace',
                'seed': 42, 'min_messages': 2},
     'request': {'max_tokens': 10240, 'timeout_s': 180, 'extra_body': {}},
-    'run': {'order': 'rotate', 'stop_after_consecutive_failures': 0},
+    # parallel 默认 false：串行是保守选择，各组互不干扰。开了更快，代价见
+    # README「并行」一节。
+    'run': {'order': 'rotate', 'parallel': False,
+            'stop_after_consecutive_failures': 0},
     'include_current': False,
     'groups': [],
 }

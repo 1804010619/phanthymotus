@@ -10,6 +10,7 @@ import os
 import pathlib
 import sqlite3
 import sys
+import time
 
 import pytest
 
@@ -34,6 +35,12 @@ def _rec(i, n_msgs=4, trace=None):
             'messages': [{'role': 'user', 'content': f'q{i}-{j}'} for j in range(n_msgs)],
             'tools': [{'type': 'function', 'function': {'name': 'finish'}}],
             'ts': 1788000000 + i}
+
+
+def _fake_ok(elapsed=1.0):
+    return {'ok': True, 'kind': 'ok', 'status': 200, 'elapsed': elapsed,
+            'prompt': 10, 'completion': 5, 'cached': 0, 'finish': 'stop',
+            'err': None, 'detail': None}
 
 
 def _write_jsonl(path, records, tail: bytes = b''):
@@ -668,6 +675,147 @@ def test_paired_uses_only_payloads_all_groups_succeeded():
     p = st.paired(by_group)
     assert p['n_common'] == 3
     assert p['pairs']['A vs B']['median_delta'] == pytest.approx(-1.0)
+
+
+# ── 并行 ──────────────────────────────────────────────────────────────────────
+
+def test_parallel_defaults_to_off():
+    assert cfgmod.DEFAULTS['run']['parallel'] is False
+
+
+def test_parallel_switch_parses_both_directions():
+    from llm_bench.__main__ import parse_args
+    assert parse_args([]).parallel is None
+    assert parse_args(['--parallel']).parallel is True
+    assert parse_args(['--no-parallel']).parallel is False
+
+
+def test_parallel_runs_groups_concurrently():
+    """同一条 payload 的各组必须真的同时在飞。"""
+    import threading
+    inflight = {'now': 0, 'peak': 0}
+    lk = threading.Lock()
+
+    class T:
+        def post_json(self, url, key, payload):
+            with lk:
+                inflight['now'] += 1
+                inflight['peak'] = max(inflight['peak'], inflight['now'])
+            time.sleep(0.05)
+            with lk:
+                inflight['now'] -= 1
+            return _fake_ok()
+
+    class Sink:
+        def write(self, rec): pass
+
+    groups = [cfgmod.Group(n, f'https://{n}/v1', 'k', 'm') for n in ('A', 'B', 'C')]
+    runner.run(groups, [_rec(i) for i in range(2)], T(),
+               {'request': {'max_tokens': 8}, 'run': {'parallel': True}},
+               Sink(), log=lambda *a, **k: None)
+    assert inflight['peak'] == 3, f'应有 3 组同时在飞，实际峰值 {inflight["peak"]}'
+
+
+def test_parallel_keeps_payloads_strictly_sequential():
+    """payload 之间绝不能并发。
+
+    payload 顺序承载前缀增长的语义（第 i+1 条的 prompt 由第 i 条追加而来），
+    跨 payload 并发会让缓存命中变成不可解释的竞态，把 trace 抽样保住的真实性
+    又毁掉。
+    """
+    import threading
+    lk = threading.Lock()
+    active_payloads = {'now': set(), 'peak': 0}
+
+    class T:
+        def post_json(self, url, key, payload):
+            idx = payload['messages'][0]['content']
+            with lk:
+                active_payloads['now'].add(idx)
+                active_payloads['peak'] = max(
+                    active_payloads['peak'], len(active_payloads['now']))
+            time.sleep(0.03)
+            with lk:
+                active_payloads['now'].discard(idx)
+            return _fake_ok()
+
+    class Sink:
+        def write(self, rec): pass
+
+    groups = [cfgmod.Group(n, f'https://{n}/v1', 'k', 'm') for n in ('A', 'B')]
+    runner.run(groups, [_rec(i) for i in range(4)], T(),
+               {'request': {'max_tokens': 8}, 'run': {'parallel': True}},
+               Sink(), log=lambda *a, **k: None)
+    assert active_payloads['peak'] == 1, \
+        f'同时只能有一条 payload 在飞，实际 {active_payloads["peak"]}'
+
+
+def test_parallel_makes_the_same_number_of_requests():
+    calls = []
+
+    class T:
+        def post_json(self, url, key, payload):
+            calls.append(url)
+            return _fake_ok()
+
+    class Sink:
+        def write(self, rec): pass
+
+    groups = [cfgmod.Group(n, f'https://{n}/v1', 'k', 'm') for n in ('A', 'B', 'C')]
+    runner.run(groups, [_rec(i) for i in range(5)], T(),
+               {'request': {'max_tokens': 8}, 'run': {'parallel': True}},
+               Sink(), log=lambda *a, **k: None)
+    assert len(calls) == 15
+
+
+def test_result_sink_is_thread_safe(tmp_path):
+    """并行下多线程同写：一条记录必须是一整行。
+
+    交错写入会产出既非上一条也非下一条的坏行，而坏行是静默跳过的 —— 那等于
+    悄悄丢结果。
+    """
+    import threading
+    p = tmp_path / 'results.jsonl'
+    sink = runner.ResultSink(p)
+    n_per_thread, n_threads = 40, 8
+
+    def worker(t):
+        for i in range(n_per_thread):
+            sink.write(_res(f'g{t}', i, elapsed=1.0))
+
+    threads = [threading.Thread(target=worker, args=(t,)) for t in range(n_threads)]
+    [t.start() for t in threads]
+    [t.join() for t in threads]
+    sink.close()
+
+    # 每行都必须是完整可解析的 JSON，且总数不能少
+    raw = p.read_text(encoding='utf-8').splitlines()
+    assert len(raw) == n_per_thread * n_threads
+    for line in raw:
+        json.loads(line)          # 抛异常就说明出现了交错写入
+    assert len(runner.load_results(p)) == n_per_thread * n_threads
+
+
+def test_parallel_survives_a_worker_exception():
+    """某组抛异常不能中断整轮 —— 其余组必须照常完成。"""
+    class T:
+        def post_json(self, url, key, payload):
+            if 'boom' in url:
+                raise RuntimeError('transport exploded')
+            return _fake_ok()
+
+    written = []
+
+    class Sink:
+        def write(self, rec): written.append(rec)
+
+    groups = [cfgmod.Group('boom', 'https://boom/v1', 'k', 'm'),
+              cfgmod.Group('ok', 'https://ok/v1', 'k', 'm')]
+    runner.run(groups, [_rec(i) for i in range(3)], T(),
+               {'request': {'max_tokens': 8}, 'run': {'parallel': True}},
+               Sink(), log=lambda *a, **k: None)
+    ok_recs = [r for r in written if r['group'] == 'ok']
+    assert len(ok_recs) == 3 and all(r['ok'] for r in ok_recs)
 
 
 # ── 报告 ──────────────────────────────────────────────────────────────────────

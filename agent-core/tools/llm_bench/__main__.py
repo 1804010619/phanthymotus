@@ -58,6 +58,12 @@ def parse_args(argv=None):
     cur.add_argument('--no-include-current', dest='include_current',
                      action='store_false',
                      help='不测当前生产配置这一组（覆盖配置文件）')
+    # 组间并行开关。默认串行（保守），命令行优先于 YAML。
+    par = ap.add_mutually_exclusive_group()
+    par.add_argument('--parallel', dest='parallel', action='store_true', default=None,
+                     help='同一条 payload 的各组并行请求（payload 之间仍串行）')
+    par.add_argument('--no-parallel', dest='parallel', action='store_false',
+                     help='各组串行请求（覆盖配置文件）')
     ap.add_argument('--probe', type=int, metavar='N',
                     help='只做探活：每组发 N 次最小请求，不跑语料')
     ap.add_argument('--probe-interval', type=float, default=2.0,
@@ -77,7 +83,7 @@ def _overrides(args) -> dict:
         'corpus': {'dir': args.corpus, 'count': args.count,
                    'sampling': args.sampling},
         'request': {'max_tokens': args.max_tokens, 'timeout_s': args.timeout},
-        'run': {},
+        'run': {'parallel': args.parallel},
         # None 表示命令行没指定 → 沿用配置文件；True/False 都是显式覆盖，
         # 所以这里不能用 `if args.include_current` 之类的真值判断。
         'include_current': args.include_current,
@@ -249,7 +255,20 @@ def _run(args, cfg, groups, transport, resume_dir, meta) -> int:
 
     # ── 正式跑 ────────────────────────────────────────────────────────────
     total = len(payloads) * len(groups)
-    print(f'\n开始：{len(groups)} 组 × {len(payloads)} 条 = {total} 次请求')
+    par = cfg['run'].get('parallel')
+    print(f'\n开始：{len(groups)} 组 × {len(payloads)} 条 = {total} 次请求'
+          f'（{"组间并行" if par else "串行"}）')
+    if par:
+        # 同一个 endpoint+model 出现在两个组里时，并行会让它们真的互相争资源，
+        # 而且共享同一份前缀缓存 —— 那时的对比结果无法解释。
+        seen: dict = {}
+        for g in groups:
+            seen.setdefault((g.host, g.model), []).append(g.name)
+        dup = {k: v for k, v in seen.items() if len(v) > 1}
+        for (host, model), names in dup.items():
+            print(f'  [!] {", ".join(names)} 指向同一个 {host} 的 {model}，'
+                  '并行下它们会互相争资源并共享同一份前缀缓存，'
+                  '结果不可解释 —— 建议对这种组合用 --no-parallel')
     print(f'输出目录 {run_dir}\n')
 
     # 先把 meta 落盘：被 kill 打断时 run.json 必须已经存在，否则这次 run 既不能

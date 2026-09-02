@@ -35,7 +35,8 @@ def build(run_meta: dict, summaries: dict, paired: dict,
     A(f'- 时间: {run_meta.get("started_at", "?")} → {run_meta.get("finished_at", "?")}')
     A(f'- 语料: {run_meta["corpus"]["count"]} 条，指纹 `{run_meta["corpus"]["fingerprint"]}`')
     A(f'- 抽样 `{run_meta["corpus"].get("sampling")}`，'
-      f'组顺序 {run_meta["run"].get("order", "rotate")}，单轮')
+      f'组顺序 {run_meta["run"].get("order", "rotate")}，单轮，'
+      f'{"组间并行" if run_meta["run"].get("parallel") else "串行"}')
     A(f'- HTTP 后端: {run_meta.get("transport", "?")}')
     if run_meta.get('incomplete'):
         A('')
@@ -207,8 +208,17 @@ def build(run_meta: dict, summaries: dict, paired: dict,
       f'{run_meta["corpus"]["count"]} 条'
       + (f'，跳过坏行 {run_meta["corpus"]["bad_lines"]} 条'
          if run_meta['corpus'].get('bad_lines') else '') + '。')
-    A(f'- `max_tokens={run_meta["request"]["max_tokens"]}`，串行发送（并发会让各组'
-      '互相争带宽和配额，污染单请求延迟）。')
+    A(f'- `max_tokens={run_meta["request"]["max_tokens"]}`。')
+    if run_meta['run'].get('parallel'):
+        A('- **组间并行**：同一条 payload 的各组同时发出，payload 之间仍严格串行'
+          '（payload 顺序承载前缀增长的语义，跨 payload 并发会让缓存命中变成'
+          '不可解释的竞态）。并行消除了时段漂移——各组拿到同一条 payload 的时刻'
+          '完全相同；但如果各组共用同一条上行链路或同一个供应商的配额，'
+          '它们会互相争资源，**绝对延迟会比串行时偏高**。组间相对比较仍然有效，'
+          '绝对值不要拿去和串行的结果对比。')
+    else:
+        A('- **串行发送**：各组互不干扰，绝对延迟最接近单请求真实水平。'
+          '代价是墙钟时间是并行的 N 倍（N = 组数）。')
     A('- **只跑一轮**，每条 payload 每组各请求一次。不做预热轮也不做重复轮：'
       '重放同一条 payload 量的是「同一个请求重发」，前缀缓存必然命中，'
       '既不代表真实负载，也会把缓存数字污染成接近 100%。'

@@ -53,6 +53,7 @@ docker exec phanthy-motus-agent-core-1 tail -f /tmp/bench.log
 | `--sampling` | `corpus.sampling` |
 | `--corpus` | `corpus.dir` |
 | `--max-tokens` / `--timeout` | `request.max_tokens` / `request.timeout_s` |
+| `--parallel` / `--no-parallel` | `run.parallel` |
 | `--include-current` / `--no-include-current` | `include_current` |
 | `--yes` | 无 |
 
@@ -163,9 +164,17 @@ groups:
 
 还有一种情况单独拦：**中位与均值符号相反**（一方赢在多数、输在长尾），逐对标为「符号冲突」并判不显著。
 
-### 串行发送
+### 并行（`run.parallel`，默认关）
 
-并发会让各组互相争带宽和配额，污染的正是要测的单请求延迟。所以固定串行，不提供并发选项。
+默认串行：各组互不干扰，绝对延迟最接近单请求真实水平。代价是墙钟时间是组数的倍数——5 组 × 50 条就是 250 次串行请求。
+
+`--parallel` 打开组间并行，快 N 倍。**只在组之间并行，payload 之间始终严格串行**——payload 的先后顺序承载着前缀增长的语义（第 i+1 条的 prompt 由第 i 条追加而来），跨 payload 并发会让缓存命中变成不可解释的竞态，把 `trace` 抽样辛苦保住的真实性又毁掉。
+
+并行的一个副产品是**时段漂移被彻底消除**：各组拿到同一条 payload 的时刻完全相同，连轮换都不需要了。
+
+代价：如果各组共用同一条上行链路，或打到同一个供应商的配额，它们会互相争资源，**绝对延迟比串行时偏高**。组间相对比较仍然有效，但绝对值不要拿去和串行跑的结果对比。报告头部和「方法与局限」都会记下用的哪种模式。
+
+**两个组指向同一个 endpoint + model 时不要用并行**——它们会真的互相争资源，还共享同一份前缀缓存，结果无法解释。启动时会检测这种组合并给出 `[!]` 警告。
 
 ## 报告怎么读
 

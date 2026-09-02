@@ -9,9 +9,10 @@
   实际只慢 1.8 倍。不预热就是在测「谁的缓存先被我喂热」。
 - 轮换：先把 N 条全发给 A 再全发给 B，两组之间的差异里会混进时段差异。
 """
+import concurrent.futures
 import json
 import pathlib
-import sys
+import threading
 import time
 
 from llm_bench.transport import Kind, Transport
@@ -41,10 +42,16 @@ class ResultSink:
     def __init__(self, path: pathlib.Path):
         self.path = path
         self._fh = path.open('a', encoding='utf-8')
+        # 并行模式下多个线程会同时写。一条记录必须是一整行，两个线程交错写入
+        # 会产出既非上一条也非下一条的坏行，而坏行是静默跳过的 —— 那等于悄悄
+        # 丢结果。
+        self._lock = threading.Lock()
 
     def write(self, rec: dict):
-        self._fh.write(json.dumps(rec, ensure_ascii=False) + '\n')
-        self._fh.flush()
+        line = json.dumps(rec, ensure_ascii=False) + '\n'
+        with self._lock:
+            self._fh.write(line)
+            self._fh.flush()
 
     def close(self):
         self._fh.close()
@@ -146,6 +153,7 @@ def run(groups, payloads, transport: Transport, cfg: dict,
     run_cfg = cfg['run']
     rotate = run_cfg.get('order', 'rotate') == 'rotate'
     stop_after = int(run_cfg.get('stop_after_consecutive_failures', 0) or 0)
+    parallel = bool(run_cfg.get('parallel', False))
 
     # 只跑一轮，每条 payload 每组各请求一次。
     #
@@ -155,58 +163,93 @@ def run(groups, payloads, transport: Transport, cfg: dict,
     #
     # 也不做重复轮：同理，重复重放不代表真实负载。显著性由配对差的置信区间 +
     # 符号检验给出（stats.significance），不需要靠重复测量估噪声。
-    rounds = [(Phase.MEASURE, 0)]
-    total = len(rounds) * len(payloads) * len(groups)
-    n = 0
+    total = len(payloads) * len(groups)
+    counter = {'n': 0}
     consecutive = {g.name: 0 for g in groups}
     skipped = {g.name: False for g in groups}
+    phase, rep = Phase.MEASURE, 0
 
-    for phase, rep in rounds:
-        for idx, rec in enumerate(payloads):
-            # 轮换组顺序，抵消时段漂移；两组时退化成 A/B 交替
-            order = groups[idx % len(groups):] + groups[:idx % len(groups)] \
-                if rotate else list(groups)
+    def build_payload(g, rec):
+        payload = {
+            'model': g.model,
+            'messages': rec['messages'],
+            'max_tokens': req['max_tokens'],
+            'stream': False,
+            **g.extra_body,
+        }
+        if rec.get('tools'):
+            payload['tools'] = rec['tools']
+        return payload
 
-            for g in order:
-                n += 1
-                key = (g.name, idx, rep, phase)
-                if key in done:
-                    continue
-                if skipped[g.name]:
-                    continue
+    def fire(g, rec, idx):
+        """发一次请求并落盘。返回结果，供调用方更新失败计数。"""
+        r = transport.post_json(f'{g.url}/chat/completions', g.key,
+                                build_payload(g, rec))
+        sink.write({'group': g.name, 'payload_idx': idx, 'repeat': rep,
+                    'phase': phase, 'ts': time.time(),
+                    **{k: r[k] for k in
+                       ('ok', 'kind', 'status', 'elapsed', 'prompt',
+                        'completion', 'cached', 'finish', 'err', 'detail')}})
+        return r
 
-                payload = {
-                    'model': g.model,
-                    'messages': rec['messages'],
-                    'max_tokens': req['max_tokens'],
-                    'stream': False,
-                    **g.extra_body,
-                }
-                if rec.get('tools'):
-                    payload['tools'] = rec['tools']
+    def report(g, r):
+        """打印一条结果并更新连续失败计数。只在主线程调用，无需加锁。"""
+        counter['n'] += 1
+        n = counter['n']
+        if r['ok']:
+            tps = r['completion'] / r['elapsed'] if r['elapsed'] else 0
+            log(f'  [{n}/{total}] {g.name:<24} ok  {r["elapsed"]:6.2f}s '
+                f'p={r["prompt"]:6d} c={r["completion"]:5d} '
+                f'cache={r["cached"]:6d} {tps:5.1f} tok/s')
+            consecutive[g.name] = 0
+        else:
+            log(f'  [{n}/{total}] {g.name:<24} FAIL {r["elapsed"]:6.2f}s '
+                f'{r["kind"]} {(r["detail"] or "")[:90]}')
+            consecutive[g.name] += 1
+            if stop_after and consecutive[g.name] >= stop_after:
+                # 只跳过这一组，其余组继续——一个入口挂了不该毁掉整轮评测
+                skipped[g.name] = True
+                log(f'  [!] {g.name} 连续失败 {stop_after} 次，跳过该组剩余请求')
 
-                r = transport.post_json(f'{g.url}/chat/completions', g.key, payload)
-                sink.write({'group': g.name, 'payload_idx': idx, 'repeat': rep,
-                            'phase': phase, 'ts': time.time(),
-                            **{k: r[k] for k in
-                               ('ok', 'kind', 'status', 'elapsed', 'prompt',
-                                'completion', 'cached', 'finish', 'err', 'detail')}})
+    for idx, rec in enumerate(payloads):
+        # 轮换组顺序，抵消时段漂移；两组时退化成 A/B 交替。
+        # 并行模式下各组本来就同时发出，顺序只影响提交次序。
+        order = groups[idx % len(groups):] + groups[:idx % len(groups)] \
+            if rotate else list(groups)
+        todo = [g for g in order
+                if (g.name, idx, rep, phase) not in done and not skipped[g.name]]
+        counter['n'] += len(order) - len(todo)   # 跳过的也占进度
+        if not todo:
+            continue
 
-                tag = 'r0'
-                if r['ok']:
-                    tps = r['completion'] / r['elapsed'] if r['elapsed'] else 0
-                    log(f'  [{n}/{total}] {tag} {g.name:<24} ok  {r["elapsed"]:6.2f}s '
-                        f'p={r["prompt"]:6d} c={r["completion"]:5d} '
-                        f'cache={r["cached"]:6d} {tps:5.1f} tok/s')
-                    consecutive[g.name] = 0
-                else:
-                    log(f'  [{n}/{total}] {tag} {g.name:<24} FAIL {r["elapsed"]:6.2f}s '
-                        f'{r["kind"]} {(r["detail"] or "")[:90]}')
-                    consecutive[g.name] += 1
-                    if stop_after and consecutive[g.name] >= stop_after:
-                        # 只跳过这一组，其余组继续——一个入口挂了不该毁掉整轮评测
-                        skipped[g.name] = True
-                        log(f'  [!] {g.name} 连续失败 {stop_after} 次，跳过该组剩余请求')
+        if not parallel:
+            for g in todo:
+                report(g, fire(g, rec, idx))
+            continue
+
+        # 并行：**只在组之间并行，payload 之间仍然严格串行**。
+        #
+        # payload 的先后顺序承载着前缀增长的语义（第 i+1 条的 prompt 是第 i 条
+        # 追加而来），跨 payload 并发会让缓存命中变成不可解释的竞态，把 trace
+        # 抽样辛苦保住的真实性又毁掉。
+        #
+        # 副产品：各组拿到同一条 payload 的时刻完全相同，时段漂移被彻底消除。
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(todo)) as ex:
+            futs = {ex.submit(fire, g, rec, idx): g for g in todo}
+            results = {}
+            for fut in concurrent.futures.as_completed(futs):
+                g = futs[fut]
+                try:
+                    results[g.name] = fut.result()
+                except Exception as e:  # 兜底：fire 本身不该抛，但绝不能让它中断整轮
+                    results[g.name] = {
+                        'ok': False, 'kind': 'unknown', 'status': None,
+                        'elapsed': 0.0, 'prompt': 0, 'completion': 0, 'cached': 0,
+                        'finish': None, 'err': type(e).__name__,
+                        'detail': str(e)[:200]}
+        # 按固定顺序打印，日志才可读、可比对
+        for g in todo:
+            report(g, results[g.name])
 
 
 def run_dir_for(base: pathlib.Path, run_id: str) -> pathlib.Path:
