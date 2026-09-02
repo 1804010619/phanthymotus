@@ -257,9 +257,10 @@ async def _acp_barrier(name: str, cancel_event, *, barge_in: bool = False,
         else:
             result = await _abort_pending_for_barge_in(interrupt_fallback)
     finally:
-        for t in (barrier, steering):
-            if not t.done():
-                t.cancel()
+        # Reap, don't just request: cancel() alone leaves these pending until the
+        # loop resumes them, and dropping the reference here is what orphaned
+        # await_pending's inner tasks on every barge-in.
+        await mcp_client.cancel_and_reap((barrier, steering))
     _acp_barrier_log(name, result)
     return result
 
