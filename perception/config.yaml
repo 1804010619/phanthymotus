@@ -2,7 +2,7 @@ mcp_port: 15720
 
 plugins:
   asr:
-    enabled: true
+    enabled: false
     # Matches the configSchema default. SenseVoice on CPU is also the faster of
     # the two int8 options (RTF 14.2x vs 9.1x for streaming paraformer) and has
     # the largest gpu upside (fp16).
@@ -38,7 +38,7 @@ plugins:
         - "x iǎo f àn x iǎo f àn @小范小范"
 
   tts:
-    enabled: false
+    enabled: true
     engine: vits2_trt
     backend: trt
     model_dir: /models/vits2
@@ -49,7 +49,7 @@ plugins:
     # sherpa_onnx engine only — vits2_trt runs on TensorRT and ignores this.
     # Matcha is fp32, so both devices load the same weights and only the provider
     # changes; gpu measured ~4.3x faster at num_threads=2.
-    device: cpu
+    device: gpu
 
   vop:
     enabled: false
