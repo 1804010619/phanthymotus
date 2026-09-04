@@ -571,7 +571,14 @@ async def _dispatch_internal(mcp_id: str, tool_name: str, args: dict) -> str:
             # instance_id 由 llm.py 从画布绑定注入（_bound_instance_ids），
             # 用它解析卡片上选的 channel —— 卡片配置必须真正决定回复去向
             return await channel_mgr.send_reply(
-                instance_id=args.get('instance_id', ''), text=text, files=files)
+                instance_id=args.get('instance_id', ''),
+                text=text,
+                files=files,
+                mention_open_id=args.get('mention_open_id', ''),
+                source_message_id=args.get('source_message_id', ''),
+                expect_reply=args.get('expect_reply', False),
+                trusted_bot_id=args.get('trusted_bot_id', ''),
+            )
         return f'Error: Unknown action "{action}". Use action="send" with "text" and/or "files".'
 
     # Default: return info for other internal tools
@@ -586,6 +593,27 @@ def _should_await_completion(completion_spec: dict, action: str | None) -> bool:
     if not actions_list:
         return True  # 无 filter → 所有 action 都是异步的
     return action in actions_list
+
+
+async def cancel_and_reap(tasks) -> None:
+    """Cancel tasks and wait for the cancellation to actually be delivered.
+
+    `Task.cancel()` only *requests* cancellation — the task stays pending until
+    the loop gets to resume it and raise CancelledError inside it. Cancelling and
+    then dropping the reference is what filled the log with
+
+        Task was destroyed but it is pending!
+        task: <Task pending ... coro=<Event.wait() ...>>
+        task: <Task pending ... coro=<await_pending.<locals>._wait_all() ...>>
+
+    on every barge-in: the barrier's outer task and the inner `Event.wait()`
+    children of its `gather` were both abandoned mid-cancellation.
+    """
+    live = [t for t in tasks if not t.done()]
+    for task in live:
+        task.cancel()
+    if live:
+        await asyncio.gather(*live, return_exceptions=True)
 
 
 async def await_pending(cancel_event: asyncio.Event | None = None, timeout: float = 120,
@@ -610,13 +638,20 @@ async def await_pending(cancel_event: asyncio.Event | None = None, timeout: floa
         if cancel_event:
             wait_task = asyncio.create_task(_wait_all())
             cancel_task = asyncio.create_task(cancel_event.wait())
-            done, pending = await asyncio.wait(
-                [wait_task, cancel_task],
-                timeout=effective_timeout,
-                return_when=asyncio.FIRST_COMPLETED,
-            )
-            for p in pending:
-                p.cancel()
+            try:
+                done, _unfinished = await asyncio.wait(
+                    [wait_task, cancel_task],
+                    timeout=effective_timeout,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+            finally:
+                # Also runs when *this* coroutine is cancelled from outside, which
+                # is the common case: on barge-in `_acp_barrier` cancels the task
+                # running await_pending as soon as a steering message arrives.
+                # Without the finally, CancelledError propagated straight out and
+                # left _wait_all and its Event.wait() children orphaned — the
+                # "Task was destroyed but it is pending!" pair in the R1 logs.
+                await cancel_and_reap([wait_task, cancel_task])
             if cancel_task in done:
                 # 用户打断：清理所有 pending
                 for aid in aids:
@@ -625,7 +660,21 @@ async def await_pending(cancel_event: asyncio.Event | None = None, timeout: floa
                     _pending_timeouts.pop(aid, None)
                     _pending_tools.pop(aid, None)
                 return {"status": "cancelled"}
+            if wait_task not in done:
+                # Unlike wait_for, asyncio.wait() does not raise on timeout — it
+                # returns with an empty `done`. Falling through from here reported
+                # a silent timeout as {"status": "completed"}, so a barrier that
+                # waited out its full 120s looked identical to one that succeeded.
+                # That is precisely the case _acp_barrier_log was added to make
+                # attributable: an ACP completion callback that never arrives
+                # (self-signed cert rejected, AGENT_CORE_URL misconfigured).
+                # Converge on the TimeoutError path below, which already clears
+                # pending and reports "timeout".
+                raise asyncio.TimeoutError()
         else:
+            # Not reached from the agent loop: it creates a cancel_event for every
+            # turn (event/llm.py:887), so the branch above is the live one. Kept
+            # for direct callers.
             await asyncio.wait_for(_wait_all(), timeout=effective_timeout)
 
         # 清理已完成的
@@ -668,13 +717,13 @@ async def sync(action_ids: list[str] | None = None, timeout: float = 120,
         wait_task = asyncio.create_task(_wait_all())
         if cancel_event:
             cancel_task = asyncio.create_task(cancel_event.wait())
-            done, pending = await asyncio.wait(
-                [wait_task, cancel_task], return_when=asyncio.FIRST_COMPLETED
-            )
-            for p in pending:
-                p.cancel()
+            try:
+                done, _pending = await asyncio.wait(
+                    [wait_task, cancel_task], return_when=asyncio.FIRST_COMPLETED
+                )
+            finally:
+                await cancel_and_reap([wait_task, cancel_task])
             if cancel_task in done:
-                wait_task.cancel()
                 raise asyncio.CancelledError()
         else:
             await wait_task

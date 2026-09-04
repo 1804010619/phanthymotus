@@ -46,6 +46,21 @@ log = logging.getLogger(__name__)
 for _quiet in ('urllib3', 'websockets', 'httpcore', 'httpx'):
     logging.getLogger(_quiet).setLevel(logging.WARNING)
 
+# Cap on how much of an MCP argument dict reaches the log. A tool call can carry
+# an image, a base64 payload or a long utterance, so an unbounded repr here is how
+# a single log line grows past the point where Docker can frame it — the result
+# side was already capped, the argument side was not.
+_LOG_ARG_CHARS = 500
+
+
+def _brief(obj) -> str:
+    """One-line, length-capped repr for logging an MCP payload."""
+    text = repr(obj)
+    if len(text) <= _LOG_ARG_CHARS:
+        return text
+    return f"{text[:_LOG_ARG_CHARS]}…[+{len(text) - _LOG_ARG_CHARS} chars]"
+
+
 # ── ACP: SSE event bus (thread-safe) ─────────────────────────────────────────
 
 import queue as _queue
@@ -131,6 +146,16 @@ class PerceptionBundle:
             if p.PREFIX == prefix:
                 return p.dispatch(name, args)
         return None
+
+    def owns(self, full_name: str) -> bool:
+        """True when some loaded plugin claims this tool name.
+
+        Lets the caller tell a genuinely unknown tool apart from a loaded
+        plugin returning None for an action it does not handle. Mirrors
+        `dispatch`'s prefix split so the two can never disagree.
+        """
+        prefix, _, _ = full_name.partition("_")
+        return any(p.PREFIX == prefix for p in self._plugins)
 
     def tts_synthesize_raw(self, text: str) -> bytes:
         for p in self._plugins:
@@ -296,10 +321,23 @@ def make_handler():
                     # info action is heartbeat probe — log at DEBUG to reduce noise
                     is_info = (args.get('action') == 'info')
                     if not is_info:
-                        log.info(f"[mcp] tools/call: {name}({args})")
+                        log.info(f"[mcp] tools/call: {name}({_brief(args)})")
                     result = _bundle.dispatch(name, args)
                     if result is None:
-                        err(-32601, f"Unknown tool: {name}")
+                        # `dispatch` returns None for two very different things:
+                        # no plugin owns the name, or a plugin owns it and
+                        # declined the action. Reporting both as "Unknown tool"
+                        # is actively misleading — it sent a debugging session
+                        # hunting a tool-registration race that did not exist,
+                        # when the tool was registered the whole time.
+                        if _bundle.owns(name):
+                            log.warning(
+                                "[mcp] %s declined action %r", name, args.get("action")
+                            )
+                            err(-32603, f"Tool {name} does not handle action "
+                                        f"{args.get('action')!r}")
+                        else:
+                            err(-32601, f"Unknown tool: {name}")
                     else:
                         if not is_info:
                             log.info(f"[mcp] tools/call result: {json.dumps(result)[:200]}")
