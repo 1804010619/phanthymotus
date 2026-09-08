@@ -472,29 +472,20 @@ COPY perception/deploy/    /deploy/
 # Runs the frontend that was just copied in, on the Python this image actually
 # ships, and asserts the one invariant the Thai engine depends on: every character
 # it emits is in the model's 71-character table. Importing the dependencies (the
-# step above) is not the same test — pythainlp's API drifts between the versions
-# cp38 and cp310 resolve to, and this is what catches that. It already would have:
-# 5.0.4's `maiyamok` takes a token list where 5.3.7's takes a string, and passing
-# the wrong one raises IndexError on "ต่างๆ" — a crash on one JetPack line only.
+# step above) is not the same test — pythainlp's and khanaa's APIs drift between
+# the versions cp38 and cp310 resolve to, and this is what catches that. It already
+# would have: khanaa 0.0.6 spells with SpellWord().spell_out() where 0.1.1 uses
+# Kham().form, and pythainlp 5.0.4's maiyamok takes a token list where 5.3.7's
+# takes a string — each a crash on one JetPack line only.
 #
-# Cheap (no model, no ROS, no sherpa-onnx) and it fences off the whole class of
-# "the image built, the voice is wrong" failures that only a listener would find.
+# The cases and assertions live in plugins/thai_frontend.py:self_check(), not
+# inline here: a Dockerfile RUN cannot contain a bare newline (every line needs a
+# trailing backslash, or the parser reports "unknown instruction"), and the
+# assertions are more use next to the code they guard.
+#
+# Cheap — no model, no ROS, no sherpa-onnx.
 RUN if [ "${ENABLE_THAI_TTS}" = "1" ]; then \
-      cd /work && python3 -c "
-import sys; sys.path.insert(0, '/work')
-from plugins.thai_frontend import ThaiFrontend, MMS_THAI_VOCAB
-f = ThaiFrontend()
-cases = ['สวัสดีครับ ห้อง 305 พร้อมแล้ว', 'น้ำ ทำ คำ สำหรับ', 'ต่างๆ นานา',
-         'ราคา 1,250.50 บาท', 'ๆ นำหน้า', 'หุ่นยนต์ Bumi พร้อม']
-for text in cases:
-    out = f.normalize(text)
-    stray = sorted({c for c in out if c not in MMS_THAI_VOCAB})
-    assert not stray, 'unspeakable %r survived from %r' % (stray, text)
-assert 'ำ' not in f.normalize('น้ำ'), 'sara am was not rewritten'
-assert '3' not in f.normalize('ห้อง 305'), 'a digit reached the model'
-assert f.normalize('ต่างๆ').count('ต่าง') == 2, 'maiyamok was not expanded'
-print('[build] Thai frontend self-check ok on ' + sys.version.split()[0])
-"; \
+      cd /work && python3 -m plugins.thai_frontend; \
     fi
 
 EXPOSE 15720

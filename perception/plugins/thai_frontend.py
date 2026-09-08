@@ -628,3 +628,63 @@ class ThaiFrontend:
         # pronunciation.
         if chunk:
             yield " ".join(chunk)
+
+
+# ── build-time self-check ────────────────────────────────────────────────────
+
+
+def self_check() -> None:
+    """Exercise the frontend and assert the one invariant the engine depends on.
+
+    Lives here rather than as a `python3 -c` one-liner in the Dockerfile for two
+    reasons. A Dockerfile `RUN` cannot contain a bare newline — every line needs a
+    trailing backslash, and the parser reports the first unescaped line as an
+    "unknown instruction", which is how the first attempt at this failed. And the
+    assertions belong next to the code they guard, where a reader changing the
+    frontend will see them.
+
+    Run at image build time, after the source COPY, on the interpreter the image
+    actually ships:
+
+        python3 -m plugins.thai_frontend
+
+    That is a stronger test than importing the dependencies, which is what the
+    earlier build-time check did: it passed on jp5.11 while khanaa's and
+    pythainlp's cp38 API differences were still waiting to crash on that one line.
+    """
+    import sys
+
+    frontend = ThaiFrontend()
+    cases = [
+        "สวัสดีครับ ห้อง 305 พร้อมแล้ว",
+        "น้ำ ทำ คำ สำหรับ น้ำหนัก",
+        "ต่างๆ นานา และมากๆ",
+        "สินค้าต่างๆ พร้อม",
+        "ๆ นำหน้า",                     # 5.0.4's own maiyamok raises IndexError here
+        "ราคา 1,250.50 บาท",
+        "เบอร์ 0812345678",
+        "ฯลฯ ๗๘๙ ฿100",
+        "หุ่นยนต์ Bumi พร้อม",
+        "เชื่อมต่อ WiFi แล้ว",
+        "ระบบ AI และ USB",
+        "ยินดีต้อนรับ 你好 ครับ",
+        "ผลลัพธ์ ✅ ok",
+    ]
+    for text in cases:
+        out = frontend.normalize(text)
+        stray = sorted({ch for ch in out if ch not in MMS_THAI_VOCAB})
+        assert not stray, f"{stray} cannot be pronounced but survived {text!r} -> {out!r}"
+
+    # The rewrites, each of which silently mangles ordinary Thai if it regresses.
+    assert "ำ" not in frontend.normalize("น้ำ"), "sara am was not rewritten"
+    assert "ํา" in frontend.normalize("น้ำ"), "sara am was dropped, not respelled"
+    assert "3" not in frontend.normalize("ห้อง 305"), "a digit reached the model"
+    assert "สาม" in frontend.normalize("ห้อง 305"), "the digit was dropped, not spoken"
+    assert frontend.normalize("ต่างๆ").count("ต่าง") == 2, "maiyamok was not expanded"
+    assert "จุด" in frontend.normalize("ระยะ 1.5 เมตร"), "the decimal point was lost"
+
+    print(f"[build] Thai frontend self-check ok on Python {sys.version.split()[0]}")
+
+
+if __name__ == "__main__":
+    self_check()

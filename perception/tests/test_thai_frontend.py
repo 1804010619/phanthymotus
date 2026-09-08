@@ -203,6 +203,57 @@ def test_maiyamok_glued_to_its_word_by_the_tokeniser_still_expands(frontend):
     _assert_speakable(out)
 
 
+# ── the build-time self-check ────────────────────────────────────────────────
+
+
+@needs_pythainlp
+def test_the_build_time_self_check_passes():
+    """`python3 -m plugins.thai_frontend`, the command the Dockerfile runs."""
+    from plugins.thai_frontend import self_check
+
+    self_check()
+
+
+@needs_pythainlp
+def test_the_self_check_actually_fails_when_the_invariant_breaks(monkeypatch):
+    """A check that cannot fail is worse than none — it reads as coverage."""
+    from plugins import thai_frontend as module
+
+    monkeypatch.setattr(module.ThaiFrontend, "_rewrite_sara_am",
+                        lambda self, text: text)
+    with pytest.raises(AssertionError):
+        module.self_check()
+
+
+def test_the_dockerfile_can_parse_its_own_self_check_step():
+    """A RUN cannot contain a bare newline — the parser reads it as an instruction.
+
+    The first version of the build-time check was a multi-line `python3 -c "..."`
+    and failed with `dockerfile parse error: unknown instruction: import` before
+    any layer built. Cheap to guard, and it covers the whole file rather than just
+    the step this change added.
+    """
+    import pathlib
+
+    instructions = {
+        "FROM", "RUN", "CMD", "LABEL", "EXPOSE", "ENV", "ADD", "COPY",
+        "ENTRYPOINT", "VOLUME", "USER", "WORKDIR", "ARG", "ONBUILD",
+        "STOPSIGNAL", "HEALTHCHECK", "SHELL",
+    }
+    dockerfile = pathlib.Path(__file__).resolve().parents[1] / "Dockerfile.jetson"
+    offenders = []
+    continuing = False
+    for number, raw in enumerate(dockerfile.read_text(encoding="utf-8").splitlines(), 1):
+        stripped = raw.strip()
+        if not continuing and stripped and not stripped.startswith("#"):
+            head = stripped.split()[0].upper()
+            if head not in instructions:
+                offenders.append((number, stripped[:60]))
+        continuing = raw.rstrip().endswith("\\")
+    assert not offenders, f"lines continuing an instruction without a backslash: {offenders}"
+    assert not continuing, "the file ends inside a line continuation"
+
+
 def test_the_khanaa_adapter_is_resolved_once_and_survives_a_broken_import():
     """khanaa 0.1.1 raises TypeError, not ImportError, when imported on py3.8.
 
