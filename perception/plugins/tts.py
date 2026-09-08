@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 """
-plugins/tts.py — TTSPlugin: sherpa-onnx VITS TTS.
+plugins/tts.py — the TTS tool contract and its ONNX Runtime engines.
 
-On-device text-to-speech using sherpa-onnx MeloTTS (Chinese + English).
+Engines are named after the model, not the runtime: `vits2` (ZH/EN, TensorRT,
+implemented in plugins/vits2_tts_trt), `matcha` (ZH/EN, Matcha-icefall) and
+`mms_thai` (Thai, MMS VITS). The last two both run on sherpa-onnx, which is why
+naming either of them after the framework did not work.
 """
 
 from __future__ import annotations
@@ -173,20 +176,31 @@ TOOLS = [
                 # builds the config form from configSchema, so an engine that
                 # exists solely as a baked YAML key cannot be seen or switched
                 # without rebuilding the image. Mirrors asr_model in asr.py.
-                "tts_engine": {"type": "string", "enum": ["vits2_trt", "sherpa_onnx"],
-                               "description": "TTS engine (vits2_trt = VITS2 TensorRT on Jetson, "
-                                              "sherpa_onnx = sherpa-onnx Matcha)",
-                               "default": "vits2_trt", "scope": "shared"},
-                # sherpa_onnx only — vits2_trt is a TensorRT engine and never
-                # touches ONNX Runtime, so this field does nothing for it. Matcha's
-                # weights are fp32, so both devices load the same files and only
-                # the provider changes; measured 4.3x faster on gpu.
+                "tts_engine": {"type": "string", "enum": ["vits2", "matcha", "mms_thai"],
+                               "description": "TTS engine, named by model "
+                                              "(vits2 = VITS2 ZH/EN on TensorRT, "
+                                              "matcha = Matcha-icefall ZH/EN, "
+                                              "mms_thai = MMS Thai, Thai only)",
+                               "default": "vits2", "scope": "shared"},
+                # matcha and mms_thai only — vits2 is a TensorRT engine and never
+                # touches ONNX Runtime, so this field does nothing for it.
+                # Matcha's weights are fp32, so both devices load the same files and
+                # only the provider changes; measured 4.3x faster on gpu.
                 "device":      {"type": "string", "enum": ["cpu", "gpu"],
-                                "description": "Inference device for the sherpa_onnx engine "
+                                "description": "Inference device for the ONNX Runtime engines "
                                                "(gpu needs the CUDA sherpa-onnx wheel; ~4.3x faster)",
                                 "default": "cpu", "scope": "shared",
-                                "x-show-when": {"tts_engine": "sherpa_onnx"}},
-                "speaker_id": {"type": "integer", "description": "Speaker ID (VITS2 supports 0 only)", "default": 0, "scope": "shared"},
+                                "x-show-when": {"tts_engine": ["matcha", "mms_thai"]}},
+                # Thai has no spaces between words, and MMS was trained on text
+                # that spaced only phrase boundaries. Segmenting every word may
+                # help prosody or hurt it — off until it has been A/B'd on device.
+                "thai_phrase_spacing": {
+                    "type": "boolean",
+                    "description": "Insert word boundaries before synthesis (Thai only; "
+                                   "experimental — may change prosody either way)",
+                    "default": False, "scope": "shared",
+                    "x-show-when": {"tts_engine": "mms_thai"}},
+                "speaker_id": {"type": "integer", "description": "Speaker ID (vits2 and mms_thai support 0 only)", "default": 0, "scope": "shared"},
                 "speed":      {"type": "number", "description": "Speech speed (1.0 = normal)", "default": 1.0, "scope": "shared"},
             },
             "required": []
@@ -208,7 +222,7 @@ class TTSAdapter(ABC):
         yield self.synthesize(text)
 
 
-class SherpaOnnxTTSAdapter(TTSAdapter):
+class MatchaTTSAdapter(TTSAdapter):
     """On-device TTS using sherpa-onnx Matcha (flow-matching, fast non-autoregressive)."""
 
     def __init__(self, model_dir: str, speaker_id: int = 0, speed: float = 1.0,
@@ -275,16 +289,193 @@ class SherpaOnnxTTSAdapter(TTSAdapter):
             yield pcm[i:i + CHUNK_BYTES]
 
 
+class MmsThaiTTSAdapter(TTSAdapter):
+    """On-device Thai TTS using sherpa-onnx VITS (MMS Thai, character-level).
+
+    A separate adapter rather than a flag on the Matcha one: the two share no
+    model file. Matcha is an acoustic model plus a vocos vocoder and reads ZH rule
+    FSTs; MMS VITS is end-to-end, has no vocoder, and has no rule FSTs at all
+    because sherpa-onnx ships none for Thai. Everything Thai-specific therefore
+    happens in Python, in plugins/thai_frontend.py, before the text gets here.
+
+    The frontend is not optional. The tokenizer is character-level over 71
+    characters and silently drops the rest, so unnormalised text loses its digits,
+    its Latin words, and — because ``ำ`` is not in the table — the vowel of a
+    large fraction of ordinary Thai words.
+    """
+
+    def __init__(self, model_dir: str, speaker_id: int = 0, speed: float = 1.0,
+                 device: str = "cpu", phrase_spacing: bool = False):
+        import os
+        from utils.model_downloader import ensure_thai_tts_model
+        from utils.onnx_provider import provider_for_device
+
+        if speaker_id != 0:
+            # MMS Thai is single-speaker. Accepting a stray id would silently
+            # synthesize speaker 0 anyway and make the card look configurable.
+            raise ValueError(
+                f"the Thai VITS model has one speaker; speaker_id must be 0, got {speaker_id}"
+            )
+
+        model_dir = ensure_thai_tts_model(model_dir)
+        model_path = os.path.join(model_dir, "model.onnx")
+        tokens_path = os.path.join(model_dir, "tokens.txt")
+        for path in (model_path, tokens_path):
+            if not os.path.exists(path):
+                raise FileNotFoundError(f"Thai TTS model is incomplete: {path} is missing")
+        _validate_thai_manifest(model_dir)
+
+        import sherpa_onnx
+
+        provider = provider_for_device(device, (model_path,))
+        tts_config = sherpa_onnx.OfflineTtsConfig(
+            model=sherpa_onnx.OfflineTtsModelConfig(
+                vits=sherpa_onnx.OfflineTtsVitsModelConfig(
+                    model=model_path,
+                    tokens=tokens_path,
+                    # Character-level: no lexicon, and no espeak-ng data dir.
+                    # Passing either makes sherpa-onnx take a phoneme path this
+                    # model was not trained for.
+                    lexicon="",
+                    data_dir="",
+                    length_scale=1.0 / speed if speed else 1.0,
+                ),
+                num_threads=2,
+                provider=provider,
+            ),
+            # No rule_fsts: sherpa-onnx has no Thai number/date FSTs. That work is
+            # thai_frontend.normalize()'s, and it has to happen anyway because the
+            # digits 3 and 5-9 are not in the token table at all.
+            rule_fsts="",
+        )
+        self._tts = sherpa_onnx.OfflineTts(tts_config)
+
+        model_rate = int(getattr(self._tts, "sample_rate", 0) or 0)
+        if model_rate and model_rate != SAMPLE_RATE:
+            # The ROS topic is audio/pcm-16k and the pacing constants are derived
+            # from that rate, so a 22.05 kHz voice would not merely need resampling
+            # — it would play back at the wrong pitch *and* drift against the
+            # 100 ms frame clock. Refuse instead. (FEMALEV2 is 22.05 kHz; MALE-
+            # NARRATOR is 16 kHz, which is why that one is the packaged voice.)
+            raise RuntimeError(
+                f"Thai TTS model is {model_rate} Hz but the audio pipeline is "
+                f"{SAMPLE_RATE} Hz; a resampler would have to be added first"
+            )
+
+        from plugins.thai_frontend import ThaiFrontend
+
+        self._frontend = ThaiFrontend(
+            vocab=_read_token_chars(tokens_path),
+            phrase_spacing=phrase_spacing,
+        )
+        self._sid = speaker_id
+        self._speed = speed
+        log.info(f"[tts] sherpa-onnx Thai VITS loaded: model_dir={model_dir}, "
+                 f"speed={speed}, device={device}, provider={provider}, "
+                 f"sample_rate={model_rate or SAMPLE_RATE}")
+
+    def synthesize(self, text: str) -> bytes:
+        return b''.join(self.synthesize_stream(text))
+
+    def synthesize_stream(self, text: str):
+        import struct
+
+        normalized = self._frontend.normalize(text)
+        if not normalized:
+            log.warning("[tts] nothing speakable left in %r after Thai normalisation", text)
+            return
+        for chunk in self._frontend.iter_chunks(normalized):
+            audio = self._tts.generate(chunk, sid=self._sid, speed=self._speed)
+            float_samples = audio.samples
+            pcm = struct.pack(f'<{len(float_samples)}h',
+                              *[int(max(-32768, min(32767, s * 32767))) for s in float_samples])
+            for i in range(0, len(pcm), CHUNK_BYTES):
+                yield pcm[i:i + CHUNK_BYTES]
+
+
+def _validate_thai_manifest(model_dir: str) -> None:
+    """Check the release's manifest before sherpa-onnx gets a chance to exit(-1).
+
+    sherpa-onnx picks its text frontend from the ONNX `frontend` metadata string,
+    and only the exact value "characters" selects the character-level path this
+    model needs. Any other value reaches a branch that logs "Not a model using
+    characters as modeling unit" and calls `SHERPA_ONNX_EXIT(-1)` — a **process
+    exit**, so main.py's try/except around the TTS plugin cannot turn it into a
+    card in `state: error`; it takes ASR, VOP and OCR down with it.
+
+    The manifest that tools/export_mms_thai_onnx.py writes alongside the model
+    records what it set, so a mismatched or hand-assembled release fails here as
+    an ordinary exception instead. Mirrors _validate_manifest in
+    plugins/vits2_tts_trt/runtime/backends/trt_numpy_tts_engine.py.
+    """
+    import os
+
+    manifest_path = os.path.join(model_dir, "manifest.json")
+    if not os.path.exists(manifest_path):
+        raise FileNotFoundError(
+            f"{manifest_path} is missing; this release was not produced by "
+            "tools/export_mms_thai_onnx.py and cannot be checked before load"
+        )
+    with open(manifest_path, encoding="utf-8") as handle:
+        manifest = json.load(handle)
+
+    frontend = manifest.get("frontend")
+    if frontend != "characters":
+        raise RuntimeError(
+            f"Thai TTS release declares frontend={frontend!r}; sherpa-onnx needs "
+            "'characters' and hard-exits the process on anything else"
+        )
+    rate = int(manifest.get("sample_rate") or 0)
+    if rate != SAMPLE_RATE:
+        raise RuntimeError(
+            f"Thai TTS release is {rate} Hz but the audio pipeline is "
+            f"{SAMPLE_RATE} Hz; a resampler would have to be added first"
+        )
+    speakers = int(manifest.get("n_speakers") or 1)
+    if speakers != 1:
+        raise RuntimeError(
+            f"Thai TTS release declares {speakers} speakers; the adapter only "
+            "supports a single-speaker model"
+        )
+
+
+def _read_token_chars(tokens_path: str) -> set:
+    """Read the model's own token table so the frontend checks against it.
+
+    The frontend has a hardcoded copy for unit tests, but the guarantee "the
+    output only contains characters this model can say" is only true if it is
+    checked against the model that is actually loaded.
+    """
+    chars = set()
+    with open(tokens_path, encoding="utf-8") as handle:
+        for line in handle:
+            line = line.rstrip("\n")
+            if not line:
+                continue
+            # "<token> <id>", and the token may itself be a space — so split off
+            # the id from the right rather than splitting the line.
+            token, _, _ = line.rpartition(" ")
+            if token:
+                chars.add(token)
+    return chars
 
 
 def _build_tts_adapter(cfg: dict) -> TTSAdapter:
     import os
     from utils.onnx_provider import normalize_device
-    model_dir = cfg.get('model_dir', '/models/sherpa-onnx/tts')
+    engine = str(cfg.get('engine', '')).lower()
+    default_dir = ('/models/mms-thai' if engine == 'mms_thai'
+                   else '/models/sherpa-onnx/tts')
+    model_dir = cfg.get('model_dir', default_dir)
     speaker_id = int(cfg.get('speaker_id', 0))
     speed = float(cfg.get('speed', 1.0))
     device = normalize_device(cfg.get('device'), cfg.get('hw_provider'))
-    return SherpaOnnxTTSAdapter(model_dir, speaker_id, speed, device)
+    if engine == 'mms_thai':
+        return MmsThaiTTSAdapter(
+            model_dir, speaker_id, speed, device,
+            phrase_spacing=bool(cfg.get('thai_phrase_spacing', False)),
+        )
+    return MatchaTTSAdapter(model_dir, speaker_id, speed, device)
 
 
 # ── ROS2 Node ─────────────────────────────────────────────────────────────────
@@ -915,13 +1106,31 @@ class SherpaOnnxTTSPlugin:
         return self._adapter.synthesize(text)
 
 
-DEFAULT_TTS_ENGINE = "vits2_trt"
-TTS_ENGINES = ("vits2_trt", "sherpa_onnx")
+DEFAULT_TTS_ENGINE = "vits2"
+# Named after the model, not the runtime that happens to execute it. Two of these
+# run on sherpa-onnx, so a name like "sherpa_onnx" said nothing about what you
+# would hear and left no room for the second one.
+TTS_ENGINES = ("vits2", "matcha", "mms_thai")
+# The old runtime-flavoured names, still accepted. They are not decoration: both
+# are already persisted in ConfigDB rows and in config.yaml on every deployed
+# robot, and _select_engine raises on an unknown engine — so dropping them would
+# turn every existing TTS card into "Unsupported TTS engine" on the next restart.
+ENGINE_ALIASES = {
+    "vits2_trt": "vits2",
+    "sherpa_onnx": "matcha",
+    "sherpa_thai": "mms_thai",   # only ever existed on this branch
+}
 # Where each engine keeps its own model files. Used for any engine other than
 # the one config.yaml was written for; see TTSPlugin._model_dir_for.
 ENGINE_MODEL_DIRS = {
-    "vits2_trt": "/models/vits2",
-    "sherpa_onnx": "/models/sherpa-onnx/tts",
+    "vits2": "/models/vits2",
+    # Kept at the old path: it is already populated on deployed robots and
+    # renaming it would force every one of them to re-download the Matcha pair.
+    "matcha": "/models/sherpa-onnx/tts",
+    # Its own directory, not a sibling file in the Matcha one: both engines call
+    # their weights by different names but share nothing, and pointing them at one
+    # directory is the mistake ENGINE_MODEL_DIRS exists to prevent.
+    "mms_thai": "/models/mms-thai",
 }
 # How long an `action=config` engine switch waits for the new engine before
 # answering `loading`. Sized so the bounded part of a build finishes inside it
@@ -997,6 +1206,10 @@ class TTSPlugin:
     @staticmethod
     def _select_engine(value) -> str:
         engine = str(value or DEFAULT_TTS_ENGINE).strip().lower()
+        # Resolve before validating, so a stored "sherpa_onnx" keeps working and
+        # everything downstream — _build, ENGINE_MODEL_DIRS, the `engine` field in
+        # info — sees only the current name.
+        engine = ENGINE_ALIASES.get(engine, engine)
         if engine not in TTS_ENGINES:
             raise ValueError(f"Unsupported TTS engine: {engine}")
         return engine
@@ -1010,7 +1223,7 @@ class TTSPlugin:
         cfg = dict(self._cfg)
         cfg["engine"] = engine
         cfg["model_dir"] = self._model_dir_for(engine)
-        impl = (self._build_vits2(cfg) if engine == "vits2_trt"
+        impl = (self._build_vits2(cfg) if engine == "vits2"
                 else SherpaOnnxTTSPlugin(cfg, self._executor))
         # An implementation may swallow its own model-load failure and come back
         # as an object that reports error through info (sherpa does exactly

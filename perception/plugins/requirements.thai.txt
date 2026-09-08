@@ -1,0 +1,29 @@
+# Thai TTS text-frontend runtime (plugins/thai_frontend.py).
+#
+# All three are pure-Python wheels with no compiled extensions and no model
+# downloads at import — pythainlp's newmm dictionary ships inside its wheel, so
+# the container never reaches the network for it. Nothing here needs numpy, so
+# unlike the VITS2 frontend set there is no C-ABI pin to preserve.
+#
+# **pythainlp is pinned per Python version, and it has to be.** 5.3.x declares
+# `requires_python >=3.9`, and the two JetPack lines are not the same
+# interpreter: jp61 is cp310, jp511 is cp38. Left unpinned, pip resolves 5.3.7 on
+# one line and 5.2.0 on the other — the same divergence documented for kaldifst
+# in vits2_tts_trt/requirements.jetson.txt. Pinning both explicitly makes the
+# split visible instead of emergent. 5.2.0 was checked to export every function
+# the frontend calls (bahttext, num_to_thaiword, expand_maiyamok, normalize,
+# remove_zw, word_tokenize), so the older line is not a degraded one.
+pythainlp==5.2.0; python_version < "3.9"
+pythainlp==5.3.7; python_version >= "3.9"
+# Same version the VITS2 frontend set pins, restated so installing this one
+# second cannot move it.
+importlib_resources==5.12.0; python_version < "3.9"
+# Thai transliteration of foreign words. wunsen composes Chinese pinyin into Thai
+# script; khanaa spells a Thai syllable from onset/vowel/coda and is what the
+# Latin fallback uses. Both MIT, both ~20 KB.
+#
+# wunsen does NOT handle English — it covers Japanese, Korean, Mandarin and
+# Vietnamese only. The Latin path is khanaa plus the rule table in
+# plugins/thai_frontend.py, not wunsen.
+wunsen==0.0.3
+khanaa==0.1.1

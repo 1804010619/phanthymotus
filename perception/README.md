@@ -75,6 +75,107 @@ The VAD parameters can be adjusted per ASR canvas card via the instance config (
 
 ---
 
+## TTS Engines
+
+`tts_engine` (configSchema on the `tts` tool, and `plugins.tts.engine` in
+`config.yaml`) selects the voice. **Engines are named after the model, not the
+runtime**: two of the three run on sherpa-onnx, so a name like `sherpa_onnx`
+identified neither of them and left no room for the second.
+
+| `tts_engine` | model | languages | runtime | model dir |
+|---|---|---|---|---|
+| `vits2` (default) | VITS2 ZH/EN 16 kHz | 中 / 英, code-switching | TensorRT | `/models/vits2` |
+| `matcha` | matcha-icefall-zh-en + vocos | 中 / 英 | ONNX Runtime | `/models/sherpa-onnx/tts` |
+| `mms_thai` | MMS-TTS-THAI-MALE-NARRATOR | ไทย only | ONNX Runtime | `/models/mms-thai` |
+
+The previous names `vits2_trt` and `sherpa_onnx` are still accepted and resolve to
+`vits2` and `matcha` (`ENGINE_ALIASES` in `plugins/tts.py`). They are not
+decoration: both are already persisted in ConfigDB rows and in `config.yaml` on
+every deployed robot, and `_select_engine` raises on an unknown engine — so
+dropping them would put every existing TTS card into `state: error` on the next
+restart.
+
+Only one engine is resident at a time. Switching disposes the outgoing one's nodes
+first, because two live publishers on one audio topic play both voices at once.
+
+### `mms_thai`, and why it cannot be handed raw text
+
+The Thai voice is an ONNX export of
+[VIZINTZOR/MMS-TTS-THAI-MALE-NARRATOR](https://huggingface.co/VIZINTZOR/MMS-TTS-THAI-MALE-NARRATOR),
+a fine-tune of Meta's MMS VITS — 36 M parameters, **natively 16 kHz** (which is why
+this voice and not the more popular `FEMALEV2`, which is 22.05 kHz and would need a
+resampler), end-to-end so there is no vocoder, and character-level so there is no
+lexicon and no espeak-ng data. Produced by `tools/export_mms_thai_onnx.py`.
+
+**Licence: CC-BY-NC-4.0, inherited from `facebook/mms-tts`. Non-commercial.**
+Re-evaluate before shipping it in a product. Every small Thai model with usable
+quality has the same constraint — the MMS family and Piper's `th_TH-tsync2` are all
+CC-BY-NC — and the only permissively-licensed alternative found was
+`VachaSpeech-0.6B` (Apache-2.0), a 0.6 B autoregressive model that is not viable on
+CPU and marginal on an Orin GPU.
+
+The tokenizer is character-level over exactly **71 characters** and skips
+everything else. sherpa-onnx records the loss as a C++ stderr line that never
+reaches the Python logger or the dashboard; the audio simply comes back short. So
+`plugins/thai_frontend.py` is **not optional**, and three of the omissions are not
+guessable:
+
+- **`ำ` (U+0E33 SARA AM) is not in the table**, but `ํ` (U+0E4D) and `า` (U+0E32)
+  are. MMS was trained on text spelling the vowel as that pair, so every `ำ` is
+  rewritten — otherwise น้ำ, ทำ, คำ, สำหรับ and a large part of the language lose
+  their vowel. Measured: "น้ำ ทำ คำ สำหรับ น้ำหนัก" logs five skipped U+0E33 and
+  synthesizes 1.34 s; rewritten it is 1.51 s and those five vowels are audible.
+- **`ๆ`** (maiyamok) is absent, so `ต่างๆ` is expanded to the repeated word.
+- **Of the Arabic digits only `0 1 2 4` are present** — `3` and `5`-`9` are not, and
+  neither are the Thai digits `๐`-`๙`. No numeral can be passed through; every
+  number becomes words.
+
+Mixed text is transliterated into Thai script rather than routed to another engine,
+so the deployment keeps one voice: numbers via `pythainlp`, Chinese via
+`pypinyin` → `wunsen`, Latin via a hand lexicon then a `khanaa`-based rule
+fallback. **`wunsen` does not handle English** — it covers Japanese, Korean,
+Mandarin and Vietnamese only — so the Latin path is the rule table in
+`thai_frontend.py`, and a name it gets wrong belongs in `_LATIN_LEXICON`, not in
+the rules. The consequence to be clear about: English inside a Thai sentence is
+spoken with a Thai accent by the Thai voice, not natively. Native pronunciation
+would need both engines resident at once, which the facade forbids.
+
+`tests/test_thai_frontend.py` guards one property above all — every character the
+frontend emits is one the model can pronounce. That is the assertion that catches a
+silent drop.
+
+### Adding a Thai voice, or replacing this one
+
+```bash
+pip3 install torch transformers onnx onnxruntime soundfile   # not in the image
+python3 tools/export_mms_thai_onnx.py --repo <hf-repo> --out /tmp/thai-tts
+```
+
+The script refuses a checkpoint that is not 16 kHz or not single-speaker, and its
+self-check fails if the ONNX output is silent, disagrees with torch on duration, or
+ignores `length_scale` (which would make the card's `speed` field decoration).
+
+Two metadata keys decide whether the result loads at all, and getting either wrong
+is worse than an ordinary error:
+
+- **`frontend` must be exactly `characters`.** sherpa-onnx's
+  `OfflineTtsVitsImpl::InitFrontend` dispatches on that string; anything else
+  reaches the lexicon branch, which logs "Not a model using characters as modeling
+  unit" and calls `SHERPA_ONNX_EXIT(-1)` — a **process exit**, so `main.py`'s
+  try/except around the TTS plugin cannot turn it into a card in `state: error`,
+  and ASR, VOP and OCR go down with it. `_validate_thai_manifest` checks the
+  release's `manifest.json` before constructing `OfflineTts` so this fails as an
+  exception instead.
+- **`comment` must not contain `piper`, `coqui` or `Inflect`.** Those select
+  different, shorter ONNX input layouts in `OfflineTtsVitsModel::Run`.
+
+Then tar `model.onnx`, `tokens.txt`, `manifest.json` and `LICENSE`, upload to
+`public/` with credentials from `resource-center/deploy/values.env`
+(`prisma/articles/upload-figs.js` cannot — it only accepts image extensions and
+forces its own key shape), **re-download from COS and hash that copy**, and paste
+the verified `size`/`sha256` into `THAI_TTS_ARCHIVE`. Hashing the local file you
+uploaded defeats the point of the pin, which is to catch a bad transfer.
+
 ## sherpa-onnx Device Selection
 
 `device: cpu | gpu` (under `plugins.asr` and `plugins.tts` in `config.yaml`, and on
@@ -108,9 +209,10 @@ on gpu ASR was enough to exhaust memory: perception was restarted in a loop, Age
 Core could not reach port 15720, and the dashboard rolled the project back and the
 cards vanished. Budget for it before enabling.
 
-TTS is simpler: Matcha is fp32 only, so both devices load the same files and
-`device` only picks the provider (gpu measured ~4.3x). The `vits2_trt` engine
-ignores `device` entirely — it is a TensorRT engine and never touches ONNX Runtime.
+TTS is simpler: Matcha and the Thai MMS model are fp32 only, so both devices load
+the same files and `device` only picks the provider (Matcha measured ~4.3x). The
+`vits2` engine ignores `device` entirely — it is a TensorRT engine and never
+touches ONNX Runtime.
 
 `device: gpu` also needs a CUDA sherpa-onnx wheel. Both Jetson images install one —
 jp5.11 and jp6.1 each have their own build, because the wheel is tied to a
@@ -337,7 +439,7 @@ fp16 weights, and the registry test rejects it.
   `_vad_segment_sync`). silero infers one 512-sample window at a time — too little
   work to amortise a kernel launch plus two copies per 32 ms of audio — and in
   `_vad_worker` it would hold a second CUDA context in a child process.
-- **`vits2_trt` TTS**, as above: TensorRT, not ONNX Runtime.
+- **`vits2` TTS**, as above: TensorRT, not ONNX Runtime.
 
 ### GPU bundle distribution
 

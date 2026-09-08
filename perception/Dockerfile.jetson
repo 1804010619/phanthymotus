@@ -419,6 +419,41 @@ print('[build] VITS2 frontend ok on numpy ' + numpy.__version__)"; \
 # bundles on jp6.1. Verified on Orin5 (py3.8, glibc 2.31) and Tianyi (py3.10).
 RUN pip3 install --no-cache-dir --no-deps -i ${PYPI_MIRROR} onnxruntime==1.18.1
 
+# ── Thai TTS frontend deps ────────────────────────────────────────
+# Three pure-Python wheels, no compiled extensions and no build-time model fetch,
+# so this needs none of the python3-dev / numpy-pin machinery the VITS2 frontend
+# step above does.
+#
+# Placed last among the dependency layers, and with its ARG declared here rather
+# than beside the others at the top of the file. Both are for build cache: an
+# `ARG` instruction changes the cache key of every layer that follows it, so
+# declaring ENABLE_THAI_TTS up top would rebuild the entire ~16 GB image — CUDA,
+# torch, sherpa-onnx, OCR and all — for three small wheels. Down here the only
+# layers invalidated are the source COPYs below, which any code change
+# invalidates anyway.
+#
+# The import check is not ceremony: the frontend degrades quietly by design — a
+# missing pythainlp only warns and skips normalisation — so a failed install
+# would ship an image whose Thai voice drops every digit and mispronounces every
+# word containing ำ, with nothing to say so until someone listened. Build time is
+# the only place that failure is cheap. The ThapSap and Kham lookups matter for
+# the same reason: wunsen and khanaa are imported for one class each, and the
+# frontend catches ImportError around both.
+ARG ENABLE_THAI_TTS=1
+COPY perception/plugins/requirements.thai.txt /tmp/thai-requirements.txt
+RUN if [ "${ENABLE_THAI_TTS}" = "1" ]; then \
+      pip3 install --no-cache-dir -i "${PYPI_MIRROR}" -r /tmp/thai-requirements.txt && \
+      python3 -c "import pythainlp; \
+from pythainlp.util import bahttext, num_to_thaiword, expand_maiyamok, normalize, remove_zw; \
+from pythainlp.tokenize import word_tokenize; \
+from wunsen import ThapSap; \
+from khanaa import Kham; \
+assert num_to_thaiword(305), 'num_to_thaiword returned nothing'; \
+assert Kham(onset='ก', vowel='อา').form, 'khanaa produced no syllable'; \
+assert word_tokenize('สวัสดีครับ', engine='newmm'), 'newmm returned no tokens'; \
+print('[build] Thai TTS frontend ok on pythainlp ' + pythainlp.__version__)"; \
+    fi && rm -f /tmp/thai-requirements.txt
+
 # ── Application code ───────────────────────────────────────────────
 WORKDIR /work
 COPY perception/main.py    /work/main.py
