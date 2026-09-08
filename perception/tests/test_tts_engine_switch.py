@@ -12,6 +12,7 @@ Run: python -m pytest perception/tests -q
 
 from __future__ import annotations
 
+import logging
 import threading
 import time
 
@@ -491,3 +492,46 @@ def test_start_after_the_build_finishes_is_not_replayed_twice(_fake_engines):
     time.sleep(0.2)
     incoming = _fake_engines["matcha-zh-en"]
     assert len([c for c in incoming.calls if c.get("action") == "start"]) == 1
+
+
+def test_a_deferred_start_that_fails_is_reported(monkeypatch, caplog):
+    """dispatch REPORTS failure rather than raising it, so `except` never fired.
+
+    On the robot a replayed start hit a failing dry-run and returned
+    {"state": "error"}. The replay loop only caught exceptions, so nothing was
+    logged and the broken start was indistinguishable from a working one — the sole
+    trace was an unrelated warning from the frontend. This is the regression for
+    that silence.
+    """
+    engines = _Engines()
+
+    class _FailingStart(_FakeEngine):
+        def dispatch(self, name, args):
+            if args.get("action") == "start":
+                self.calls.append(args)
+                return {"state": "error", "message": "TTS dry-run produced no audio"}
+            return super().dispatch(name, args)
+
+    monkeypatch.setattr(
+        tts, "SherpaOnnxTTSPlugin",
+        lambda cfg, executor: _FailingStart(cfg.get("engine", "matcha-zh-en"), cfg,
+                                            executor, engines.add, delay=0.3),
+    )
+    monkeypatch.setattr(
+        tts.TTSPlugin, "_build_vits2",
+        lambda self, cfg: _FakeEngine("vits2-zh-en", cfg, self._executor, engines.add),
+    )
+    monkeypatch.setattr(tts, "ENGINE_SWITCH_WAIT_S", 0.05)
+
+    plugin = tts.TTSPlugin({"engine": "vits2-zh-en"}, _FakeExecutor())
+    with caplog.at_level(logging.ERROR, logger="plugins.tts"):
+        plugin.dispatch("tts", {"action": "config", "tts_engine": "matcha-zh-en"})
+        assert plugin.dispatch("tts", {"action": "start",
+                                       "instance_id": "card-1"})["state"] == "loading"
+        assert _wait_until(lambda: any("deferred start" in record.getMessage()
+                                       for record in caplog.records))
+
+    failure = next(record.getMessage() for record in caplog.records
+                   if "deferred start" in record.getMessage())
+    assert "card-1" in failure, "the failing instance must be named"
+    assert "no audio" in failure, "the engine's own message must be carried through"

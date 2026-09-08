@@ -215,6 +215,14 @@ TOOLS = [
 # ── TTS Adapter ──────────────────────────────────────────────────────────────
 
 class TTSAdapter(ABC):
+    # Text _TTSNode.start() synthesizes to prove the model works before declaring
+    # `running`. Per-adapter, because a probe is only valid if the adapter's own
+    # frontend keeps it: "." is punctuation, and the Thai frontend normalises
+    # punctuation to a space and then strips it, so the probe reached the model as
+    # an empty string and every Thai start failed with "TTS dry-run produced no
+    # audio". Keep it to one syllable — it is synthesized on every start.
+    dry_run_text = "."
+
     @abstractmethod
     def synthesize(self, text: str) -> bytes: ...
 
@@ -305,6 +313,13 @@ class MmsThaiTTSAdapter(TTSAdapter):
     large fraction of ordinary Thai words.
     """
 
+    # A single Thai consonant, not the "." the other adapters use: the frontend
+    # normalises punctuation to a space and strips it, so "." reached the model as
+    # an empty string and every start failed with "dry-run produced no audio".
+    # Measured 0.384 s of audio and 108 ms to synthesize — the cheapest probe that
+    # still proves the model runs.
+    dry_run_text = "ก"
+
     def __init__(self, model_dir: str, speaker_id: int = 0, speed: float = 1.0,
                  device: str = "cpu", phrase_spacing: bool = False):
         import os
@@ -391,6 +406,18 @@ class MmsThaiTTSAdapter(TTSAdapter):
         log.info(f"[tts] sherpa-onnx Thai VITS loaded: model_dir={model_dir}, "
                  f"speed={speed}, device={device}, provider={provider}, "
                  f"sample_rate={model_rate or SAMPLE_RATE}")
+
+        # Fail here, not on the first start. _TTSNode.start() refuses to declare
+        # `running` unless the probe produces audio, and a probe the frontend
+        # normalises away can never do that — which is how "." made every Thai
+        # start report "dry-run produced no audio" while the model itself was
+        # fine. Checking at construction turns a future frontend change that
+        # swallows this probe into a load error naming the cause.
+        if not self._frontend.normalize(self.dry_run_text):
+            raise RuntimeError(
+                f"the Thai frontend normalises the dry-run probe "
+                f"{self.dry_run_text!r} to nothing, so no start could ever succeed"
+            )
 
     def synthesize(self, text: str) -> bytes:
         return b''.join(self.synthesize_stream(text))
@@ -533,11 +560,14 @@ class _TTSNode(Node):
             return self._status_dict()
         if not self._adapter:
             raise RuntimeError("TTS adapter not configured")
-        # Dry-run: verify model can synthesize before declaring running
+        # Dry-run: verify model can synthesize before declaring running. The probe
+        # comes from the adapter, not a literal here — see TTSAdapter.dry_run_text.
+        probe = getattr(self._adapter, "dry_run_text", ".")
         try:
-            test_chunks = list(self._adapter.synthesize_stream("."))
+            test_chunks = list(self._adapter.synthesize_stream(probe))
             if not test_chunks:
-                return {"state": "error", "message": "TTS dry-run produced no audio"}
+                return {"state": "error",
+                        "message": f"TTS dry-run produced no audio for {probe!r}"}
         except Exception as e:
             return {"state": "error", "message": f"TTS dry-run failed: {e}"}
         self._stop_event.clear()
@@ -1307,14 +1337,27 @@ class TTSPlugin:
             # comes up idle, and Agent Core — which polls `info` after a start
             # answered `loading` — reports the card as "启动已取消".
             for start_args in replay:
+                instance = (start_args.get("instance_id")
+                            or start_args.get("input_topic") or "?")
                 try:
                     log.info("[tts] replaying start deferred during the %s build: %s",
-                             engine, start_args.get("instance_id") or
-                             start_args.get("input_topic"))
-                    impl.dispatch("tts", start_args)
+                             engine, instance)
+                    result = impl.dispatch("tts", start_args) or {}
                 except Exception:
                     log.error("[tts] deferred start failed after the %s build",
                               engine, exc_info=True)
+                    continue
+                # dispatch REPORTS failure, it does not raise it — start() returns
+                # {"state": "error", ...} for a failed dry-run — so the except above
+                # never fired and a replayed start that failed was completely
+                # silent. That is what made a broken Thai start look like a
+                # successful one: the only trace was the frontend's own warning,
+                # and the card kept whatever state Agent Core inferred from
+                # polling. Inspect the result.
+                if result.get("state") == "error":
+                    log.error("[tts] deferred start for %s failed after the %s "
+                              "build: %s", instance, engine,
+                              result.get("message") or result.get("desc") or result)
 
         threading.Thread(target=_run, name=f"tts-engine-{engine}", daemon=True).start()
 

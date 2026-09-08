@@ -147,6 +147,26 @@ would need both engines resident at once, which the facade forbids.
 frontend emits is one the model can pronounce. That is the assertion that catches a
 silent drop.
 
+### The dry-run probe is per adapter
+
+`_TTSNode.start()` refuses to report `running` until the adapter has synthesized a
+short probe. That probe used to be a literal `"."` for every engine — and this
+frontend normalises punctuation to a space and then strips it, so the probe reached
+the Thai model as an empty string and **every** start on the robot answered
+`TTS dry-run produced no audio` while the model itself was fine.
+
+It is now `TTSAdapter.dry_run_text`, overridden to `ก` for `mms-th` (measured
+0.384 s of audio, 108 ms to synthesize — the cheapest probe that still proves the
+model runs). `MmsThaiTTSAdapter.__init__` also refuses to construct if the frontend
+normalises its own probe away, so a future frontend change that swallows it fails at
+load, naming the cause, instead of at every start.
+
+A related silence surfaced in the same session: a start deferred during an engine
+build is replayed afterwards, and `dispatch` **reports** failure rather than raising
+it — `start()` returns `{"state": "error"}`. The replay loop only caught exceptions,
+so a replayed start that failed logged nothing at all and looked like a successful
+one. It now inspects the result and logs the engine's own message.
+
 ### The Thai deps are pinned per Python version, and `requires_python` lies
 
 jp6.1 is cp310, **jp5.11 is cp38**, and both `pythainlp` and `khanaa` declare

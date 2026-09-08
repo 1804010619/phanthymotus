@@ -203,7 +203,37 @@ def test_maiyamok_glued_to_its_word_by_the_tokeniser_still_expands(frontend):
     _assert_speakable(out)
 
 
-# ── the build-time self-check ────────────────────────────────────────────────
+# ── the dry-run probe (device regression) ────────────────────────────────────
+
+
+@needs_pythainlp
+def test_the_thai_dry_run_probe_survives_normalisation(frontend):
+    """_TTSNode.start() refuses `running` unless its probe produces audio.
+
+    The shared probe was ".", and this frontend normalises punctuation to a space
+    and then strips it — so the probe reached the model as an empty string and
+    every Thai start on the robot answered "TTS dry-run produced no audio" while
+    the model itself was fine. The probe is now per-adapter; this pins the property
+    that made the old one wrong.
+    """
+    from plugins.tts import MmsThaiTTSAdapter, TTSAdapter
+
+    assert frontend.normalize(TTSAdapter.dry_run_text) == "", \
+        "the shared '.' probe is expected to normalise away — that was the bug"
+    probe = MmsThaiTTSAdapter.dry_run_text
+    assert probe != TTSAdapter.dry_run_text, "the Thai adapter must override it"
+    assert frontend.normalize(probe), f"the Thai probe {probe!r} normalises to nothing"
+    _assert_speakable(frontend.normalize(probe))
+
+
+def test_every_adapter_declares_a_dry_run_probe():
+    """A new engine that forgets this inherits '.', which its frontend may drop."""
+    from plugins.tts import MatchaTTSAdapter, MmsThaiTTSAdapter, TTSAdapter
+
+    for adapter in (TTSAdapter, MatchaTTSAdapter, MmsThaiTTSAdapter):
+        probe = getattr(adapter, "dry_run_text", None)
+        assert isinstance(probe, str) and probe, f"{adapter.__name__} has no probe"
+
 
 
 @needs_pythainlp
