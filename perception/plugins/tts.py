@@ -318,6 +318,23 @@ class MmsThaiTTSAdapter(TTSAdapter):
                 f"the Thai VITS model has one speaker; speaker_id must be 0, got {speaker_id}"
             )
 
+        # Refuse to start without the text frontend's dependencies. Every function
+        # in thai_frontend degrades to a warning when an import fails, which is
+        # right for a single missing transliterator but wrong as a whole: without
+        # pythainlp no number is converted, and the digits 3 and 5-9 are not in the
+        # token table, so they are dropped from the audio. The card would come up
+        # `running` and mispronounce every utterance carrying a number. Better a
+        # visible `state: error` on this one card than a robot that sounds fine and
+        # says the wrong thing.
+        try:
+            import pythainlp  # noqa: F401
+        except ImportError as error:
+            raise RuntimeError(
+                "the Thai TTS engine needs pythainlp (perception/plugins/"
+                "requirements.thai.txt); without it numbers are dropped from the "
+                f"audio rather than spoken: {error}"
+            ) from error
+
         model_dir = ensure_thai_tts_model(model_dir)
         model_path = os.path.join(model_dir, "model.onnx")
         tokens_path = os.path.join(model_dir, "tokens.txt")

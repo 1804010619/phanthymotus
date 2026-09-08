@@ -297,10 +297,8 @@ def _transliterate_latin_word(word: str) -> str:
     if word.isupper() and len(lowered) <= 4:
         return " ".join(_LATIN_LETTER_NAMES.get(ch, "") for ch in lowered).strip()
 
-    try:
-        from khanaa import Kham
-    except ImportError:
-        log.warning("[thai] khanaa is not installed; spelling %r letter by letter", word)
+    if _KHANAA_SPELL is None:
+        # Already warned once at import; spelling the word out stays intelligible.
         return " ".join(_LATIN_LETTER_NAMES.get(ch, "") for ch in lowered).strip()
 
     syllables: list[str] = []
@@ -317,14 +315,14 @@ def _transliterate_latin_word(word: str) -> str:
         if not onset:
             onset = "อ"      # ตัวเต็ม placeholder onset for a vowel-initial syllable
         try:
-            syllables.append(Kham(onset=onset, vowel=vowel, coda=coda).form)
+            syllables.append(_KHANAA_SPELL(onset, vowel, coda))
         except Exception:
             # khanaa refuses impossible combinations (e.g. a coda the vowel
             # already carries). Keep the syllable audible rather than losing it.
             log.debug("[thai] khanaa refused onset=%r vowel=%r coda=%r from %r",
                       onset, vowel, coda, word)
             try:
-                syllables.append(Kham(onset=onset, vowel=vowel).form)
+                syllables.append(_KHANAA_SPELL(onset, vowel))
             except Exception:
                 continue
     return "".join(syllables)
@@ -341,8 +339,12 @@ def _transliterate_cjk(run: str) -> str:
     try:
         from pypinyin import Style, lazy_pinyin
         from wunsen import ThapSap
-    except ImportError:
-        log.warning("[thai] pypinyin/wunsen unavailable; cannot say Chinese %r", run)
+    except Exception as error:  # noqa: BLE001
+        # Exception, not ImportError: wunsen imports khanaa, which can fail at
+        # import time on Python 3.8 with a TypeError rather than an ImportError.
+        # See _load_khanaa.
+        log.warning("[thai] pypinyin/wunsen unusable (%s: %s); cannot say Chinese %r",
+                    type(error).__name__, error, run)
         return ""
     try:
         pinyin = lazy_pinyin(run, style=Style.TONE3, neutral_tone_with_five=False)
@@ -378,6 +380,60 @@ def _number_to_thai(literal: str) -> str:
     # how Thai reads decimals aloud.
     tail = "".join(_THAI_DIGIT_WORDS.get(ch, "") for ch in fraction)
     return f"{head}จุด{tail}"
+
+
+def _load_khanaa():
+    """Return a `spell(onset, vowel, coda, tone) -> str`, or None if unavailable.
+
+    Hides two independent problems behind one uniform callable.
+
+    **The API differs by version, and the version differs by JetPack line.**
+    khanaa 0.1.1 (jp6.1, cp310) exposes `Kham(...).form`; 0.0.6 — the newest that
+    imports at all on cp38, so what jp5.11 gets — exposes
+    `SpellWord().spell_out(...)`. Verified to produce identical output for the
+    same inputs (สต+เอะ+ก+tone 3 -> เสต๊ก on both), so this is a rename, not a
+    downgrade.
+
+    **It catches Exception, not ImportError.** A pure-Python package can fail at
+    *import* time without the module being missing: khanaa 0.1.1 annotates
+    `def find_same_sound_consonant(...) -> list[str]` at module level, and PEP 585
+    builtin generics in a function annotation are evaluated at def time, so
+    importing it on Python 3.8 raises
+
+        TypeError: 'type' object is not subscriptable
+
+    An `except ImportError` did not catch that and the TypeError propagated out of
+    normalize(), killing the utterance instead of degrading it. pythainlp has the
+    same failure shape; see plugins/requirements.thai.txt.
+    """
+    try:
+        from khanaa import Kham
+
+        def spell(onset, vowel, coda="", tone=-1):
+            return Kham(onset=onset, vowel=vowel, coda=coda, tone=tone).form
+
+        return spell
+    except Exception:  # noqa: BLE001 - see docstring; fall through to the old API
+        pass
+    try:
+        from khanaa import SpellWord
+
+        speller = SpellWord()
+
+        def spell(onset, vowel, coda="", tone=-1):
+            return speller.spell_out(onset=onset, vowel=vowel, coda=coda, tone=tone)
+
+        return spell
+    except Exception as error:  # noqa: BLE001 - see docstring
+        log.warning("[thai] khanaa is unusable (%s: %s); Latin words will be "
+                    "spelled out letter by letter instead of transliterated",
+                    type(error).__name__, error)
+        return None
+
+
+# Resolved once: the failure is a property of the interpreter, not of the text, so
+# re-importing per word would only repeat the same warning on every utterance.
+_KHANAA_SPELL = _load_khanaa()
 
 
 class ThaiFrontend:
@@ -458,18 +514,48 @@ class ThaiFrontend:
 
     @staticmethod
     def _expand_maiyamok(text: str) -> str:
+        """Replace each ๆ with the word before it.
+
+        Done here rather than through pythainlp's own helper because that helper's
+        signature is not stable across the versions the two JetPack lines get.
+        5.3.7 (jp6.1, cp310) exports `expand_maiyamok` and accepts a string;
+        5.0.4 — the newest release that imports at all on cp38, so what jp5.11
+        gets — exports only `maiyamok` and accepts a token *list*, raising
+        IndexError on a string. Ten lines of our own beats branching on that, and
+        it also handles a leading ๆ, which 5.0.4's helper crashes on.
+        """
         if "ๆ" not in text:
             return text
         try:
-            from pythainlp.util import expand_maiyamok
+            from pythainlp.tokenize import word_tokenize
         except ImportError:
             log.warning("[thai] pythainlp unavailable; ๆ will be dropped")
             return text
         try:
-            return "".join(expand_maiyamok(text))
+            tokens = word_tokenize(text, engine="newmm", keep_whitespace=True)
         except Exception as error:
-            log.warning("[thai] ๆ expansion failed: %s", error)
+            log.warning("[thai] ๆ expansion could not tokenise %r: %s", text, error)
             return text
+
+        out: list[str] = []
+        for token in tokens:
+            if token.strip() == "ๆ":
+                # The nearest preceding non-blank token is the one repeated.
+                previous = next((t for t in reversed(out) if t.strip()), "")
+                if previous:
+                    out.append(previous)
+                else:
+                    # A sentence opening with ๆ has nothing to repeat; dropping it
+                    # is the only option, but say so.
+                    log.warning("[thai] leading ๆ has no preceding word to repeat")
+            elif token.endswith("ๆ") and len(token) > 1:
+                # newmm can return the marker glued to its word ("ต่างๆ").
+                stem = token[:-1]
+                out.append(stem)
+                out.append(stem)
+            else:
+                out.append(token)
+        return "".join(out)
 
     def _transliterate_foreign(self, text: str) -> str:
         text = _CJK_RUN.sub(lambda m: _transliterate_cjk(m.group(0)), text)

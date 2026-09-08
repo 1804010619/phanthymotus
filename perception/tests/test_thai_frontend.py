@@ -179,6 +179,50 @@ def test_maiyamok_is_expanded_because_the_marker_is_not_in_the_table(frontend):
 
 
 @needs_pythainlp
+def test_a_leading_maiyamok_has_nothing_to_repeat_and_does_not_crash(frontend, caplog):
+    """pythainlp 5.0.4's own `maiyamok` raises IndexError on this.
+
+    Which is one of the two reasons the expansion is done here instead: its
+    signature also differs between the versions cp38 and cp310 resolve to (token
+    list vs string). Dropping the marker is the only option, but it is logged.
+    """
+    with caplog.at_level(logging.WARNING, logger="plugins.thai_frontend"):
+        out = frontend.normalize("ๆ นำหน้า")
+    assert "ๆ" not in out
+    assert "นํา" in out, "the rest of the sentence was lost with the marker"
+    assert any("ๆ" in record.getMessage() for record in caplog.records)
+    _assert_speakable(out)
+
+
+@needs_pythainlp
+def test_maiyamok_glued_to_its_word_by_the_tokeniser_still_expands(frontend):
+    """newmm can return "ต่างๆ" as a single token rather than two."""
+    out = frontend.normalize("สินค้าต่างๆ พร้อม")
+    assert "ๆ" not in out
+    assert out.count("ต่าง") == 2
+    _assert_speakable(out)
+
+
+def test_the_khanaa_adapter_is_resolved_once_and_survives_a_broken_import():
+    """khanaa 0.1.1 raises TypeError, not ImportError, when imported on py3.8.
+
+    An `except ImportError` did not catch that and the TypeError escaped
+    normalize(), killing the utterance. The loader must swallow any import-time
+    failure and let the Latin path fall back to spelling words out.
+    """
+    from plugins import thai_frontend as module
+
+    # Whatever this host has, the loader answered with a callable or None — never
+    # by raising.
+    assert module._KHANAA_SPELL is None or callable(module._KHANAA_SPELL)
+    if module._KHANAA_SPELL is not None:
+        # Both khanaa APIs must produce the same syllable for the same input;
+        # verified on cp38 (SpellWord.spell_out) and cp310+ (Kham.form).
+        assert module._KHANAA_SPELL("ก", "อา") == "กา"
+        assert module._KHANAA_SPELL("สต", "เอะ", "ก", 3) == "เสต๊ก"
+
+
+@needs_pythainlp
 def test_thai_digits_are_read_too(frontend):
     out = frontend.normalize("๗ ชิ้น")
     assert "๗" not in out

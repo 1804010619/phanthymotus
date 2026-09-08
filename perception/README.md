@@ -147,6 +147,58 @@ would need both engines resident at once, which the facade forbids.
 frontend emits is one the model can pronounce. That is the assertion that catches a
 silent drop.
 
+### The Thai deps are pinned per Python version, and `requires_python` lies
+
+jp6.1 is cp310, **jp5.11 is cp38**, and both `pythainlp` and `khanaa` declare
+`requires_python >= 3.7` while shipping code that cannot be imported on 3.8. Each
+annotates a module-level name with a PEP 585 builtin generic — `_THAI_DICT:
+dict[str, list]`, `def find_same_sound_consonant(...) -> list[str]` — and those are
+evaluated at runtime, so the import raises:
+
+```
+TypeError: 'type' object is not subscriptable
+```
+
+pip installs them happily first. This is why the jp5.11 build failed on the first
+attempt with `pythainlp==5.2.0`, and why reading a changelog is not verification
+here — the metadata is simply wrong.
+
+| package | cp38 (jp5.11) | cp310+ (jp6.1) | newer versions on cp38 |
+|---|---|---|---|
+| `pythainlp` | `5.0.4` | `5.3.7` | 5.0.5+ all raise the TypeError |
+| `khanaa` | `0.0.6` | `0.1.1` | 0.1.0+ raise it |
+
+Both older pins also have **different APIs**, and both differences are absorbed in
+`plugins/thai_frontend.py` rather than pushed onto callers:
+
+- `khanaa` 0.0.6 spells with `SpellWord().spell_out(...)` where 0.1.1 uses
+  `Kham(...).form`. `_load_khanaa` returns one uniform callable for either. Verified
+  on cp38 that they agree — `สต+เอะ+ก+tone 3` → `เสต๊ก`, `บ+อู` → `บู`.
+- `pythainlp` 5.0.4 has no `expand_maiyamok`, and its `maiyamok` takes a token list
+  where 5.3.7's takes a string (passing a string raises `IndexError`). So the
+  frontend expands `ๆ` itself, which also fixes a leading `ๆ` that 5.0.4's helper
+  crashes on.
+
+The loaders catch `Exception`, not `ImportError`: a pure-Python package failing at
+import time with a `TypeError` is exactly the case here, and an `ImportError`-only
+guard let it escape `normalize()` and kill the utterance.
+
+Verified by running the real frontend inside the actual jp5.11 perception image
+(Python 3.8.10) — output is byte-identical to cp312 for every case, including
+`Bumi` → `บูมิ`, `WiFi` → `ไวไฟ`, `你好` → `หนี ห่าว` and `ต่างๆ` → `ต่างต่าง`. There
+is no degraded JetPack line.
+
+The image therefore carries a build-time self-check *after* the source COPY that
+runs `normalize()` on the shipped interpreter and asserts the vocabulary invariant.
+Importing the dependencies is a weaker test: it passes while an API difference is
+still waiting to crash on one line only.
+
+The adapter also refuses to construct without `pythainlp`. The frontend's
+per-transliterator fallbacks are deliberately quiet, but losing number conversion
+is not survivable — the digits `3` and `5`-`9` are not in the token table, so they
+vanish from the audio and the card would report `running` while mispronouncing every
+utterance carrying a number.
+
 ### Adding a Thai voice, or replacing this one
 
 ```bash
