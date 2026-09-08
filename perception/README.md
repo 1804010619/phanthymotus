@@ -167,6 +167,70 @@ it — `start()` returns `{"state": "error"}`. The replay loop only caught excep
 so a replayed start that failed logged nothing at all and looked like a successful
 one. It now inspects the result and logs the engine's own message.
 
+### `config` must not rebuild the session it just built
+
+`SherpaOnnxTTSPlugin`'s config action used to call `_build_tts_adapter`
+**unconditionally** and then dispose every node. On Orin5 an identical, no-op
+config measured **2.6–2.8 s** for `mms-th` — a full ONNX session teardown, reload
+and archive re-verification — and the card then had to `start` again. The dashboard
+re-applies a card's config around a speak, so that landed on *every* utterance:
+"every speak takes 5 s".
+
+It now rebuilds only when a key the session is built from actually changed
+(`device`, `speaker_id`, `model_dir`, `thai_phrase_spacing`), comparing normalised
+values so the dashboard's `speed: 1` does not read as a change against a stored
+`1.0`. `speed` is applied with `set_speed()` on the resident model — which is what
+`vits2` has always done ("avoids tearing down a resident model for a slider
+change"), and why only the two sherpa-onnx engines were slow. **`matcha-zh-en`
+benefits identically; `vits2-zh-en` never had the bug.**
+
+Measured after the fix: repeated identical config **2 ms**, and speak → first
+`AudioChunk` on the topic **226–333 ms**.
+
+Two things this exposed:
+
+- `TTSPlugin._config` carried a hardcoded `("speaker_id", "speed", "device")` into
+  a newly built engine and so dropped `thai_phrase_spacing`. The engine came up
+  without it and the next config saw a change and rebuilt — one extra 2.7 s per
+  switch. The list is now derived from `configSchema` (`SHARED_CONFIG_KEYS`).
+- The config filter dropped every falsy value, so `thai_phrase_spacing: False` and
+  `speaker_id: 0` were unsendable — phrase spacing could be turned on and never
+  off. `_session_keys()` now decides presence per key.
+
+### Warmup applies to the sherpa-onnx engines too
+
+`plugins.tts.warmup` in `config.yaml` existed all along and only the VITS2 plugin
+honoured it. Unpaid, the first utterance carried two separate costs, both measured
+on Orin5:
+
+| cost | measured | note |
+|---|---|---|
+| CUDA kernels + memory pool | 1695 ms | first utterance 2361 ms vs 342 ms for the second |
+| pythainlp lazy corpus load | **3183 ms** | `normalize()`'s first call; 0.2 ms after |
+
+The frontend is the larger of the two and is pure CPU. `TTSAdapter.warmup()`
+synthesizes `dry_run_text`, which goes through the adapter's own frontend and so
+covers both; measured 1.29 s at load on device.
+
+### Throughput, and why `device: cpu` is not viable for Thai
+
+Measured on Orin5 for a 5 s Thai utterance:
+
+| device | RTF | first frame (warm) |
+|---|---|---|
+| `gpu` (cuda) | **0.07 – 0.13** | 342 – 665 ms |
+| `cpu` | **0.96 – 1.04** | ~5000 ms |
+
+On CPU this model is barely realtime — no headroom, and first audio arrives about
+when the utterance would have ended. Use `device: gpu` for `mms-th`. (An earlier
+note here cited RTF 0.31 for CPU; that was measured on an x86/arm64 dev laptop, not
+on an Orin, and is not representative.)
+
+Total wall time from speak to the *last* frame is necessarily ≥ the audio duration:
+the node paces publication at exactly realtime, deliberately — see
+`FRAME_INTERVAL_S`, where over-delivering by 30 ms per frame made the browser player
+rewind its schedule and play overlapped at 1.43x.
+
 ### The Thai deps are pinned per Python version, and `requires_python` lies
 
 jp6.1 is cp310, **jp5.11 is cp38**, and both `pythainlp` and `khanaa` declare

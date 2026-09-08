@@ -22,6 +22,11 @@ from vision_stubs import _FakeExecutor, _wait_until  # noqa: F401
 
 import plugins.tts as tts  # noqa: E402
 
+# Captured before any fixture runs. The autouse _fake_engines fixture replaces
+# tts.SherpaOnnxTTSPlugin with a stub, so the tests at the bottom that exercise the
+# *real* plugin's config path have to hold their own reference to it.
+_REAL_SHERPA_PLUGIN = tts.SherpaOnnxTTSPlugin
+
 
 class _FakeEngine:
     """Stands in for one engine implementation behind the facade."""
@@ -535,3 +540,133 @@ def test_a_deferred_start_that_fails_is_reported(monkeypatch, caplog):
                    if "deferred start" in record.getMessage())
     assert "card-1" in failure, "the failing instance must be named"
     assert "no audio" in failure, "the engine's own message must be carried through"
+
+
+# ── config must not rebuild what it just built (device regression) ───────────
+
+
+class _CountingAdapter:
+    """Counts constructions, so a needless rebuild is visible."""
+
+    builds = 0
+    dry_run_text = "."
+
+    def __init__(self, cfg):
+        type(self).builds += 1
+        self.cfg = dict(cfg)
+        self.speed = float(cfg.get("speed", 1.0))
+        self.speeds = []
+
+    def synthesize(self, text):
+        return b"\x00" * 3200
+
+    def synthesize_stream(self, text):
+        yield b"\x00" * 3200
+
+    def warmup(self):
+        return 3200
+
+    def set_speed(self, speed):
+        self.speed = speed
+        self.speeds.append(speed)
+
+
+@pytest.fixture
+def _sherpa(monkeypatch):
+    """A real SherpaOnnxTTSPlugin over a counting adapter."""
+    _CountingAdapter.builds = 0
+    holder = {}
+
+    def build(cfg):
+        holder["adapter"] = _CountingAdapter(cfg)
+        return holder["adapter"]
+
+    monkeypatch.setattr(tts, "_build_tts_adapter", build)
+    plugin = _REAL_SHERPA_PLUGIN(
+        {"engine": "mms-th", "device": "gpu", "speed": 1.0,
+         "speaker_id": 0, "thai_phrase_spacing": True}, _FakeExecutor())
+    return plugin, holder
+
+
+def test_an_identical_config_does_not_rebuild_the_session(_sherpa):
+    """The "every speak takes 5 s" bug.
+
+    config used to rebuild the adapter unconditionally. On Orin5 that measured
+    2.6-2.8 s for the Thai model — a full ONNX session teardown, reload and archive
+    re-verification — and it also disposed every node, so the card had to start
+    again. The dashboard re-applies a card's config around a speak, so the cost
+    landed on every utterance. Same code path serves matcha-zh-en; vits2 has its
+    own plugin and never had the bug.
+    """
+    plugin, _ = _sherpa
+    assert _CountingAdapter.builds == 1, "constructed once at init"
+
+    # Exactly what the dashboard sends, including `speed: 1` as an int where the
+    # stored value is 1.0 — the normalisation that makes this comparable.
+    same = {"action": "config", "device": "gpu", "speed": 1,
+            "speaker_id": 0, "thai_phrase_spacing": True}
+    for _ in range(3):
+        result = plugin.dispatch("tts", same)
+        assert result["status"] == "configured"
+        assert result["rebuilt"] is False
+    assert _CountingAdapter.builds == 1, "an identical config rebuilt the session"
+
+
+def test_changing_speed_alone_updates_the_resident_model(_sherpa):
+    """speed is a per-generate() scale, so it must not reload anything."""
+    plugin, holder = _sherpa
+    result = plugin.dispatch("tts", {"action": "config", "speed": 1.5})
+    assert result["rebuilt"] is False
+    assert _CountingAdapter.builds == 1
+    assert holder["adapter"].speeds == [1.5], "set_speed was not applied"
+
+
+@pytest.mark.parametrize("change", [
+    {"device": "cpu"},
+    {"speaker_id": 1},
+    {"thai_phrase_spacing": False},
+    {"model_dir": "/models/other"},
+])
+def test_changing_a_session_key_does_rebuild(_sherpa, change):
+    """The other half: a real change must still take effect."""
+    plugin, _ = _sherpa
+    result = plugin.dispatch("tts", {"action": "config", **change})
+    assert result["rebuilt"] is True, f"{change} was ignored"
+    assert _CountingAdapter.builds == 2
+
+
+def test_the_facade_carries_every_shared_field_into_a_new_engine():
+    """A hardcoded key list here missed thai_phrase_spacing.
+
+    The engine was then built without it, and the next config saw a change and
+    rebuilt the session that had just been built — 2.7 s, once per switch. Deriving
+    the list from configSchema is what stops the next field being forgotten.
+    """
+    shared = {key for key, spec in tts.TOOLS[0]["configSchema"]["properties"].items()
+              if spec.get("scope") == "shared"} - {"tts_engine"}
+    assert set(tts.SHARED_CONFIG_KEYS) == shared
+    assert "thai_phrase_spacing" in tts.SHARED_CONFIG_KEYS
+
+
+def test_the_adapter_is_warmed_up_at_load(_sherpa):
+    """`warmup` in config.yaml did nothing for either sherpa engine.
+
+    Unpaid, the first utterance carried it: 1695 ms of CUDA kernels for the model
+    plus 3183 ms for pythainlp's lazy corpus load on the Thai frontend's first
+    normalise().
+    """
+    plugin, holder = _sherpa
+    assert holder["adapter"].cfg  # built
+    # warmup() is called through the adapter, so a plugin that skipped it would
+    # leave the model cold; assert the plugin honours the flag both ways.
+    _CountingAdapter.builds = 0
+    calls = []
+    monkey = _CountingAdapter.warmup
+    try:
+        _CountingAdapter.warmup = lambda self: calls.append(1) or 3200
+        _REAL_SHERPA_PLUGIN({"engine": "mms-th", "warmup": True}, _FakeExecutor())
+        assert calls == [1], "warmup: true was ignored"
+        _REAL_SHERPA_PLUGIN({"engine": "mms-th", "warmup": False}, _FakeExecutor())
+        assert calls == [1], "warmup: false was ignored"
+    finally:
+        _CountingAdapter.warmup = monkey

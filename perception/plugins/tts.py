@@ -230,6 +230,39 @@ class TTSAdapter(ABC):
         """Yield raw PCM bytes as they arrive. Default: collect all."""
         yield self.synthesize(text)
 
+    def warmup(self) -> int:
+        """Pay the first-inference cost at load; return the bytes produced.
+
+        Two separate one-off costs, both measured on Orin5 with the Thai model:
+
+        - **The model.** First utterance after the session is built takes 2361 ms
+          to its first frame; the second takes 342 ms — 1695 ms of lazy CUDA
+          kernels and memory pool.
+        - **The frontend.** `ThaiFrontend.normalize()` costs **3183 ms** on its
+          first call and 0.2 ms after, because pythainlp loads its corpora and the
+          newmm dictionary lazily. That is the larger of the two and is pure CPU.
+
+        Synthesizing `dry_run_text` covers both, because it goes through the
+        adapter's own frontend. Deliberately one short syllable, not a coverage
+        pass: engine construction happens inside the config path that
+        ENGINE_SWITCH_WAIT_S bounds, so a long warmup would push a switch into
+        answering `loading`.
+
+        `plugins.tts.warmup` in config.yaml has existed all along and, until this,
+        did nothing for either sherpa-onnx engine — only the VITS2 plugin honoured
+        it.
+        """
+        return sum(len(chunk) for chunk in self.synthesize_stream(self.dry_run_text))
+
+    def set_speed(self, speed: float) -> None:
+        """Change speed on the resident model, without rebuilding it.
+
+        Mirrors Vits2TensorRTAdapter.set_speed. sherpa-onnx takes `speed` on every
+        `generate()` call, so nothing has to be reloaded — which is the whole point:
+        `config` used to rebuild the session for any change at all.
+        """
+        del speed
+
 
 class MatchaTTSAdapter(TTSAdapter):
     """On-device TTS using sherpa-onnx Matcha (flow-matching, fast non-autoregressive)."""
@@ -296,6 +329,11 @@ class MatchaTTSAdapter(TTSAdapter):
                          *[int(max(-32768, min(32767, s * 32767))) for s in float_samples])
         for i in range(0, len(pcm), CHUNK_BYTES):
             yield pcm[i:i + CHUNK_BYTES]
+
+    def set_speed(self, speed: float) -> None:
+        # sherpa-onnx applies `speed` per generate() call (it overrides the
+        # session's length_scale when speed != 1), so there is nothing to reload.
+        self._speed = speed
 
 
 class MmsThaiTTSAdapter(TTSAdapter):
@@ -436,6 +474,11 @@ class MmsThaiTTSAdapter(TTSAdapter):
                               *[int(max(-32768, min(32767, s * 32767))) for s in float_samples])
             for i in range(0, len(pcm), CHUNK_BYTES):
                 yield pcm[i:i + CHUNK_BYTES]
+
+    def set_speed(self, speed: float) -> None:
+        # sherpa-onnx applies `speed` per generate() call (it overrides the
+        # session's length_scale when speed != 1), so there is nothing to reload.
+        self._speed = speed
 
 
 def _validate_thai_manifest(model_dir: str) -> None:
@@ -920,11 +963,53 @@ class _TTSNode(Node):
 
 # ── Plugin ────────────────────────────────────────────────────────────────────
 
+# Every shared field on the tool, derived from the schema rather than restated.
+# TTSPlugin._config has to carry these into a newly built engine, and the list was
+# previously a hardcoded ("speaker_id", "speed", "device") that missed
+# thai_phrase_spacing — so a switch built the engine without it, and the next
+# config saw a change and rebuilt the session that had just been built (2.7 s).
+# Deriving it means a new configSchema field cannot be forgotten here again.
+SHARED_CONFIG_KEYS = tuple(
+    key for key, spec in TOOLS[0]["configSchema"]["properties"].items()
+    if spec.get("scope") == "shared" and key != "tts_engine"
+)
+
+
+def _session_keys(cfg: dict) -> dict:
+    """The subset of config the loaded sherpa-onnx session is built from.
+
+    Normalised, because the comparison in `config` is only meaningful if both
+    sides went through the same conversion: the dashboard sends `speed: 1` where
+    config.yaml has `1.0`, and `device` may arrive as any string. `speed` is
+    deliberately absent — it is applied per generate() call, so changing it must
+    not reload anything.
+
+    Used at construction as well as on config: without it the first config after
+    an engine switch always looked like a change (the new plugin's _cfg had the
+    raw config.yaml values, or none at all for a dashboard-only field like
+    thai_phrase_spacing) and rebuilt a session that had just been built. Measured:
+    that one extra rebuild cost 2.7 s.
+    """
+    out: dict = {}
+    if 'speaker_id' in cfg and cfg['speaker_id'] is not None:
+        out['speaker_id'] = int(cfg['speaker_id'])
+    if cfg.get('device'):
+        out['device'] = str(cfg['device'])
+    if cfg.get('model_dir'):
+        out['model_dir'] = str(cfg['model_dir'])
+    if 'thai_phrase_spacing' in cfg:
+        out['thai_phrase_spacing'] = bool(cfg['thai_phrase_spacing'])
+    return out
+
+
 class SherpaOnnxTTSPlugin:
     PREFIX = "tts"
 
     def __init__(self, plugin_cfg: dict, executor):
         self._cfg      = plugin_cfg
+        # Normalise the session keys up front so the first `config` that repeats
+        # them compares equal instead of rebuilding what was just built.
+        self._cfg.update(_session_keys(plugin_cfg))
         self._loading  = False
         self._load_error = None
         try:
@@ -933,6 +1018,27 @@ class SherpaOnnxTTSPlugin:
             log.error(f"[tts] failed to load model: {e}", exc_info=True)
             self._adapter = None
             self._load_error = str(e)
+        else:
+            # Pay the first-inference cost here rather than on whoever speaks
+            # first — 1695 ms on Orin5's gpu for the Thai model. `warmup` is a
+            # config.yaml key that both sherpa-onnx engines silently ignored until
+            # now; only the VITS2 plugin honoured it.
+            #
+            # A failed warmup is logged, not fatal: the model loaded, and
+            # _TTSNode.start()'s dry run is the gate that decides whether it can
+            # actually speak. Refusing here would turn a slow first utterance into
+            # a dead card.
+            if plugin_cfg.get("warmup", True):
+                try:
+                    started = time.monotonic()
+                    warmed = self._adapter.warmup()
+                    log.info("[tts] warmup: %d bytes in %.2fs", warmed,
+                             time.monotonic() - started)
+                    if not warmed:
+                        log.warning("[tts] warmup produced no audio")
+                except Exception:
+                    log.warning("[tts] warmup failed; the first utterance will "
+                                "pay the cold-start cost", exc_info=True)
         self._nodes: dict[str, _TTSNode] = {}
         # main.py serves MCP over ThreadingHTTPServer, so start/stop/speak/config
         # can run concurrently. Every read-modify-write of _nodes must hold this:
@@ -1115,20 +1221,52 @@ class SherpaOnnxTTSPlugin:
             return {"status": "queued", "action_id": action_id, "text": text}
 
         elif action == "config":
-            cfg = {k: v for k, v in args.items() if k not in ('action', 'instance_id') and v}
-            # Update config and rebuild adapter
-            if 'speaker_id' in cfg:
-                self._cfg['speaker_id'] = int(cfg['speaker_id'])
-            if 'speed' in cfg:
-                self._cfg['speed'] = float(cfg['speed'])
-            if 'device' in cfg:
-                self._cfg['device'] = cfg['device']
-            self._adapter = _build_tts_adapter(self._cfg)
-            # Stop all nodes (they'll use new adapter on next start)
-            with self._nodes_lock:
-                for key in list(self._nodes.keys()):
-                    self._dispose_node(self._nodes.pop(key), key)
-            return {"status": "configured"}
+            # No `and v` filter here. It used to drop every falsy value, which made
+            # `thai_phrase_spacing: False` and `speaker_id: 0` unsendable — you
+            # could turn phrase spacing on and never off. _session_keys() decides
+            # per key whether a value counts as present, so an empty `device` is
+            # still ignored while `False` is honoured.
+            cfg = {k: v for k, v in args.items()
+                   if k not in ('action', 'instance_id')}
+            # Rebuild ONLY when something the loaded session is built from actually
+            # changed. This used to rebuild unconditionally, and an identical no-op
+            # config measured **2.6-2.8 s** on Orin5 for the Thai model — a full
+            # ONNX session teardown and reload, plus a re-verification of the model
+            # archive — and then disposed every node, forcing the card to start
+            # again. The dashboard re-applies a card's config around a speak, so
+            # that cost was paid on *every* utterance: "every speak takes 5 s".
+            #
+            # `speed` is deliberately not in this set. sherpa-onnx takes it on each
+            # generate() call, so it is a scale on the resident model — the same
+            # reason vits2's _config only calls set_speed (see
+            # plugins/vits2_tts_trt/plugin.py: "avoids tearing down a resident
+            # model for a slider change"). vits2 already behaved this way, which is
+            # why only the two sherpa-onnx engines were slow.
+            #
+            # Values are normalised before comparing, or `speed: 1` from the
+            # dashboard would differ from a stored `1.0` and defeat the check.
+            incoming = _session_keys(cfg)
+            speed = float(cfg['speed']) if 'speed' in cfg else None
+
+            needs_rebuild = any(self._cfg.get(key) != value
+                                for key, value in incoming.items())
+            self._cfg.update(incoming)
+            if speed is not None:
+                self._cfg['speed'] = speed
+
+            if needs_rebuild or self._adapter is None:
+                changed = sorted(incoming) if needs_rebuild else ['(no model loaded)']
+                log.info("[tts] rebuilding the adapter: %s changed", ", ".join(changed))
+                self._adapter = _build_tts_adapter(self._cfg)
+                self._load_error = None
+                # Nodes hold the old adapter, so they have to go — but only when
+                # there really is a new adapter for them to pick up.
+                with self._nodes_lock:
+                    for key in list(self._nodes.keys()):
+                        self._dispose_node(self._nodes.pop(key), key)
+            elif speed is not None:
+                self._adapter.set_speed(speed)
+            return {"status": "configured", "rebuilt": bool(needs_rebuild)}
 
         elif action == "interrupt":
             # 立即中止所有 TTS 播放（清空队列 + 停止当前 utterance）
@@ -1452,7 +1590,7 @@ class TTSPlugin:
         requested = args.get("tts_engine") or args.get("engine")
         forwarded = {k: v for k, v in args.items()
                      if k not in ("tts_engine", "engine")}
-        for key in ("speaker_id", "speed", "device"):
+        for key in SHARED_CONFIG_KEYS:
             if key in args:
                 self._cfg[key] = args[key]
 
