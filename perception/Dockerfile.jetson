@@ -396,6 +396,29 @@ assert numpy.__version__ == '${NUMPY_VERSION}', numpy.__version__; \
 print('[build] VITS2 frontend ok on numpy ' + numpy.__version__)"; \
     fi && rm -f /tmp/vits2-requirements.txt
 
+# ── onnxruntime, CPU-only (used by the face recognition plugin alone) ────────
+# A second ONNX Runtime: sherpa-onnx bundles its own but exposes no way to run
+# our models on it. They coexist fine — measured on Orin6, both import orders
+# and both holding live sessions.
+#
+# Deliberately the last dependency layer. A step inserted higher up invalidates
+# the cache for every layer below, and several of those install *unpinned*
+# (ultralytics, phonemizer), so they silently re-resolve to whatever is newest.
+#
+# --no-deps: a resolved install also pulls protobuf, coloredlogs, humanfriendly
+# and flatbuffers, and protobuf was not in this image at all. None is needed for
+# inference (verified on Tianyi: session builds, run() returns all 9 outputs),
+# so this adds exactly one wheel and moves nothing else — numpy included, which
+# the torch/cv2/rapidocr stack is ABI-bound to.
+#
+# 1.18.1 pinned, and **never 1.19.x**: 1.19.2 pins a thread to every core in
+# /sys/devices/system/cpu/present, so where a power mode has parked some (Tianyi
+# in MODE_30W: present 0-11, online 0-7) pthread_setaffinity_np returns EINVAL,
+# a vector index goes out of range, and all of perception abort()s inside
+# InferenceSession() with no traceback. 1.18.1 is also exactly what sherpa-onnx
+# bundles on jp6.1. Verified on Orin5 (py3.8, glibc 2.31) and Tianyi (py3.10).
+RUN pip3 install --no-cache-dir --no-deps -i ${PYPI_MIRROR} onnxruntime==1.18.1
+
 # ── Application code ───────────────────────────────────────────────
 WORKDIR /work
 COPY perception/main.py    /work/main.py

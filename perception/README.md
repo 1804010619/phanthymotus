@@ -686,6 +686,442 @@ instance_id ever showed up in the log.
 
 ---
 
+## Face Recognition
+
+`plugins/face.py` — a `processor` card named **`face_recognition`**. Subscribes to an
+`image/jpeg` topic, publishes identities on `{input_topic}/face` as `data/json`, and
+enrols new people from a photo, the live stream, or a batch package.
+
+### Models
+
+InsightFace **buffalo_sc**, the smallest pack that still ships landmarks (alignment
+needs them):
+
+| File | Size | Role |
+|------|------|------|
+| `det_500m.onnx` | 2.5 MB | SCRFD-500M-BNKPS — detection + 5 keypoints |
+| `w600k_mbf.onnx` | 13 MB | ArcFace MobileFaceNet — 512-d embedding |
+
+Both run on the **standalone `onnxruntime`**, which is a second, independent ONNX
+Runtime from the one compiled into the sherpa-onnx wheel (ASR/TTS reach only that
+one; there is no supported way to run our own models on it).
+
+`device: auto | cpu | gpu`, default **auto** — use the GPU when the installed
+onnxruntime offers a CUDA or TensorRT provider, else CPU. `auto` resolving to cpu
+is not warned about, because it is the expected outcome on this image: it ships
+the **CPU wheel**, so today `auto` always means cpu. An explicit `gpu` that cannot
+be honoured warns and degrades. A per-JetPack `onnxruntime-gpu` wheel on COS is
+the follow-up, mirroring `SHERPA_GPU_WHEEL` in `Dockerfile.jetson`; nothing else
+has to change when it lands, because `auto` will pick it up.
+
+#### The onnxruntime version is pinned, and 1.19.x must not be used
+
+**One version for both JetPack lines: 1.18.1.** That is what sherpa-onnx bundles on
+jp6.1 (`sherpa_onnx/lib/libonnxruntime.so.1.18.1`), so on that line the two mapped
+runtimes are ABI-identical. It runs on jp5.11 too — its cp38 aarch64 wheel is
+manylinux_2_28 and focal has glibc 2.31 — verified on Orin5 (Ubuntu 20.04, glibc
+2.31, Python 3.8) building a session and inferring. A per-line split was tried
+first and dropped: nothing required it, and one version is one thing to reason
+about.
+
+`ORT_VERSION` is an `ARG` on the onnxruntime step itself, **not** in
+`/etc/jetpack.env`, because that file is layer 2 — see § Where this layer sits.
+
+**onnxruntime 1.19.2 abort()s the whole perception process** during
+`InferenceSession()` on a Jetson where some cores are parked. It enumerates
+`/sys/devices/system/cpu/present` and pins threads to every core in it; on Tianyi
+in MODE_30W (`present` 0-11, `online` 0-7) `pthread_setaffinity_np` returns EINVAL
+and a `std::vector` index then goes out of range:
+
+```
+pthread_setaffinity_np failed for thread: 31, index: 1, mask: {9, }, error code: 22
+stl_vector.h:1123 ... Assertion '__n < this->size()' failed.  Fatal Python error: Aborted
+```
+
+Measured on Tianyi: 1.19.2 aborts with **every** `SessionOptions` combination,
+including none at all, so no amount of configuration avoids it; 1.18.1, 1.17.3 and
+1.16.3 each build a session and return all 9 SCRFD outputs. The build asserts the
+installed version is not 1.19.x, and `warn_on_parked_cores()` logs the
+present/online mismatch at load time — an abort leaves no Python traceback, so the
+precondition has to be in the log *before* the session is created.
+
+Orin6 has `present == online`, so this never reproduces there. Judge it on a robot
+whose power mode parks cores.
+
+#### Where this layer sits, and why that matters more than it looks
+
+The onnxruntime step is the **last of the dependency layers**, below everything
+ASR/TTS/VOP/OCR share and above only the `COPY` of application code.
+
+That placement is the whole safety story. A layer inserted higher up invalidates
+the Docker cache for every layer below it, and several of those install
+**unpinned** — `ultralytics` and `phonemizer` have no version constraint — so they
+silently re-resolve to whatever is newest on the next build. An earlier revision of
+this change put `ORT_VERSION` in `/etc/jetpack.env` near the top of the file, and
+that alone moved `ultralytics` 8.4.138 → 8.4.142 in the built image, with nothing
+to do with face recognition. Measured by diffing `pip freeze` between the old and
+new images.
+
+So the rule for this layer: it must stay below every shared layer, and anything it
+needs must be resolved *in* it. Against `main` the Dockerfile diff is a single
+additive hunk — 74 lines added, **0 removed** — so no shared layer's inputs change
+and no other algorithm's dependencies can drift because of it.
+
+#### Its dependencies are deliberately not installed
+
+`pip install --no-deps`. A resolved install pulls in protobuf, coloredlogs,
+humanfriendly and flatbuffers — and measured on the jp6.1 image, **protobuf was
+not present at all** beforehand, so a plain install would introduce protobuf
+7.36.1 into an image where rapidocr, TensorRT and ROS2 all live. None of it is
+needed for inference: verified on Tianyi that with `--no-deps` and none of those
+packages present, `InferenceSession` builds and `run()` returns all 9 outputs. So
+this layer adds exactly one package and touches nothing else — numpy included,
+which matters because the torch/cv2/rapidocr stack is built against a specific
+numpy C-ABI.
+
+The `insightface` package is deliberately not a dependency: it wants onnx,
+scikit-image, scikit-learn and Cython to wrap ~200 lines of pre/post-processing.
+Those 200 lines are in `plugins/face_runtime.py` instead — the SCRFD decode there
+(strides 8/16/32, 2 anchors per location, distance-coded boxes and keypoints) is a
+wire format, not a design choice, and was verified against the real model:
+`det_500m.onnx` has 9 outputs and `12800 = 80x80x2` rows for stride 8 at 640px.
+
+Alignment uses an explicit Umeyama similarity fit, **not**
+`cv2.estimateAffinePartial2D`: that runs RANSAC/LMEDS, and on exactly five
+correspondences a robust estimator can discard a point and return a different
+transform run to run, which would make one photo produce different embeddings.
+
+#### Re-hosting the models
+
+`FACE_MODEL_BASE` points at COS, not the upstream GitHub release: the release URL
+redirects to a signed, expiring `release-assets.githubusercontent` URL that cannot
+be pinned, and the robots have no reliable route to GitHub. To refresh, download
+`buffalo_sc.zip` from the insightface v0.7 release, upload the two `.onnx` files to
+`public/face/buffalo_sc/` with credentials from `resource-center/deploy/values.env`
+(`prisma/articles/upload-figs.js` cannot do it — it only accepts image extensions
+and forces its own key shape), then re-download from COS and paste the *verified*
+`size`/`sha256` into `FACE_MODEL_FILES`.
+
+### The person record: `name` vs `profile`
+
+The split is about **what gets published**:
+
+| field | type | in the per-frame payload | what it is |
+|---|---|---|---|
+| `id` | str | yes | `p-N` (named) or `unknown-N` |
+| `name` | str | yes | 姓名, structured. A non-blank name is what makes an entry *named* |
+| `profile` | object | yes | 非结构化: gender, appearance, notes, tags - whatever the operator wants the agent to have in context |
+| `registered_at` | float | no | when the identity was created |
+| `last_seen_at` | float | no | most recent sighting |
+
+The timestamps are deliberately out of the payload: they change every frame (or
+never), and "when was this person around" is a question the **visit log** answers
+properly and a per-frame field cannot.
+
+A `profile` sent as a plain string is stored as `{"note": ...}` rather than
+rejected - an LLM will occasionally send prose where an object is expected.
+
+A database written by the pre-split build migrates on load: the old free-text
+`profile` becomes `name`, the old structured `meta` becomes `profile`, and
+`created_at` becomes `registered_at`. `persons.json` carries `version: 2`.
+
+### 访问记录表 - the visit log
+
+`visits.jsonl`, one line per **visit**, where a visit is a contiguous presence:
+
+```json
+{"person_id": "p-1", "name": "小王", "first_seen": 1788780000.0,
+ "last_seen": 1788783600.0, "sightings": 3417, "topic": "/cam/rgb"}
+```
+
+`list_visits` takes `person_id`, `since`, `until`, `limit`, `offset`. `since` and
+`until` accept epoch seconds **or** ISO-8601 (`2026-09-07T15:00`), because an
+operator asking "who was here at 3pm" thinks in wall-clock and an LLM will send a
+string. Filtering is by **overlap, not containment**: somebody present
+14:50-15:10 *was* there at 15:00, and a query for 15:00-15:05 has to say so.
+
+Three design points that are not obvious:
+
+**One row per visit, not per frame.** At the default 1 detection/second a
+per-frame log would be 86 400 writes a day per person onto eMMC, carrying no
+information a visit does not.
+
+**`visit_gap_s` is 10 minutes.** A visit closes only after the person has been
+unseen that long. A short gap would fragment one afternoon in the office into
+dozens of rows every time somebody turned their head.
+
+**Open visits are checkpointed, because that 10-minute gap is a data-loss
+window.** Somebody present all afternoon is a single visit held in memory for
+hours, and a robot that loses power would lose the whole record - not just the
+tail. So `visits-open.json` is rewritten at most every `visit_checkpoint_s`
+(60 s), bounding the loss to a minute of `last_seen`/`sightings`. On startup a
+checkpointed visit is **resumed** if its subject was seen recently, or closed and
+appended if they left while the process was down. The checkpoint is written
+*after* the append when a visit closes, so a crash in between replays a closed
+visit rather than dropping it - a duplicate is recoverable, a loss is not.
+Stopping an instance force-closes its open visits for the same reason.
+
+`list_visits` also returns visits still in progress, flagged `open: true`, so the
+10-minute close latency does not hide who is in the room right now.
+
+### Actions: register vs recognize
+
+Symmetric by suffix, and the two halves differ in more than direction:
+
+| | photo | stream | corpus |
+|---|---|---|---|
+| **register** (writes) | `register_by_photo` | `register_by_stream` | `register_by_corpus` |
+| **recognize** (read-only) | `recognize_by_photo` | `recognize_by_stream` | - |
+
+`recognize_*` is **read-only**: it neither auto-enrols the stranger it failed to
+match nor records a sighting. Asking "who is this" must not quietly change the
+answer. It also does **not** apply `subject_dominance`: that gate exists because
+enrolment has to resolve to exactly one person, whereas a query can just report
+everyone it sees. So a two-person photo is answered with two identities by
+`recognize_by_photo` and refused with `ambiguous_subject` by `register_by_photo` -
+same input, opposite handling, both correct.
+
+An unmatched face comes back as `person_id: null` with a `best_score`, which is
+the number an operator needs to decide whether `match_threshold` is too strict.
+
+`recognize_by_stream` scans the last **1 s** by default (not the 3 s enrolment
+window - the question is "who is in front of me now"), reports each person once at
+their best score across those frames, and falls back to reporting the clearest
+unidentified face so the answer is "someone I do not know" rather than "nobody".
+
+### Identity database
+
+`plugins/face_db.py`, default `/models/face_db` — `/models` is the only host-mounted
+writable path this container has (`deploy/service.yml`).
+
+Two files, and **`persons.json` is the commit point**: it names the
+`embeddings-<n>.npy` it belongs to, is replaced last, and the superseded matrix is
+unlinked only after that succeeds. Writing `embeddings.npy` in place instead means
+two `os.replace` calls with a window where the row count and the owner list
+disagree — which silently misattributes every identity after the missing row.
+
+Matching is one `matrix @ embedding`: both sides are L2-normalised, so the dot
+product *is* the cosine and no `sklearn` is needed. Rows are per **sample**, and a
+person's score is their best sample — a mean-vector centroid would blur the pose
+variation that several enrolment photos exist to capture, and could push a real
+match below threshold when a second photo is added.
+
+Ids are `p-N` for named people and `unknown-N` for strangers, from monotonic
+counters that never decrease: a retired id must not resolve to a different person
+later, because it may already be on the activity stream and in the agent's history.
+
+### Recognising
+
+Published payload (`{input_topic}/face`):
+
+```json
+{"ts": 1788777509.34, "count": 1, "latency_ms": 28,
+ "faces": [{"person_id": "p-1", "name": "小王", "profile": {"gender": "male"},
+            "known": true, "score": 0.61, "bbox": [207, 186, 149, 206],
+            "det_score": 0.811, "blur": 1484.2, "min_side_px": 149,
+            "quality": "ok"}]}
+```
+
+A stranger who clears the quality gate is auto-enrolled and reported as
+`unknown-N`, with the **same id on every later sighting and after a restart** —
+which is what makes `register_by_stream` able to name them retroactively.
+
+Detection runs at **`detect_fps`** — 检测频率, detections per second, default
+**1.0**, fractional allowed (`0.5` = once every two seconds, `0` = every frame the
+camera delivers). It is per-instance, so two cameras can run at different
+cadences. Expressed as a frequency rather than a minimum interval because that is
+what an operator reasons about, and it stays meaningful when the camera's own rate
+changes. (`min_interval_ms`, the knob this replaced, is still honoured when
+`detect_fps` is absent, so a canvas saved by an earlier build keeps working.)
+
+A face that *fails* the gate is reported with `person_id: null`, `quality: "low"`
+and a `reason`, and is neither matched nor enrolled. Matching a blurred 30 px face
+is a coin flip, and enrolling one would spend an `unknown-N` slot forever on a
+smear that never matches anything again. Relax `min_face_px` / `blur_min` if you
+want identities at greater distance.
+
+`match_threshold` defaults to **0.35**. Measured separations on this model, same
+photo transformed: same face at half resolution **0.983**, same face +35
+brightness **0.979**, a different person **-0.108**. Real same-person /
+different-photo scores sit well below the first two, so **tune this against your own
+faces and record what you saw** — 0.35 is a starting point, not a measurement.
+
+### Registering, and why it fails
+
+Any channel can fail for mundane physical reasons, so all three return
+`{"ok": false, "reason": ..., "detail": ...}` rather than raising:
+
+| `reason` | Condition |
+|----------|-----------|
+| `no_face` | no detection anywhere in the input |
+| `low_quality` | best face fails `det_thresh` / `min_face_px` / `blur_min`; the detail names each gate with the measured value |
+| `ambiguous_subject` | ≥2 faces pass the gate and the primary is not `subject_dominance`x the runner-up; every candidate's bbox and score is returned |
+| `no_frames` | no running instance, or nothing in the window |
+| `bad_input` | undecodable image, unreachable URL, unreadable package, path outside `image_roots` |
+
+A real `low_quality` detail, from the group photo in the end-to-end check:
+
+```
+no clear face: face 53 px < 64 px (move closer); sharpness 41.4 < 60.0 (hold still)
+```
+
+Prominence is area discounted 40% for being off-centre — pure area picks the
+bystander standing nearer the lens edge, pure centrality picks a distant face
+framed dead-on.
+
+| Action | Input |
+|--------|-------|
+| `register_by_photo` | `image_path` — uploaded from the card, or written to `/uploads` (see below) — plus `name` and `profile` |
+| `register_by_stream` | `instance_id` + `name`; analyses **every frame in the last `enroll_window_s`** (default 3 s, up to `enroll_max_analyzed` of them, newest first) |
+| `register_by_corpus` | `package`: a directory, `.zip` or `.tar.gz`, by path or URL |
+
+#### Getting a photo *into* this container
+
+Not obvious, and it produced two real failures before being fixed.
+
+perception and agent-core share **no filesystem**: agent-core mounts
+`/opt/phanthy-motus` and `/opt/phanthy-motus/data`, perception mounts `/dev` and
+`/opt/embodied/models`. The intersection is empty, and each container's `/tmp`
+and `/work` is its own. So an LLM that downloads a photo inside agent-core and
+passes `image_path: /work/daiwen.jpg` names a file that genuinely exists — just
+not here. That was failure one. Its next attempt, `image_b64`, failed too: the
+photo was 43 800 base64 characters, which does not survive being carried through
+a model's own context, so what arrived was truncated.
+
+**base64 input has been removed**, and files now move through a proxy:
+
+```
+browser / LLM ──upload──▶ agent-core  POST /api/mcp/{mcp_id}/file/upload
+                              │  looks the target's address up in the MCP
+                              │  registry, streams the body on in 1 MiB chunks
+                              ▼
+                          perception  POST /file/upload
+                              │  writes to file_intake.dir (/models/uploads)
+                              ▼
+                     ◀──reply── {"path": "/models/uploads/2026-09-08/alice.jpg"}
+                          that path is used verbatim as image_path
+```
+
+The reply carries the path **in the receiving container's own namespace**, so
+there is one viewpoint and nothing to translate. No shared mount is involved,
+which also means no container has to be recreated to enable it.
+
+The address comes from the MCP registry — every service reports `url` when it
+registers — so this one route covers perception, actucore and every driver even
+though their ports all differ. `utils/file_intake.py` is stdlib-only for the same
+reason: the drivers run a bare `ThreadingHTTPServer`, so they can adopt the
+identical endpoint in about five lines.
+
+On the card, `image_path` is declared `"format": "file"` with
+`"uploadTo": "mcp"`, which is what routes the canvas file picker through the
+proxy instead of agent-core's own `/api/file/upload`. Omitting `uploadTo` keeps
+the old behaviour, which is correct for a tool agent-core serves itself
+(`remote_image`, `remote_audio`).
+
+Details worth knowing about the receiving end:
+
+* **Size is capped while writing**, not after, so an oversized body is never
+  fully committed to disk or held in memory. Files land under a `.part` name and
+  are renamed, so a reader listing the directory never sees half a file.
+* **Filenames are reduced to one component** and keep CJK characters — the
+  people using this name their files in Chinese — after NFC normalisation, so a
+  macOS upload and a Linux one produce the same name rather than two files that
+  look identical.
+* **`subdir` is refused rather than sanitised** if it contains a separator.
+  Sanitising turned `../escape` into `.._escape`, a valid name, so the write
+  succeeded somewhere the caller did not ask for and nothing said so.
+* **Uploads are pruned after `retention_days`** (7). They are a transfer buffer,
+  not storage: enrolment keeps the *embedding* and never the photo, so without
+  this the directory grows forever on a 57 GB eMMC.
+* **Auth is by reachability, not a secret.** The endpoint honours `ACCESS_TOKEN`
+  if the service has one, but perception is not given one today (verified on
+  Tianyi) — and the port already serves `tools/call`, so anything that can reach
+  it can already drive the plugin.
+
+Verified on Tianyi: 200 KB of random binary round-trips byte-identically through
+the real endpoint with a Chinese filename, returning `/…/2026-09-08/戴文渊.jpg`.
+
+Passing `image_b64` now returns a `bad_input` naming the mechanism that works,
+and a path outside `image_roots` says to upload through the proxy or use
+`register_by_url` — an LLM told only "cannot read" retries with another
+invisible path, which is exactly what happened.
+
+`register_by_stream` averages the agreeing frames rather than trusting one
+grab, and refuses with `ambiguous_subject` when fewer than half the usable frames
+agree with each other — two people taking turns being the dominant face would
+otherwise be enrolled as one identity matching neither.
+
+Enrolment never silently duplicates. A new face matching an existing **named**
+person is added as another sample (`merged: true`); matching an **`unknown-N`**
+promotes that entry **keeping its id** (`promoted: true`), so earlier sightings stay
+attributable.
+
+#### Batch package layout
+
+Images plus an optional `manifest.json`, in either shape:
+
+```json
+[{"file": "alice.jpg", "name": "Alice from ops", "person": "alice", "profile": {"badge": "A7"}}]
+{"alice.jpg": "Alice from ops"}
+```
+
+Fallbacks in order: a sidecar `alice.json` / `alice.txt`, then the filename stem. A
+shared `person` key merges several photos into one identity. Archive members that
+are absolute, contain `..`, or are not regular files are skipped and logged.
+
+The result carries **one record per photo**, so a 40-person batch says exactly which
+people registered and why each of the rest did not:
+
+```json
+{"ok": true, "total": 40, "registered": 37, "failed": 3,
+ "results": [{"file": "alice.jpg", "ok": true, "person_id": "p-9"},
+             {"file": "bob.jpg", "ok": false, "reason": "low_quality", "detail": "..."},
+             {"file": "team.jpg", "ok": false, "reason": "ambiguous_subject", "candidates": [...]}]}
+```
+
+Synchronous, capped at `max_batch` (200); over the cap it returns `bad_input` naming
+the count rather than hanging the MCP client.
+
+### Roster CRUD
+
+`list_persons` (`named` = all/named/unknown, `query` over id+name+profile,
+`limit`, `offset`), `get_person`, `update_person` (`name`, `profile`,
+`profile_delete[]`, `merge` — default merges, `merge: false` replaces), `forget`
+(or `named: "unknown"` to clear every anonymous entry), and `list_visits`.
+Setting a non-blank `name` on an `unknown-N` names it in place, keeping the id.
+Reads never return embeddings.
+
+`unknown_capacity` (default 500, editable on the card) bounds automatic enrolment
+only; lowering it evicts the excess immediately, oldest `last_seen_at` first, and
+reports how many went. Named people are never candidates.
+
+### Tool-name dispatch
+
+`face_recognition` is the first `PREFIX` containing an underscore.
+`PerceptionBundle.dispatch`/`owns` used to split on the first `_` and compare that
+to `PREFIX`, which made such a name undispatchable — it resolved to a plugin called
+`face`, matched nothing, and reported the tool as unknown. Both now go through
+`_plugin_for`, which matches the **longest** prefix; `tests/test_bundle_dispatch.py`
+pins that and that the two functions can never disagree.
+
+### Verifying
+
+The pytest suite fakes the analyzer — a host-side suite must not need models or
+onnxruntime — and covers the lifecycle, all five reason codes, `unknown-N`
+stability and promotion, id retirement, capacity eviction, profile CRUD, the
+visit log (sessionisation, checkpoint recovery, overlap queries), batch
+per-item results and zip traversal (`tests/test_face_plugin.py`,
+`tests/test_face_db.py`).
+
+What that cannot cover is the decode itself, so it was checked separately against
+the real models: a known similarity transform recovered to 4e-6, all 5 landmarks
+inside their bbox on real photos, and the identity separations quoted above. On
+hardware, confirm `info` goes `loading → ready`, that `{topic}/face` publishes,
+and — because two ONNX Runtimes share the process — that an ASR utterance is still
+transcribed and TTS still speaks with the card running.
+
+---
+
 ## Topic Naming
 
 | Direction | Topic pattern | Format |
