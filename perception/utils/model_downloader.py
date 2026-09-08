@@ -781,3 +781,41 @@ def ensure_vits2_model(model_dir: str, family: str | None = None) -> str:
         entry,
     )
     return os.path.join(model_dir, "engines", key)
+
+
+# The Thai TTS voice: an ONNX export of VIZINTZOR/MMS-TTS-THAI-MALE-NARRATOR,
+# produced by tools/export_mms_thai_onnx.py. One pinned tarball rather than a
+# per-file bundle because the payload is a model plus its token table plus the
+# licence note, and the archive checksum then covers all three.
+#
+# Licence: CC-BY-NC-4.0, inherited from facebook/mms-tts. NON-COMMERCIAL —
+# see the LICENSE file inside the archive.
+THAI_TTS_MODEL_BASE = os.environ.get("THAI_TTS_MODEL_BASE_URL", COS_BASE)
+THAI_TTS_ARCHIVE = {
+    "archive": "mms-tts-thai-male-narrator-16k.tar.gz",
+    # Verified by re-downloading the uploaded object and hashing that copy, not
+    # the local file that was uploaded — the point of the pin is to catch a bad
+    # transfer, and hashing the source cannot.
+    "size": 105246833,
+    "sha256": "85aba3adca3017e955993a3f1ca0fd9aed3216a24b8c64b210f02375b12a4eb4",
+}
+
+
+def ensure_thai_tts_model(model_dir: str) -> str:
+    """Ensure the Thai VITS model + tokens are installed; return the directory."""
+    model_dir = require_models_subpath(model_dir)
+    if not THAI_TTS_ARCHIVE.get("sha256") or not THAI_TTS_ARCHIVE.get("size"):
+        # Refuse rather than download unpinned: every other model here is
+        # size+SHA256 verified, and a Thai voice that skipped that would be the
+        # one unauthenticated blob in the image's supply chain.
+        raise RuntimeError(
+            "THAI_TTS_ARCHIVE has no pinned size/sha256 — publish the tarball to "
+            "COS and record them (see tools/export_mms_thai_onnx.py)"
+        )
+    ensure_verified_archive(
+        "thai-tts",
+        model_dir,
+        f"{THAI_TTS_MODEL_BASE.rstrip('/')}/{THAI_TTS_ARCHIVE['archive']}",
+        THAI_TTS_ARCHIVE,
+    )
+    return model_dir
