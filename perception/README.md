@@ -78,27 +78,30 @@ The VAD parameters can be adjusted per ASR canvas card via the instance config (
 ## TTS Engines
 
 `tts_engine` (configSchema on the `tts` tool, and `plugins.tts.engine` in
-`config.yaml`) selects the voice. **Engines are named after the model, not the
-runtime**: two of the three run on sherpa-onnx, so a name like `sherpa_onnx`
-identified neither of them and left no room for the second.
+`config.yaml`) selects the voice. Engines are named **`<model>-<languages>`** —
+the same shape `asr_model` uses (`x-asr-zh-en`, `paraformer-zh-en`, `zipformer-en`),
+because the dashboard renders the raw enum string, so these two dropdowns sit side
+by side in front of the same operator. Language codes, not country codes: `zh`, not
+`cn`. Naming an engine after its *runtime* was the previous mistake — `matcha-zh-en`
+and `mms-th` both run on sherpa-onnx, so `sherpa_onnx` identified neither.
 
 | `tts_engine` | model | languages | runtime | model dir |
 |---|---|---|---|---|
-| `vits2` (default) | VITS2 ZH/EN 16 kHz | 中 / 英, code-switching | TensorRT | `/models/vits2` |
-| `matcha` | matcha-icefall-zh-en + vocos | 中 / 英 | ONNX Runtime | `/models/sherpa-onnx/tts` |
-| `mms_thai` | MMS-TTS-THAI-MALE-NARRATOR | ไทย only | ONNX Runtime | `/models/mms-thai` |
+| `vits2-zh-en` (default) | VITS2 16 kHz | 中 / 英, code-switching | TensorRT | `/models/vits2` |
+| `matcha-zh-en` | matcha-icefall-zh-en + vocos | 中 / 英 | ONNX Runtime | `/models/sherpa-onnx/tts` |
+| `mms-th` | MMS-TTS-THAI-MALE-NARRATOR | ไทย only | ONNX Runtime | `/models/mms-th` |
 
-The previous names `vits2_trt` and `sherpa_onnx` are still accepted and resolve to
-`vits2` and `matcha` (`ENGINE_ALIASES` in `plugins/tts.py`). They are not
-decoration: both are already persisted in ConfigDB rows and in `config.yaml` on
-every deployed robot, and `_select_engine` raises on an unknown engine — so
-dropping them would put every existing TTS card into `state: error` on the next
-restart.
+`vits2_trt` and `sherpa_onnx` still resolve, via `ENGINE_ALIASES` in
+`plugins/tts.py`, and underscores fold to hyphens first so `vits2_zh_en` works too.
+The aliases are not decoration: both old names are already persisted in ConfigDB
+rows and in `config.yaml` on every deployed robot, and `_select_engine` raises on an
+unknown engine — so dropping them would put every existing TTS card into
+`state: error` on the next restart.
 
 Only one engine is resident at a time. Switching disposes the outgoing one's nodes
 first, because two live publishers on one audio topic play both voices at once.
 
-### `mms_thai`, and why it cannot be handed raw text
+### `mms-th`, and why it cannot be handed raw text
 
 The Thai voice is an ONNX export of
 [VIZINTZOR/MMS-TTS-THAI-MALE-NARRATOR](https://huggingface.co/VIZINTZOR/MMS-TTS-THAI-MALE-NARRATOR),
@@ -211,7 +214,7 @@ cards vanished. Budget for it before enabling.
 
 TTS is simpler: Matcha and the Thai MMS model are fp32 only, so both devices load
 the same files and `device` only picks the provider (Matcha measured ~4.3x). The
-`vits2` engine ignores `device` entirely — it is a TensorRT engine and never
+`vits2-zh-en` engine ignores `device` entirely — it is a TensorRT engine and never
 touches ONNX Runtime.
 
 `device: gpu` also needs a CUDA sherpa-onnx wheel. Both Jetson images install one —
@@ -439,7 +442,7 @@ fp16 weights, and the registry test rejects it.
   `_vad_segment_sync`). silero infers one 512-sample window at a time — too little
   work to amortise a kernel launch plus two copies per 32 ms of audio — and in
   `_vad_worker` it would hold a second CUDA context in a child process.
-- **`vits2` TTS**, as above: TensorRT, not ONNX Runtime.
+- **`vits2-zh-en` TTS**, as above: TensorRT, not ONNX Runtime.
 
 ### GPU bundle distribution
 

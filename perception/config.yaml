@@ -50,14 +50,14 @@ plugins:
 
   tts:
     enabled: true
-    engine: vits2
+    engine: vits2-zh-en
     backend: trt
     model_dir: /models/vits2
     speaker_id: 0
     speed: 1.0
     warmup: true
     max_chunk_tokens: 256
-    # matcha / mms_thai only — vits2 runs on TensorRT and ignores this.
+    # matcha-zh-en / mms-th only — vits2-zh-en runs on TensorRT and ignores this.
     # Matcha is fp32, so both devices load the same weights and only the provider
     # changes; gpu measured ~4.3x faster at num_threads=2.
     device: cpu

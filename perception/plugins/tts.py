@@ -2,10 +2,10 @@
 """
 plugins/tts.py — the TTS tool contract and its ONNX Runtime engines.
 
-Engines are named after the model, not the runtime: `vits2` (ZH/EN, TensorRT,
-implemented in plugins/vits2_tts_trt), `matcha` (ZH/EN, Matcha-icefall) and
-`mms_thai` (Thai, MMS VITS). The last two both run on sherpa-onnx, which is why
-naming either of them after the framework did not work.
+Engines are named `<model>-<languages>`, the same shape `asr_model` uses:
+`vits2-zh-en` (TensorRT, implemented in plugins/vits2_tts_trt), `matcha-zh-en`
+(Matcha-icefall) and `mms-th` (MMS VITS). The last two both run on sherpa-onnx,
+which is why naming either of them after the framework did not work.
 """
 
 from __future__ import annotations
@@ -176,21 +176,22 @@ TOOLS = [
                 # builds the config form from configSchema, so an engine that
                 # exists solely as a baked YAML key cannot be seen or switched
                 # without rebuilding the image. Mirrors asr_model in asr.py.
-                "tts_engine": {"type": "string", "enum": ["vits2", "matcha", "mms_thai"],
-                               "description": "TTS engine, named by model "
-                                              "(vits2 = VITS2 ZH/EN on TensorRT, "
-                                              "matcha = Matcha-icefall ZH/EN, "
-                                              "mms_thai = MMS Thai, Thai only)",
-                               "default": "vits2", "scope": "shared"},
-                # matcha and mms_thai only — vits2 is a TensorRT engine and never
-                # touches ONNX Runtime, so this field does nothing for it.
+                "tts_engine": {"type": "string",
+                               "enum": ["vits2-zh-en", "matcha-zh-en", "mms-th"],
+                               "description": "TTS engine, named <model>-<languages> to match "
+                                              "asr_model (vits2-zh-en = VITS2 on TensorRT, "
+                                              "matcha-zh-en = Matcha-icefall, "
+                                              "mms-th = MMS Thai)",
+                               "default": "vits2-zh-en", "scope": "shared"},
+                # matcha-zh-en and mms-th only — vits2-zh-en is a TensorRT engine
+                # and never touches ONNX Runtime, so this field does nothing for it.
                 # Matcha's weights are fp32, so both devices load the same files and
                 # only the provider changes; measured 4.3x faster on gpu.
                 "device":      {"type": "string", "enum": ["cpu", "gpu"],
                                 "description": "Inference device for the ONNX Runtime engines "
                                                "(gpu needs the CUDA sherpa-onnx wheel; ~4.3x faster)",
                                 "default": "cpu", "scope": "shared",
-                                "x-show-when": {"tts_engine": ["matcha", "mms_thai"]}},
+                                "x-show-when": {"tts_engine": ["matcha-zh-en", "mms-th"]}},
                 # Thai has no spaces between words, and MMS was trained on text
                 # that spaced only phrase boundaries. Segmenting every word may
                 # help prosody or hurt it — off until it has been A/B'd on device.
@@ -199,8 +200,8 @@ TOOLS = [
                     "description": "Insert word boundaries before synthesis (Thai only; "
                                    "experimental — may change prosody either way)",
                     "default": False, "scope": "shared",
-                    "x-show-when": {"tts_engine": "mms_thai"}},
-                "speaker_id": {"type": "integer", "description": "Speaker ID (vits2 and mms_thai support 0 only)", "default": 0, "scope": "shared"},
+                    "x-show-when": {"tts_engine": "mms-th"}},
+                "speaker_id": {"type": "integer", "description": "Speaker ID (vits2-zh-en and mms-th support 0 only)", "default": 0, "scope": "shared"},
                 "speed":      {"type": "number", "description": "Speech speed (1.0 = normal)", "default": 1.0, "scope": "shared"},
             },
             "required": []
@@ -464,13 +465,13 @@ def _build_tts_adapter(cfg: dict) -> TTSAdapter:
     import os
     from utils.onnx_provider import normalize_device
     engine = str(cfg.get('engine', '')).lower()
-    default_dir = ('/models/mms-thai' if engine == 'mms_thai'
+    default_dir = ('/models/mms-th' if engine == 'mms-th'
                    else '/models/sherpa-onnx/tts')
     model_dir = cfg.get('model_dir', default_dir)
     speaker_id = int(cfg.get('speaker_id', 0))
     speed = float(cfg.get('speed', 1.0))
     device = normalize_device(cfg.get('device'), cfg.get('hw_provider'))
-    if engine == 'mms_thai':
+    if engine == 'mms-th':
         return MmsThaiTTSAdapter(
             model_dir, speaker_id, speed, device,
             phrase_spacing=bool(cfg.get('thai_phrase_spacing', False)),
@@ -1106,31 +1107,41 @@ class SherpaOnnxTTSPlugin:
         return self._adapter.synthesize(text)
 
 
-DEFAULT_TTS_ENGINE = "vits2"
-# Named after the model, not the runtime that happens to execute it. Two of these
-# run on sherpa-onnx, so a name like "sherpa_onnx" said nothing about what you
-# would hear and left no room for the second one.
-TTS_ENGINES = ("vits2", "matcha", "mms_thai")
-# The old runtime-flavoured names, still accepted. They are not decoration: both
-# are already persisted in ConfigDB rows and in config.yaml on every deployed
-# robot, and _select_engine raises on an unknown engine — so dropping them would
-# turn every existing TTS card into "Unsupported TTS engine" on the next restart.
+DEFAULT_TTS_ENGINE = "vits2-zh-en"
+# `<model>-<languages>`, the shape `asr_model` in plugins/asr.py already uses
+# (x-asr-zh-en, paraformer-zh-en, zipformer-en). Two reasons to match it rather
+# than invent a second convention: the dashboard renders the raw enum string, so
+# this is what an operator reads in the dropdown right next to the ASR one; and
+# naming an engine after its runtime said nothing about what you would hear —
+# `matcha` and `mms-th` both run on sherpa-onnx.
+#
+# Language codes, not country codes: `zh`, not `cn`.
+TTS_ENGINES = ("vits2-zh-en", "matcha-zh-en", "mms-th")
+# Older spellings, still accepted. `vits2_trt` and `sherpa_onnx` are not
+# decoration: both are already persisted in ConfigDB rows and in config.yaml on
+# every deployed robot, and _select_engine raises on an unknown engine — so
+# dropping them would turn every existing TTS card into "Unsupported TTS engine"
+# on the next restart. The bare `vits2`/`matcha`/`mms_thai` forms existed only on
+# this branch before the languages were added, and cost one line each to keep.
 ENGINE_ALIASES = {
-    "vits2_trt": "vits2",
-    "sherpa_onnx": "matcha",
-    "sherpa_thai": "mms_thai",   # only ever existed on this branch
+    "vits2-trt": "vits2-zh-en",
+    "vits2": "vits2-zh-en",
+    "sherpa-onnx": "matcha-zh-en",
+    "matcha": "matcha-zh-en",
+    "mms-thai": "mms-th",
+    "mms-tts-thai": "mms-th",
 }
 # Where each engine keeps its own model files. Used for any engine other than
 # the one config.yaml was written for; see TTSPlugin._model_dir_for.
 ENGINE_MODEL_DIRS = {
-    "vits2": "/models/vits2",
+    "vits2-zh-en": "/models/vits2",
     # Kept at the old path: it is already populated on deployed robots and
     # renaming it would force every one of them to re-download the Matcha pair.
-    "matcha": "/models/sherpa-onnx/tts",
+    "matcha-zh-en": "/models/sherpa-onnx/tts",
     # Its own directory, not a sibling file in the Matcha one: both engines call
     # their weights by different names but share nothing, and pointing them at one
     # directory is the mistake ENGINE_MODEL_DIRS exists to prevent.
-    "mms_thai": "/models/mms-thai",
+    "mms-th": "/models/mms-th",
 }
 # How long an `action=config` engine switch waits for the new engine before
 # answering `loading`. Sized so the bounded part of a build finishes inside it
@@ -1206,7 +1217,11 @@ class TTSPlugin:
     @staticmethod
     def _select_engine(value) -> str:
         engine = str(value or DEFAULT_TTS_ENGINE).strip().lower()
-        # Resolve before validating, so a stored "sherpa_onnx" keeps working and
+        # Underscores fold to hyphens before the alias lookup, so both the stored
+        # `vits2_trt` and a hand-typed `vits2_zh_en` land on the same key and the
+        # alias table only has to spell each old name once.
+        engine = engine.replace("_", "-")
+        # Resolve before validating, so a stored `sherpa_onnx` keeps working and
         # everything downstream — _build, ENGINE_MODEL_DIRS, the `engine` field in
         # info — sees only the current name.
         engine = ENGINE_ALIASES.get(engine, engine)
@@ -1223,7 +1238,7 @@ class TTSPlugin:
         cfg = dict(self._cfg)
         cfg["engine"] = engine
         cfg["model_dir"] = self._model_dir_for(engine)
-        impl = (self._build_vits2(cfg) if engine == "vits2"
+        impl = (self._build_vits2(cfg) if engine == "vits2-zh-en"
                 else SherpaOnnxTTSPlugin(cfg, self._executor))
         # An implementation may swallow its own model-load failure and come back
         # as an object that reports error through info (sherpa does exactly

@@ -87,23 +87,23 @@ def _fake_engines(monkeypatch):
     # _build, and stubbing it out would skip exactly what these tests check.
     # sherpa-onnx really does fetch its model in __init__, hence the delay.
     #
-    # The fake takes its name from cfg["engine"] rather than a literal: matcha and
-    # mms_thai are two different models behind this one constructor, so a
-    # hardcoded name silently filed a Thai engine under "matcha".
+    # The fake takes its name from cfg["engine"] rather than a literal: matcha-zh-en
+    # and mms-th are two different models behind this one constructor, so a
+    # hardcoded name silently filed a Thai engine under "matcha-zh-en".
     monkeypatch.setattr(
         tts, "SherpaOnnxTTSPlugin",
-        lambda cfg, executor: _FakeEngine(cfg.get("engine", "matcha"), cfg, executor,
+        lambda cfg, executor: _FakeEngine(cfg.get("engine", "matcha-zh-en"), cfg, executor,
                                           engines.add, delay=0.3),
     )
     monkeypatch.setattr(
         tts.TTSPlugin, "_build_vits2",
-        lambda self, cfg: _FakeEngine("vits2", cfg, self._executor, engines.add),
+        lambda self, cfg: _FakeEngine("vits2-zh-en", cfg, self._executor, engines.add),
     )
     return engines
 
 
 def _plugin(**cfg):
-    return tts.TTSPlugin({"engine": "vits2", **cfg}, _FakeExecutor())
+    return tts.TTSPlugin({"engine": "vits2-zh-en", **cfg}, _FakeExecutor())
 
 
 def test_config_schema_exposes_the_engine_selector():
@@ -117,15 +117,15 @@ def test_config_schema_exposes_the_engine_selector():
 
 def test_default_engine_is_built_at_startup(_fake_engines):
     plugin = _plugin()
-    assert _fake_engines.order == ["vits2"]
-    assert plugin.dispatch("tts", {"action": "info"})["engine"] == "vits2"
+    assert _fake_engines.order == ["vits2-zh-en"]
+    assert plugin.dispatch("tts", {"action": "info"})["engine"] == "vits2-zh-en"
 
 
 def test_actions_are_forwarded_to_the_active_engine(_fake_engines):
     plugin = _plugin()
     result = plugin.dispatch("tts", {"action": "start", "input_topic": "/say"})
-    assert result["engine_seen"] == "vits2"
-    assert _fake_engines["vits2"].calls[-1]["input_topic"] == "/say"
+    assert result["engine_seen"] == "vits2-zh-en"
+    assert _fake_engines["vits2-zh-en"].calls[-1]["input_topic"] == "/say"
 
 
 def test_switch_stops_the_old_engine_and_waits_for_the_new_one(_fake_engines):
@@ -134,17 +134,17 @@ def test_switch_stops_the_old_engine_and_waits_for_the_new_one(_fake_engines):
     dashboard send a start the engine could not honour — see the deferred-start
     tests at the bottom for the case where waiting is not enough."""
     plugin = _plugin()
-    outgoing = _fake_engines["vits2"]
+    outgoing = _fake_engines["vits2-zh-en"]
 
-    result = plugin.dispatch("tts", {"action": "config", "tts_engine": "matcha"})
+    result = plugin.dispatch("tts", {"action": "config", "tts_engine": "matcha-zh-en"})
 
     assert result["status"] == "configured"
     assert "state" not in result, "a completed switch must not report loading"
-    assert result["engine"] == "matcha"
+    assert result["engine"] == "matcha-zh-en"
     # The outgoing engine is stopped before the new one can publish.
     assert outgoing.stopped is True
     # And the engine is live *now*, so the start that follows lands on it.
-    assert plugin.dispatch("tts", {"action": "info"})["engine"] == "matcha"
+    assert plugin.dispatch("tts", {"action": "info"})["engine"] == "matcha-zh-en"
     assert plugin.dispatch("tts", {"action": "start",
                                    "input_topic": "/say"})["state"] == "running"
 
@@ -153,7 +153,7 @@ def test_config_gives_up_waiting_and_reports_loading(monkeypatch, _fake_engines)
     """A build slower than the bound — a cold model download — still goes async."""
     monkeypatch.setattr(tts, "ENGINE_SWITCH_WAIT_S", 0.05)
     result = _plugin().dispatch("tts", {"action": "config",
-                                        "tts_engine": "matcha"})
+                                        "tts_engine": "matcha-zh-en"})
     assert result["status"] == "configured"
     assert result["state"] == "loading"
 
@@ -166,10 +166,10 @@ def test_config_reports_a_build_failure_instead_of_loading(monkeypatch):
     monkeypatch.setattr(tts, "SherpaOnnxTTSPlugin", _Boom)
     monkeypatch.setattr(
         tts.TTSPlugin, "_build_vits2",
-        lambda self, cfg: _FakeEngine("vits2", cfg, self._executor, lambda i: None),
+        lambda self, cfg: _FakeEngine("vits2-zh-en", cfg, self._executor, lambda i: None),
     )
-    plugin = tts.TTSPlugin({"engine": "vits2"}, _FakeExecutor())
-    result = plugin.dispatch("tts", {"action": "config", "tts_engine": "matcha"})
+    plugin = tts.TTSPlugin({"engine": "vits2-zh-en"}, _FakeExecutor())
+    result = plugin.dispatch("tts", {"action": "config", "tts_engine": "matcha-zh-en"})
     assert result["status"] == "error"
     assert "Protobuf parsing failed" in result["message"]
 
@@ -179,38 +179,38 @@ def test_info_reports_loading_while_the_new_engine_builds(monkeypatch, _fake_eng
     window in which the facade has no engine."""
     monkeypatch.setattr(tts, "ENGINE_SWITCH_WAIT_S", 0.05)
     plugin = _plugin()
-    plugin.dispatch("tts", {"action": "config", "tts_engine": "matcha"})
+    plugin.dispatch("tts", {"action": "config", "tts_engine": "matcha-zh-en"})
 
     info = plugin.dispatch("tts", {"action": "info"})
     assert info["state"] == "loading"
-    assert "matcha" in info["desc"]
+    assert "matcha-zh-en" in info["desc"]
     # Other actions answer loading too, rather than hanging or lying.
     assert plugin.dispatch("tts", {"action": "speak", "text": "hi"})["state"] == "loading"
 
 
 def test_switching_back_and_forth_keeps_one_engine_live(_fake_engines):
     plugin = _plugin()
-    plugin.dispatch("tts", {"action": "config", "tts_engine": "matcha"})
-    assert _wait_until(lambda: "matcha" in _fake_engines)
+    plugin.dispatch("tts", {"action": "config", "tts_engine": "matcha-zh-en"})
+    assert _wait_until(lambda: "matcha-zh-en" in _fake_engines)
     assert _wait_until(
         lambda: plugin.dispatch("tts", {"action": "info"})["state"] != "loading"
     )
-    sherpa = _fake_engines["matcha"]
+    sherpa = _fake_engines["matcha-zh-en"]
 
-    plugin.dispatch("tts", {"action": "config", "tts_engine": "vits2"})
+    plugin.dispatch("tts", {"action": "config", "tts_engine": "vits2-zh-en"})
     assert sherpa.stopped is True
     assert _wait_until(
         lambda: plugin.dispatch("tts", {"action": "info"})["state"] != "loading"
     )
-    assert plugin.dispatch("tts", {"action": "info"})["engine"] == "vits2"
-    assert _fake_engines.order == ["vits2", "matcha", "vits2"]
+    assert plugin.dispatch("tts", {"action": "info"})["engine"] == "vits2-zh-en"
+    assert _fake_engines.order == ["vits2-zh-en", "matcha-zh-en", "vits2-zh-en"]
 
 
 def test_reconfiguring_the_same_engine_does_not_rebuild(_fake_engines):
     plugin = _plugin()
-    result = plugin.dispatch("tts", {"action": "config", "tts_engine": "vits2",
+    result = plugin.dispatch("tts", {"action": "config", "tts_engine": "vits2-zh-en",
                                      "speed": 1.3})
-    assert _fake_engines.order == ["vits2"], "same engine was rebuilt"
+    assert _fake_engines.order == ["vits2-zh-en"], "same engine was rebuilt"
     # tts_engine is the facade's own field and must not be forwarded as if it
     # were an engine parameter; speed must be.
     applied = result["applied"]
@@ -220,17 +220,17 @@ def test_reconfiguring_the_same_engine_does_not_rebuild(_fake_engines):
 def test_shared_config_survives_an_engine_switch(_fake_engines):
     plugin = _plugin()
     plugin.dispatch("tts", {"action": "config", "speed": 0.7})
-    plugin.dispatch("tts", {"action": "config", "tts_engine": "matcha"})
-    assert _wait_until(lambda: "matcha" in _fake_engines)
-    assert _fake_engines["matcha"].cfg["speed"] == 0.7
+    plugin.dispatch("tts", {"action": "config", "tts_engine": "matcha-zh-en"})
+    assert _wait_until(lambda: "matcha-zh-en" in _fake_engines)
+    assert _fake_engines["matcha-zh-en"].cfg["speed"] == 0.7
 
 
 def test_unknown_engine_is_refused_without_touching_the_live_one(_fake_engines):
     plugin = _plugin()
     with pytest.raises(ValueError):
         plugin.dispatch("tts", {"action": "config", "tts_engine": "espeak"})
-    assert _fake_engines["vits2"].stopped is False
-    assert plugin.dispatch("tts", {"action": "info"})["engine"] == "vits2"
+    assert _fake_engines["vits2-zh-en"].stopped is False
+    assert plugin.dispatch("tts", {"action": "info"})["engine"] == "vits2-zh-en"
 
 
 def test_engine_build_failure_is_reported_not_raised(monkeypatch):
@@ -249,7 +249,7 @@ def test_engine_build_failure_is_reported_not_raised(monkeypatch):
 
 def test_concurrent_switches_leave_exactly_one_engine_live(_fake_engines):
     plugin = _plugin()
-    targets = ["matcha", "vits2", "matcha", "vits2"]
+    targets = ["matcha-zh-en", "vits2-zh-en", "matcha-zh-en", "vits2-zh-en"]
     threads = [
         threading.Thread(
             target=lambda e=e: plugin.dispatch(
@@ -287,39 +287,69 @@ def test_each_engine_gets_its_own_model_dir(_fake_engines):
     "I picked sherpa_onnx and it downloaded the VITS2 model" looked like.
     """
     plugin = tts.TTSPlugin(
-        {"engine": "vits2", "model_dir": "/models/vits2"}, _FakeExecutor()
+        {"engine": "vits2-zh-en", "model_dir": "/models/vits2"}, _FakeExecutor()
     )
-    assert _fake_engines["vits2"].cfg["model_dir"] == "/models/vits2"
+    assert _fake_engines["vits2-zh-en"].cfg["model_dir"] == "/models/vits2"
 
-    plugin.dispatch("tts", {"action": "config", "tts_engine": "matcha"})
-    assert _wait_until(lambda: "matcha" in _fake_engines)
-    assert (_fake_engines["matcha"].cfg["model_dir"]
-            == tts.ENGINE_MODEL_DIRS["matcha"])
+    plugin.dispatch("tts", {"action": "config", "tts_engine": "matcha-zh-en"})
+    assert _wait_until(lambda: "matcha-zh-en" in _fake_engines)
+    assert (_fake_engines["matcha-zh-en"].cfg["model_dir"]
+            == tts.ENGINE_MODEL_DIRS["matcha-zh-en"])
 
-    plugin.dispatch("tts", {"action": "config", "tts_engine": "mms_thai"})
-    assert _wait_until(lambda: "mms_thai" in _fake_engines)
+    plugin.dispatch("tts", {"action": "config", "tts_engine": "mms-th"})
+    assert _wait_until(lambda: "mms-th" in _fake_engines)
     # Its own directory, not a file alongside Matcha's: the two share no weights.
-    assert (_fake_engines["mms_thai"].cfg["model_dir"]
-            == tts.ENGINE_MODEL_DIRS["mms_thai"])
-    assert (tts.ENGINE_MODEL_DIRS["mms_thai"]
-            != tts.ENGINE_MODEL_DIRS["matcha"])
+    assert (_fake_engines["mms-th"].cfg["model_dir"]
+            == tts.ENGINE_MODEL_DIRS["mms-th"])
+    assert (tts.ENGINE_MODEL_DIRS["mms-th"]
+            != tts.ENGINE_MODEL_DIRS["matcha-zh-en"])
 
 
 # ── legacy engine names (upgrade regression) ─────────────────────────────────
 
 def test_engines_are_named_after_the_model_not_the_runtime():
-    """Two engines run on sherpa-onnx, so a runtime name identifies neither."""
-    assert set(tts.TTS_ENGINES) == {"vits2", "matcha", "mms_thai"}
-    assert tts.DEFAULT_TTS_ENGINE == "vits2"
+    """`<model>-<languages>`, the shape asr_model already uses.
+
+    Two engines run on sherpa-onnx, so a runtime name identifies neither. And the
+    dashboard renders the raw enum string, so this is what an operator reads in
+    the dropdown next to the ASR one — a second convention would be visible.
+    """
+    assert set(tts.TTS_ENGINES) == {"vits2-zh-en", "matcha-zh-en", "mms-th"}
+    assert tts.DEFAULT_TTS_ENGINE == "vits2-zh-en"
+    for engine in tts.TTS_ENGINES:
+        assert "_" not in engine, "asr_model uses hyphens; do not mix separators"
+        assert "cn" not in engine.split("-"), "zh is the language code; cn is a country"
+    # Every engine needs a model dir, or _model_dir_for raises a KeyError on the
+    # first switch to it.
+    assert set(tts.ENGINE_MODEL_DIRS) == set(tts.TTS_ENGINES)
+
+
+def test_the_asr_model_field_uses_the_same_shape():
+    """Guards the reason for the naming: the two dropdowns sit side by side."""
+    import plugins.asr as asr
+
+    asr_models = asr.TOOLS[0]["configSchema"]["properties"]["asr_model"]["enum"]
+    assert all("_" not in name for name in asr_models), \
+        "asr_model changed separator; tts_engine was matched to it deliberately"
 
 
 @pytest.mark.parametrize("stored, expected", [
-    ("vits2_trt", "vits2"),
-    ("sherpa_onnx", "matcha"),
-    ("VITS2_TRT", "vits2"),
-    (" sherpa_onnx ", "matcha"),
+    # What is actually persisted in ConfigDB and config.yaml on deployed robots.
+    ("vits2_trt", "vits2-zh-en"),
+    ("sherpa_onnx", "matcha-zh-en"),
+    # Case and stray whitespace, as a hand-edited YAML value arrives.
+    ("VITS2_TRT", "vits2-zh-en"),
+    (" sherpa_onnx ", "matcha-zh-en"),
+    # The bare forms this branch briefly used before the languages were added.
+    ("vits2", "vits2-zh-en"),
+    ("matcha", "matcha-zh-en"),
+    ("mms_thai", "mms-th"),
+    # Underscores fold to hyphens, so someone typing the new name the old way
+    # still lands on it rather than getting "Unsupported TTS engine".
+    ("vits2_zh_en", "vits2-zh-en"),
+    ("mms-th", "mms-th"),
 ])
-def test_the_old_runtime_flavoured_names_still_resolve(_fake_engines, stored, expected):
+def test_the_old_and_hand_typed_names_still_resolve(_fake_engines, stored, expected):
     """Every deployed robot has one of the old names in ConfigDB and config.yaml.
 
     _select_engine raises on an unknown engine and TTSPlugin.__init__ turns that
@@ -332,26 +362,33 @@ def test_the_old_runtime_flavoured_names_still_resolve(_fake_engines, stored, ex
     assert plugin.dispatch("tts", {"action": "info"})["engine"] == expected
 
 
+def test_every_alias_resolves_to_a_real_engine():
+    """A typo in ENGINE_ALIASES would only surface when someone upgraded."""
+    for alias, target in tts.ENGINE_ALIASES.items():
+        assert target in tts.TTS_ENGINES, f"{alias} points at nothing"
+        assert "_" not in alias, "aliases are looked up after _ folds to -"
+
+
 def test_a_legacy_name_arriving_by_config_also_resolves(_fake_engines):
-    plugin = tts.TTSPlugin({"engine": "vits2"}, _FakeExecutor())
+    plugin = tts.TTSPlugin({"engine": "vits2-zh-en"}, _FakeExecutor())
     plugin.dispatch("tts", {"action": "config", "tts_engine": "sherpa_onnx"})
-    assert _wait_until(lambda: "matcha" in _fake_engines)
-    assert plugin.dispatch("tts", {"action": "info"})["engine"] == "matcha"
+    assert _wait_until(lambda: "matcha-zh-en" in _fake_engines)
+    assert plugin.dispatch("tts", {"action": "info"})["engine"] == "matcha-zh-en"
 
 
 def test_configured_model_dir_follows_the_configured_engine(_fake_engines):
     """A sherpa-configured deployment keeps its own path, and VITS2 gets its own."""
     plugin = tts.TTSPlugin(
-        {"engine": "matcha", "model_dir": "/models/custom/sherpa"},
+        {"engine": "matcha-zh-en", "model_dir": "/models/custom/sherpa"},
         _FakeExecutor(),
     )
-    assert _wait_until(lambda: "matcha" in _fake_engines)
-    assert _fake_engines["matcha"].cfg["model_dir"] == "/models/custom/sherpa"
+    assert _wait_until(lambda: "matcha-zh-en" in _fake_engines)
+    assert _fake_engines["matcha-zh-en"].cfg["model_dir"] == "/models/custom/sherpa"
 
-    plugin.dispatch("tts", {"action": "config", "tts_engine": "vits2"})
-    assert _wait_until(lambda: "vits2" in _fake_engines)
-    assert (_fake_engines["vits2"].cfg["model_dir"]
-            == tts.ENGINE_MODEL_DIRS["vits2"])
+    plugin.dispatch("tts", {"action": "config", "tts_engine": "vits2-zh-en"})
+    assert _wait_until(lambda: "vits2-zh-en" in _fake_engines)
+    assert (_fake_engines["vits2-zh-en"].cfg["model_dir"]
+            == tts.ENGINE_MODEL_DIRS["vits2-zh-en"])
 
 
 def test_engine_that_reports_error_after_construction_is_not_installed(monkeypatch):
@@ -371,7 +408,7 @@ def test_engine_that_reports_error_after_construction_is_not_installed(monkeypat
 
     monkeypatch.setattr(tts, "SherpaOnnxTTSPlugin",
                         lambda cfg, executor: _BrokenEngine())
-    plugin = tts.TTSPlugin({"engine": "matcha"}, _FakeExecutor())
+    plugin = tts.TTSPlugin({"engine": "matcha-zh-en"}, _FakeExecutor())
 
     info = plugin.dispatch("tts", {"action": "info"})
     assert info["state"] == "error"
@@ -392,7 +429,7 @@ def test_engine_that_reports_error_after_construction_is_not_installed(monkeypat
 def test_start_during_a_switch_is_replayed_once_the_engine_is_up(monkeypatch, _fake_engines):
     monkeypatch.setattr(tts, "ENGINE_SWITCH_WAIT_S", 0.05)
     plugin = _plugin()
-    plugin.dispatch("tts", {"action": "config", "tts_engine": "matcha"})
+    plugin.dispatch("tts", {"action": "config", "tts_engine": "matcha-zh-en"})
 
     # The build is still in flight, so the call cannot start anything yet.
     result = plugin.dispatch("tts", {"action": "start",
@@ -400,8 +437,8 @@ def test_start_during_a_switch_is_replayed_once_the_engine_is_up(monkeypatch, _f
                                      "input_topic": "/say"})
     assert result["state"] == "loading"
 
-    _wait_until(lambda: "matcha" in _fake_engines)
-    incoming = _fake_engines["matcha"]
+    _wait_until(lambda: "matcha-zh-en" in _fake_engines)
+    incoming = _fake_engines["matcha-zh-en"]
     _wait_until(lambda: any(c.get("action") == "start" for c in incoming.calls))
 
     started = [c for c in incoming.calls if c.get("action") == "start"]
@@ -414,14 +451,14 @@ def test_a_stop_during_a_switch_cancels_the_deferred_start(monkeypatch, _fake_en
     """Otherwise the node reappears after the operator asked for it to stop."""
     monkeypatch.setattr(tts, "ENGINE_SWITCH_WAIT_S", 0.05)
     plugin = _plugin()
-    plugin.dispatch("tts", {"action": "config", "tts_engine": "matcha"})
+    plugin.dispatch("tts", {"action": "config", "tts_engine": "matcha-zh-en"})
     plugin.dispatch("tts", {"action": "start", "instance_id": "card-1",
                             "input_topic": "/say"})
     assert plugin.dispatch("tts", {"action": "stop",
                                    "instance_id": "card-1"})["state"] == "idle"
 
-    _wait_until(lambda: "matcha" in _fake_engines)
-    incoming = _fake_engines["matcha"]
+    _wait_until(lambda: "matcha-zh-en" in _fake_engines)
+    incoming = _fake_engines["matcha-zh-en"]
     time.sleep(0.4)   # past the fake build delay, so a replay would have landed
     assert not [c for c in incoming.calls if c.get("action") == "start"]
 
@@ -429,13 +466,13 @@ def test_a_stop_during_a_switch_cancels_the_deferred_start(monkeypatch, _fake_en
 def test_deferred_starts_are_per_instance(monkeypatch, _fake_engines):
     monkeypatch.setattr(tts, "ENGINE_SWITCH_WAIT_S", 0.05)
     plugin = _plugin()
-    plugin.dispatch("tts", {"action": "config", "tts_engine": "matcha"})
+    plugin.dispatch("tts", {"action": "config", "tts_engine": "matcha-zh-en"})
     for card, topic in (("card-1", "/say/a"), ("card-2", "/say/b")):
         plugin.dispatch("tts", {"action": "start", "instance_id": card,
                                 "input_topic": topic})
 
-    _wait_until(lambda: "matcha" in _fake_engines)
-    incoming = _fake_engines["matcha"]
+    _wait_until(lambda: "matcha-zh-en" in _fake_engines)
+    incoming = _fake_engines["matcha-zh-en"]
     _wait_until(lambda: len([c for c in incoming.calls
                              if c.get("action") == "start"]) == 2)
     topics = sorted(c["input_topic"] for c in incoming.calls
@@ -446,11 +483,11 @@ def test_deferred_starts_are_per_instance(monkeypatch, _fake_engines):
 def test_start_after_the_build_finishes_is_not_replayed_twice(_fake_engines):
     """A start that the live engine already handled must not also be queued."""
     plugin = _plugin()
-    plugin.dispatch("tts", {"action": "config", "tts_engine": "matcha"})
+    plugin.dispatch("tts", {"action": "config", "tts_engine": "matcha-zh-en"})
     _wait_until(lambda: plugin.dispatch("tts", {"action": "info"})["state"] != "loading")
 
     plugin.dispatch("tts", {"action": "start", "instance_id": "card-1",
                             "input_topic": "/say"})
     time.sleep(0.2)
-    incoming = _fake_engines["matcha"]
+    incoming = _fake_engines["matcha-zh-en"]
     assert len([c for c in incoming.calls if c.get("action") == "start"]) == 1
