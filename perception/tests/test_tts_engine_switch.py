@@ -670,3 +670,64 @@ def test_the_adapter_is_warmed_up_at_load(_sherpa):
         assert calls == [1], "warmup: false was ignored"
     finally:
         _CountingAdapter.warmup = monkey
+
+
+def test_info_reports_the_engine_the_facade_actually_has(_fake_engines):
+    """An implementation must not name the engine; only the facade knows.
+
+    vits2_tts_trt hardcoded `"engine": "vits2_trt"` in its identity dict, and the
+    facade merged it with setdefault — so after the rename the card displayed
+    `vits2_trt`, a value not in the configSchema enum, while the sherpa engines
+    (which report no engine of their own) showed the right one. It looked like the
+    default had never been renamed.
+    """
+    class _Opinionated(_FakeEngine):
+        def dispatch(self, name, args):
+            result = super().dispatch(name, args)
+            if args.get("action") == "info":
+                result["engine"] = "vits2_trt"   # the stale hardcoded name
+            return result
+
+    engines = _Engines()
+    import plugins.tts as _tts
+    _tts.TTSPlugin._build_vits2 = (
+        lambda self, cfg: _Opinionated("vits2-zh-en", cfg, self._executor, engines.add))
+    plugin = tts.TTSPlugin({"engine": "vits2-zh-en"}, _FakeExecutor())
+    reported = plugin.dispatch("tts", {"action": "info"})["engine"]
+    assert reported == "vits2-zh-en", f"the impl's stale name won: {reported}"
+    assert reported in tts.TTS_ENGINES, "info reported an engine not in the enum"
+
+
+def test_no_implementation_declares_its_own_engine_name():
+    """Guards the rule rather than one instance of breaking it.
+
+    Parses the AST instead of grepping the source: the comment that explains this
+    rule quotes the key it forbids, and a substring check matched the comment.
+    """
+    import ast
+    import inspect
+    import textwrap
+
+    import plugins.vits2_tts_trt.plugin as vits2_plugin
+
+    tree = ast.parse(textwrap.dedent(inspect.getsource(vits2_plugin.TTSPlugin._identity)))
+    dict_keys = [key.value for node in ast.walk(tree) if isinstance(node, ast.Dict)
+                 for key in node.keys if isinstance(key, ast.Constant)]
+    assert "engine" not in dict_keys, (
+        "the engine name belongs to plugins/tts.py's facade, not to an engine")
+
+
+def test_the_default_engine_is_vits2_zh_en():
+    """The ZH/EN TensorRT engine is the default everywhere it is declared."""
+    import pathlib
+
+    import yaml
+
+    assert tts.DEFAULT_TTS_ENGINE == "vits2-zh-en"
+    props = tts.TOOLS[0]["configSchema"]["properties"]
+    assert props["tts_engine"]["default"] == "vits2-zh-en"
+    config = yaml.safe_load(
+        (pathlib.Path(__file__).resolve().parents[1] / "config.yaml").read_text())
+    # config.yaml and the schema must agree, or the card shows one default while
+    # the process boots another.
+    assert config["plugins"]["tts"]["engine"] == "vits2-zh-en"

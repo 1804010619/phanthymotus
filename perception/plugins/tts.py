@@ -1517,7 +1517,15 @@ class TTSPlugin:
         if impl is not None:
             result = impl.dispatch(name, args)
             if isinstance(result, dict) and action == "info":
-                result.setdefault("engine", engine)
+                # Assignment, not setdefault: the facade is the only thing that
+                # knows which engine is live, and an implementation that reports
+                # its own name overrode it. vits2_tts_trt hardcoded
+                # `"engine": "vits2_trt"`, so after the rename the card displayed
+                # a value that is not even in the configSchema enum — while the
+                # sherpa engines, which report no engine of their own, showed the
+                # right one. That asymmetry is what made it look like the default
+                # had not been renamed.
+                result["engine"] = engine
             return result
 
         # No engine resident: only happens while a switch is building, or after
