@@ -254,6 +254,34 @@ def test_the_dockerfile_can_parse_its_own_self_check_step():
     assert not continuing, "the file ends inside a line continuation"
 
 
+def test_the_dockerfile_names_no_version_specific_thai_apis():
+    """Build steps must not reference an API that exists on only one JetPack line.
+
+    This mistake was made twice in a single Dockerfile command. `expand_maiyamok`
+    exists in pythainlp 5.3.7 but not 5.0.4; `Kham` exists in khanaa 0.1.1 but not
+    0.0.6 — and cp38 (jp5.11) gets the older of each. Naming either in the build
+    check turns a working image into a failed build on that one line, which is only
+    discovered by building it.
+
+    The versions are pinned per Python version and adapted over in
+    plugins/thai_frontend.py; the Dockerfile's job is to prove the packages import.
+    """
+    import pathlib
+
+    dockerfile = (pathlib.Path(__file__).resolve().parents[1] / "Dockerfile.jetson")
+    text = dockerfile.read_text(encoding="utf-8")
+    # Only the RUN steps matter — a comment may name these while explaining why.
+    code = "\n".join(
+        line.split("#", 1)[0] for line in text.splitlines()
+        if not line.lstrip().startswith("#")
+    )
+    for name in ("Kham", "SpellWord", "expand_maiyamok", "spell_out"):
+        assert name not in code, (
+            f"{name} exists in only one of the pinned versions; assert it in "
+            "plugins/thai_frontend.py:self_check() instead"
+        )
+
+
 def test_the_khanaa_adapter_is_resolved_once_and_survives_a_broken_import():
     """khanaa 0.1.1 raises TypeError, not ImportError, when imported on py3.8.
 

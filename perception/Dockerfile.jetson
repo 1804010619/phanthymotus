@@ -432,32 +432,28 @@ RUN pip3 install --no-cache-dir --no-deps -i ${PYPI_MIRROR} onnxruntime==1.18.1
 # layers invalidated are the source COPYs below, which any code change
 # invalidates anyway.
 #
-# The import check is not ceremony: the frontend degrades quietly by design — a
-# missing transliterator only warns — so a failed install would ship an image
-# whose Thai voice drops every digit and mispronounces every word containing ำ,
-# with nothing to say so until someone listened. Build time is the only place that
-# failure is cheap, and it has already earned its keep: it is what caught
-# pythainlp 5.2.0 installing happily on cp38 and then failing to import.
+# This step proves only one thing: that the three packages **import**. That is not
+# a low bar here — it is the check that catches the failure mode these pins exist
+# for. pythainlp 5.0.5+ and khanaa 0.1.x annotate module-level names with PEP 585
+# builtin generics, which are evaluated at runtime, so on cp38 the import raises
+# `TypeError: 'type' object is not subscriptable` *after* pip has installed them
+# happily. A plain import catches that; `requires_python` does not warn about it.
 #
-# It deliberately does NOT require `expand_maiyamok` — that name does not exist in
-# 5.0.4, the version cp38 gets. thai_frontend expands ๆ itself for exactly that
-# reason, so requiring it here would fail the jp5.11 build over a function nothing
-# calls. What is checked is what the frontend actually uses, exercised rather than
-# just imported.
+# It deliberately names **no functions or classes**. The two APIs differ between
+# the versions the two lines resolve to — khanaa is `Kham` on 0.1.1 and `SpellWord`
+# on 0.0.6, pythainlp has `expand_maiyamok` only on the newer one — and asserting
+# either name here fails the build on the *other* JetPack line. That mistake was
+# made twice in this one command. Version-specific API names belong in
+# plugins/thai_frontend.py, which adapts between them; every behavioural assertion
+# belongs in its self_check(), run after the source COPY below.
 ARG ENABLE_THAI_TTS=1
 COPY perception/plugins/requirements.thai.txt /tmp/thai-requirements.txt
 RUN if [ "${ENABLE_THAI_TTS}" = "1" ]; then \
       pip3 install --no-cache-dir -i "${PYPI_MIRROR}" -r /tmp/thai-requirements.txt && \
-      python3 -c "import pythainlp; \
-from pythainlp.util import bahttext, num_to_thaiword, normalize, remove_zw; \
-from pythainlp.tokenize import word_tokenize; \
-from wunsen import ThapSap; \
-from khanaa import Kham; \
-assert num_to_thaiword(305), 'num_to_thaiword returned nothing'; \
-assert bahttext(100), 'bahttext returned nothing'; \
-assert Kham(onset='ก', vowel='อา').form, 'khanaa produced no syllable'; \
-assert word_tokenize('สวัสดีครับ', engine='newmm'), 'newmm returned no tokens'; \
-print('[build] Thai TTS frontend ok on pythainlp ' + pythainlp.__version__)"; \
+      python3 -c "import pythainlp, wunsen, khanaa; \
+import importlib.metadata as m; \
+print('[build] Thai deps import ok: pythainlp %s, khanaa %s, wunsen %s' % \
+(pythainlp.__version__, m.version('khanaa'), m.version('wunsen')))"; \
     fi && rm -f /tmp/thai-requirements.txt
 
 # ── Application code ───────────────────────────────────────────────
