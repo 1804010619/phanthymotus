@@ -122,6 +122,32 @@ def test_full_width_punctuation_counts_as_chinese_context():
     assert _has_chinese_number("有25个，很多。")
 
 
+@pytest.mark.parametrize("text", [
+    "a fundamental transition—from model-driven to a new engine",
+    "Wait… what happened?",
+    'He said “hello” to me.',
+    "It's a well-known fact — really.",
+])
+def test_english_typography_does_not_make_a_sentence_chinese(text):
+    """The em dash, ellipsis and curly quotes are English punctuation too.
+
+    They were in _CJK_PUNCT at first, which split an English sentence in three and
+    handed the bare dash to the ZH FSTs as "Chinese". It happened to be harmless —
+    the FSTs leave punctuation alone — but it made English text look Chinese to
+    anyone reading the segmentation, and an FST that did rewrite punctuation would
+    have made it a real bug.
+    """
+    assert zh_text_norm.segment(text) == [(False, text)], zh_text_norm.segment(text)
+
+
+def test_the_cjk_punctuation_set_holds_only_cjk_only_characters():
+    """Guards the rule rather than the four cases above."""
+    for ch in "—…“”‘’·":
+        assert ch not in zh_text_norm._CJK_PUNCT, f"{ch!r} is used in English too"
+    for ch in "。，、；：？！":
+        assert ch in zh_text_norm._CJK_PUNCT, f"{ch!r} only appears in CJK text"
+
+
 # ── the FST is fed whole segments, not bare digits ────────────────────────────
 
 class _RecordingNormalizer(zh_text_norm.ZhTextNormalizer):

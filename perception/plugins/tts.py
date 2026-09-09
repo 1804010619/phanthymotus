@@ -955,7 +955,22 @@ class KokoroTTSAdapter(TTSAdapter):
             # Per-utterance, which is the whole reason language is not a session
             # key. Empty would fall back to meta_data.voice, but we always set it.
             config.extra = {"lang": self._voice}
-            audio = self._tts.generate(text, config)
+            try:
+                audio = self._tts.generate(text, config)
+            except Exception as error:
+                # Re-raise with the input attached. ONNX Runtime's own message names
+                # a graph node ("SequenceInsert", "Loop") and nothing about what was
+                # being said, so a failure in the field arrives as a stack trace with
+                # no way to reproduce it. One robot hit
+                # "SequenceInsert ... tensor to be added has a different data type"
+                # on a sentence that synthesizes fine on both Orins, and the log gave
+                # no voice, language or text to work from.
+                raise RuntimeError(
+                    f"kokoro generate failed (language={self._language}, espeak="
+                    f"{self._voice}, speaker={self._voice_index}/{self.voice_name}, "
+                    f"global_sid={self._sid}, {len(text)} chars): {error}\n"
+                    f"  text: {text!r}"
+                ) from error
 
         samples = np.asarray(audio.samples, dtype=np.float32)
         if samples.size == 0:

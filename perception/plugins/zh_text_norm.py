@@ -60,14 +60,21 @@ _RUN = re.compile(
 
 # Characters that carry no language of their own and so must not break the
 # adjacency test: "延迟 200 毫秒" and "第25，26个" both have a Chinese neighbour.
-# Full-width punctuation is *not* here — 。，、？！ are unambiguously Chinese and
-# are treated as CJK context below.
 _NEUTRAL = set(" \t\n\r\f\v.,:;!?()[]{}\"'`~@#$%^&*+=|\\/<>-_")
 
-# Full-width punctuation only ever appears in Chinese text, so it counts as
-# Chinese context on its own: "有 25 个。" and "2026年。" both read as Chinese even
-# when the adjacent run is the sentence end.
-_CJK_PUNCT = set("。，、；：？！（）《》【】“”‘’—…·")
+# Punctuation that only appears in CJK text, so it counts as Chinese context on its
+# own: "有 25 个。" and "2026年。" read as Chinese even when the adjacent run is the
+# sentence end.
+#
+# Deliberately excludes the characters an English typographer uses — the em dash
+# `—` (U+2014), ellipsis `…` (U+2026), curly quotes `“ ” ‘ ’` and the middle dot
+# `·`. Those were in here at first, which split
+# "a fundamental transition—from model-driven" into three segments and handed the
+# bare dash to the ZH FSTs as "Chinese". Harmless as it turned out (the FSTs leave
+# punctuation alone, so the text came back byte-identical), but it made an English
+# sentence look Chinese to every later reader of this code, and a future FST that
+# *did* rewrite punctuation would have turned it into a real bug.
+_CJK_PUNCT = set("。，、；：？！（）《》【】")
 
 
 def _classify(text: str):
