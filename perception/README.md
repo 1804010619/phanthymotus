@@ -102,6 +102,63 @@ unknown engine — so dropping them would put every existing TTS card into
 Only one engine is resident at a time. Switching disposes the outgoing one's nodes
 first, because two live publishers on one audio topic play both voices at once.
 
+### Chinese number normalisation is applied by us, never by `rule_fsts`
+
+Affects both sherpa-onnx engines that can speak Chinese (`matcha-zh-en`,
+`kokoro-multi`). Both pass **`rule_fsts=""`** and call `plugins/zh_text_norm.py`
+instead. Do not "simplify" that back.
+
+sherpa-onnx applies every FST in `rule_fsts` to the **whole text before its frontend
+decides what is Chinese** (`offline-tts-kokoro-impl.h`: the `tn_list_` loop runs, and
+only then `ConvertTextToTokenIds`). The frontend routes on `[一-鿿]`. So handing it
+the ZH number/date/phone FSTs rewrites every digit into Chinese characters *first*,
+and the frontend then reads them in Chinese — regardless of `lang`, in every language:
+
+| input | with `rule_fsts` | fixed |
+|---|---|---|
+| `...opened in 2026.` | `...opened in 二千零二十六.` | unchanged, espeak reads it |
+| `We have 25 exhibits today.` | `We have 二十五 exhibits today.` | unchanged |
+| `Hola, tenemos 25 exposiciones hoy.` | `Hola, tenemos 二十五 exposiciones.` | unchanged |
+
+The FSTs are not the problem and must not be dropped — for Chinese they are
+load-bearing and good: `2026年` → `二零二六年`, `2026年1月15日` →
+`二零二六年一月十五日`, `第25个展品` → `第二十五个展品`, `延迟200毫秒` →
+`延迟二百毫秒`.
+
+So `zh_text_norm` runs them in Python, before sherpa sees the text, and only on the
+Chinese parts. **A digit run is Chinese when either neighbour is** — which gets both
+directions right in a way that gating on `tts_language` could not:
+
+```
+"延迟 200 毫秒"        -> Chinese on both sides   -> 二百
+"共25 items"           -> Chinese only before     -> 二十五
+"In 2026 我们开业"     -> Chinese only after      -> 二零二六
+"we have 25 exhibits"  -> Chinese on neither      -> left to espeak
+```
+
+Two details are load-bearing and pinned by `tests/test_zh_text_norm.py`, which needs
+no model and no `kaldifst`:
+
+- **Whole segments go to the FST, never the bare digits.** `date-zh.fst` has to see
+  the `年` to produce `二零二六年` instead of the quantity form `二千零二十六`.
+- **The CJK range is the same one sherpa routes on** (`一-鿿`). If the two
+  disagreed, text could be normalised here and then routed to espeak anyway.
+
+`matcha-zh-en` has no language field at all, which is the other reason the decision is
+made per number rather than per engine setting.
+
+`kaldifst` reaches the image through `plugins/vits2_tts_trt/requirements.jetson.txt`,
+installed when `ENABLE_VITS2_TRT=1` (the Dockerfile default). Without it this degrades
+to a **warning, not a refusal**: Chinese digits get read by espeak in the selected
+voice — wrong, but audible and confined to numbers. Contrast the Thai frontend, which
+*does* refuse without pythainlp, because there the digits vanish from the audio
+entirely.
+
+Known limitation, sherpa's FSTs rather than this code: `电话13800138000` becomes
+`一百三十八亿零一十三万八千` — `phone-zh.fst` does not match a bare number, so
+`number-zh.fst` reads it as a quantity. And a bare `2026.` with no `年` reads as
+`二千零二十六`; the year form needs the context character.
+
 ### `kokoro-multi`, the multilingual voice
 
 [Kokoro-82M](https://huggingface.co/hexgrad/Kokoro-82M) **v1.0**, added because
@@ -151,13 +208,30 @@ made `en-gb` look like it ought to work. Hence a closed map rather than passing 
 configured label through, and a construction-time probe that refuses to load if the
 resolved voice produces no audio.
 
-**Language and voice are independent.** `lang` picks the pronunciation;
-`speaker_id` picks the timbre. 54 voices: **0–19 `en-us`, 20–27 `en-gb`, 28–29 + 53
-`es`, 30 `fr`, 31–34 `hi`, 35–36 `it`, 37–41 `ja`, 42–44 `pt-br`, 45–52 `zh`**.
-`af_heart` (3) and `af_bella` (2) are the highest-graded English voices. A voice from
-a *different* language is legal and gives an accented result, so the adapter warns
-rather than refuses — except for `zh`, which is exempt in both directions because a
-Chinese voice with `en-us` is the correct Chinese setup, not a mistake.
+**`speaker_id` is an index within the selected language, not a global voice number.**
+`speaker_id: 0` is the first voice of whatever `tts_language` is set to, so switching
+language moves the voice with it and the two cannot end up disagreeing. The model's
+own numbering is not learnable — Japanese starts at 37 and Spanish is 28, 29 **and**
+53 — and exposing it made it easy to pick an American voice, switch to Japanese, and
+wonder why the result sounded wrong. That class of mistake is now unrepresentable
+rather than warned about.
+
+| `tts_language` | voices | `speaker_id: 0` is |
+|---|---|---|
+| `en-us` | 20 | `af_alloy` (`af_heart` is 3, `af_bella` 2 — the highest-graded) |
+| `en-gb` | 8 | `bf_alice` |
+| `zh` | 8 | `zf_xiaobei` |
+| `ja` | 5 | `jf_alpha` |
+| `hi` | 4 | `hf_alpha` |
+| `es` / `pt-br` | 3 | `ef_dora` / `pf_dora` |
+| `it` | 2 | `if_sara` |
+| `fr` | 1 | `ff_siwis` |
+
+Out of range at load is a `ValueError` naming the language and its count. Out of
+range *after* a language switch clamps to voice 0 with a warning instead — language
+is a free per-utterance setting and must not be able to fail, and `fr` has exactly
+one voice. The requested index is remembered, so switching back restores it. Logs and
+`info` report the resolved name (`af_heart`), not the number.
 
 > **Only `en-us`, `en-gb` and `zh` have been listened to.** sherpa-onnx's own
 > documentation says of this model "it is a multi-lingual model, but we only add
@@ -165,6 +239,13 @@ Chinese voice with `en-us` is the correct Chinese setup, not a mistake.
 > the other six the espeak phoneme set is not guaranteed to be the one the acoustic
 > model learned. All nine produce audio of a plausible length on device; treat the
 > rest as best-effort until someone who reads the language has heard them.
+>
+> **`ja` is known to be wrong, not merely unverified.** sherpa-onnx's frontend routes
+> every character in `[一-鿿]` to its *Chinese* branch with no language check, and
+> Japanese kanji live in exactly that range — `展` is U+5C55, `示` is U+793A. So
+> `こんにちは、25の展示があります。` reaches the model as Japanese kana through
+> espeak-ja plus kanji pronounced in **Mandarin** from `lexicon-zh.txt`. Nothing here
+> can fix that; it needs a Japanese lexicon in sherpa-onnx.
 
 #### Measured on Orin 6 (jp6.1), fp32 on gpu
 

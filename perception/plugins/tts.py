@@ -26,6 +26,7 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPo
 from std_msgs.msg import String
 
 from utils.resample import downsample_24k_to_16k
+from plugins.zh_text_norm import ZhTextNormalizer
 
 log = logging.getLogger(__name__)
 
@@ -230,11 +231,9 @@ TOOLS = [
                     "type": "string",
                     "enum": ["en-us", "en-gb", "zh", "ja", "es", "fr", "it",
                              "pt-br", "hi"],
-                    "description": "Pronunciation language for kokoro-multi. Independent of "
-                                   "the voice — pick a matching speaker_id (0-19 en-us, "
-                                   "20-27 en-gb, 28-29/53 es, 30 fr, 31-34 hi, 35-36 it, "
-                                   "37-41 ja, 42-44 pt-br, 45-52 zh). Chinese is spoken "
-                                   "correctly on any setting",
+                    "description": "Pronunciation language for kokoro-multi. Chinese is "
+                                   "spoken correctly on any setting; this picks the espeak "
+                                   "voice for the non-Chinese parts of the text",
                     "default": "en-us", "scope": "shared",
                     "x-show-when": {"tts_engine": ["kokoro-multi"]}},
                 # Thai has no spaces between words, and MMS was trained on text
@@ -246,7 +245,7 @@ TOOLS = [
                                    "experimental — may change prosody either way)",
                     "default": False, "scope": "shared",
                     "x-show-when": {"tts_engine": "mms-th"}},
-                "speaker_id": {"type": "integer", "description": "Speaker ID (vits2-zh-en and mms-th support 0 only; kokoro-multi has 54 voices — 0-19 en-us, 20-27 en-gb, 45-52 zh)", "default": 0, "scope": "shared"},
+                "speaker_id": {"type": "integer", "description": "Speaker ID (vits2-zh-en and mms-th support 0 only; for kokoro-multi it is an index within the selected language — 0 is that language's first voice, and the voice moves with tts_language)", "default": 0, "scope": "shared"},
                 "speed":      {"type": "number", "description": "Speech speed (1.0 = normal)", "default": 1.0, "scope": "shared"},
             },
             "required": []
@@ -344,13 +343,13 @@ class MatchaTTSAdapter(TTSAdapter):
         # picks the provider — measured 4.3x faster on gpu at num_threads=2.
         provider = provider_for_device(device, (acoustic_model, vocoder))
 
-        # Gather rule FSTs
-        rule_fsts = []
-        for name in ("date-zh.fst", "number-zh.fst", "phone-zh.fst"):
-            p = os.path.join(model_dir, name)
-            if os.path.exists(p):
-                rule_fsts.append(p)
-
+        # The ZH number/date/phone FSTs are applied by us, in Python, not handed to
+        # sherpa-onnx as rule_fsts. sherpa runs rule_fsts over the *whole* text
+        # before its frontend decides what is Chinese, so passing them here rewrote
+        # every digit into Chinese characters and the frontend then read them in
+        # Chinese — "We have 25 exhibits" came out as "We have 二十五 exhibits".
+        # plugins/zh_text_norm.py applies them only to the Chinese runs.
+        self._zh_norm = ZhTextNormalizer(model_dir)
         tts_config = sherpa_onnx.OfflineTtsConfig(
             model=sherpa_onnx.OfflineTtsModelConfig(
                 matcha=sherpa_onnx.OfflineTtsMatchaModelConfig(
@@ -364,20 +363,24 @@ class MatchaTTSAdapter(TTSAdapter):
                 num_threads=2,
                 provider=provider,
             ),
-            rule_fsts=",".join(rule_fsts) if rule_fsts else "",
+            rule_fsts="",
         )
         self._tts = sherpa_onnx.OfflineTts(tts_config)
         self._sid = speaker_id
         self._speed = speed
         log.info(f"[tts] sherpa-onnx Matcha loaded: model_dir={model_dir}, "
                  f"speaker_id={speaker_id}, speed={speed}, "
-                 f"device={device}, provider={provider}")
+                 f"device={device}, provider={provider}, "
+                 f"zh_text_norm={'on' if self._zh_norm.available else 'off'}")
 
     def synthesize(self, text: str) -> bytes:
         return b''.join(self.synthesize_stream(text))
 
     def synthesize_stream(self, text: str):
         import struct
+        # Normalise before the engine sees the text, and only the Chinese parts of
+        # it — see the rule_fsts comment in __init__.
+        text = self._zh_norm.normalize(text)
         audio = self._tts.generate(text, sid=self._sid, speed=self._speed)
         float_samples = audio.samples
         # Matcha + vocos-16khz outputs 16kHz directly, no resampling needed
@@ -766,12 +769,13 @@ class KokoroTTSAdapter(TTSAdapter):
 
         provider = provider_for_device(device, (model_path,))
 
-        # The same three ZH rule FSTs Matcha loads opportunistically — number, date
-        # and phone normalisation for Chinese text. Absent for an English-only
-        # release, which is why this is a filter and not a requirement.
-        rule_fsts = [os.path.join(model_dir, name)
-                     for name in ("date-zh.fst", "number-zh.fst", "phone-zh.fst")
-                     if os.path.exists(os.path.join(model_dir, name))]
+        # The ZH number/date/phone FSTs are applied by us, not by sherpa-onnx. Given
+        # to it as rule_fsts they run over the *whole* text before the frontend
+        # splits it, so the digits become Chinese characters and are then read in
+        # Chinese whatever `lang` says — "opened in 2026" became "opened in
+        # 二千零二十六" in English, Spanish, Japanese, all of them.
+        # plugins/zh_text_norm.py applies them only to the Chinese runs.
+        self._zh_norm = ZhTextNormalizer(model_dir)
 
         tts_config = sherpa_onnx.OfflineTtsConfig(
             model=sherpa_onnx.OfflineTtsModelConfig(
@@ -794,7 +798,7 @@ class KokoroTTSAdapter(TTSAdapter):
                 num_threads=2,
                 provider=provider,
             ),
-            rule_fsts=",".join(rule_fsts) if rule_fsts else "",
+            rule_fsts="",
         )
         self._tts = sherpa_onnx.OfflineTts(tts_config)
 
@@ -809,29 +813,32 @@ class KokoroTTSAdapter(TTSAdapter):
                 f"built for {KOKORO_SAMPLE_RATE} Hz -> {SAMPLE_RATE} Hz"
             )
 
-        # Re-check against the loaded graph, not just the manifest: the manifest is
-        # our own file and could have been written for a different voices.bin.
-        live_speakers = int(getattr(self._tts, "num_speakers", 0) or 0)
-        if live_speakers and not 0 <= int(speaker_id) < live_speakers:
-            raise ValueError(
-                f"speaker_id must be 0..{live_speakers - 1} for this Kokoro "
-                f"release, got {speaker_id}"
-            )
-
-        self._sid = int(speaker_id)
         self._speed = speed
         self._language = language
         self._manifest = manifest
         self._lock = threading.Lock()
+        # `voice_index` is per language; `_sid` is the global index the model wants.
+        self._voice_index = int(speaker_id)
+        self._sid = self._resolve_sid(self._voice_index, language, strict=True)
 
-        speaker_name = manifest.get("id2speaker", {}).get(str(self._sid), "?")
+        # Re-check against the loaded graph, not just the manifest: the manifest is
+        # our own file and could have been written for a different voices.bin.
+        live_speakers = int(getattr(self._tts, "num_speakers", 0) or 0)
+        if live_speakers and not 0 <= self._sid < live_speakers:
+            raise ValueError(
+                f"resolved speaker index {self._sid} is outside this Kokoro "
+                f"release's 0..{live_speakers - 1}; the manifest does not match "
+                "voices.bin"
+            )
+
         log.info(f"[tts] sherpa-onnx Kokoro loaded: model_dir={model_dir}, "
                  f"weights={os.path.basename(model_path)}, "
-                 f"speaker_id={self._sid} ({speaker_name}), language={language}, "
+                 f"speaker_id={self._voice_index} ({self.voice_name}, global "
+                 f"{self._sid}), language={language} (espeak {self._voice}), "
                  f"speed={speed}, device={device}, provider={provider}, "
                  f"model_rate={model_rate or KOKORO_SAMPLE_RATE} -> {SAMPLE_RATE}, "
-                 f"lexicon={'zh' if lexicon else 'none'}, rule_fsts={len(rule_fsts)}")
-        self._warn_if_voice_mismatches_language()
+                 f"lexicon={'zh' if lexicon else 'none'}, "
+                 f"zh_text_norm={'on' if self._zh_norm.available else 'off'}")
 
         # Prove the espeak voice resolves before anything asks this adapter to
         # speak. A bad voice name is close to invisible at runtime: sherpa-onnx
@@ -878,40 +885,65 @@ class KokoroTTSAdapter(TTSAdapter):
         """The espeak-ng voice name for the configured language."""
         return self.LANGUAGE_VOICES[self._language]
 
-    def _warn_if_voice_mismatches_language(self) -> None:
-        """Warn — never refuse — when the voice belongs to a different language.
+    def _voice_ids(self, language: str) -> list:
+        """The model's global speaker ids for `language`, in order."""
+        return list(self._manifest.get("languages", {}).get(language) or [])
 
-        A Spanish voice reading text phonemised as Italian is legal, produces a
-        recognisably wrong-accented result, and is what you get by changing one
-        dropdown and forgetting the other. Worth a log line, not a refusal.
+    def _resolve_sid(self, voice_index: int, language: str, strict: bool) -> int:
+        """Map a per-language voice index to the model's global speaker id.
 
-        `zh` is exempt in both directions. It maps to an English espeak voice by
-        design (Chinese comes from lexicon-zh.txt, which never consults `lang`), so a
-        Chinese voice with `en-us`, or an English voice with `zh`, is a normal and
-        correct configuration rather than a mistake. An earlier version of this check
-        compared against the selected language's id list alone and would have fired
-        on exactly that — the recommended Chinese setup.
+        `speaker_id` is an index *within the selected language* — 0 is the first
+        voice of that language, whatever the model happens to number it. The global
+        ids are not learnable: Japanese starts at 37, Spanish is 28, 29 and 53.
+        Exposing them made it easy to pick an American voice, switch the language to
+        Japanese, and be left wondering why the Japanese sounded wrong.
+
+        Because the index is language-relative, an incoherent voice/language pair is
+        no longer *representable* — which is why this adapter has no mismatch
+        warning. An earlier version had one; designing the mistake out beats warning
+        about it.
+
+        `strict` separates the two callers. At construction an out-of-range value is
+        a configuration error and must be reported. On `set_language` it must not be:
+        language is a per-utterance setting that changes freely, the languages have
+        different voice counts (French has exactly one), and a language switch that
+        could fail would make the dropdown a trap.
         """
-        languages = self._manifest.get("languages") or {}
-        if self._language == "zh" or self._sid in (languages.get("zh") or []):
-            return
-        for lang, ids in languages.items():
-            if lang in ("zh", self._language) or lang not in self.LANGUAGE_VOICES:
-                continue
-            if self._sid in (ids or []):
-                name = self._manifest.get("id2speaker", {}).get(str(self._sid), "?")
-                log.warning(
-                    "[tts] kokoro speaker_id=%d (%s) is a %s voice but the text is "
-                    "phonemised as %s; set tts_language=%s to match, or pick a %s "
-                    "voice", self._sid, name, lang, self._language, lang,
-                    self._language)
-                return
+        ids = self._voice_ids(language)
+        if not ids:
+            raise RuntimeError(
+                f"the Kokoro release manifest lists no voices for {language!r}; "
+                f"it has {sorted(self._manifest.get('languages', {}))}"
+            )
+        if 0 <= voice_index < len(ids):
+            return ids[voice_index]
+        if strict:
+            raise ValueError(
+                f"speaker_id must be 0..{len(ids) - 1} for language {language!r} "
+                f"({len(ids)} voices); got {voice_index}. speaker_id is an index "
+                "within the selected language, not a global speaker number"
+            )
+        log.warning(
+            "[tts] kokoro speaker_id=%d is out of range for %s (%d voices); "
+            "using 0 (%s)", voice_index, language, len(ids),
+            self._manifest.get("id2speaker", {}).get(str(ids[0]), "?"))
+        return ids[0]
+
+    @property
+    def voice_name(self) -> str:
+        """The model's own name for the resident voice, e.g. `af_heart`."""
+        return self._manifest.get("id2speaker", {}).get(str(self._sid), "?")
 
     def synthesize(self, text: str) -> bytes:
         return b''.join(self.synthesize_stream(text))
 
     def synthesize_stream(self, text: str):
         import sherpa_onnx
+
+        # Normalise Chinese numbers here, not via sherpa's rule_fsts — see the
+        # comment in __init__. Non-Chinese text comes back untouched, so espeak
+        # reads "2026" in whatever language it is phonemising.
+        text = self._zh_norm.normalize(text)
 
         # One generate() at a time. sherpa-onnx's OfflineTts is not documented as
         # thread-safe, and dispatch() runs on a ThreadingHTTPServer thread per
@@ -947,13 +979,20 @@ class KokoroTTSAdapter(TTSAdapter):
         this costs a field assignment rather than the ~2.7 s session rebuild a
         session key would. Which is why `tts_language` is deliberately absent from
         _session_keys.
+
+        The voice moves with the language, because `speaker_id` is an index within
+        it — switching to `ja` gives voice 0 of Japanese, not whatever global id the
+        English voice 0 happened to occupy. Out of range clamps rather than raising:
+        French has one voice, and a free per-utterance setting must not be able to
+        fail. `sid` is a per-generate() argument, so none of this reloads anything.
         """
         resolved = self._normalize_language(language)
         if resolved == self._language:
             return
         self._language = resolved
-        log.info("[tts] kokoro language -> %s", resolved)
-        self._warn_if_voice_mismatches_language()
+        self._sid = self._resolve_sid(self._voice_index, resolved, strict=False)
+        log.info("[tts] kokoro language -> %s (espeak %s), voice -> %s (global %d)",
+                 resolved, self._voice, self.voice_name, self._sid)
 
 
 def _validate_kokoro_manifest(model_dir: str) -> dict:

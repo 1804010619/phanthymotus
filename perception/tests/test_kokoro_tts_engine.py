@@ -149,12 +149,12 @@ def test_a_language_set_earlier_survives_a_later_rebuild(_kokoro):
     assert _LangCountingAdapter.builds == 1
 
     # speaker_id IS a session key, so this one really does rebuild.
-    result = plugin.dispatch("tts", {"action": "config", "speaker_id": 47})
+    result = plugin.dispatch("tts", {"action": "config", "speaker_id": 5})
     assert result["rebuilt"] is True
     assert _LangCountingAdapter.builds == 2
     assert holder["adapter"].cfg["tts_language"] == "zh", \
         "the rebuild lost the selected language"
-    assert holder["adapter"].cfg["speaker_id"] == 47
+    assert holder["adapter"].cfg["speaker_id"] == 5
 
 
 def test_every_adapter_accepts_set_language(_kokoro):
@@ -387,6 +387,115 @@ def test_the_pipeline_rate_and_kokoro_rate_are_both_stated():
     from utils import resample
     assert (resample.UP, resample.DOWN) == (2, 3)
     assert tts.KOKORO_SAMPLE_RATE * resample.UP // resample.DOWN == tts.SAMPLE_RATE
+
+
+# ── speaker_id is an index within the language, not a global id ───────────────
+
+# The real manifest's shape, abbreviated. Note es is non-contiguous (28, 29, 53)
+# and fr has exactly one voice — both are why a global id is unguessable and why
+# the per-language range differs.
+_LANGS = {
+    "en-us": list(range(0, 20)),
+    "en-gb": list(range(20, 28)),
+    "es": [28, 29, 53],
+    "fr": [30],
+    "hi": [31, 32, 33, 34],
+    "it": [35, 36],
+    "ja": [37, 38, 39, 40, 41],
+    "pt-br": [42, 43, 44],
+    "zh": list(range(45, 53)),
+}
+_NAMES = {"0": "af_alloy", "3": "af_heart", "20": "bf_alice", "30": "ff_siwis",
+          "37": "jf_alpha", "45": "zf_xiaobei", "53": "em_santa"}
+
+
+def _bare_adapter(voice_index=0, language="en-us"):
+    """A KokoroTTSAdapter with only the fields the mapping logic touches.
+
+    Constructed without __init__ on purpose: resolving a voice index is pure
+    manifest arithmetic, and requiring a 310 MB model to test it would mean it never
+    got tested at all.
+    """
+    a = object.__new__(tts.KokoroTTSAdapter)
+    a._manifest = {"languages": _LANGS, "id2speaker": _NAMES}
+    a._language = language
+    a._voice_index = voice_index
+    a._sid = a._resolve_sid(voice_index, language, strict=True)
+    return a
+
+
+@pytest.mark.parametrize("language,index,expected", [
+    ("en-us", 0, 0),
+    ("en-us", 3, 3),
+    ("en-gb", 0, 20),      # not 0 — the global ids are unguessable
+    ("ja", 0, 37),
+    ("ja", 4, 41),
+    ("zh", 0, 45),
+    ("fr", 0, 30),
+    ("es", 2, 53),         # non-contiguous: es is 28, 29 and 53
+])
+def test_speaker_id_is_relative_to_the_language(language, index, expected):
+    assert _bare_adapter(index, language)._sid == expected
+
+
+def test_voice_zero_of_every_language_is_a_voice_of_that_language():
+    """The property that makes the mismatch warning unnecessary."""
+    for language, ids in _LANGS.items():
+        a = _bare_adapter(0, language)
+        assert a._sid == ids[0]
+        assert a._sid in ids
+
+
+@pytest.mark.parametrize("language,bad", [("fr", 1), ("it", 2), ("en-us", 20)])
+def test_out_of_range_at_construction_is_an_error(language, bad):
+    """A configuration mistake must be reported, naming the language's count."""
+    with pytest.raises(ValueError, match=f"language '{language}'"):
+        _bare_adapter(bad, language)
+
+
+def test_switching_language_moves_the_voice_with_it():
+    a = _bare_adapter(0, "en-us")
+    assert a._sid == 0
+    a.set_language("ja")
+    assert a._language == "ja"
+    assert a._sid == 37, "the voice stayed English while the phonemes went Japanese"
+    a.set_language("zh")
+    assert a._sid == 45
+
+
+def test_switching_into_a_language_with_fewer_voices_clamps(caplog):
+    """Language is per-utterance and free, so it must not be able to fail.
+
+    French has exactly one voice. Raising here would turn the language dropdown
+    into a trap for anyone who had picked voice 5 of English first.
+    """
+    a = _bare_adapter(5, "en-us")
+    assert a._sid == 5
+    with caplog.at_level("WARNING"):
+        a.set_language("fr")
+    assert a._sid == 30, "did not fall back to the language's first voice"
+    assert a._voice_index == 5, "the requested index is remembered, not overwritten"
+    assert "out of range" in caplog.text
+
+    # ...and coming back restores the original voice rather than the clamp.
+    a.set_language("en-us")
+    assert a._sid == 5
+
+
+def test_the_resolved_voice_is_named_for_logs_and_info():
+    """An operator reads `af_heart`, not `3`."""
+    assert _bare_adapter(3, "en-us").voice_name == "af_heart"
+    assert _bare_adapter(0, "ja").voice_name == "jf_alpha"
+    # Unknown ids degrade rather than raising — the map is only for display.
+    a = _bare_adapter(1, "en-us")
+    assert a.voice_name == "?"
+
+
+def test_a_language_absent_from_the_manifest_is_refused():
+    a = _bare_adapter(0, "en-us")
+    a._manifest = {"languages": {"en-us": [0]}, "id2speaker": {}}
+    with pytest.raises(RuntimeError, match="no voices for 'ja'"):
+        a._resolve_sid(0, "ja", strict=True)
 
 
 # ── the download: one archive per device, each in its own subdirectory ─────────
