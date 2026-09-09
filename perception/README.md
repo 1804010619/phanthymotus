@@ -387,6 +387,64 @@ sentence boundaries.
 > That was inferred from "no kanji left in the text" without listening, and it was
 > wrong.
 
+#### Superseded: Japanese now bypasses sherpa entirely (`plugins/kokoro_direct.py`)
+
+The romaji route above is what the accent limit was measured on. It is no longer the
+shipping path — the limit was the *phoneme alphabet*, so the fix is to stop letting
+espeak choose it. `kokoro_direct.py` loads the same `model.onnx` with onnxruntime and
+feeds it misaki phonemes directly, the way upstream Kokoro is driven:
+
+```
+kana --(plugins/ja_phonemes.py, vendored misaki mora table)--> phonemes --> tokens.txt ids --> ONNX
+```
+
+The mora table is pinned to misaki at **`fdc9c5e5e` (2025-01-13)**, the commit that
+matches Kokoro v1.0. This pin is the whole point and `pip install misaki` is the wrong
+thing to do here — current misaki targets a newer Kokoro with a larger vocabulary:
+
+| misaki `ja.py` | distinct phonemes | missing from our `tokens.txt` |
+|---|---|---|
+| **2025-01-13 (pinned)** | 31 | **0** |
+| 2025-04-05 (what pip gives) | 39 | 12 — `G K g ƫ ᶀ ᶁ ᶃ ᶄ ᶆ ᶈ ᶉ` |
+
+A test asserts every phoneme the table can emit exists in `tokens.txt`. The absence of
+that assertion is what let the original 12-drop bug ship.
+
+**This session is CPU-only by construction, and that is not a tuning decision.** On
+jp6.1 the standalone onnxruntime (1.18.0) and sherpa's bundled one (1.18.1) share a
+single `libonnxruntime_providers_cuda.so` — the Dockerfile copies sherpa's into
+`onnxruntime/capi/` to get the face plugin onto the GPU, and the soname collides so the
+first `dlopen` wins. Separate graphs coexist fine, but a *second* CUDA session on the
+**Kokoro** graph fails in whichever runtime did not load the provider, symmetrically:
+
+| order | result |
+|---|---|
+| sherpa's CUDA session first | the standalone one fails, error names `/home/tian/Yxh/…` |
+| the standalone one first | **sherpa** fails, error names `/home/yifanl/…` |
+
+both with `Error mapping output names: Could not find OrtValue with name
+'/Squeeze_2_output_0'`. Order does not save it; staying off CUDA does. `KokoroDirect`
+therefore takes **no device argument**, so it cannot be asked.
+
+The cost is confined to Japanese, and it is affordable. Measured on Orin 6, one process,
+Japanese synthesized first so its CPU session is live throughout:
+
+| language | runtime | RTF |
+|---|---|---|
+| en-us / en-gb | sherpa, cuda | 0.31 / 0.21 |
+| zh | sherpa, cuda | 0.14 |
+| es / fr / it / pt-br / hi | sherpa, cuda | 0.10 – 0.11 |
+| **ja** | **direct ONNX, cpu** | **0.54** |
+
+Real time with margin, and the other eight languages keep the GPU. Threads are the only
+lever left for Japanese and they matter — `intra_op_num_threads` defaults to one per
+core (RTF 0.52); the ORT default of 2 gives 1.17, i.e. slower than real time.
+
+**Pitch accent is not implemented and cannot be with this model.** The pinned misaki has
+no accent code at all (it arrived in 2025-04, alongside the larger vocabulary above),
+and sherpa's v1.1 token table is a symlink to v1.0's. Japanese here is correctly
+*phonemised* but flat. Fixing it needs a newer Kokoro, which is a different change.
+
 ### Chinese: use `vits2-zh-en`, and why Kokoro's Chinese is not broken
 
 Chinese takes a different path from Japanese and loses nothing. `Skip unknown phonemes`

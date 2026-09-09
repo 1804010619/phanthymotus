@@ -49,16 +49,32 @@ class KokoroDirect:
     held for the lifetime of the object.
     """
 
-    def __init__(self, model_dir: str, weights: str, provider: str = "cpu",
-                 num_threads: int = 0):
-        """`num_threads=0` means one per core, which is the difference between
-        usable and not.
+    def __init__(self, model_dir: str, weights: str, num_threads: int = 0):
+        """Always CPU. `num_threads=0` means one per core, which is the difference
+        between usable and not.
 
-        This runs on the **CPU whatever `provider` says**: the standalone
-        `onnxruntime` package is a CPU-only build, and the CUDA provider .so the
-        Dockerfile copies into `onnxruntime/capi/` cannot register with it because
-        the pybind layer was not compiled with CUDA support. (sherpa's bundled
-        onnxruntime does have it, but exposes no generic session to Python.)
+        **This session must not use CUDA, and it takes no `provider` argument so it
+        cannot be asked to.** Two ONNX Runtime builds live in this process — sherpa's
+        bundled 1.18.1 and the standalone 1.18.0 wheel — and on jp6.1 they share one
+        copy of `libonnxruntime_providers_cuda.so`, because the Dockerfile puts
+        sherpa's into `onnxruntime/capi/` and the soname collides. Whichever runtime
+        dlopens it first owns it, and the *second* CUDA session built on the Kokoro
+        graph then fails in the other runtime's code. Measured on Orin 6, both orders,
+        with the error naming the build it landed in:
+
+            sherpa's CUDA session first  -> this one fails   (/home/tian/Yxh/...)
+            this one first               -> sherpa fails     (/home/yifanl/...)
+
+            "Error mapping output names: Could not find OrtValue with
+             name '/Squeeze_2_output_0'"
+
+        Order does not save it; only staying off CUDA does. A standalone CUDA session
+        on the *face* model is unaffected and keeps its 3x — that graph has none of
+        the fused squeeze outputs this one trips over.
+
+        An earlier version of this docstring said the CUDA request was harmless
+        because the standalone wheel was CPU-only. That stopped being true the moment
+        the Dockerfile started installing the GPU wheel, and this is how it failed.
 
         So threads are the only lever, and they matter. Measured on Orin 6 (6 cores),
         one 9.35 s Japanese utterance:
@@ -85,9 +101,8 @@ class KokoroDirect:
         # 0 lets ORT pick one thread per core, which measured fastest; an explicit
         # value is honoured so a busy robot can be told to use fewer.
         opts.intra_op_num_threads = int(num_threads or 0)
-        providers = (["CUDAExecutionProvider", "CPUExecutionProvider"]
-                     if provider in ("cuda", "gpu") else ["CPUExecutionProvider"])
-        self._session = ort.InferenceSession(model_path, opts, providers=providers)
+        self._session = ort.InferenceSession(
+            model_path, opts, providers=["CPUExecutionProvider"])
         actual = self._session.get_providers()
 
         styles = np.fromfile(voices_path, dtype=np.float32)

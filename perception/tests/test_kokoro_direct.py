@@ -152,3 +152,48 @@ def test_the_japanese_table_encodes_with_no_unknowns():
                  "ワタシハシャオ・ファントモウシマス", "ナニカオテツダイシマショウカ"]:
         _, unknown = direct.encode(ja_phonemes.kana_to_phonemes(text))
         assert unknown == [], (text, unknown)
+
+
+# ── the session must never ask for CUDA ───────────────────────────────────────
+
+def test_the_session_is_built_on_cpu_and_cannot_be_asked_for_cuda(tmp_path,
+                                                                  monkeypatch):
+    """A CUDA session here collides with sherpa's; the collision is not order-fixable.
+
+    Two ONNX Runtime builds share one `libonnxruntime_providers_cuda.so` on jp6.1,
+    and whichever of them builds the *second* CUDA session on this graph dies with
+    "Could not find OrtValue with name '/Squeeze_2_output_0'". Measured both ways
+    round on Orin 6.
+
+    This shipped once. The code requested CUDA while a stale docstring asserted the
+    request was inert because the wheel was CPU-only — true until the Dockerfile
+    started installing the GPU wheel, and untested either way. So assert the two
+    things that keep it from coming back: the providers list, and the absence of any
+    argument that could reintroduce a device.
+    """
+    import inspect
+
+    signature = inspect.signature(kd.KokoroDirect.__init__)
+    assert "provider" not in signature.parameters, (
+        "KokoroDirect must expose no device argument — see its docstring for why")
+
+    (tmp_path / "tokens.txt").write_text("a 1\n", encoding="utf-8")
+    (tmp_path / "voices.bin").write_bytes(
+        b"\0" * (kd.STYLE_LENGTHS * kd.STYLE_DIM * 4))
+    (tmp_path / "model.onnx").write_bytes(b"not a real model")
+
+    seen = {}
+
+    class _Session:
+        def __init__(self, path, opts, providers):
+            seen["providers"] = providers
+
+        def get_providers(self):
+            return seen["providers"]
+
+    fake_ort = type("ort", (), {"SessionOptions": lambda: type(
+        "o", (), {"intra_op_num_threads": 0})(), "InferenceSession": _Session})
+    monkeypatch.setitem(sys.modules, "onnxruntime", fake_ort)
+
+    kd.KokoroDirect(str(tmp_path), "model.onnx")
+    assert seen["providers"] == ["CPUExecutionProvider"], seen

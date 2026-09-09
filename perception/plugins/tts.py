@@ -992,14 +992,19 @@ class KokoroTTSAdapter(TTSAdapter):
     def _direct(self):
         """The phoneme-driven ONNX runtime, built on first Japanese utterance.
 
-        A second session on the same weights, so it costs another CUDA context —
-        which is why it is lazy and only Japanese pays for it. Everything else keeps
-        using sherpa, which is correct for those languages and better tested.
+        A second session on the same weights, so it is lazy and only Japanese pays
+        for it. Everything else keeps using sherpa, which is correct for those
+        languages and better tested.
+
+        It is deliberately given no device: `KokoroDirect` is CPU-only by
+        construction, because a second *CUDA* session on this graph collides with
+        sherpa's inside the shared CUDA provider library. That is not a tuning
+        choice — see the reasoning and the measurements in `kokoro_direct.py`.
         """
         if self._direct_runtime is None:
             from plugins.kokoro_direct import KokoroDirect
             self._direct_runtime = KokoroDirect(
-                self._model_dir, self._weights_name, provider=self._provider)
+                self._model_dir, self._weights_name)
         return self._direct_runtime
 
     def synthesize(self, text: str) -> bytes:

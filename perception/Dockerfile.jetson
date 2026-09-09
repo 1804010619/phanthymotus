@@ -454,14 +454,34 @@ RUN . /etc/jetpack.env && \
 # Neither half works alone — see the measurements on the wheel-selection step above.
 # Do not "simplify" this away and go back to the PyPI CPU wheel: that has no bridge
 # at all, and this copy then silently does nothing while the plugin logs
-# "device='gpu' ... falling back to cpu".
+# "device='gpu' ... falling back to cpu". Re-confirmed by running the same probe in
+# both images, with and without sherpa_onnx imported first — the import order makes
+# no difference, so this is not something symbol interposition can rescue:
+#
+#   release.260910.84b5450 (PyPI wheel + copy)  compiled-in ['Azure','CPU']  18.5 ms
+#   release.260910.10266c2 (COS wheel + copy)   compiled-in [...,'CUDA',...]  6.0 ms
+#
+# The price of the copy, and it is a real one: the standalone runtime (1.18.0) and
+# sherpa's (**1.18.1**, not 1.18.0 — check `sherpa_onnx/lib/`) now share a single
+# provider library, since the soname collides and the first dlopen wins. They
+# coexist fine for separate graphs — face keeps its 3x with a sherpa CUDA session
+# live — but a *second* CUDA session on the **Kokoro** graph fails in whichever
+# runtime did not load the provider, symmetrically:
+#
+#   sherpa's session first  -> the standalone one fails, naming /home/tian/Yxh/...
+#   the standalone first    -> sherpa's fails, naming /home/yifanl/...
+#   both: "Error mapping output names: Could not find OrtValue '/Squeeze_2_output_0'"
+#
+# That is why plugins/kokoro_direct.py is CPU-only by construction and takes no
+# device argument. Anything else that wants a standalone CUDA session on a graph
+# sherpa also loads has the same constraint.
 RUN . /etc/jetpack.env && \
     if [ "${JP_VERSION}" = "61" ]; then \
         SHERPA_LIB="/usr/local/lib/python3.10/dist-packages/sherpa_onnx/lib" && \
         ORT_CAPI="/usr/local/lib/python3.10/dist-packages/onnxruntime/capi" && \
         cp "${SHERPA_LIB}/libonnxruntime_providers_cuda.so" "${ORT_CAPI}/" && \
         cp "${SHERPA_LIB}/libonnxruntime_providers_shared.so" "${ORT_CAPI}/" && \
-        echo "[build] JP6.1: Enabled GPU using sherpa-onnx's onnxruntime 1.18.0 (cuDNN 9)"; \
+        echo "[build] JP6.1: GPU enabled via sherpa-onnx's cuDNN-9 CUDA provider"; \
     fi
 
 # ── Thai TTS frontend deps ────────────────────────────────────────
