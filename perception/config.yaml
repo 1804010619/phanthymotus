@@ -57,10 +57,30 @@ plugins:
     speed: 1.0
     warmup: true
     max_chunk_tokens: 256
-    # matcha-zh-en / mms-th only — vits2-zh-en runs on TensorRT and ignores this.
-    # Matcha is fp32, so both devices load the same weights and only the provider
-    # changes; gpu measured ~4.3x faster at num_threads=2.
+    # matcha-zh-en / mms-th / kokoro-multi only — vits2-zh-en runs on TensorRT and
+    # ignores this. Matcha is fp32, so both devices load the same weights and only
+    # the provider changes; gpu measured ~4.3x faster at num_threads=2.
+    #
+    # Left unset for kokoro-multi on purpose: it is the one engine whose two
+    # devices load *different weight files* (fp32 on gpu, int8 on cpu, because the
+    # CUDA provider falls back per node on quantised ops), so it carries its own
+    # default in ENGINE_DEVICE_DEFAULTS — gpu. An explicit `cpu` here would apply
+    # to every engine and quietly override that.
     device: cpu
+    # kokoro-multi only: pronunciation language. One of en-us, en-gb, zh, ja, es,
+    # fr, it, pt-br, hi — every language Kokoro v1.0 has voices for. Read per
+    # generate() call, so changing it costs nothing.
+    #
+    # It selects the espeak voice for the NON-Chinese runs of the text; Chinese is
+    # phonemised from lexicon-zh.txt on every setting, so mixed zh/en code-switches
+    # on its own and `zh` deliberately maps to an English voice (that only affects
+    # how embedded Latin is read). Pick a speaker_id from the same language, or the
+    # voice's accent will not match: 0-19 en-us, 20-27 en-gb, 28-29/53 es, 30 fr,
+    # 31-34 hi, 35-36 it, 37-41 ja, 42-44 pt-br, 45-52 zh.
+    #
+    # Only en-us / en-gb / zh have been listened to — sherpa-onnx documents English
+    # and Chinese as this model's supported pair, so the rest are best-effort.
+    language: en-us
 
   vop:
     enabled: true

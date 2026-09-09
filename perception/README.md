@@ -90,6 +90,7 @@ and `mms-th` both run on sherpa-onnx, so `sherpa_onnx` identified neither.
 | `vits2-zh-en` (default) | VITS2 16 kHz | 中 / 英, code-switching | TensorRT | `/models/vits2` |
 | `matcha-zh-en` | matcha-icefall-zh-en + vocos | 中 / 英 | ONNX Runtime | `/models/sherpa-onnx/tts` |
 | `mms-th` | MMS-TTS-THAI-MALE-NARRATOR | ไทย only | ONNX Runtime | `/models/mms-th` |
+| `kokoro-multi` | Kokoro-82M v1.0 | 英 / 中 / 日 / 西 / 法 / 意 / 葡 / 印地, code-switching | ONNX Runtime | `/models/kokoro-multi/<device>` |
 
 `vits2_trt` and `sherpa_onnx` still resolve, via `ENGINE_ALIASES` in
 `plugins/tts.py`, and underscores fold to hyphens first so `vits2_zh_en` works too.
@@ -100,6 +101,147 @@ unknown engine — so dropping them would put every existing TTS card into
 
 Only one engine is resident at a time. Switching disposes the outgoing one's nodes
 first, because two live publishers on one audio topic play both voices at once.
+
+### `kokoro-multi`, the multilingual voice
+
+[Kokoro-82M](https://huggingface.co/hexgrad/Kokoro-82M) **v1.0**, added because
+`vits2-zh-en` is a Chinese male voice whose English is the weaker half, and there was
+no engine good enough to put in front of an English-speaking audience. 82 M
+parameters, Apache-2.0, and it needs no new framework: sherpa-onnx already ships
+`OfflineTtsKokoroModelConfig`, so this engine added **no Dockerfile change** — only
+Python, a COS artefact and tests.
+
+Named `kokoro-multi`, not `kokoro-zh-en`: it has voices for nine languages, and a
+name claiming two would mislead every operator reading the dropdown. `multi` is also
+what upstream calls the release (`kokoro-multi-lang-v1_0`).
+
+**Language is a runtime dropdown, and switching it is free.** `tts_language`
+(`plugins.tts.language` in `config.yaml`) takes `en-us`, `en-gb`, `zh`, `ja`, `es`,
+`fr`, `it`, `pt-br` or `hi`. sherpa-onnx reads it from
+`GenerationConfig.extra["lang"]` on *every* `generate()` call, so it is a scale on
+the resident model exactly like `speed` — it is deliberately **absent from
+`_session_keys`**, because putting it there would tear down and reload a 310 MB fp32
+CUDA session every time someone changed the dropdown. Verified on the shipped wheels
+for both Python ABIs (cp38/jp5.11 and cp310/jp6.1): `extra` accepts a plain dict and
+round-trips.
+
+**What the field actually selects is the espeak-ng voice for the *non-Chinese* runs
+of the text.** Chinese is phonemised from `lexicon-zh.txt` on every setting, because
+that branch of sherpa-onnx's frontend never consults `lang`. Two consequences:
+
+- Mixed zh/en in one sentence code-switches on its own, with no Python-side
+  detection — `KokoroMultiLangLexicon` splits the text on Chinese vs non-Chinese
+  character runs and phonemises each separately.
+- **`zh` maps to an English espeak voice on purpose**, and is not redundant with
+  `en-us`: it only decides how *embedded Latin* in a Chinese sentence is read, and
+  English is the right answer. Digits are already converted to Chinese characters
+  upstream by the ZH rule FSTs.
+
+**The espeak voice names in `LANGUAGE_VOICES` are measured, not guessed.** Getting
+one wrong fails in two ways, both silent on the robot:
+
+| configured | espeak voice | what a guess did |
+|---|---|---|
+| `en-gb` | `en-gb-x-rp` | plain `en-GB` is **not a voice espeak-ng ships** → "Failed to set eSpeak-ng voice", **no audio at all** |
+| `pt-br` | `pt-BR` | — |
+| `fr` | `fr` | `fr-FR` **silently truncates**: 18280 samples where `fr` gave 63277 on the same sentence, nothing raised, nothing logged |
+
+espeak matching is case-insensitive, which is why `en-us` resolves to `en-US` and
+made `en-gb` look like it ought to work. Hence a closed map rather than passing the
+configured label through, and a construction-time probe that refuses to load if the
+resolved voice produces no audio.
+
+**Language and voice are independent.** `lang` picks the pronunciation;
+`speaker_id` picks the timbre. 54 voices: **0–19 `en-us`, 20–27 `en-gb`, 28–29 + 53
+`es`, 30 `fr`, 31–34 `hi`, 35–36 `it`, 37–41 `ja`, 42–44 `pt-br`, 45–52 `zh`**.
+`af_heart` (3) and `af_bella` (2) are the highest-graded English voices. A voice from
+a *different* language is legal and gives an accented result, so the adapter warns
+rather than refuses — except for `zh`, which is exempt in both directions because a
+Chinese voice with `en-us` is the correct Chinese setup, not a mistake.
+
+> **Only `en-us`, `en-gb` and `zh` have been listened to.** sherpa-onnx's own
+> documentation says of this model "it is a multi-lingual model, but we only add
+> English and Chinese support for it" — Kokoro was trained with misaki G2P, and for
+> the other six the espeak phoneme set is not guaranteed to be the one the acoustic
+> model learned. All nine produce audio of a plausible length on device; treat the
+> rest as best-effort until someone who reads the language has heard them.
+
+#### Measured on Orin 6 (jp6.1), fp32 on gpu
+
+| lang | sid | audio | synth | RTF | resample |
+|---|---|---|---|---|---|
+| `en-us` | 3 | 8.46 s | 0.78 s | **0.092** | 26 ms |
+| `en-gb` | 26 | 10.62 s | 0.85 s | 0.080 | 36 ms |
+| `zh` | 47 | 9.02 s | 0.89 s | 0.099 | 27 ms |
+| `ja` | 37 | 6.44 s | 0.54 s | 0.085 | 18 ms |
+| `es` / `fr` / `it` / `pt-br` / `hi` | — | ~4-6 s | 0.31-0.44 s | 0.070-0.083 | 11-22 ms |
+
+Session build 2.6 s (well inside `ENGINE_SWITCH_WAIT_S = 20`), warmup probe 0.93 s,
+and the resampler costs 3-4% of synthesis — not worth a polyphase rewrite.
+
+**`cpu` is not viable for streaming.** int8 on the same box measured **RTF 1.6** —
+slower than real time, so the audio cannot keep up with the frame clock. That is why
+`ENGINE_DEVICE_DEFAULTS` puts this engine on **gpu**; `cpu` exists for hosts with no
+CUDA wheel and for offline synthesis, not for live speech. (Note the dashboard form
+still renders the schema's `cpu` default, since JSON Schema cannot express a
+per-engine one.)
+
+**It is the only engine whose sample rate is not the pipeline's** — Kokoro is
+24 kHz, everything downstream is 16 kHz, and `AudioChunk` has no way to be told
+otherwise (the rate lives inside the `audio/pcm-16k` format string, and the
+publisher's pacing derives from `SAMPLE_RATE`). So the adapter downsamples
+internally, in `utils/resample.py`: 24000 → 16000 is exactly 2:3, so it upsamples by
+2, lowpasses at 8 kHz with a 97-tap Blackman-windowed sinc, and decimates by 3 —
+numpy only, because scipy would pull its own numpy pin and every plugin
+requirements file here exists partly to prevent that. Nothing outside the adapter
+knows Kokoro is 24 kHz.
+
+Checked against `scipy.signal.resample_poly` on a real 8.5 s utterance: correlation
+**0.999997**, peak error −39.6 dB, and the residual confined to the 7–8 kHz
+transition band (error/signal 3.8e-3 there against ~1e-6 below 6 kHz). The ~2-5% DC
+offset in the output is **Kokoro's own** — the raw 24 kHz is +0.0236 and the
+resampled 16 kHz is +0.0236, which is what a unity-DC-gain lowpass should do.
+
+Two details in that resampler are load-bearing and are pinned by
+`tests/test_resample.py`: the whole utterance is resampled *before* being framed
+(doing it per 3200-byte frame restarts the filter every 100 ms, which is ten clicks
+a second), and clipping happens in float before the int16 cast (`astype(np.int16)`
+on an out-of-range value wraps, turning an overshoot into a full-scale *opposite*
+polarity tick on the loudest part of the utterance). A third was found by those
+tests rather than by ear: `np.convolve(mode="same")` returns
+`max(len(signal), len(taps))`, so an utterance shorter than the 97-tap filter came
+back padded out to 97 samples of filter tail — which a punctuation-only chunk hits.
+
+**`device` selects different weight files here, not just a provider.** `gpu` gets
+fp32 and `cpu` gets int8, because `provider_for_device` refuses int8 on CUDA (the
+CUDA provider falls back to CPU per quantised node). So the two are separate pinned
+archives that unpack into `/models/kokoro-multi/gpu` and `.../cpu` — flipping the
+field downloads the other one and leaves the first in place.
+
+The release is repacked from sherpa-onnx's `kokoro-multi-lang-v1_0` by
+`tools/repack_kokoro_v1_0.py` and mirrored to COS, pinned by size + SHA256 like
+every other model here. Two things upstream ships are dropped:
+
+- `lexicon-us-en.txt` / `lexicon-gb-en.txt` (11.6 MB) — **unreachable.** For
+  non-Chinese runs sherpa-onnx short-circuits to espeak whenever `lang` is
+  non-empty, and `lang` falls back to the model's own `meta_data.voice` (`"en-us"`)
+  when unset, so it never is. English pronunciation here comes from espeak-ng, not
+  from a dictionary.
+- `dict/` (14 MB, the jieba dictionary) — ignored since sherpa-onnx v1.12.15, which
+  logs "you don't need to provide dict_dir" if you pass one.
+
+`lexicon-zh.txt` stays: the Chinese branch does *not* consult `lang`, so it is
+genuinely used. The three ZH rule FSTs stay for number/date/phone normalisation.
+Result: **~358 MB unpacked on gpu, ~157 MB on cpu** (from 384 MB / 183 MB upstream).
+
+`_validate_kokoro_manifest` checks the release *before* `OfflineTts` is
+constructed, and one of those checks is not optional: for a `version >= 2` Kokoro
+model with **both `lexicon` and `lang` empty**, sherpa-onnx's `InitFrontend` calls
+`SHERPA_ONNX_EXIT(-1)` — a **process exit**, so `main.py`'s try/except around the
+TTS plugin cannot turn it into a card in `state: error`; it takes ASR, VOP and OCR
+down with it. Same hazard `_validate_thai_manifest` exists for. It also refuses a
+`model_version` of 1 (v0.19 ignores `lang`, so the dropdown would be visibly present
+and silently inert) and any `sample_rate` other than 24000.
 
 ### `mms-th`, and why it cannot be handed raw text
 

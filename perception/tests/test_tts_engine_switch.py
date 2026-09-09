@@ -310,17 +310,28 @@ def test_each_engine_gets_its_own_model_dir(_fake_engines):
     assert (tts.ENGINE_MODEL_DIRS["mms-th"]
             != tts.ENGINE_MODEL_DIRS["matcha-zh-en"])
 
+    plugin.dispatch("tts", {"action": "config", "tts_engine": "kokoro-multi"})
+    assert _wait_until(lambda: "kokoro-multi" in _fake_engines)
+    assert (_fake_engines["kokoro-multi"].cfg["model_dir"]
+            == tts.ENGINE_MODEL_DIRS["kokoro-multi"])
+    # Its own tree too. Kokoro's archives land in `<dir>/gpu` and `<dir>/cpu`
+    # beneath it, so sharing a directory with another engine would put two
+    # independent ensure_verified_archive installs in one tree.
+    assert len(set(tts.ENGINE_MODEL_DIRS.values())) == len(tts.ENGINE_MODEL_DIRS)
+
 
 # ── legacy engine names (upgrade regression) ─────────────────────────────────
 
 def test_engines_are_named_after_the_model_not_the_runtime():
     """`<model>-<languages>`, the shape asr_model already uses.
 
-    Two engines run on sherpa-onnx, so a runtime name identifies neither. And the
-    dashboard renders the raw enum string, so this is what an operator reads in
-    the dropdown next to the ASR one — a second convention would be visible.
+    Three engines run on sherpa-onnx, so a runtime name identifies none of them.
+    And the dashboard renders the raw enum string, so this is what an operator
+    reads in the dropdown next to the ASR one — a second convention would be
+    visible.
     """
-    assert set(tts.TTS_ENGINES) == {"vits2-zh-en", "matcha-zh-en", "mms-th"}
+    assert set(tts.TTS_ENGINES) == {"vits2-zh-en", "matcha-zh-en", "mms-th",
+                                    "kokoro-multi"}
     assert tts.DEFAULT_TTS_ENGINE == "vits2-zh-en"
     for engine in tts.TTS_ENGINES:
         assert "_" not in engine, "asr_model uses hyphens; do not mix separators"
