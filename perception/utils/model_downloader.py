@@ -853,15 +853,18 @@ def ensure_thai_tts_model(model_dir: str) -> str:
 # inside the archive.
 KOKORO_MODEL_BASE = os.environ.get("KOKORO_MODEL_BASE_URL", COS_BASE)
 KOKORO_MODEL_ARCHIVES = {
+    # Verified by re-downloading the uploaded object and hashing that copy, not the
+    # local file that was uploaded — the point of the pin is to catch a bad
+    # transfer, and hashing the source cannot. (Same note as THAI_TTS_ARCHIVE.)
     "gpu": {
         "archive": "kokoro-multi-v1_0-24k-fp32.tar.gz",
-        "size": 0,
-        "sha256": "",
+        "size": 337021832,
+        "sha256": "519afd6a443c5eb4c9c75d4f677c43beb0aa56f33c73c063d0456d4ceeb58156",
     },
     "cpu": {
         "archive": "kokoro-multi-v1_0-24k-int8.tar.gz",
-        "size": 0,
-        "sha256": "",
+        "size": 124706598,
+        "sha256": "ccf70f4fd809a1c697333c3a036c9d94799f1620aedf932271ea163cd72b97fc",
     },
 }
 
