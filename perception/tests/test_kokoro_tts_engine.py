@@ -304,6 +304,24 @@ def test_every_language_maps_to_an_espeak_voice_verified_on_device():
     assert "fr-FR" not in adapter.LANGUAGE_VOICES.values()
 
 
+def test_japanese_uses_a_latin_script_voice_on_purpose():
+    """`ja` must NOT map to espeak's `ja`, and that looks wrong until you measure it.
+
+    Kokoro's token table is the misaki inventory and lacks `ʑ`, which espeak-ja emits
+    for じ. sherpa drops what it cannot look up — 12 phonemes from one sentence,
+    audible as holes. plugins/ja_text_norm.py emits romaji instead, so the voice is
+    picked for its phoneme inventory rather than its language:
+
+        kana   + ja     12 dropped,  4.81 s
+        romaji + it      0 dropped,  4.60 s
+    """
+    voice = tts.KokoroTTSAdapter.LANGUAGE_VOICES["ja"]
+    assert voice != "ja", (
+        "espeak-ja emits phonemes Kokoro cannot represent; ja must use a "
+        "Latin-script voice against romanised text")
+    assert voice in ("it", "es", "en-us"), voice
+
+
 def test_chinese_maps_to_an_english_espeak_voice_on_purpose():
     """Not a bug and not redundant with en-us.
 

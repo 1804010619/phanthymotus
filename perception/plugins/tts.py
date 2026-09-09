@@ -677,7 +677,29 @@ class KokoroTTSAdapter(TTSAdapter):
         "en-us": "en-us",       # ids 0-19   af_*/am_*
         "en-gb": "en-gb-x-rp",  # ids 20-27  bf_*/bm_*
         "zh": "en-us",          # ids 45-52  zf_*/zm_*  (see above)
-        "ja": "ja",             # ids 37-41  jf_*/jm_*
+        # NOT "ja", and this is the one entry that must not be "corrected".
+        #
+        # Kokoro's 114-token table is the misaki phoneme inventory — it has
+        # `ʣ ʥ ʦ ʨ ᵝ`, so the model was trained to speak Japanese — but it does not
+        # contain `ʑ`, which is exactly what espeak-ja emits for じ, along with the
+        # combining diacritics U+0308 and U+031E. sherpa phonemises with espeak and
+        # looks the result up in that table, silently discarding whatever is missing.
+        # Measured on Orin 6: 12 phonemes dropped from one sentence, and the audible
+        # holes made it unintelligible.
+        #
+        # plugins/ja_text_norm.py therefore emits **romaji**, and this picks the
+        # espeak voice by its phoneme inventory rather than by its language. Measured
+        # on the same sentence, dropped-phoneme count and duration:
+        #
+        #     kana    + ja      12 dropped   4.81 s
+        #     romaji  + ja       0 dropped  14.78 s   (spelled out letter by letter)
+        #     romaji  + it       0 dropped   4.60 s
+        #     romaji  + es       0 dropped   4.83 s
+        #     romaji  + en-us    0 dropped   5.19 s
+        #
+        # Italian of the three: five pure vowels like Japanese, and native geminate
+        # consonants for っ (`nikki`), which Spanish lacks and English would reduce.
+        "ja": "it",             # ids 37-41  jf_*/jm_*
         "es": "es",             # ids 28-29, 53  ef_*/em_*
         "fr": "fr",             # id  30     ff_siwis
         "it": "it",             # ids 35-36  if_*/im_*

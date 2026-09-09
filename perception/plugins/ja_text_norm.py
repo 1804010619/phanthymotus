@@ -172,14 +172,22 @@ def normalize_dates(text: str) -> str:
     Runs before Janome because Janome would give `月` the isolated reading `ツキ`
     and `日` the reading `ニチ`, so `10月1日` came out `10ツキ1ニチ` where a speaker
     says `ジュウガツツイタチ`.
+
+    Components are joined with **spaces**. Running before Janome means the result is
+    one unknown token to it, so nothing downstream will ever break the pieces apart —
+    `ニセンニジュウロクネンジュウガツツイタチ` reached espeak as a single 33-character
+    "word" and was read as one. The spaces are the only chance to say otherwise.
     """
     text = _DATE_FULL.sub(
-        lambda m: (read_number(int(m.group(1))) + "ネン"
-                   + _read_month(int(m.group(2))) + _read_day(int(m.group(3)))), text)
+        lambda m: (read_number(int(m.group(1))) + "ネン "
+                   + _read_month(int(m.group(2))) + " "
+                   + _read_day(int(m.group(3)))), text)
     text = _DATE_MD.sub(
-        lambda m: _read_month(int(m.group(1))) + _read_day(int(m.group(2))), text)
+        lambda m: _read_month(int(m.group(1))) + " " + _read_day(int(m.group(2))),
+        text)
     text = _TIME.sub(
-        lambda m: _read_hour(int(m.group(1))) + _read_minute(int(m.group(2))), text)
+        lambda m: _read_hour(int(m.group(1))) + " " + _read_minute(int(m.group(2))),
+        text)
     text = _YEAR.sub(lambda m: read_number(int(m.group(1))) + "ネン", text)
     text = _MONTH.sub(lambda m: _read_month(int(m.group(1))), text)
     text = _DAY.sub(lambda m: _read_day(int(m.group(1))), text)
@@ -208,6 +216,172 @@ def has_kanji(text: str) -> bool:
     return bool(_CJK.search(text))
 
 
+# ── katakana -> Hepburn romaji ────────────────────────────────────────────────
+#
+# The last stage, and the one that makes Japanese audible at all.
+#
+# Kana are *not* fed to the model. Kokoro's 114-token table is the misaki phoneme
+# inventory — it has `ʣ ʥ ʦ ʨ ᵝ`, so the model was trained to speak Japanese — but it
+# does **not** contain `ʑ`, which is exactly what espeak-ja emits for じ, along with
+# combining diacritics U+0308 and U+031E. sherpa phonemises with espeak and looks the
+# result up in that misaki-derived table, and silently discards whatever is missing.
+# Measured on Orin 6: 12 phonemes dropped from one sentence, kana or hiragana alike.
+# Those drops are audible holes, and they made the output unintelligible.
+#
+# Romanising instead and phonemising with a Latin-script voice drops **nothing** —
+# measured 0 for `it`, `es` and `en-us`, at the same duration as the kana version
+# (4.60-4.83 s vs 4.81 s), so it reads words rather than spelling them out. Feeding
+# romaji to espeak-`ja` does *not* work: it spells the letters, 14.78 s for the same
+# sentence.
+#
+# Hand-rolled rather than via `jaconv`: one fewer dependency, and the romanisation is
+# the tuning surface for how the chosen voice reads it (`tsu` not `tu`, doubled
+# vowels not digraphs). A library would hide exactly the decisions that matter here.
+# Same call plugins/thai_frontend.py made.
+
+_ROMAJI_DIGRAPHS = {
+    "キャ": "kya", "キュ": "kyu", "キョ": "kyo", "シャ": "sha", "シュ": "shu",
+    "ショ": "sho", "チャ": "cha", "チュ": "chu", "チョ": "cho", "ニャ": "nya",
+    "ニュ": "nyu", "ニョ": "nyo", "ヒャ": "hya", "ヒュ": "hyu", "ヒョ": "hyo",
+    "ミャ": "mya", "ミュ": "myu", "ミョ": "myo", "リャ": "rya", "リュ": "ryu",
+    "リョ": "ryo", "ギャ": "gya", "ギュ": "gyu", "ギョ": "gyo", "ジャ": "ja",
+    "ジュ": "ju", "ジョ": "jo", "ヂャ": "ja", "ヂュ": "ju", "ヂョ": "jo",
+    "ビャ": "bya", "ビュ": "byu", "ビョ": "byo", "ピャ": "pya", "ピュ": "pyu",
+    "ピョ": "pyo",
+    # Katakana-only combinations, common in loanwords and names (シャオ・ファン).
+    "ファ": "fa", "フィ": "fi", "フェ": "fe", "フォ": "fo", "ヴァ": "va",
+    "ヴィ": "vi", "ヴェ": "ve", "ヴォ": "vo", "ウィ": "wi", "ウェ": "we",
+    "ウォ": "wo", "ティ": "ti", "ディ": "di", "トゥ": "tu", "ドゥ": "du",
+    "チェ": "che", "ジェ": "je", "シェ": "she",
+}
+
+_ROMAJI = {
+    "ア": "a", "イ": "i", "ウ": "u", "エ": "e", "オ": "o",
+    "カ": "ka", "キ": "ki", "ク": "ku", "ケ": "ke", "コ": "ko",
+    "サ": "sa", "シ": "shi", "ス": "su", "セ": "se", "ソ": "so",
+    "タ": "ta", "チ": "chi", "ツ": "tsu", "テ": "te", "ト": "to",
+    "ナ": "na", "ニ": "ni", "ヌ": "nu", "ネ": "ne", "ノ": "no",
+    "ハ": "ha", "ヒ": "hi", "フ": "fu", "ヘ": "he", "ホ": "ho",
+    "マ": "ma", "ミ": "mi", "ム": "mu", "メ": "me", "モ": "mo",
+    "ヤ": "ya", "ユ": "yu", "ヨ": "yo",
+    "ラ": "ra", "リ": "ri", "ル": "ru", "レ": "re", "ロ": "ro",
+    "ワ": "wa", "ヲ": "o", "ン": "n",
+    "ガ": "ga", "ギ": "gi", "グ": "gu", "ゲ": "ge", "ゴ": "go",
+    "ザ": "za", "ジ": "ji", "ズ": "zu", "ゼ": "ze", "ゾ": "zo",
+    "ダ": "da", "ヂ": "ji", "ヅ": "zu", "デ": "de", "ド": "do",
+    "バ": "ba", "ビ": "bi", "ブ": "bu", "ベ": "be", "ボ": "bo",
+    "パ": "pa", "ピ": "pi", "プ": "pu", "ペ": "pe", "ポ": "po",
+    "ヴ": "vu",
+    # Small kana left stranded by an unmatched digraph — better a vowel than a hole.
+    "ァ": "a", "ィ": "i", "ゥ": "u", "ェ": "e", "ォ": "o",
+    "ャ": "ya", "ュ": "yu", "ョ": "yo",
+    "・": " ",
+}
+
+_VOWELS = "aiueo"
+_SOKUON = "ッ"
+_CHOONPU = "ー"
+
+# Readings a dictionary gives as written rather than as spoken. Applied only to
+# tokens Janome tags 助詞 (particle), so the は inside a word like コンニチハ is not
+# touched — that one is handled by _GREETINGS below.
+_PARTICLE_READINGS = {"ハ": "ワ", "ヘ": "エ"}
+
+# Lexicalised exceptions: single tokens whose dictionary reading keeps a は that is
+# nevertheless pronounced わ. These are greetings, and they are frequent enough in a
+# guide robot's script that getting them wrong is immediately noticeable.
+_GREETINGS = {"コンニチハ": "コンニチワ", "コンバンハ": "コンバンワ"}
+
+# Tokens that must not be pushed away from the word before them.
+_LEADING_PUNCT = re.compile(r"^[、。！？，．!?,.\)）」』]")
+
+# Tokens that are not words but the tail of the previous one. Janome splits the
+# volitional `マショウ` into `マショ` + `ウ`, and `ー` can arrive alone; a space
+# before either invents a boundary and blocks the long-vowel rule.
+_VOWEL_CONTINUATIONS = {"ウ", "ー"}
+
+# Full-width punctuation carries no meaning to a Latin-script espeak voice, which
+# needs ASCII to find sentence boundaries — without this it runs the whole utterance
+# together as one breath group.
+_PUNCT_TO_ASCII = {"。": ".", "、": ",", "！": "!", "？": "?", "：": ":",
+                   "；": ";", "（": "(", "）": ")", "「": '"', "」": '"',
+                   "『": '"', "』": '"', "・": " "}
+
+
+def _to_hiragana(text: str) -> str:
+    """Katakana -> hiragana, so one table serves both."""
+    return "".join(chr(ord(c) - 0x60) if 0x30A1 <= ord(c) <= 0x30F6 else c
+                   for c in text)
+
+
+def _to_katakana(text: str) -> str:
+    return "".join(chr(ord(c) + 0x60) if 0x3041 <= ord(c) <= 0x3096 else c
+                   for c in text)
+
+
+def to_romaji(text: str) -> str:
+    """Kana -> Hepburn romaji, with gemination and long vowels spelled out.
+
+    Three rules beyond the table, each chosen for how a Latin-script espeak voice
+    will read the result rather than for orthographic tradition:
+
+    - `ッ` doubles the next consonant (`ツイタチ` stays `tsuitachi`, but `ニッキ`
+      becomes `nikki`). Italian reads doubled consonants as geminates natively,
+      which is what Japanese actually does with them.
+    - `ー` doubles the preceding vowel, and so does a vowel that simply repeats
+      (`キョウ` -> `kyoo`, not `kyou`). `ou` would be read as two syllables.
+    - `ン` is a bare `n`.
+    """
+    text = _to_katakana(text)
+    out = []
+    i = 0
+    while i < len(text):
+        pair = text[i:i + 2]
+        if pair in _ROMAJI_DIGRAPHS:
+            out.append(_ROMAJI_DIGRAPHS[pair])
+            i += 2
+            continue
+        ch = text[i]
+        if ch == _SOKUON:
+            # Double whatever consonant comes next; a trailing ッ is dropped.
+            nxt = text[i + 1:i + 3]
+            syllable = (_ROMAJI_DIGRAPHS.get(nxt)
+                        or _ROMAJI.get(text[i + 1:i + 2], ""))
+            if syllable and syllable[0] not in _VOWELS:
+                out.append(syllable[0])
+            i += 1
+            continue
+        if ch == _CHOONPU:
+            # Lengthen by repeating the vowel we just emitted.
+            if out and out[-1] and out[-1][-1] in _VOWELS:
+                out.append(out[-1][-1])
+            i += 1
+            continue
+        mapped = _ROMAJI.get(ch)
+        if mapped is None:
+            # Punctuation, digits, Latin — pass through, translating full-width
+            # punctuation to ASCII so espeak can find the sentence boundaries.
+            out.append(_PUNCT_TO_ASCII.get(ch, ch))
+            i += 1
+            continue
+        prev = out[-1][-1] if (out and out[-1]) else ""
+        if prev in _VOWELS and (mapped == prev
+                                or (ch == "ウ" and prev in "ou")):
+            # A long vowel, written two ways in kana and needing one spelling here:
+            #   オオ / ウウ  -> a repeated vowel
+            #   オウ         -> the ordinary way to write long o (キョウ = kyoo)
+            # Both become a doubled vowel, because `kyou` reads as two syllables in
+            # Italian and Spanish while `kyoo` reads as one long one.
+            out.append(prev)
+            i += 1
+            continue
+        out.append(mapped)
+        i += 1
+    # Collapse the runs of spaces the interpunct and token joining can leave.
+    return re.sub(r" {2,}", " ", "".join(out)).strip()
+
+
+
 class JapaneseFrontend:
     """Turns Japanese text into kana so it takes the espeak-ja path.
 
@@ -233,7 +407,25 @@ class JapaneseFrontend:
         log.info("[tts] Japanese frontend ready (janome)")
 
     def to_kana(self, text: str) -> str:
-        """Kanji -> katakana, via Janome's per-token readings."""
+        """Kanji -> katakana, via Janome's per-token readings.
+
+        Two readings are corrected here, because a dictionary gives the *written*
+        kana and Japanese pronounces these two differently as particles:
+
+            は as a particle -> ワ (wa), not ハ
+            へ as a particle -> エ (e),  not ヘ
+
+        `今日は` is `kyoo wa`, never `kyoo ha`. Janome tags the part of speech, so
+        this is a lookup rather than a guess — and it has to happen here, where the
+        tags exist, not in the romaji table, which sees only kana.
+
+        Tokens are joined with **spaces**, which matters more than it looks. Japanese
+        is written without them, but the romaji is read by a Latin-script espeak
+        voice, and one unbroken `kyoowanisennijuurokunenjuugatsutsuitachidesu` is a
+        single enormous "word" it has to guess the stress of. Measured on the
+        reported sentence: 7.62 s unspaced against 4.60 s spaced, for the same text.
+        Janome has already found the morpheme boundaries; this just keeps them.
+        """
         parts = []
         for token in self._tokenizer.tokenize(text):
             reading = token.reading
@@ -241,19 +433,36 @@ class JapaneseFrontend:
                 # Punctuation, Latin and anything out-of-dictionary keep their
                 # surface form; only kanji actually need converting.
                 reading = token.surface
+            if token.part_of_speech.split(",")[0] == "助詞":
+                reading = _PARTICLE_READINGS.get(reading, reading)
+            reading = _GREETINGS.get(reading, reading)
+            # No space before punctuation, or espeak reads the gap as a pause.
+            # Nor before a bare ウ / ー: Janome splits `マショウ` (mashoo) into
+            # `マショ` + `ウ`, and a space there both invents a word boundary that
+            # is not there and stops the long-vowel rule from firing, giving
+            # `masho u` instead of `mashoo`.
+            if (parts and not _LEADING_PUNCT.match(reading)
+                    and reading not in _VOWEL_CONTINUATIONS):
+                parts.append(" ")
             parts.append(reading)
         return "".join(parts)
 
     def normalize(self, text: str) -> str:
-        """Full pipeline: counters, then leftover numbers, then kanji."""
+        """Counters, then leftover numbers, then kanji->kana, then kana->romaji.
+
+        The output is **romaji, not kana**, and that is deliberate: see the
+        katakana->romaji section above. Kana handed to espeak-ja produce phonemes
+        Kokoro's token table cannot represent, and sherpa drops them, which is what
+        made the first version of this unintelligible.
+        """
         if not text:
             return text
-        out = self.to_kana(normalize_numbers(normalize_dates(text)))
-        if has_kanji(out):
-            # Not fatal — partial kana is still better than all-Mandarin — but it
-            # means those characters will be read in Chinese, so say so once.
+        kana = self.to_kana(normalize_numbers(normalize_dates(text)))
+        if has_kanji(kana):
+            # Not fatal — partial conversion still beats all-Mandarin — but those
+            # characters stay in the CJK range and will be read in Chinese.
             log.warning(
                 "[tts] Japanese text still contains kanji after conversion (%s); "
                 "those characters will be pronounced in Mandarin",
-                "".join(sorted(set(_CJK.findall(out))))[:20])
-        return out
+                "".join(sorted(set(_CJK.findall(kana))))[:20])
+        return to_romaji(kana)

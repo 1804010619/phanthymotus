@@ -75,7 +75,7 @@ def test_numbers_group_by_four_digits_not_three():
 def test_the_reported_date_reads_correctly():
     """2026年10月1日 was read in Mandarin, then as ツキ/ニチ. Both are wrong."""
     got = ja.normalize_dates("2026年10月1日")
-    assert got == "ニセンニジュウロクネンジュウガツツイタチ", got
+    assert got == "ニセンニジュウロクネン ジュウガツ ツイタチ", got
     assert "ツキ" not in got, "月 must be ガツ in a date, not the isolated ツキ"
     assert "1ニチ" not in got
 
@@ -108,10 +108,10 @@ def test_day_readings_are_native_for_the_first_ten_and_14_20_24(n, expected):
     assert ja.normalize_dates(f"{n}日") == expected
 
 
-def test_a_full_date_is_consumed_before_the_单_counters_match():
+def test_a_full_date_is_consumed_before_the_single_counters_match():
     """Ordering matters: 年月日 must not be eaten piecemeal by the 年 rule."""
-    assert ja.normalize_dates("2026年1月15日") == "ニセンニジュウロクネンイチガツジュウゴニチ"
-    assert ja.normalize_dates("10月1日") == "ジュウガツツイタチ"
+    assert ja.normalize_dates("2026年1月15日") == "ニセンニジュウロクネン イチガツ ジュウゴニチ"
+    assert ja.normalize_dates("10月1日") == "ジュウガツ ツイタチ"
 
 
 def test_times_use_their_own_irregulars():
@@ -119,7 +119,7 @@ def test_times_use_their_own_irregulars():
     assert ja.normalize_dates("9時") == "クジ"
     assert ja.normalize_dates("3分") == "サンプン"   # not サンフン
     assert ja.normalize_dates("10分") == "ジュップン"
-    assert ja.normalize_dates("4時30分") == "ヨジサンジュップン"
+    assert ja.normalize_dates("4時30分") == "ヨジ サンジュップン"
 
 
 @pytest.mark.parametrize("n,expected", [
@@ -148,7 +148,7 @@ def test_minute_irregulars_follow_the_trailing_digit(n, expected):
 
 
 def test_spacing_between_number_and_counter_is_tolerated():
-    assert ja.normalize_dates("2026 年 10 月 1 日") == "ニセンニジュウロクネンジュウガツツイタチ"
+    assert ja.normalize_dates("2026 年 10 月 1 日") == "ニセンニジュウロクネン ジュウガツ ツイタチ"
 
 
 # ── leftover numbers ──────────────────────────────────────────────────────────
@@ -178,6 +178,122 @@ def test_has_kanji_detects_what_would_reach_the_chinese_branch():
     assert not ja.has_kanji("キョウハニセンニジュウロクネン")
     assert not ja.has_kanji("こんにちは")
     assert not ja.has_kanji("")
+
+
+# ── katakana -> romaji ────────────────────────────────────────────────────────
+#
+# Kana are never fed to the model: espeak-ja emits phonemes Kokoro's token table
+# lacks (ʑ, U+0308, U+031E) and sherpa drops them, which is what made the first
+# version unintelligible. These assertions are auditable by anyone who reads
+# Japanese, which is the point — I cannot hear the result.
+
+@pytest.mark.parametrize("kana,expected", [
+    ("アイウエオ", "aiueo"),
+    ("カキクケコ", "kakikukeko"),
+    ("サシスセソ", "sashisuseso"),      # shi, not si
+    ("タチツテト", "tachitsuteto"),     # chi and tsu, not ti/tu
+    ("ハヒフヘホ", "hahifuheho"),       # fu, not hu
+    ("ザジズゼゾ", "zajizuzezo"),       # ji, not zi
+    ("ワヲン", "waon"),
+])
+def test_the_gojuon_uses_hepburn_spellings(kana, expected):
+    """Hepburn, because that is what a Latin-script voice reads correctly."""
+    assert ja.to_romaji(kana) == expected
+
+
+@pytest.mark.parametrize("kana,expected", [
+    ("キャキュキョ", "kyakyukyo"),
+    ("シャシュショ", "shashusho"),
+    ("チャチュチョ", "chachucho"),
+    ("ジャジュジョ", "jajujo"),
+    ("ファ", "fa"),          # loanword combinations, needed for names
+    ("ティ", "ti"),
+    ("シェ", "she"),
+])
+def test_digraphs_are_one_syllable(kana, expected):
+    assert ja.to_romaji(kana) == expected
+
+
+@pytest.mark.parametrize("kana,expected", [
+    ("ニッキ", "nikki"),        # sokuon doubles the next consonant
+    ("キッテ", "kitte"),
+    ("イッショ", "issho"),
+    ("ツイタチ", "tsuitachi"),  # no sokuon here; must not gain one
+])
+def test_sokuon_geminates_the_following_consonant(kana, expected):
+    """Doubled consonants are why Italian is the natural target voice."""
+    assert ja.to_romaji(kana) == expected
+
+
+@pytest.mark.parametrize("kana,expected", [
+    ("キョウ", "kyoo"),        # オウ is the ordinary long o — NOT kyou
+    ("トウキョウ", "tookyoo"),
+    ("ジュウ", "juu"),
+    ("オオキイ", "ookii"),
+    ("ラーメン", "raamen"),    # chounpu lengthens
+    ("コーヒー", "koohii"),
+])
+def test_long_vowels_are_doubled_not_written_as_digraphs(kana, expected):
+    """`kyou` reads as two syllables in Italian and Spanish; `kyoo` as one long one.
+
+    This is the rule that decides whether the output sounds Japanese or like
+    someone spelling out a transliteration.
+    """
+    assert ja.to_romaji(kana) == expected
+
+
+def test_punctuation_and_digits_pass_through():
+    assert ja.to_romaji("ABC123") == "ABC123"
+    assert ja.to_romaji("") == ""
+    # The interpunct between name parts becomes a space, or espeak runs them together.
+    assert ja.to_romaji("シャオ・ファン") == "shao fan"
+
+
+@pytest.mark.parametrize("kana,expected", [
+    ("コンニチワ！", "konnichiwa!"),
+    ("ソウデス。", "soodesu."),
+    ("アレ、コレ", "are,kore"),
+    ("ナニ？", "nani?"),
+])
+def test_full_width_punctuation_becomes_ascii(kana, expected):
+    """espeak finds sentence boundaries in ASCII punctuation, not in 。！？.
+
+    Left as full-width, the whole utterance is one breath group with no pauses.
+    """
+    assert ja.to_romaji(kana) == expected
+
+
+def test_the_particle_ha_is_read_wa():
+    """A dictionary gives the written kana; Japanese says something else.
+
+    `今日は` is `kyoo wa`, never `kyoo ha`. The correction happens in to_kana where
+    Janome's part-of-speech tags are available, so this test asserts the table those
+    tags select from — the wiring itself needs janome and is covered below.
+    """
+    assert ja._PARTICLE_READINGS["ハ"] == "ワ"
+    assert ja._PARTICLE_READINGS["ヘ"] == "エ"
+    assert ja.to_romaji("キョウワ") == "kyoowa"
+    assert ja._GREETINGS["コンニチハ"] == "コンニチワ"
+
+
+def test_the_reported_sentence_romanises():
+    """The whole pipeline's output, spelled out so a reader can check it."""
+    kana = "コンニチハ！キョウハニセンニジュウロクネンジュウガツツイタチデス。"
+    got = ja.to_romaji(kana)
+    assert "kyoo" in got, got
+    assert "nisen" in got and "nijuuroku" in got, got
+    assert "juugatsu" in got, got
+    assert "tsuitachi" in got, got
+    assert not any(0x3040 <= ord(c) <= 0x30FF for c in got), f"kana survived: {got}"
+
+
+def test_no_kana_survives_romanisation():
+    """Anything left in kana would reach espeak-ja and lose phonemes again."""
+    for kana in ["アイウエオ", "キャキュキョ", "ニッキ", "ラーメン",
+                 "シャオ・ファン", "ヴィヴァ"]:
+        got = ja.to_romaji(kana)
+        assert not any(0x3040 <= ord(c) <= 0x30FF for c in got), (kana, got)
+
 
 
 @janome_only
