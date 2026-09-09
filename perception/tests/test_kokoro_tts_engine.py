@@ -380,6 +380,52 @@ def test_a_manifest_without_the_speaker_map_is_refused(tmp_path):
         tts._validate_kokoro_manifest(str(tmp_path))
 
 
+def test_the_face_plugin_imports_onnxruntime_at_module_scope():
+    """Guards a one-line placement that keeps Kokoro working at all.
+
+    perception ends up with two builds of ONNX Runtime in one process: sherpa-onnx
+    bundles its own libonnxruntime.so, and the face plugin uses the standalone
+    `onnxruntime` package. They export the same symbols, so whichever arrives first
+    wins resolution for both. Measured on Orin 6: Kokoro synthesizes fine, the face
+    card starts, and every later utterance dies with
+
+        SequenceInsert ... TensorSeq::Add ... IsSameDataType(tensor) was false
+
+    with the real cause one line above it — espeak losing its voice
+    ("Unknown phoneme table: ''"), producing no phonemes, so the graph's Loop gets
+    an empty sequence.
+
+    Importing at module scope is enough on its own (no session needed, +27 MB,
+    0.19 s) because main.py imports plugins.face during startup, before any plugin
+    builds a model. Moving it back inside FaceAnalyzer.__init__ — which is where it
+    was, and which looks tidier — reintroduces the bug, and nothing else would
+    catch that.
+    """
+    import ast
+    import inspect
+
+    from plugins import face_runtime
+
+    tree = ast.parse(inspect.getsource(face_runtime))
+    module_level = set()
+    nested = set()
+    for node in tree.body:                      # module scope only
+        for sub in ast.walk(node):
+            if isinstance(sub, ast.Import):
+                names = {a.name for a in sub.names}
+                if isinstance(node, (ast.Import, ast.Try)):
+                    module_level |= names
+                else:
+                    nested |= names
+
+    assert "onnxruntime" in module_level, (
+        "plugins/face_runtime.py must import onnxruntime at module scope, before "
+        "sherpa-onnx creates any session — see the comment on that import")
+    assert "onnxruntime" not in nested, (
+        "onnxruntime is imported lazily somewhere in face_runtime; that defers the "
+        "library load past sherpa's and breaks kokoro-multi")
+
+
 def test_the_pipeline_rate_and_kokoro_rate_are_both_stated():
     """Two named constants, so neither is a magic number in the adapter."""
     assert tts.SAMPLE_RATE == 16000

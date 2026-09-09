@@ -35,6 +35,37 @@ from utils.cv2_compat import load_cv2
 from utils.model_downloader import ensure_face_model
 from utils.onnx_provider import ort_providers_for_device, warn_on_parked_cores
 
+# Imported at module scope, not lazily inside FaceAnalyzer, and that placement is
+# load-bearing.
+#
+# This process ends up with **two builds of ONNX Runtime**: sherpa-onnx bundles its
+# own libonnxruntime.so in its wheel, and this plugin uses the standalone
+# `onnxruntime` package. They export the same symbols, so whichever one is brought
+# in first wins symbol resolution for both. If sherpa gets there first and the
+# standalone library is loaded afterwards, sherpa's later inferences execute
+# against the wrong implementation and fail an internal type check:
+#
+#   Non-zero status code returned while running SequenceInsert node ...
+#   TensorSeq::Add ... IsSameDataType(tensor) was false
+#
+# Measured on Orin 6: Kokoro TTS synthesizes fine, the face card is then started,
+# and every subsequent Kokoro utterance fails — with the real cause visible one
+# line earlier as espeak losing its voice ("Unknown phoneme table: ''"). Importing
+# here instead is enough on its own; no session has to be created. `main.py`
+# imports plugins.face (and so this module) during startup, before any plugin
+# builds a model, so this lands first.
+#
+# Only ASR/TTS graphs that use the sequence ops are affected, which is why the
+# conflict lay dormant until Kokoro — the first model here whose graph has a
+# Loop/SequenceInsert. sherpa's sensevoice ASR was measured unaffected.
+#
+# Guarded because the host test suite imports this module without onnxruntime
+# installed; FaceAnalyzer raises a clear error if it is genuinely missing.
+try:
+    import onnxruntime as ort
+except ImportError:  # pragma: no cover - exercised on dev hosts, not on device
+    ort = None
+
 log = logging.getLogger(__name__)
 
 DEFAULT_FACE_MODEL_DIR = "/models/face/buffalo_sc"
@@ -214,8 +245,12 @@ class FaceAnalyzer:
         num_threads: int = 2,
         warmup: bool = True,
     ):
-        import onnxruntime as ort
-
+        if ort is None:
+            raise RuntimeError(
+                "the face plugin needs the standalone onnxruntime package; it is "
+                "imported at the top of plugins/face_runtime.py, and that import "
+                "must keep happening there — see the comment on it"
+            )
         self._cv2 = load_cv2()
         self._requested_device = (device or "auto").strip().lower()
         self._det_thresh = float(det_thresh)
