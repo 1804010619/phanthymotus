@@ -90,6 +90,7 @@ and `mms-th` both run on sherpa-onnx, so `sherpa_onnx` identified neither.
 | `vits2-zh-en` (default) | VITS2 16 kHz | 中 / 英, code-switching | TensorRT | `/models/vits2` |
 | `matcha-zh-en` | matcha-icefall-zh-en + vocos | 中 / 英 | ONNX Runtime | `/models/sherpa-onnx/tts` |
 | `mms-th` | MMS-TTS-THAI-MALE-NARRATOR | ไทย only | ONNX Runtime | `/models/mms-th` |
+| `kokoro-multi` | Kokoro-82M v1.0 | 英 / 中 / 日 / 西 / 法 / 意 / 葡 / 印地, code-switching | ONNX Runtime | `/models/kokoro-multi/<device>` |
 
 `vits2_trt` and `sherpa_onnx` still resolve, via `ENGINE_ALIASES` in
 `plugins/tts.py`, and underscores fold to hyphens first so `vits2_zh_en` works too.
@@ -100,6 +101,368 @@ unknown engine — so dropping them would put every existing TTS card into
 
 Only one engine is resident at a time. Switching disposes the outgoing one's nodes
 first, because two live publishers on one audio topic play both voices at once.
+
+### Chinese number normalisation is applied by us, never by `rule_fsts`
+
+Affects both sherpa-onnx engines that can speak Chinese (`matcha-zh-en`,
+`kokoro-multi`). Both pass **`rule_fsts=""`** and call `plugins/zh_text_norm.py`
+instead. Do not "simplify" that back.
+
+sherpa-onnx applies every FST in `rule_fsts` to the **whole text before its frontend
+decides what is Chinese** (`offline-tts-kokoro-impl.h`: the `tn_list_` loop runs, and
+only then `ConvertTextToTokenIds`). The frontend routes on `[一-鿿]`. So handing it
+the ZH number/date/phone FSTs rewrites every digit into Chinese characters *first*,
+and the frontend then reads them in Chinese — regardless of `lang`, in every language:
+
+| input | with `rule_fsts` | fixed |
+|---|---|---|
+| `...opened in 2026.` | `...opened in 二千零二十六.` | unchanged, espeak reads it |
+| `We have 25 exhibits today.` | `We have 二十五 exhibits today.` | unchanged |
+| `Hola, tenemos 25 exposiciones hoy.` | `Hola, tenemos 二十五 exposiciones.` | unchanged |
+
+The FSTs are not the problem and must not be dropped — for Chinese they are
+load-bearing and good: `2026年` → `二零二六年`, `2026年1月15日` →
+`二零二六年一月十五日`, `第25个展品` → `第二十五个展品`, `延迟200毫秒` →
+`延迟二百毫秒`.
+
+So `zh_text_norm` runs them in Python, before sherpa sees the text, and only on the
+Chinese parts. **A digit run is Chinese when either neighbour is** — which gets both
+directions right in a way that gating on `tts_language` could not:
+
+```
+"延迟 200 毫秒"        -> Chinese on both sides   -> 二百
+"共25 items"           -> Chinese only before     -> 二十五
+"In 2026 我们开业"     -> Chinese only after      -> 二零二六
+"we have 25 exhibits"  -> Chinese on neither      -> left to espeak
+```
+
+Two details are load-bearing and pinned by `tests/test_zh_text_norm.py`, which needs
+no model and no `kaldifst`:
+
+- **Whole segments go to the FST, never the bare digits.** `date-zh.fst` has to see
+  the `年` to produce `二零二六年` instead of the quantity form `二千零二十六`.
+- **The CJK range is the same one sherpa routes on** (`一-鿿`). If the two
+  disagreed, text could be normalised here and then routed to espeak anyway.
+
+`matcha-zh-en` has no language field at all, which is the other reason the decision is
+made per number rather than per engine setting.
+
+`kaldifst` reaches the image through `plugins/vits2_tts_trt/requirements.jetson.txt`,
+installed when `ENABLE_VITS2_TRT=1` (the Dockerfile default). Without it this degrades
+to a **warning, not a refusal**: Chinese digits get read by espeak in the selected
+voice — wrong, but audible and confined to numbers. Contrast the Thai frontend, which
+*does* refuse without pythainlp, because there the digits vanish from the audio
+entirely.
+
+Known limitation, sherpa's FSTs rather than this code: `电话13800138000` becomes
+`一百三十八亿零一十三万八千` — `phone-zh.fst` does not match a bare number, so
+`number-zh.fst` reads it as a quantity. And a bare `2026.` with no `年` reads as
+`二千零二十六`; the year form needs the context character.
+
+### `kokoro-multi`, the multilingual voice
+
+[Kokoro-82M](https://huggingface.co/hexgrad/Kokoro-82M) **v1.0**, added because
+`vits2-zh-en` is a Chinese male voice whose English is the weaker half, and there was
+no engine good enough to put in front of an English-speaking audience. 82 M
+parameters, Apache-2.0, and it needs no new framework: sherpa-onnx already ships
+`OfflineTtsKokoroModelConfig`, so this engine added **no Dockerfile change** — only
+Python, a COS artefact and tests.
+
+Named `kokoro-multi`, not `kokoro-zh-en`: it has voices for nine languages, and a
+name claiming two would mislead every operator reading the dropdown. `multi` is also
+what upstream calls the release (`kokoro-multi-lang-v1_0`).
+
+**Language is a runtime dropdown, and switching it is free.** `tts_language`
+(`plugins.tts.language` in `config.yaml`) takes `en-us`, `en-gb`, `zh`, `ja`, `es`,
+`fr`, `it`, `pt-br` or `hi`. sherpa-onnx reads it from
+`GenerationConfig.extra["lang"]` on *every* `generate()` call, so it is a scale on
+the resident model exactly like `speed` — it is deliberately **absent from
+`_session_keys`**, because putting it there would tear down and reload a 310 MB fp32
+CUDA session every time someone changed the dropdown. Verified on the shipped wheels
+for both Python ABIs (cp38/jp5.11 and cp310/jp6.1): `extra` accepts a plain dict and
+round-trips.
+
+**What the field actually selects is the espeak-ng voice for the *non-Chinese* runs
+of the text.** Chinese is phonemised from `lexicon-zh.txt` on every setting, because
+that branch of sherpa-onnx's frontend never consults `lang`. Two consequences:
+
+- Mixed zh/en in one sentence code-switches on its own, with no Python-side
+  detection — `KokoroMultiLangLexicon` splits the text on Chinese vs non-Chinese
+  character runs and phonemises each separately.
+- **`zh` maps to an English espeak voice on purpose**, and is not redundant with
+  `en-us`: it only decides how *embedded Latin* in a Chinese sentence is read, and
+  English is the right answer. Digits are already converted to Chinese characters
+  upstream by the ZH rule FSTs.
+
+**The espeak voice names in `LANGUAGE_VOICES` are measured, not guessed.** Getting
+one wrong fails in two ways, both silent on the robot:
+
+| configured | espeak voice | what a guess did |
+|---|---|---|
+| `en-gb` | `en-gb-x-rp` | plain `en-GB` is **not a voice espeak-ng ships** → "Failed to set eSpeak-ng voice", **no audio at all** |
+| `pt-br` | `pt-BR` | — |
+| `fr` | `fr` | `fr-FR` **silently truncates**: 18280 samples where `fr` gave 63277 on the same sentence, nothing raised, nothing logged |
+
+espeak matching is case-insensitive, which is why `en-us` resolves to `en-US` and
+made `en-gb` look like it ought to work. Hence a closed map rather than passing the
+configured label through, and a construction-time probe that refuses to load if the
+resolved voice produces no audio.
+
+**`speaker_id` is an index within the selected language, not a global voice number.**
+`speaker_id: 0` is the first voice of whatever `tts_language` is set to, so switching
+language moves the voice with it and the two cannot end up disagreeing. The model's
+own numbering is not learnable — Japanese starts at 37 and Spanish is 28, 29 **and**
+53 — and exposing it made it easy to pick an American voice, switch to Japanese, and
+wonder why the result sounded wrong. That class of mistake is now unrepresentable
+rather than warned about.
+
+| `tts_language` | voices | `speaker_id: 0` is |
+|---|---|---|
+| `en-us` | 20 | `af_alloy` (`af_heart` is 3, `af_bella` 2 — the highest-graded) |
+| `en-gb` | 8 | `bf_alice` |
+| `zh` | 8 | `zf_xiaobei` |
+| `ja` | 5 | `jf_alpha` |
+| `hi` | 4 | `hf_alpha` |
+| `es` / `pt-br` | 3 | `ef_dora` / `pf_dora` |
+| `it` | 2 | `if_sara` |
+| `fr` | 1 | `ff_siwis` |
+
+Out of range at load is a `ValueError` naming the language and its count. Out of
+range *after* a language switch clamps to voice 0 with a warning instead — language
+is a free per-utterance setting and must not be able to fail, and `fr` has exactly
+one voice. The requested index is remembered, so switching back restores it. Logs and
+`info` report the resolved name (`af_heart`), not the number.
+
+> **Only `en-us`, `en-gb`, `zh` and `ja` have been exercised on device.**
+> sherpa-onnx's own documentation says of this model "it is a multi-lingual model,
+> but we only add English and Chinese support for it" — Kokoro was trained with
+> misaki G2P, and for `es` / `fr` / `it` / `pt-br` / `hi` the espeak phoneme set is
+> not guaranteed to be the one the acoustic model learned. All of them produce audio
+> of a plausible length; treat those five as best-effort until someone who reads the
+> language has heard them.
+
+#### Measured on Orin 6 (jp6.1), fp32 on gpu
+
+| lang | sid | audio | synth | RTF | resample |
+|---|---|---|---|---|---|
+| `en-us` | 3 | 8.46 s | 0.78 s | **0.092** | 26 ms |
+| `en-gb` | 26 | 10.62 s | 0.85 s | 0.080 | 36 ms |
+| `zh` | 47 | 9.02 s | 0.89 s | 0.099 | 27 ms |
+| `ja` | 37 | 6.44 s | 0.54 s | 0.085 | 18 ms |
+| `es` / `fr` / `it` / `pt-br` / `hi` | — | ~4-6 s | 0.31-0.44 s | 0.070-0.083 | 11-22 ms |
+
+Session build 2.6 s (well inside `ENGINE_SWITCH_WAIT_S = 20`), warmup probe 0.93 s,
+and the resampler costs 3-4% of synthesis — not worth a polyphase rewrite.
+
+**`cpu` is not viable for streaming.** int8 on the same box measured **RTF 1.6** —
+slower than real time, so the audio cannot keep up with the frame clock. That is why
+`ENGINE_DEVICE_DEFAULTS` puts this engine on **gpu**; `cpu` exists for hosts with no
+CUDA wheel and for offline synthesis, not for live speech. (Note the dashboard form
+still renders the schema's `cpu` default, since JSON Schema cannot express a
+per-engine one.)
+
+**It is the only engine whose sample rate is not the pipeline's** — Kokoro is
+24 kHz, everything downstream is 16 kHz, and `AudioChunk` has no way to be told
+otherwise (the rate lives inside the `audio/pcm-16k` format string, and the
+publisher's pacing derives from `SAMPLE_RATE`). So the adapter downsamples
+internally, in `utils/resample.py`: 24000 → 16000 is exactly 2:3, so it upsamples by
+2, lowpasses at 8 kHz with a 97-tap Blackman-windowed sinc, and decimates by 3 —
+numpy only, because scipy would pull its own numpy pin and every plugin
+requirements file here exists partly to prevent that. Nothing outside the adapter
+knows Kokoro is 24 kHz.
+
+Checked against `scipy.signal.resample_poly` on a real 8.5 s utterance: correlation
+**0.999997**, peak error −39.6 dB, and the residual confined to the 7–8 kHz
+transition band (error/signal 3.8e-3 there against ~1e-6 below 6 kHz). The ~2-5% DC
+offset in the output is **Kokoro's own** — the raw 24 kHz is +0.0236 and the
+resampled 16 kHz is +0.0236, which is what a unity-DC-gain lowpass should do.
+
+Two details in that resampler are load-bearing and are pinned by
+`tests/test_resample.py`: the whole utterance is resampled *before* being framed
+(doing it per 3200-byte frame restarts the filter every 100 ms, which is ten clicks
+a second), and clipping happens in float before the int16 cast (`astype(np.int16)`
+on an out-of-range value wraps, turning an overshoot into a full-scale *opposite*
+polarity tick on the loudest part of the utterance). A third was found by those
+tests rather than by ear: `np.convolve(mode="same")` returns
+`max(len(signal), len(taps))`, so an utterance shorter than the 97-tap filter came
+back padded out to 97 samples of filter tail — which a punctuation-only chunk hits.
+
+**`device` selects different weight files here, not just a provider.** `gpu` gets
+fp32 and `cpu` gets int8, because `provider_for_device` refuses int8 on CUDA (the
+CUDA provider falls back to CPU per quantised node). So the two are separate pinned
+archives that unpack into `/models/kokoro-multi/gpu` and `.../cpu` — flipping the
+field downloads the other one and leaves the first in place.
+
+The release is repacked from sherpa-onnx's `kokoro-multi-lang-v1_0` by
+`tools/repack_kokoro_v1_0.py` and mirrored to COS, pinned by size + SHA256 like
+every other model here. Two things upstream ships are dropped:
+
+- `lexicon-us-en.txt` / `lexicon-gb-en.txt` (11.6 MB) — **unreachable.** For
+  non-Chinese runs sherpa-onnx short-circuits to espeak whenever `lang` is
+  non-empty, and `lang` falls back to the model's own `meta_data.voice` (`"en-us"`)
+  when unset, so it never is. English pronunciation here comes from espeak-ng, not
+  from a dictionary.
+- `dict/` (14 MB, the jieba dictionary) — ignored since sherpa-onnx v1.12.15, which
+  logs "you don't need to provide dict_dir" if you pass one.
+
+`lexicon-zh.txt` stays: the Chinese branch does *not* consult `lang`, so it is
+genuinely used. The three ZH rule FSTs stay for number/date/phone normalisation.
+Result: **~358 MB unpacked on gpu, ~157 MB on cpu** (from 384 MB / 183 MB upstream).
+
+`_validate_kokoro_manifest` checks the release *before* `OfflineTts` is
+constructed, and one of those checks is not optional: for a `version >= 2` Kokoro
+model with **both `lexicon` and `lang` empty**, sherpa-onnx's `InitFrontend` calls
+`SHERPA_ONNX_EXIT(-1)` — a **process exit**, so `main.py`'s try/except around the
+TTS plugin cannot turn it into a card in `state: error`; it takes ASR, VOP and OCR
+down with it. Same hazard `_validate_thai_manifest` exists for. It also refuses a
+`model_version` of 1 (v0.19 ignores `lang`, so the dropdown would be visibly present
+and silently inert) and any `sample_rate` other than 24000.
+
+### `ja`: why it is hard, and how far this gets
+
+Two separate problems, and the second is only partly solved.
+
+**1. Raw Japanese is read in Mandarin.** sherpa-onnx's Kokoro frontend splits text on
+`[一-鿿]` and sends that range to `ConvertChineseToTokenIDs`, which reads
+`lexicon-zh.txt`. **That function never receives the requested language.** Japanese
+kanji are inside the range (`今` U+4ECA, `私` U+79C1, `何` U+4F55), so kanji are
+pronounced in Mandarin whatever `tts_language` says. Measured on Orin 6:
+
+| text | `ja` | `en-us` | `es` | `fr` |
+|---|---|---|---|---|
+| `今日私何` (kanji only) | 30682 | 30682 | 30682 | 30682 |
+| `こんにちは` (kana only) | 28908 | 114986 | — | — |
+
+Identical sample counts for kanji under every language; kana change 4x. `lang` has no
+effect on kanji at all.
+
+**2. Kana are read with holes.** Kokoro's 114-token table *is* the misaki phoneme
+inventory — it contains `ʣ ʥ ʦ ʨ ᵝ`, so the model was trained to speak Japanese. But
+it has no `ʑ`, and espeak-ja emits exactly that for じ, plus combining diacritics
+`U+0308` and `U+031E`. sherpa phonemises with espeak and looks the result up in a
+misaki-derived table, silently discarding what is missing: **12 phonemes dropped from
+one sentence**, audible as gaps, and unintelligible.
+
+**The root cause of (2) is that upstream Kokoro and sherpa-onnx use different G2P.**
+Upstream drives Kokoro with misaki, whose phonemes are the table the model was trained
+on. sherpa-onnx uses espeak-ng, whose inventory does not match. This is not a
+limitation of the model.
+
+`plugins/ja_text_norm.py` works around both: kanji→kana via Janome, dates and counters
+by rule, then **kana→Hepburn romaji**, so nothing is left in the CJK range and the
+text is phonemised by a Latin-script voice whose output Kokoro can represent.
+`LANGUAGE_VOICES["ja"]` is therefore `"it"`, not `"ja"` — the voice is chosen for its
+**phoneme inventory**, not its language. Measured on the reported sentence:
+
+| | dropped | duration |
+|---|---|---|
+| kana + espeak `ja` | **12** | 12.11 s |
+| romaji + espeak `ja` | 0 | 14.78 s — spelled out letter by letter |
+| **romaji + espeak `it`** | **0** | **7.85 s** |
+
+Two details cost more than they look:
+
+- **Word boundaries.** Japanese has none, but the romaji is read by a Latin-script
+  voice, and one unbroken `kyoowanisennijuurokunen…` is a single enormous word whose
+  stress espeak has to guess: 7.62 s unspaced against 4.60 s spaced. Janome has
+  already found the morpheme boundaries, so they are kept — except before a lone
+  `ウ`/`ー`, since Janome splits `マショウ` into `マショ`+`ウ` and a space there gives
+  `masho u` rather than `mashoo`.
+- **Long vowels are doubled, not written as digraphs.** `キョウ` becomes `kyoo`, never
+  `kyou`, which Italian and Spanish read as two syllables.
+
+Also corrected here: the particle `は` is *read* `ハ` but *pronounced* わ — `今日は` is
+`kyoo wa`, never `kyoo ha` — and full-width `。！？` become ASCII so espeak can find
+sentence boundaries.
+
+> **Honest limit: this sounds like a non-native speaker reading Japanese.** Verified by
+> ear, not inferred. Zero phonemes are dropped and it is intelligible, which the kana
+> version was not, but Italian phonemes are not Japanese ones. Making it sound native
+> needs misaki-compatible phonemes reaching the model, which sherpa-onnx offers no path
+> for today — its only phoneme-level entry point is the lexicon, and
+> `ConvertNonChineseToTokenIDs` bypasses the lexicon whenever `lang` is non-empty,
+> which it always is because it falls back to the model's own `meta_data.voice`.
+>
+> An earlier version of this section claimed the output was "unmistakably Japanese".
+> That was inferred from "no kanji left in the text" without listening, and it was
+> wrong.
+
+#### Superseded: Japanese now bypasses sherpa entirely (`plugins/kokoro_direct.py`)
+
+The romaji route above is what the accent limit was measured on. It is no longer the
+shipping path — the limit was the *phoneme alphabet*, so the fix is to stop letting
+espeak choose it. `kokoro_direct.py` loads the same `model.onnx` with onnxruntime and
+feeds it misaki phonemes directly, the way upstream Kokoro is driven:
+
+```
+kana --(plugins/ja_phonemes.py, vendored misaki mora table)--> phonemes --> tokens.txt ids --> ONNX
+```
+
+The mora table is pinned to misaki at **`fdc9c5e5e` (2025-01-13)**, the commit that
+matches Kokoro v1.0. This pin is the whole point and `pip install misaki` is the wrong
+thing to do here — current misaki targets a newer Kokoro with a larger vocabulary:
+
+| misaki `ja.py` | distinct phonemes | missing from our `tokens.txt` |
+|---|---|---|
+| **2025-01-13 (pinned)** | 31 | **0** |
+| 2025-04-05 (what pip gives) | 39 | 12 — `G K g ƫ ᶀ ᶁ ᶃ ᶄ ᶆ ᶈ ᶉ` |
+
+A test asserts every phoneme the table can emit exists in `tokens.txt`. The absence of
+that assertion is what let the original 12-drop bug ship.
+
+**This session is CPU-only by construction, and that is not a tuning decision.** On
+jp6.1 the standalone onnxruntime (1.18.0) and sherpa's bundled one (1.18.1) share a
+single `libonnxruntime_providers_cuda.so` — the Dockerfile copies sherpa's into
+`onnxruntime/capi/` to get the face plugin onto the GPU, and the soname collides so the
+first `dlopen` wins. Separate graphs coexist fine, but a *second* CUDA session on the
+**Kokoro** graph fails in whichever runtime did not load the provider, symmetrically:
+
+| order | result |
+|---|---|
+| sherpa's CUDA session first | the standalone one fails, error names `/home/tian/Yxh/…` |
+| the standalone one first | **sherpa** fails, error names `/home/yifanl/…` |
+
+both with `Error mapping output names: Could not find OrtValue with name
+'/Squeeze_2_output_0'`. Order does not save it; staying off CUDA does. `KokoroDirect`
+therefore takes **no device argument**, so it cannot be asked.
+
+The cost is confined to Japanese, and it is affordable. Measured on Orin 6, one process,
+Japanese synthesized first so its CPU session is live throughout:
+
+| language | runtime | RTF |
+|---|---|---|
+| en-us / en-gb | sherpa, cuda | 0.31 / 0.21 |
+| zh | sherpa, cuda | 0.14 |
+| es / fr / it / pt-br / hi | sherpa, cuda | 0.10 – 0.11 |
+| **ja** | **direct ONNX, cpu** | **0.54** |
+
+Real time with margin, and the other eight languages keep the GPU. Threads are the only
+lever left for Japanese and they matter — `intra_op_num_threads` defaults to one per
+core (RTF 0.52); the ORT default of 2 gives 1.17, i.e. slower than real time.
+
+**Pitch accent is not implemented and cannot be with this model.** The pinned misaki has
+no accent code at all (it arrived in 2025-04, alongside the larger vocabulary above),
+and sherpa's v1.1 token table is a symlink to v1.0's. Japanese here is correctly
+*phonemised* but flat. Fixing it needs a newer Kokoro, which is a different change.
+
+### Chinese: use `vits2-zh-en`, and why Kokoro's Chinese is not broken
+
+Chinese takes a different path from Japanese and loses nothing. `Skip unknown phonemes`
+counts on Orin 6:
+
+| text | dropped |
+|---|---|
+| Chinese, ordinary | **0** |
+| Chinese with embedded English | **0** |
+| Chinese, rare characters (`饕餮纹鼎鬲甗簋簠盨匜盘`) | **0** |
+| English | **0** |
+| Japanese kana (for contrast) | **12** |
+
+`ConvertChineseToTokenIDs` reads `lexicon-zh.txt`, whose entries are already misaki
+phonemes (`七 ʨ ʰ i →`), and never touches espeak — so there is no bug here to fix.
+What remains is that Kokoro is one 82 M model covering nine languages, while
+`vits2-zh-en` is a **purpose-trained 16 kHz Chinese voice** and is already the default
+engine. Prefer it for Chinese; `kokoro-multi` exists for English.
 
 ### `mms-th`, and why it cannot be handed raw text
 

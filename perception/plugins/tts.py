@@ -4,8 +4,9 @@ plugins/tts.py — the TTS tool contract and its ONNX Runtime engines.
 
 Engines are named `<model>-<languages>`, the same shape `asr_model` uses:
 `vits2-zh-en` (TensorRT, implemented in plugins/vits2_tts_trt), `matcha-zh-en`
-(Matcha-icefall) and `mms-th` (MMS VITS). The last two both run on sherpa-onnx,
-which is why naming either of them after the framework did not work.
+(Matcha-icefall), `mms-th` (MMS VITS) and `kokoro-multi` (Kokoro-82M v1.0). The
+last three all run on sherpa-onnx, which is why naming any of them after the
+framework did not work.
 """
 
 from __future__ import annotations
@@ -18,16 +19,25 @@ import time
 from abc import ABC, abstractmethod
 from typing import Optional
 
+import numpy as np
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
 from std_msgs.msg import String
+
+from utils.resample import downsample_24k_to_16k
+from plugins.zh_text_norm import ZhTextNormalizer
 
 log = logging.getLogger(__name__)
 
 SAMPLE_RATE = 16000
 CHUNK_BYTES = 3200  # 100ms @ 16kHz 16-bit mono
 PCM_FRAME_S = CHUNK_BYTES / (SAMPLE_RATE * 2)  # 0.1s of audio per frame
+
+# Kokoro's native rate. The only engine here that is not SAMPLE_RATE: its adapter
+# resamples 24000 -> 16000 internally (utils/resample.py) so that the topic stays
+# audio/pcm-16k and nothing downstream has to learn a second rate.
+KOKORO_SAMPLE_RATE = 24000
 
 # Frames held back before pacing starts, then published in one burst, so the
 # consumer begins with a real cushion. 5 frames = 500ms, matching the
@@ -177,21 +187,55 @@ TOOLS = [
                 # exists solely as a baked YAML key cannot be seen or switched
                 # without rebuilding the image. Mirrors asr_model in asr.py.
                 "tts_engine": {"type": "string",
-                               "enum": ["vits2-zh-en", "matcha-zh-en", "mms-th"],
+                               "enum": ["vits2-zh-en", "matcha-zh-en", "mms-th",
+                                        "kokoro-multi"],
                                "description": "TTS engine, named <model>-<languages> to match "
                                               "asr_model (vits2-zh-en = VITS2 on TensorRT, "
                                               "matcha-zh-en = Matcha-icefall, "
-                                              "mms-th = MMS Thai)",
+                                              "mms-th = MMS Thai, "
+                                              "kokoro-multi = Kokoro-82M v1.0)",
                                "default": "vits2-zh-en", "scope": "shared"},
-                # matcha-zh-en and mms-th only — vits2-zh-en is a TensorRT engine
-                # and never touches ONNX Runtime, so this field does nothing for it.
-                # Matcha's weights are fp32, so both devices load the same files and
-                # only the provider changes; measured 4.3x faster on gpu.
+                # matcha-zh-en, mms-th and kokoro-multi only — vits2-zh-en is a
+                # TensorRT engine and never touches ONNX Runtime, so this field does
+                # nothing for it. Matcha's weights are fp32, so both devices load the
+                # same files and only the provider changes; measured 4.3x faster on
+                # gpu. kokoro-multi is the first engine where the two devices load
+                # *different weight files* — fp32 for gpu, int8 for cpu, because
+                # provider_for_device refuses int8 on CUDA — so changing this one
+                # downloads a different archive, not just a different provider.
                 "device":      {"type": "string", "enum": ["cpu", "gpu"],
                                 "description": "Inference device for the ONNX Runtime engines "
-                                               "(gpu needs the CUDA sherpa-onnx wheel; ~4.3x faster)",
+                                               "(gpu needs the CUDA sherpa-onnx wheel; ~4.3x faster). "
+                                               "kokoro-multi defaults to gpu and loads fp32 there, "
+                                               "int8 on cpu",
                                 "default": "cpu", "scope": "shared",
-                                "x-show-when": {"tts_engine": ["matcha-zh-en", "mms-th"]}},
+                                "x-show-when": {"tts_engine": ["matcha-zh-en", "mms-th",
+                                                               "kokoro-multi"]}},
+                # Kokoro takes `lang` per generate() call, so this is a scale on the
+                # resident model like `speed` — not a session key.
+                #
+                # Every language Kokoro v1.0 has voices for. The value selects the
+                # espeak voice for the **non-Chinese** runs of the text; Chinese is
+                # phonemised from lexicon-zh.txt on every setting, so a mixed zh/en
+                # sentence code-switches on its own. `zh` maps to an English voice for
+                # exactly that reason — see KokoroTTSAdapter.LANGUAGE_VOICES, which
+                # also records that these espeak names are measured, not guessed
+                # (`en-gb` produces no audio and `fr-FR` silently truncates).
+                #
+                # Only en-us/en-gb/zh have been listened to; sherpa-onnx documents
+                # English and Chinese as the supported pair for this model, so the
+                # rest are offered as best-effort. Kept in one enum rather than split
+                # into "supported" and "experimental" fields because the dashboard
+                # renders one dropdown and the caveat belongs in the docs.
+                "tts_language": {
+                    "type": "string",
+                    "enum": ["en-us", "en-gb", "zh", "ja", "es", "fr", "it",
+                             "pt-br", "hi"],
+                    "description": "Pronunciation language for kokoro-multi. Chinese is "
+                                   "spoken correctly on any setting; this picks the espeak "
+                                   "voice for the non-Chinese parts of the text",
+                    "default": "en-us", "scope": "shared",
+                    "x-show-when": {"tts_engine": ["kokoro-multi"]}},
                 # Thai has no spaces between words, and MMS was trained on text
                 # that spaced only phrase boundaries. Segmenting every word may
                 # help prosody or hurt it — off until it has been A/B'd on device.
@@ -201,7 +245,7 @@ TOOLS = [
                                    "experimental — may change prosody either way)",
                     "default": False, "scope": "shared",
                     "x-show-when": {"tts_engine": "mms-th"}},
-                "speaker_id": {"type": "integer", "description": "Speaker ID (vits2-zh-en and mms-th support 0 only)", "default": 0, "scope": "shared"},
+                "speaker_id": {"type": "integer", "description": "Speaker ID (vits2-zh-en and mms-th support 0 only; for kokoro-multi it is an index within the selected language — 0 is that language's first voice, and the voice moves with tts_language)", "default": 0, "scope": "shared"},
                 "speed":      {"type": "number", "description": "Speech speed (1.0 = normal)", "default": 1.0, "scope": "shared"},
             },
             "required": []
@@ -263,6 +307,17 @@ class TTSAdapter(ABC):
         """
         del speed
 
+    def set_language(self, language: str) -> None:
+        """Change the pronunciation language on the resident model, if it has one.
+
+        A no-op by default, so `_config` can call it unconditionally: only Kokoro
+        takes a language, and only because sherpa-onnx reads `lang` out of
+        GenerationConfig.extra per call. An engine whose language is baked into the
+        checkpoint (Matcha, MMS Thai, VITS2) has nothing to change, and its
+        configSchema field is hidden by `x-show-when` anyway.
+        """
+        del language
+
 
 class MatchaTTSAdapter(TTSAdapter):
     """On-device TTS using sherpa-onnx Matcha (flow-matching, fast non-autoregressive)."""
@@ -288,13 +343,13 @@ class MatchaTTSAdapter(TTSAdapter):
         # picks the provider — measured 4.3x faster on gpu at num_threads=2.
         provider = provider_for_device(device, (acoustic_model, vocoder))
 
-        # Gather rule FSTs
-        rule_fsts = []
-        for name in ("date-zh.fst", "number-zh.fst", "phone-zh.fst"):
-            p = os.path.join(model_dir, name)
-            if os.path.exists(p):
-                rule_fsts.append(p)
-
+        # The ZH number/date/phone FSTs are applied by us, in Python, not handed to
+        # sherpa-onnx as rule_fsts. sherpa runs rule_fsts over the *whole* text
+        # before its frontend decides what is Chinese, so passing them here rewrote
+        # every digit into Chinese characters and the frontend then read them in
+        # Chinese — "We have 25 exhibits" came out as "We have 二十五 exhibits".
+        # plugins/zh_text_norm.py applies them only to the Chinese runs.
+        self._zh_norm = ZhTextNormalizer(model_dir)
         tts_config = sherpa_onnx.OfflineTtsConfig(
             model=sherpa_onnx.OfflineTtsModelConfig(
                 matcha=sherpa_onnx.OfflineTtsMatchaModelConfig(
@@ -308,20 +363,24 @@ class MatchaTTSAdapter(TTSAdapter):
                 num_threads=2,
                 provider=provider,
             ),
-            rule_fsts=",".join(rule_fsts) if rule_fsts else "",
+            rule_fsts="",
         )
         self._tts = sherpa_onnx.OfflineTts(tts_config)
         self._sid = speaker_id
         self._speed = speed
         log.info(f"[tts] sherpa-onnx Matcha loaded: model_dir={model_dir}, "
                  f"speaker_id={speaker_id}, speed={speed}, "
-                 f"device={device}, provider={provider}")
+                 f"device={device}, provider={provider}, "
+                 f"zh_text_norm={'on' if self._zh_norm.available else 'off'}")
 
     def synthesize(self, text: str) -> bytes:
         return b''.join(self.synthesize_stream(text))
 
     def synthesize_stream(self, text: str):
         import struct
+        # Normalise before the engine sees the text, and only the Chinese parts of
+        # it — see the rule_fsts comment in __init__.
+        text = self._zh_norm.normalize(text)
         audio = self._tts.generate(text, sid=self._sid, speed=self._speed)
         float_samples = audio.samples
         # Matcha + vocos-16khz outputs 16kHz directly, no resampling needed
@@ -548,20 +607,599 @@ def _read_token_chars(tokens_path: str) -> set:
     return chars
 
 
+class KokoroTTSAdapter(TTSAdapter):
+    """On-device TTS using sherpa-onnx Kokoro (Kokoro-82M v1.0, 24 kHz).
+
+    A third adapter rather than a flag on either existing one, for three reasons
+    that are all structural:
+
+    - It is configured through `OfflineTtsKokoroModelConfig`, which shares no field
+      with the Matcha or VITS ones: the voice is a style vector read out of a
+      separate `voices.bin`, not a speaker embedding inside the graph.
+    - Its text frontend is sherpa-onnx's own `KokoroMultiLangLexicon`, which splits
+      the text on Chinese vs non-Chinese character runs and phonemises each
+      separately. So zh/en code-switching inside one sentence works without any
+      Python-side detection — unlike mms-th, which needs plugins/thai_frontend.py.
+    - **It is the only engine whose sample rate is not the pipeline's.** Kokoro is
+      24 kHz; everything downstream is 16 kHz and has no way to be told otherwise
+      (AudioChunk carries the rate inside its `format` string, and the publisher's
+      pacing derives from SAMPLE_RATE). The conversion therefore happens here, in
+      utils/resample.py, and what leaves this adapter is 16 kHz like every other
+      engine's output. Nothing outside this class knows Kokoro is 24 kHz.
+
+    Language is a per-utterance argument, not a session key: sherpa-onnx reads it
+    from `GenerationConfig.extra["lang"]` on every call. So `set_language` is a
+    field assignment, the same shape as `set_speed`, and switching language costs
+    nothing. Verified on the shipped wheels for both Python ABIs (cp38/jp5.11 and
+    cp310/jp6.1): `extra` accepts a plain dict and round-trips.
+    """
+
+    # Not the inherited ".". Kokoro's frontend has an explicit punctuation branch
+    # that turns "." into a three-token near-silent sequence, and _TTSNode.start()
+    # refuses to declare `running` unless the probe produced audio — the same trap
+    # that made every Thai start fail. "ok" is one syllable, is phonemised by
+    # espeak on every language setting (routing is by character class, so an
+    # English probe exercises the espeak path even when lang=zh), and is audible.
+    dry_run_text = "ok"
+
+    # Every language Kokoro v1.0 has voices for. The value on the left is what the
+    # dashboard and config.yaml use; the value on the right is the espeak-ng voice
+    # name that phonemises the non-Chinese runs of the text.
+    #
+    # The right-hand names are **measured, not guessed** — each was checked on
+    # Orin 6 against this release's espeak-ng-data with a sentence in that language
+    # containing digits. Guessing is not safe here, in two distinct ways:
+    #
+    #   en-gb  -> "Failed to set eSpeak-ng voice", no samples at all. The data ships
+    #             en-GB-x-rp, en-GB-scotland, en-GB-x-gbclan, en-GB-x-gbcwmd and
+    #             en-029, but no plain en-GB. (Matching is case-insensitive, which
+    #             is why en-us resolves to en-US and made en-gb look plausible.)
+    #   fr-FR  -> *worse*: it "works" and silently truncates. 18280 samples against
+    #             63277 for `fr` on the same sentence — most of the utterance simply
+    #             missing, with nothing raised and nothing logged.
+    #
+    # `zh` maps to an English voice on purpose, and is not redundant with `en-us`.
+    # Chinese is phonemised from lexicon-zh.txt on every setting — that branch of
+    # sherpa-onnx's frontend never consults `lang` — so this field only decides how
+    # the *embedded Latin* in a Chinese sentence is read, and English is the right
+    # answer for that. Digits are already converted to Chinese characters upstream
+    # by the ZH rule FSTs. The label exists because an operator setting up a Chinese
+    # robot looks for it, and its absence reads as "Chinese is unsupported".
+    #
+    # CAVEAT, and it is a real one: sherpa-onnx's own documentation says of this
+    # model "it is a multi-lingual model, but we only add English and Chinese
+    # support for it". Kokoro was trained with misaki G2P, and for the languages
+    # below other than English the espeak phoneme set is not guaranteed to be the
+    # one the acoustic model learned. All nine produce audio of a plausible length;
+    # en-us, en-gb and zh are the ones that have been listened to. Treat the rest as
+    # best-effort until someone who reads the language has heard them.
+    LANGUAGE_VOICES = {
+        "en-us": "en-us",       # ids 0-19   af_*/am_*
+        "en-gb": "en-gb-x-rp",  # ids 20-27  bf_*/bm_*
+        "zh": "en-us",          # ids 45-52  zf_*/zm_*  (see above)
+        # NOT "ja", and this is the one entry that must not be "corrected".
+        #
+        # Kokoro's 114-token table is the misaki phoneme inventory — it has
+        # `ʣ ʥ ʦ ʨ ᵝ`, so the model was trained to speak Japanese — but it does not
+        # contain `ʑ`, which is exactly what espeak-ja emits for じ, along with the
+        # combining diacritics U+0308 and U+031E. sherpa phonemises with espeak and
+        # looks the result up in that table, silently discarding whatever is missing.
+        # Measured on Orin 6: 12 phonemes dropped from one sentence, and the audible
+        # holes made it unintelligible.
+        #
+        # plugins/ja_text_norm.py therefore emits **romaji**, and this picks the
+        # espeak voice by its phoneme inventory rather than by its language. Measured
+        # on the same sentence, dropped-phoneme count and duration:
+        #
+        #     kana    + ja      12 dropped   4.81 s
+        #     romaji  + ja       0 dropped  14.78 s   (spelled out letter by letter)
+        #     romaji  + it       0 dropped   4.60 s
+        #     romaji  + es       0 dropped   4.83 s
+        #     romaji  + en-us    0 dropped   5.19 s
+        #
+        # Italian of the three: five pure vowels like Japanese, and native geminate
+        # consonants for っ (`nikki`), which Spanish lacks and English would reduce.
+        "ja": "it",             # ids 37-41  jf_*/jm_*
+        "es": "es",             # ids 28-29, 53  ef_*/em_*
+        "fr": "fr",             # id  30     ff_siwis
+        "it": "it",             # ids 35-36  if_*/im_*
+        "pt-br": "pt-BR",       # ids 42-44  pf_*/pm_*
+        "hi": "hi",             # ids 31-34  hf_*/hm_*
+    }
+    LANGUAGES = tuple(LANGUAGE_VOICES)
+    DEFAULT_LANGUAGE = "en-us"
+
+    # Spellings that are not the canonical label but are what someone would write.
+    # `cn` is accepted here even though the repo's naming rule rejects it as an
+    # engine-name component — refusing an operator's config is not the place to make
+    # that point, and the alternative is a Chinese robot silently speaking English.
+    LANGUAGE_ALIASES = {
+        "en": "en-us", "en-au": "en-us", "en-029": "en-gb", "en-gb-x-rp": "en-gb",
+        "zh-cn": "zh", "cmn": "zh", "cn": "zh", "zh-hans": "zh",
+        "pt": "pt-br", "pt-pt": "pt-br",
+        "es-419": "es", "es-es": "es",
+        "fr-fr": "fr", "fr-ca": "fr",
+        "jp": "ja", "ja-jp": "ja",
+        "hi-in": "hi", "it-it": "it",
+    }
+
+    def __init__(self, model_dir: str, speaker_id: int = 0, speed: float = 1.0,
+                 device: str = "gpu", language: str = DEFAULT_LANGUAGE):
+        import os
+        from utils.model_downloader import ensure_kokoro_model
+        from utils.onnx_provider import normalize_device, pick_weights, provider_for_device
+
+        device = normalize_device(device)
+        language = self._normalize_language(language)
+
+        model_dir = ensure_kokoro_model(model_dir, device)
+        # gpu directories hold fp32, cpu directories hold int8 — pick_weights'
+        # documented behaviour of falling back to the *last* candidate means a
+        # missing file produces an error naming the one this device wanted.
+        candidates = (("model.onnx", "model.int8.onnx") if device == "gpu"
+                      else ("model.int8.onnx", "model.onnx"))
+        model_path = pick_weights(model_dir, *candidates)
+        voices_path = os.path.join(model_dir, "voices.bin")
+        tokens_path = os.path.join(model_dir, "tokens.txt")
+        data_dir = os.path.join(model_dir, "espeak-ng-data")
+        lexicon_path = os.path.join(model_dir, "lexicon-zh.txt")
+
+        manifest = _validate_kokoro_manifest(model_dir)
+
+        for path in (model_path, voices_path, tokens_path):
+            if not os.path.exists(path):
+                raise FileNotFoundError(f"Kokoro release is incomplete: {path} is missing")
+        # The four files sherpa-onnx's own Validate() checks for inside data_dir.
+        # Checking them here turns a missing espeak tree into an exception naming
+        # the file, instead of a Validate() failure during OfflineTts construction.
+        missing = [name for name in ("phontab", "phonindex", "phondata", "intonations")
+                   if not os.path.exists(os.path.join(data_dir, name))]
+        if missing:
+            raise FileNotFoundError(
+                f"{data_dir} is not an espeak-ng data directory (missing "
+                f"{', '.join(missing)}); sherpa-onnx requires all four"
+            )
+
+        # Only lexicon-zh.txt. The two English lexicons upstream ships can never be
+        # read: for non-Chinese runs sherpa-onnx short-circuits to espeak whenever
+        # `lang` is non-empty, and `lang` falls back to the model's own
+        # meta_data.voice ("en-us") when unset, so it never is. The Chinese branch
+        # does not consult `lang`, which is why this one is load-bearing.
+        lexicon = lexicon_path if os.path.exists(lexicon_path) else ""
+
+        # THE process-exit guard. For a version >= 2 Kokoro model with *both*
+        # `lexicon` and `lang` empty, sherpa-onnx's InitFrontend logs and calls
+        # SHERPA_ONNX_EXIT(-1) — a process exit, not an exception, so main.py's
+        # try/except around the TTS plugin cannot turn it into a card in
+        # `state: error`; it takes ASR, VOP and OCR down with it. `language` is
+        # normalised to a non-empty value above, so this can only fire if someone
+        # later makes it optional.
+        if not lexicon and not language:
+            raise RuntimeError(
+                "Kokoro v1.0 needs a lexicon or a language; with neither, "
+                "sherpa-onnx exits the whole process instead of raising"
+            )
+
+        n_speakers = int(manifest.get("n_speakers") or 0)
+        if n_speakers and not 0 <= int(speaker_id) < n_speakers:
+            raise ValueError(
+                f"speaker_id must be 0..{n_speakers - 1} for kokoro-multi, "
+                f"got {speaker_id}"
+            )
+
+        import sherpa_onnx
+
+        provider = provider_for_device(device, (model_path,))
+
+        # The ZH number/date/phone FSTs are applied by us, not by sherpa-onnx. Given
+        # to it as rule_fsts they run over the *whole* text before the frontend
+        # splits it, so the digits become Chinese characters and are then read in
+        # Chinese whatever `lang` says — "opened in 2026" became "opened in
+        # 二千零二十六" in English, Spanish, Japanese, all of them.
+        # plugins/zh_text_norm.py applies them only to the Chinese runs.
+        self._zh_norm = ZhTextNormalizer(model_dir)
+        # Japanese needs the opposite treatment to Chinese: not "normalise the
+        # numbers", but "get every kanji out of the text". sherpa-onnx routes
+        # [一-鿿] to its Chinese branch with no language check, and Japanese kanji
+        # live in that range, so without this they are pronounced in Mandarin.
+        # Built lazily on the first switch to `ja` — Janome loads a ~180 MB
+        # dictionary, and a Chinese or English deployment must not pay for it.
+        self._ja_frontend = None
+        # Japanese does not go through sherpa at all — see _synthesize_japanese —
+        # so the direct runtime needs to know which weights and provider to reuse.
+        self._direct_runtime = None
+        self._model_dir = model_dir
+        self._weights_name = os.path.basename(model_path)
+        self._provider = provider
+
+        tts_config = sherpa_onnx.OfflineTtsConfig(
+            model=sherpa_onnx.OfflineTtsModelConfig(
+                kokoro=sherpa_onnx.OfflineTtsKokoroModelConfig(
+                    model=model_path,
+                    voices=voices_path,
+                    tokens=tokens_path,
+                    lexicon=lexicon,
+                    data_dir=data_dir,
+                    # Ignored since sherpa-onnx v1.12.15 (it logs "you don't need to
+                    # provide dict_dir" if given), so the release ships no dict/.
+                    dict_dir="",
+                    length_scale=1.0 / speed if speed else 1.0,
+                    # Also set at construction, not only per call: it is what makes
+                    # the InitFrontend check above pass, and it is the fallback if a
+                    # generate() ever arrives without extra["lang"]. The espeak
+                    # voice name, not the configured label — see LANGUAGE_VOICES.
+                    lang=self.LANGUAGE_VOICES[language],
+                ),
+                num_threads=2,
+                provider=provider,
+            ),
+            rule_fsts="",
+        )
+        self._tts = sherpa_onnx.OfflineTts(tts_config)
+
+        model_rate = int(getattr(self._tts, "sample_rate", 0) or 0)
+        if model_rate and model_rate != KOKORO_SAMPLE_RATE:
+            # utils/resample.py's filter is designed for exactly 24000 -> 16000
+            # (2:3). Another rate would need its own filter, and using this one
+            # would resample by the wrong ratio — audio at the wrong pitch that
+            # also drifts against the 100 ms frame clock.
+            raise RuntimeError(
+                f"Kokoro model is {model_rate} Hz but the adapter's resampler is "
+                f"built for {KOKORO_SAMPLE_RATE} Hz -> {SAMPLE_RATE} Hz"
+            )
+
+        self._speed = speed
+        self._language = language
+        self._manifest = manifest
+        self._lock = threading.Lock()
+        # `voice_index` is per language; `_sid` is the global index the model wants.
+        self._voice_index = int(speaker_id)
+        self._sid = self._resolve_sid(self._voice_index, language, strict=True)
+
+        # Re-check against the loaded graph, not just the manifest: the manifest is
+        # our own file and could have been written for a different voices.bin.
+        live_speakers = int(getattr(self._tts, "num_speakers", 0) or 0)
+        if live_speakers and not 0 <= self._sid < live_speakers:
+            raise ValueError(
+                f"resolved speaker index {self._sid} is outside this Kokoro "
+                f"release's 0..{live_speakers - 1}; the manifest does not match "
+                "voices.bin"
+            )
+
+        log.info(f"[tts] sherpa-onnx Kokoro loaded: model_dir={model_dir}, "
+                 f"weights={os.path.basename(model_path)}, "
+                 f"speaker_id={self._voice_index} ({self.voice_name}, global "
+                 f"{self._sid}), language={language} (espeak {self._voice}), "
+                 f"speed={speed}, device={device}, provider={provider}, "
+                 f"model_rate={model_rate or KOKORO_SAMPLE_RATE} -> {SAMPLE_RATE}, "
+                 f"lexicon={'zh' if lexicon else 'none'}, "
+                 f"zh_text_norm={'on' if self._zh_norm.available else 'off'}")
+
+        if language == "ja":
+            # Build the Japanese frontend before the probe, so a missing janome is a
+            # load error naming the build flag rather than a card that comes up
+            # `running` and then speaks Mandarin.
+            self._ja()
+
+        # Prove the espeak voice resolves before anything asks this adapter to
+        # speak. A bad voice name is close to invisible at runtime: sherpa-onnx
+        # writes "Failed to set eSpeak-ng voice" to stderr, `generate` returns no
+        # samples, and the utterance is silently skipped — which is how `en-gb`
+        # (a voice espeak-ng does not have; it is en-GB-x-rp) looked like a model
+        # problem. `dry_run_text` is Latin, so it exercises exactly this path.
+        #
+        # Same reasoning as the Thai adapter checking its probe survives the
+        # frontend, and it also pays the first-inference cost, so the warmup a
+        # moment later is cheap.
+        if not any(self.synthesize_stream(self.dry_run_text)):
+            raise RuntimeError(
+                f"Kokoro produced no audio for the probe {self.dry_run_text!r} with "
+                f"language={self._language} (espeak voice {self._voice!r}); the "
+                "voice name is probably not one this espeak-ng-data provides"
+            )
+
+    @classmethod
+    def _normalize_language(cls, value) -> str:
+        """Coerce a configured language to one this release can actually phonemize.
+
+        Falls back rather than raising, the way provider_for_device does: a stale
+        value in a baked config.yaml should degrade to a working voice, not stop the
+        card from loading. The dashboard's enum is the place that constrains it.
+
+        Aliases exist for the spellings someone would reasonably write — `en` for
+        `en-us`, `pt` for `pt-br`, `cmn` for `zh` — because the alternative is a
+        silent fall back to English on a Portuguese robot.
+        """
+        raw = str(value or "").strip().lower().replace("_", "-")
+        if raw in cls.LANGUAGE_VOICES:
+            return raw
+        alias = cls.LANGUAGE_ALIASES.get(raw)
+        if alias:
+            return alias
+        if raw:
+            log.warning("[tts] unknown kokoro language %r, using %s (supported: %s)",
+                        value, cls.DEFAULT_LANGUAGE, ", ".join(cls.LANGUAGES))
+        return cls.DEFAULT_LANGUAGE
+
+    @property
+    def _voice(self) -> str:
+        """The espeak-ng voice name for the configured language."""
+        return self.LANGUAGE_VOICES[self._language]
+
+    def _voice_ids(self, language: str) -> list:
+        """The model's global speaker ids for `language`, in order."""
+        return list(self._manifest.get("languages", {}).get(language) or [])
+
+    def _resolve_sid(self, voice_index: int, language: str, strict: bool) -> int:
+        """Map a per-language voice index to the model's global speaker id.
+
+        `speaker_id` is an index *within the selected language* — 0 is the first
+        voice of that language, whatever the model happens to number it. The global
+        ids are not learnable: Japanese starts at 37, Spanish is 28, 29 and 53.
+        Exposing them made it easy to pick an American voice, switch the language to
+        Japanese, and be left wondering why the Japanese sounded wrong.
+
+        Because the index is language-relative, an incoherent voice/language pair is
+        no longer *representable* — which is why this adapter has no mismatch
+        warning. An earlier version had one; designing the mistake out beats warning
+        about it.
+
+        `strict` separates the two callers. At construction an out-of-range value is
+        a configuration error and must be reported. On `set_language` it must not be:
+        language is a per-utterance setting that changes freely, the languages have
+        different voice counts (French has exactly one), and a language switch that
+        could fail would make the dropdown a trap.
+        """
+        ids = self._voice_ids(language)
+        if not ids:
+            raise RuntimeError(
+                f"the Kokoro release manifest lists no voices for {language!r}; "
+                f"it has {sorted(self._manifest.get('languages', {}))}"
+            )
+        if 0 <= voice_index < len(ids):
+            return ids[voice_index]
+        if strict:
+            raise ValueError(
+                f"speaker_id must be 0..{len(ids) - 1} for language {language!r} "
+                f"({len(ids)} voices); got {voice_index}. speaker_id is an index "
+                "within the selected language, not a global speaker number"
+            )
+        log.warning(
+            "[tts] kokoro speaker_id=%d is out of range for %s (%d voices); "
+            "using 0 (%s)", voice_index, language, len(ids),
+            self._manifest.get("id2speaker", {}).get(str(ids[0]), "?"))
+        return ids[0]
+
+    @property
+    def voice_name(self) -> str:
+        """The model's own name for the resident voice, e.g. `af_heart`."""
+        return self._manifest.get("id2speaker", {}).get(str(self._sid), "?")
+
+    def _ja(self):
+        """The Japanese frontend, built on first use and then kept.
+
+        Lazy because Janome loads a ~180 MB dictionary and only `ja` needs it; a
+        Chinese or English deployment must not pay for it at every start. Built
+        eagerly at construction and in `set_language` when `ja` is selected, so a
+        missing janome surfaces as a load error naming the build flag rather than as
+        a failed utterance halfway through a tour.
+        """
+        if self._ja_frontend is None:
+            from plugins.ja_text_norm import JapaneseFrontend
+            self._ja_frontend = JapaneseFrontend()
+        return self._ja_frontend
+
+    def _direct(self):
+        """The phoneme-driven ONNX runtime, built on first Japanese utterance.
+
+        A second session on the same weights, so it is lazy and only Japanese pays
+        for it. Everything else keeps using sherpa, which is correct for those
+        languages and better tested.
+
+        It is deliberately given no device: `KokoroDirect` is CPU-only by
+        construction, because a second *CUDA* session on this graph collides with
+        sherpa's inside the shared CUDA provider library. That is not a tuning
+        choice — see the reasoning and the measurements in `kokoro_direct.py`.
+        """
+        if self._direct_runtime is None:
+            from plugins.kokoro_direct import KokoroDirect
+            self._direct_runtime = KokoroDirect(
+                self._model_dir, self._weights_name)
+        return self._direct_runtime
+
+    def synthesize(self, text: str) -> bytes:
+        return b''.join(self.synthesize_stream(text))
+
+    def synthesize_stream(self, text: str):
+        import sherpa_onnx
+
+        # Normalise Chinese numbers here, not via sherpa's rule_fsts — see the
+        # comment in __init__. Non-Chinese text comes back untouched, so espeak
+        # reads "2026" in whatever language it is phonemising.
+        text = self._zh_norm.normalize(text)
+
+        if self._language == "ja":
+            # Japanese leaves sherpa entirely. Its frontend phonemises with espeak,
+            # whose alphabet Kokoro's misaki-derived vocabulary cannot represent, and
+            # drops the misses — 12 phonemes from one sentence, audible as holes.
+            # plugins/ja_phonemes produces the phonemes the model was actually
+            # trained on, and plugins/kokoro_direct feeds them to the graph, because
+            # sherpa has no phoneme input path.
+            yield from self._synthesize_japanese(text)
+            return
+
+        # One generate() at a time. sherpa-onnx's OfflineTts is not documented as
+        # thread-safe, and dispatch() runs on a ThreadingHTTPServer thread per
+        # tools/call, so a config-driven speak can overlap a topic-driven one.
+        with self._lock:
+            config = sherpa_onnx.GenerationConfig()
+            config.sid = self._sid
+            config.speed = self._speed
+            # Per-utterance, which is the whole reason language is not a session
+            # key. Empty would fall back to meta_data.voice, but we always set it.
+            config.extra = {"lang": self._voice}
+            try:
+                audio = self._tts.generate(text, config)
+            except Exception as error:
+                # Re-raise with the input attached. ONNX Runtime's own message names
+                # a graph node ("SequenceInsert", "Loop") and nothing about what was
+                # being said, so a failure in the field arrives as a stack trace with
+                # no way to reproduce it. One robot hit
+                # "SequenceInsert ... tensor to be added has a different data type"
+                # on a sentence that synthesizes fine on both Orins, and the log gave
+                # no voice, language or text to work from.
+                raise RuntimeError(
+                    f"kokoro generate failed (language={self._language}, espeak="
+                    f"{self._voice}, speaker={self._voice_index}/{self.voice_name}, "
+                    f"global_sid={self._sid}, {len(text)} chars): {error}\n"
+                    f"  text: {text!r}"
+                ) from error
+
+        samples = np.asarray(audio.samples, dtype=np.float32)
+        if samples.size == 0:
+            log.warning("[tts] kokoro produced no audio for %r", text)
+            return
+        # Resample the *whole* utterance, then frame it. Doing it per 3200-byte
+        # frame would restart the filter every 100 ms and inject a transient each
+        # time — see utils/resample.resample_poly.
+        pcm = downsample_24k_to_16k(samples)
+        for i in range(0, len(pcm), CHUNK_BYTES):
+            yield pcm[i:i + CHUNK_BYTES]
+
+    def _synthesize_japanese(self, text: str):
+        """Kanji -> kana -> misaki phonemes -> the ONNX graph, bypassing sherpa."""
+        from plugins import ja_phonemes
+
+        kana = self._ja().to_kana_only(text)
+        phonemes = ja_phonemes.kana_to_phonemes(kana)
+        if not phonemes.strip():
+            log.warning("[tts] nothing speakable left in %r after Japanese "
+                        "normalisation", text)
+            return
+
+        with self._lock:
+            samples = self._direct().synthesize(
+                phonemes, speaker_id=self._sid, speed=self._speed)
+
+        if samples.size == 0:
+            log.warning("[tts] kokoro_direct produced no audio for %r (%r)",
+                        text, phonemes)
+            return
+        pcm = downsample_24k_to_16k(samples)
+        for i in range(0, len(pcm), CHUNK_BYTES):
+            yield pcm[i:i + CHUNK_BYTES]
+
+    def set_speed(self, speed: float) -> None:
+        # Applied per generate() call, so nothing reloads — same as the other two.
+        self._speed = speed
+
+    def set_language(self, language: str) -> None:
+        """Change the pronunciation language on the resident model.
+
+        The point of the whole design: `lang` rides in GenerationConfig.extra, so
+        this costs a field assignment rather than the ~2.7 s session rebuild a
+        session key would. Which is why `tts_language` is deliberately absent from
+        _session_keys.
+
+        The voice moves with the language, because `speaker_id` is an index within
+        it — switching to `ja` gives voice 0 of Japanese, not whatever global id the
+        English voice 0 happened to occupy. Out of range clamps rather than raising:
+        French has one voice, and a free per-utterance setting must not be able to
+        fail. `sid` is a per-generate() argument, so none of this reloads anything.
+        """
+        resolved = self._normalize_language(language)
+        if resolved == self._language:
+            return
+        self._language = resolved
+        self._sid = self._resolve_sid(self._voice_index, resolved, strict=False)
+        if resolved == "ja":
+            # Build now, not on the first utterance: a missing janome should stop
+            # the config call with a clear error, not a speak.
+            self._ja()
+        log.info("[tts] kokoro language -> %s (espeak %s), voice -> %s (global %d)",
+                 resolved, self._voice, self.voice_name, self._sid)
+
+
+def _validate_kokoro_manifest(model_dir: str) -> dict:
+    """Check the release before sherpa-onnx gets a chance to exit(-1) or mis-tune.
+
+    Mirrors _validate_thai_manifest above and _validate_manifest in
+    plugins/vits2_tts_trt/runtime/backends/trt_numpy_tts_engine.py: the release
+    carries a manifest written by the repack script from the ONNX graph's own
+    metadata, so a mismatched or hand-assembled directory fails here as an ordinary
+    exception rather than during model load.
+
+    Two of these checks cannot be made later:
+
+    - `model_version` must be 2. Only Kokoro >= 1.0 honours `lang`; on a v0.19
+      graph sherpa-onnx takes the PiperPhonemizeLexicon path and the language
+      selector would silently do nothing.
+    - `sample_rate` must be 24000, because utils/resample.py's filter is designed
+      for that ratio and nothing downstream can be told about another one.
+
+    Returns the parsed manifest, which the adapter uses for its speaker-name and
+    language-coherence checks.
+    """
+    import os
+
+    manifest_path = os.path.join(model_dir, "manifest.json")
+    if not os.path.exists(manifest_path):
+        raise FileNotFoundError(
+            f"{manifest_path} is missing; this release was not produced by "
+            "tools/repack_kokoro_v1_0.py and cannot be checked before load"
+        )
+    with open(manifest_path, encoding="utf-8") as handle:
+        manifest = json.load(handle)
+
+    version = int(manifest.get("model_version") or 0)
+    if version != 2:
+        raise RuntimeError(
+            f"Kokoro release declares model_version={version}; the language "
+            "selector needs 2 (Kokoro >= 1.0), and v0.19 ignores `lang` entirely"
+        )
+    rate = int(manifest.get("sample_rate") or 0)
+    if rate != KOKORO_SAMPLE_RATE:
+        raise RuntimeError(
+            f"Kokoro release is {rate} Hz but the adapter resamples "
+            f"{KOKORO_SAMPLE_RATE} Hz -> {SAMPLE_RATE} Hz; another rate needs its "
+            "own filter in utils/resample.py first"
+        )
+    if not manifest.get("id2speaker"):
+        raise RuntimeError(
+            "Kokoro release manifest has no id2speaker map; the adapter needs it "
+            "to check that the voice matches the language"
+        )
+    return manifest
+
+
 def _build_tts_adapter(cfg: dict) -> TTSAdapter:
     import os
     from utils.onnx_provider import normalize_device
     engine = str(cfg.get('engine', '')).lower()
-    default_dir = ('/models/mms-th' if engine == 'mms-th'
-                   else '/models/sherpa-onnx/tts')
+    default_dir = ENGINE_MODEL_DIRS.get(engine, '/models/sherpa-onnx/tts')
     model_dir = cfg.get('model_dir', default_dir)
     speaker_id = int(cfg.get('speaker_id', 0))
     speed = float(cfg.get('speed', 1.0))
-    device = normalize_device(cfg.get('device'), cfg.get('hw_provider'))
+    # An engine may want somewhere other than cpu when nothing is configured;
+    # normalize_device turns an absent value into 'cpu', so the default has to be
+    # applied before it, not after.
+    device = normalize_device(
+        cfg.get('device') or ENGINE_DEVICE_DEFAULTS.get(engine),
+        cfg.get('hw_provider'),
+    )
     if engine == 'mms-th':
         return MmsThaiTTSAdapter(
             model_dir, speaker_id, speed, device,
             phrase_spacing=bool(cfg.get('thai_phrase_spacing', False)),
+        )
+    if engine == 'kokoro-multi':
+        return KokoroTTSAdapter(
+            model_dir, speaker_id, speed, device,
+            # `tts_language` is the configSchema name the dashboard sends;
+            # `language` is the short form config.yaml uses. Both accepted, the
+            # same way the facade takes `tts_engine` or `engine`.
+            language=(cfg.get('tts_language') or cfg.get('language')
+                      or KokoroTTSAdapter.DEFAULT_LANGUAGE),
         )
     return MatchaTTSAdapter(model_dir, speaker_id, speed, device)
 
@@ -1243,16 +1881,29 @@ class SherpaOnnxTTSPlugin:
             # model for a slider change"). vits2 already behaved this way, which is
             # why only the two sherpa-onnx engines were slow.
             #
+            # `tts_language` is not in it either, for exactly the same reason:
+            # Kokoro reads `lang` out of GenerationConfig.extra on every call, so a
+            # language change is a field assignment. Putting it in _session_keys
+            # would cost a 310 MB fp32 session rebuild per dropdown change.
+            #
             # Values are normalised before comparing, or `speed: 1` from the
             # dashboard would differ from a stored `1.0` and defeat the check.
             incoming = _session_keys(cfg)
             speed = float(cfg['speed']) if 'speed' in cfg else None
+            language = str(cfg['tts_language']) if cfg.get('tts_language') else None
 
             needs_rebuild = any(self._cfg.get(key) != value
                                 for key, value in incoming.items())
             self._cfg.update(incoming)
+            # Both of these have to be written back explicitly, because they are
+            # absent from `incoming` by design and _build_tts_adapter reads them out
+            # of self._cfg. Without this, a rebuild triggered by some *other* key
+            # would construct the adapter with the default language rather than the
+            # one the operator selected.
             if speed is not None:
                 self._cfg['speed'] = speed
+            if language is not None:
+                self._cfg['tts_language'] = language
 
             if needs_rebuild or self._adapter is None:
                 changed = sorted(incoming) if needs_rebuild else ['(no model loaded)']
@@ -1264,8 +1915,13 @@ class SherpaOnnxTTSPlugin:
                 with self._nodes_lock:
                     for key in list(self._nodes.keys()):
                         self._dispose_node(self._nodes.pop(key), key)
-            elif speed is not None:
-                self._adapter.set_speed(speed)
+            else:
+                if speed is not None:
+                    self._adapter.set_speed(speed)
+                if language is not None:
+                    # A no-op on every engine but Kokoro; TTSAdapter defines it so
+                    # this does not need to know which one is resident.
+                    self._adapter.set_language(language)
             return {"status": "configured", "rebuilt": bool(needs_rebuild)}
 
         elif action == "interrupt":
@@ -1301,7 +1957,7 @@ DEFAULT_TTS_ENGINE = "vits2-zh-en"
 # `matcha` and `mms-th` both run on sherpa-onnx.
 #
 # Language codes, not country codes: `zh`, not `cn`.
-TTS_ENGINES = ("vits2-zh-en", "matcha-zh-en", "mms-th")
+TTS_ENGINES = ("vits2-zh-en", "matcha-zh-en", "mms-th", "kokoro-multi")
 # Older spellings, still accepted. `vits2_trt` and `sherpa_onnx` are not
 # decoration: both are already persisted in ConfigDB rows and in config.yaml on
 # every deployed robot, and _select_engine raises on an unknown engine — so
@@ -1327,6 +1983,22 @@ ENGINE_MODEL_DIRS = {
     # their weights by different names but share nothing, and pointing them at one
     # directory is the mistake ENGINE_MODEL_DIRS exists to prevent.
     "mms-th": "/models/mms-th",
+    # Its own tree, and the archives land in `<dir>/gpu` and `<dir>/cpu` beneath
+    # it: the two devices load different weight files (fp32 vs int8), so they are
+    # separate downloads that must not overwrite each other.
+    "kokoro-multi": "/models/kokoro-multi",
+}
+# Where an engine wants to run when nothing has been configured. Only Kokoro
+# differs: it is a 310 MB fp32 graph on gpu and the CUDA provider is worth having,
+# whereas Matcha and MMS are small enough that cpu is a reasonable default.
+#
+# Known wart: the dashboard renders the configSchema's `device.default` ("cpu"),
+# so the form and the effective default disagree until someone touches the field.
+# JSON Schema cannot express a per-engine default, and a second engine-specific
+# device field would be worse — the value is stated in the field description
+# instead.
+ENGINE_DEVICE_DEFAULTS = {
+    "kokoro-multi": "gpu",
 }
 # How long an `action=config` engine switch waits for the new engine before
 # answering `loading`. Sized so the bounded part of a build finishes inside it

@@ -819,3 +819,80 @@ def ensure_thai_tts_model(model_dir: str) -> str:
         THAI_TTS_ARCHIVE,
     )
     return model_dir
+
+
+# ── Kokoro TTS (Kokoro-82M v1.0, 24 kHz, ONNX; one archive per device) ─────────
+# Keyed by **device**, not by JetPack family: Kokoro is plain ONNX Runtime, so
+# unlike the VITS2 TensorRT plans above there is nothing tied to a TensorRT major
+# and select_bundle_family does not apply. What does differ per device is the
+# weights themselves — provider_for_device refuses int8 on CUDA (ONNX Runtime's
+# CUDA provider falls back to CPU per quantised node and measured slower than
+# fp32), so gpu must get fp32 and cpu wants int8. Two archives rather than one
+# holding both means a robot downloads ~330 MB or ~120 MB, not 450 MB of which
+# half is never loaded.
+#
+# Each extracts into its own `<device>/` subdirectory, the same shape
+# ensure_vits2_model uses for `engines/<family>/`. Sharing one directory would put
+# two ensure_verified_archive installs in the same tree, where the second's
+# staging replace could take the first's weights with it; separate subdirectories
+# make the question not arise, and flipping `device` back finds its files still
+# there.
+#
+# Repacked from the sherpa-onnx release asset kokoro-multi-lang-v1_0.tar.bz2 by
+# tools/repack_kokoro_v1_0.py, which drops three things upstream ships that this
+# deployment can never read:
+#   - lexicon-us-en.txt / lexicon-gb-en.txt — unreachable. sherpa-onnx takes the
+#     espeak path for non-Chinese text whenever `lang` is non-empty, and `lang`
+#     defaults to the model's own meta_data.voice ("en-us"), so it is never empty.
+#   - dict/ (the jieba dictionary) — ignored since sherpa-onnx v1.12.15; passing
+#     dict_dir now only logs a warning.
+# lexicon-zh.txt IS reachable (the Chinese branch does not consult `lang`) and is
+# required for lang=zh, so it stays, as do the three ZH rule FSTs.
+#
+# Licence: Apache-2.0, inherited from hexgrad/Kokoro-82M — see the LICENSE file
+# inside the archive.
+KOKORO_MODEL_BASE = os.environ.get("KOKORO_MODEL_BASE_URL", COS_BASE)
+KOKORO_MODEL_ARCHIVES = {
+    # Verified by re-downloading the uploaded object and hashing that copy, not the
+    # local file that was uploaded — the point of the pin is to catch a bad
+    # transfer, and hashing the source cannot. (Same note as THAI_TTS_ARCHIVE.)
+    "gpu": {
+        "archive": "kokoro-multi-v1_0-24k-fp32.tar.gz",
+        "size": 337021832,
+        "sha256": "519afd6a443c5eb4c9c75d4f677c43beb0aa56f33c73c063d0456d4ceeb58156",
+    },
+    "cpu": {
+        "archive": "kokoro-multi-v1_0-24k-int8.tar.gz",
+        "size": 124706598,
+        "sha256": "ccf70f4fd809a1c697333c3a036c9d94799f1620aedf932271ea163cd72b97fc",
+    },
+}
+
+
+def ensure_kokoro_model(model_dir: str, device: str = "gpu") -> str:
+    """Ensure the Kokoro release for `device` is installed; return its directory.
+
+    Returns `<model_dir>/<device>`, which is what the adapter passes to
+    sherpa-onnx — the caller never assembles the subdirectory itself.
+    """
+    model_dir = require_models_subpath(model_dir)
+    key = "gpu" if str(device).strip().lower() == "gpu" else "cpu"
+    entry = KOKORO_MODEL_ARCHIVES[key]
+    if not entry.get("sha256") or not entry.get("size"):
+        # Refuse rather than download unpinned, the same rule ensure_thai_tts_model
+        # states: every other model here is size+SHA256 verified, and an
+        # unauthenticated 330 MB blob would be the one hole in that.
+        raise RuntimeError(
+            f"KOKORO_MODEL_ARCHIVES[{key!r}] has no pinned size/sha256 — build the "
+            "tarball with tools/repack_kokoro_v1_0.py, publish it to COS, and "
+            "record the size and SHA256 of the *uploaded* copy here"
+        )
+    target = os.path.join(model_dir, key)
+    log.info(f"[model_downloader] kokoro: using {key} archive")
+    ensure_verified_archive(
+        f"kokoro/{key}",
+        target,
+        f"{KOKORO_MODEL_BASE.rstrip('/')}/{entry['archive']}",
+        entry,
+    )
+    return target
