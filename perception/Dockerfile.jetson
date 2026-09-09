@@ -483,6 +483,35 @@ print('[build] Thai deps import ok: pythainlp %s, khanaa %s, wunsen %s' % \
 (pythainlp.__version__, m.version('khanaa'), m.version('wunsen')))"; \
     fi && rm -f /tmp/thai-requirements.txt
 
+# ── Japanese TTS frontend dep ─────────────────────────────────────────────────
+# One pure-Python wheel with a bundled dictionary (~180 MB installed, and that is
+# the whole cost of Japanese support).
+#
+# Same ARG placement as ENABLE_THAI_TTS above and for the same build-cache reason:
+# an `ARG` up top would rebuild the entire ~16 GB image for one wheel.
+#
+# Janome and not the obvious alternatives, both of which were checked first:
+#   pykakasi       does the same job but is GPL-3.0.
+#   fugashi/cutlet declare requires_python >= 3.9, so they cannot run on jp5.11's
+#                  cp38 at all.
+# Janome is Apache-2.0, `py3-none-any`, and was verified to import and convert on
+# both cp38 (jp5.11) and cp310 (jp6.1) before being picked.
+#
+# The import check is not ceremony: it is the same trap requirements.thai.txt
+# documents — a pure-Python wheel installs happily on cp38 and then fails at
+# import. Verified by running it, not by reading `requires_python`.
+ARG ENABLE_JA_TTS=1
+COPY perception/plugins/requirements.ja.txt /tmp/ja-requirements.txt
+RUN if [ "${ENABLE_JA_TTS}" = "1" ]; then \
+      pip3 install --no-cache-dir -i "${PYPI_MIRROR}" -r /tmp/ja-requirements.txt && \
+      python3 -c "from janome.tokenizer import Tokenizer; \
+t = Tokenizer(); \
+out = ''.join((k.reading if k.reading and k.reading != '*' else k.surface) \
+              for k in t.tokenize('今日は2026年10月1日です')); \
+assert not any(0x4E00 <= ord(c) <= 0x9FFF for c in out), out; \
+print('[build] janome ok, no kanji left: %s' % out)"; \
+    fi && rm -f /tmp/ja-requirements.txt
+
 # ── Application code ───────────────────────────────────────────────
 WORKDIR /work
 COPY perception/main.py    /work/main.py

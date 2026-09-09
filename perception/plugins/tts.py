@@ -776,6 +776,13 @@ class KokoroTTSAdapter(TTSAdapter):
         # 二千零二十六" in English, Spanish, Japanese, all of them.
         # plugins/zh_text_norm.py applies them only to the Chinese runs.
         self._zh_norm = ZhTextNormalizer(model_dir)
+        # Japanese needs the opposite treatment to Chinese: not "normalise the
+        # numbers", but "get every kanji out of the text". sherpa-onnx routes
+        # [一-鿿] to its Chinese branch with no language check, and Japanese kanji
+        # live in that range, so without this they are pronounced in Mandarin.
+        # Built lazily on the first switch to `ja` — Janome loads a ~180 MB
+        # dictionary, and a Chinese or English deployment must not pay for it.
+        self._ja_frontend = None
 
         tts_config = sherpa_onnx.OfflineTtsConfig(
             model=sherpa_onnx.OfflineTtsModelConfig(
@@ -839,6 +846,12 @@ class KokoroTTSAdapter(TTSAdapter):
                  f"model_rate={model_rate or KOKORO_SAMPLE_RATE} -> {SAMPLE_RATE}, "
                  f"lexicon={'zh' if lexicon else 'none'}, "
                  f"zh_text_norm={'on' if self._zh_norm.available else 'off'}")
+
+        if language == "ja":
+            # Build the Japanese frontend before the probe, so a missing janome is a
+            # load error naming the build flag rather than a card that comes up
+            # `running` and then speaks Mandarin.
+            self._ja()
 
         # Prove the espeak voice resolves before anything asks this adapter to
         # speak. A bad voice name is close to invisible at runtime: sherpa-onnx
@@ -934,6 +947,20 @@ class KokoroTTSAdapter(TTSAdapter):
         """The model's own name for the resident voice, e.g. `af_heart`."""
         return self._manifest.get("id2speaker", {}).get(str(self._sid), "?")
 
+    def _ja(self):
+        """The Japanese frontend, built on first use and then kept.
+
+        Lazy because Janome loads a ~180 MB dictionary and only `ja` needs it; a
+        Chinese or English deployment must not pay for it at every start. Built
+        eagerly at construction and in `set_language` when `ja` is selected, so a
+        missing janome surfaces as a load error naming the build flag rather than as
+        a failed utterance halfway through a tour.
+        """
+        if self._ja_frontend is None:
+            from plugins.ja_text_norm import JapaneseFrontend
+            self._ja_frontend = JapaneseFrontend()
+        return self._ja_frontend
+
     def synthesize(self, text: str) -> bytes:
         return b''.join(self.synthesize_stream(text))
 
@@ -944,6 +971,10 @@ class KokoroTTSAdapter(TTSAdapter):
         # comment in __init__. Non-Chinese text comes back untouched, so espeak
         # reads "2026" in whatever language it is phonemising.
         text = self._zh_norm.normalize(text)
+        if self._language == "ja":
+            # Everything, not just the numbers: kanji have to leave the text
+            # entirely or sherpa routes them to lexicon-zh.txt and speaks Mandarin.
+            text = self._ja().normalize(text)
 
         # One generate() at a time. sherpa-onnx's OfflineTts is not documented as
         # thread-safe, and dispatch() runs on a ThreadingHTTPServer thread per
@@ -1006,6 +1037,10 @@ class KokoroTTSAdapter(TTSAdapter):
             return
         self._language = resolved
         self._sid = self._resolve_sid(self._voice_index, resolved, strict=False)
+        if resolved == "ja":
+            # Build now, not on the first utterance: a missing janome should stop
+            # the config call with a clear error, not a speak.
+            self._ja()
         log.info("[tts] kokoro language -> %s (espeak %s), voice -> %s (global %d)",
                  resolved, self._voice, self.voice_name, self._sid)
 

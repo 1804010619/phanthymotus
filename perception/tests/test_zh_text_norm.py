@@ -148,6 +148,42 @@ def test_the_cjk_punctuation_set_holds_only_cjk_only_characters():
         assert ch in zh_text_norm._CJK_PUNCT, f"{ch!r} only appears in CJK text"
 
 
+# ── Japanese must not be treated as Chinese ───────────────────────────────────
+
+@pytest.mark.parametrize("text", [
+    "今日は2026年10月1日です",
+    "こんにちは！今日は2026年10月1日です。私はシャオ・ファンと申します。",
+    "こんにちは、25の展示があります。",
+    "第1話",                       # kanji + digit, but kana-free? no: no kana here
+])
+def test_japanese_numbers_are_left_for_the_japanese_frontend(text):
+    """Kanji are inside the CJK range, so the adjacency rule would claim them.
+
+    Left alone, "今日は2026年10月1日です" became "今日は二零二六年十月一日です" and
+    was then read in Mandarin. Japanese dates want ジュウガツ / ツイタチ, which
+    plugins/ja_text_norm.py produces; the ZH FSTs must not get there first.
+    """
+    if not zh_text_norm.has_kana(text):
+        pytest.skip("no kana: this case is not distinguishable from Chinese")
+    assert zh_text_norm.segment(text) == [(False, text)], zh_text_norm.segment(text)
+    assert not _has_chinese_number(text)
+
+
+def test_kana_detection():
+    assert zh_text_norm.has_kana("こんにちは")          # hiragana
+    assert zh_text_norm.has_kana("シャオ")              # katakana
+    assert zh_text_norm.has_kana("今日は")              # mixed
+    assert not zh_text_norm.has_kana("今天有25个展品")   # Chinese
+    assert not zh_text_norm.has_kana("We have 25")
+    assert not zh_text_norm.has_kana("")
+
+
+def test_chinese_still_normalises_when_no_kana_present():
+    """The kana guard must not disarm the Chinese path it sits next to."""
+    assert _has_chinese_number("今天是2026年1月15日，有25个展品。")
+    assert _has_chinese_number("延迟200毫秒")
+
+
 # ── the FST is fed whole segments, not bare digits ────────────────────────────
 
 class _RecordingNormalizer(zh_text_norm.ZhTextNormalizer):

@@ -76,6 +76,22 @@ _NEUTRAL = set(" \t\n\r\f\v.,:;!?()[]{}\"'`~@#$%^&*+=|\\/<>-_")
 # *did* rewrite punctuation would have turned it into a real bug.
 _CJK_PUNCT = set("。，、；：？！（）《》【】")
 
+# Hiragana and katakana. Their presence means the text is Japanese, not Chinese —
+# and Japanese kanji sit inside _CJK, so without this check the adjacency rule below
+# marks a Japanese sentence's numbers as Chinese and the ZH FSTs rewrite them:
+#
+#   今日は2026年10月1日です  ->  今日は二零二六年十月一日です
+#
+# which is then read in Mandarin. Japanese dates want ジュウガツ / ツイタチ, which
+# plugins/ja_text_norm.py handles. Chinese text does not contain kana, so treating
+# any kana as "this is not Chinese" is safe in the direction that matters.
+_KANA = re.compile(r"[぀-ヿ]")
+
+
+def has_kana(text: str) -> bool:
+    """True when the text contains hiragana or katakana, i.e. it is Japanese."""
+    return bool(_KANA.search(text))
+
 
 def _classify(text: str):
     """Split into (kind, start, end) runs, kind in cjk/digit/latin/other."""
@@ -139,7 +155,14 @@ def segment(text: str):
 
     Neutral runs join whichever segment is open, so punctuation never splits a
     sentence into extra pieces. Concatenating the substrings reproduces the input.
+
+    Japanese is excluded wholesale: kanji are inside the CJK range, so a Japanese
+    sentence would otherwise have its numbers rewritten into Chinese numerals and
+    read in Mandarin. See has_kana.
     """
+    if has_kana(text):
+        return [(False, text)] if text else []
+
     runs = _classify(text)
     if not runs:
         return [(False, text)] if text else []

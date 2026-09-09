@@ -233,19 +233,13 @@ is a free per-utterance setting and must not be able to fail, and `fr` has exact
 one voice. The requested index is remembered, so switching back restores it. Logs and
 `info` report the resolved name (`af_heart`), not the number.
 
-> **Only `en-us`, `en-gb` and `zh` have been listened to.** sherpa-onnx's own
-> documentation says of this model "it is a multi-lingual model, but we only add
-> English and Chinese support for it" — Kokoro was trained with misaki G2P, and for
-> the other six the espeak phoneme set is not guaranteed to be the one the acoustic
-> model learned. All nine produce audio of a plausible length on device; treat the
-> rest as best-effort until someone who reads the language has heard them.
->
-> **`ja` is known to be wrong, not merely unverified.** sherpa-onnx's frontend routes
-> every character in `[一-鿿]` to its *Chinese* branch with no language check, and
-> Japanese kanji live in exactly that range — `展` is U+5C55, `示` is U+793A. So
-> `こんにちは、25の展示があります。` reaches the model as Japanese kana through
-> espeak-ja plus kanji pronounced in **Mandarin** from `lexicon-zh.txt`. Nothing here
-> can fix that; it needs a Japanese lexicon in sherpa-onnx.
+> **Only `en-us`, `en-gb`, `zh` and `ja` have been exercised on device.**
+> sherpa-onnx's own documentation says of this model "it is a multi-lingual model,
+> but we only add English and Chinese support for it" — Kokoro was trained with
+> misaki G2P, and for `es` / `fr` / `it` / `pt-br` / `hi` the espeak phoneme set is
+> not guaranteed to be the one the acoustic model learned. All of them produce audio
+> of a plausible length; treat those five as best-effort until someone who reads the
+> language has heard them.
 
 #### Measured on Orin 6 (jp6.1), fp32 on gpu
 
@@ -323,6 +317,68 @@ TTS plugin cannot turn it into a card in `state: error`; it takes ASR, VOP and O
 down with it. Same hazard `_validate_thai_manifest` exists for. It also refuses a
 `model_version` of 1 (v0.19 ignores `lang`, so the dropdown would be visibly present
 and silently inert) and any `sample_rate` other than 24000.
+
+### `ja` needs its own frontend, or it comes out in Mandarin
+
+sherpa-onnx's Kokoro frontend splits text on `[一-鿿]` and sends everything in that
+range to `ConvertChineseToTokenIDs`, which reads `lexicon-zh.txt`. **That function
+never receives the requested language** — only the non-Chinese branch does. Japanese
+kanji are inside that range (`今` U+4ECA, `私` U+79C1, `何` U+4F55), so raw Japanese
+reaches the model as Mandarin-pronounced kanji plus espeak-ja kana. That is what
+"the Japanese sounds Chinese" turned out to be.
+
+Measured on Orin 6, and this is the whole argument:
+
+| text | `ja` | `en-us` | `es` | `fr` |
+|---|---|---|---|---|
+| `今日私何` (kanji only) | 30682 | 30682 | 30682 | 30682 |
+| `こんにちは` (kana only) | 28908 | 114986 | — | — |
+
+Identical sample counts for kanji under every language: `lang` has **no effect** on
+them. Kana, by contrast, change 4x. No sherpa-onnx release ships a Japanese lexicon
+(checked v0_19, v1_0 and v1_1), so the fix has to happen before the engine sees the
+text.
+
+`plugins/ja_text_norm.py` converts every kanji to kana, so nothing is left in the
+CJK range and the whole utterance takes the espeak-ja path. Same role as
+`plugins/thai_frontend.py`. Two stages, and the second is not optional:
+
+1. **Dates, times and counters, by rule.** Japanese counter readings are irregular
+   and context-dependent, and a morphological analyser gives the isolated-morpheme
+   reading instead — Janome renders `10月` as `ツキ` and `1日` as `ニチ`, where a
+   speaker says `ジュウガツ` and `ツイタチ`. Also `4月`=シガツ (not ヨンガツ),
+   `4時`=ヨジ, `30分`=サンジュップン. The irregular follows the **trailing** digit,
+   so a flat table keyed on the whole number gets `14時` and `30分` wrong —
+   `tests/test_ja_text_norm.py` pins both, and caught exactly that mistake.
+2. **Everything else, via Janome.** Apache-2.0, `py3-none-any`, its own IPADIC
+   dictionary, verified to import *and convert correctly* on cp38/jp5.11 **and**
+   cp310/jp6.1 before it was chosen. `pykakasi` does the same job but is GPL-3.0;
+   `fugashi`/`cutlet` declare `requires_python >= 3.9` and cannot run on jp5.11.
+
+Result on the sentence that prompted this:
+
+```
+こんにちは！今日は2026年10月1日です。私はシャオ・ファンと申します。何かお手伝いしましょうか？
+  -> コンニチハ！キョウハニセンニジュウロクネンジュウガツツイタチデス。
+     ワタシハシャオ・ファントモウシマス。ナニカオテツダイシマショウカ？
+  kanji left: none
+```
+
+Janome costs **~180 MB installed** and is gated by `ENABLE_JA_TTS` (default 1),
+placed last among the Dockerfile's dependency layers for the same build-cache reason
+as `ENABLE_THAI_TTS`. The frontend is built lazily on the first switch to `ja`, so a
+Chinese or English deployment never loads that dictionary — but eagerly enough (at
+construction and in `set_language`) that a missing janome is a load error naming the
+build flag, rather than a card that comes up `running` and speaks Mandarin. That is
+the one place this refuses instead of degrading, and for the same reason the Thai
+adapter refuses without pythainlp.
+
+Remaining caveat, measured rather than assumed: espeak-ja emits a few phonemes
+Kokoro's token table does not contain — `U+0308`, `U+031E` and `ʑ` `U+0291` — and
+sherpa drops them ("Skip unknown phonemes"), about a dozen in a long sentence.
+Japanese is now unmistakably Japanese, but Kokoro's tokens were built for misaki's
+phoneme set rather than espeak's, so it is not as clean as English or Chinese.
+
 
 ### `mms-th`, and why it cannot be handed raw text
 

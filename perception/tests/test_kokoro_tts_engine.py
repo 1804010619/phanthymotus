@@ -461,13 +461,23 @@ def _bare_adapter(voice_index=0, language="en-us"):
     Constructed without __init__ on purpose: resolving a voice index is pure
     manifest arithmetic, and requiring a 310 MB model to test it would mean it never
     got tested at all.
+
+    `_ja_frontend` is pre-filled so switching to `ja` does not drag janome in — this
+    fixture is about the speaker mapping, and the Japanese frontend has its own
+    tests in test_ja_text_norm.py.
     """
     a = object.__new__(tts.KokoroTTSAdapter)
     a._manifest = {"languages": _LANGS, "id2speaker": _NAMES}
     a._language = language
     a._voice_index = voice_index
+    a._ja_frontend = _StubJapaneseFrontend()
     a._sid = a._resolve_sid(voice_index, language, strict=True)
     return a
+
+
+class _StubJapaneseFrontend:
+    def normalize(self, text):
+        return text
 
 
 @pytest.mark.parametrize("language,index,expected", [
@@ -507,6 +517,22 @@ def test_switching_language_moves_the_voice_with_it():
     assert a._sid == 37, "the voice stayed English while the phonemes went Japanese"
     a.set_language("zh")
     assert a._sid == 45
+
+
+def test_selecting_japanese_builds_the_frontend_eagerly():
+    """A missing janome must fail the config call, not the first utterance.
+
+    Kanji reach sherpa's Chinese branch without it, so the card would come up
+    `running` and speak Mandarin — the failure the Thai adapter refuses to ship for
+    the same reason.
+    """
+    import inspect
+
+    for src in (inspect.getsource(tts.KokoroTTSAdapter.set_language),
+                inspect.getsource(tts.KokoroTTSAdapter.__init__)):
+        assert "self._ja()" in src, (
+            "the Japanese frontend must be built when ja is selected, not lazily "
+            "on the first speak")
 
 
 def test_switching_into_a_language_with_fewer_voices_clamps(caplog):
