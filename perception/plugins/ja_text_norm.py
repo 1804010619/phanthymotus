@@ -447,6 +447,24 @@ class JapaneseFrontend:
             parts.append(reading)
         return "".join(parts)
 
+    def to_kana_only(self, text: str) -> str:
+        """Counters, then leftover numbers, then kanji->kana — stopping at kana.
+
+        `normalize` continues on to romaji, which is what a Latin-script espeak voice
+        needs. The direct runtime wants kana instead, because plugins/ja_phonemes maps
+        kana to the phonemes the model was actually trained on. Same first three
+        stages either way.
+        """
+        if not text:
+            return text
+        kana = self.to_kana(normalize_numbers(normalize_dates(text)))
+        if has_kanji(kana):
+            log.warning(
+                "[tts] Japanese text still contains kanji after conversion (%s); "
+                "those characters have no phoneme mapping and will be dropped",
+                "".join(sorted(set(_CJK.findall(kana))))[:20])
+        return kana
+
     def normalize(self, text: str) -> str:
         """Counters, then leftover numbers, then kanji->kana, then kana->romaji.
 

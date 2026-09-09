@@ -805,6 +805,12 @@ class KokoroTTSAdapter(TTSAdapter):
         # Built lazily on the first switch to `ja` — Janome loads a ~180 MB
         # dictionary, and a Chinese or English deployment must not pay for it.
         self._ja_frontend = None
+        # Japanese does not go through sherpa at all — see _synthesize_japanese —
+        # so the direct runtime needs to know which weights and provider to reuse.
+        self._direct_runtime = None
+        self._model_dir = model_dir
+        self._weights_name = os.path.basename(model_path)
+        self._provider = provider
 
         tts_config = sherpa_onnx.OfflineTtsConfig(
             model=sherpa_onnx.OfflineTtsModelConfig(
@@ -983,6 +989,19 @@ class KokoroTTSAdapter(TTSAdapter):
             self._ja_frontend = JapaneseFrontend()
         return self._ja_frontend
 
+    def _direct(self):
+        """The phoneme-driven ONNX runtime, built on first Japanese utterance.
+
+        A second session on the same weights, so it costs another CUDA context —
+        which is why it is lazy and only Japanese pays for it. Everything else keeps
+        using sherpa, which is correct for those languages and better tested.
+        """
+        if self._direct_runtime is None:
+            from plugins.kokoro_direct import KokoroDirect
+            self._direct_runtime = KokoroDirect(
+                self._model_dir, self._weights_name, provider=self._provider)
+        return self._direct_runtime
+
     def synthesize(self, text: str) -> bytes:
         return b''.join(self.synthesize_stream(text))
 
@@ -993,10 +1012,16 @@ class KokoroTTSAdapter(TTSAdapter):
         # comment in __init__. Non-Chinese text comes back untouched, so espeak
         # reads "2026" in whatever language it is phonemising.
         text = self._zh_norm.normalize(text)
+
         if self._language == "ja":
-            # Everything, not just the numbers: kanji have to leave the text
-            # entirely or sherpa routes them to lexicon-zh.txt and speaks Mandarin.
-            text = self._ja().normalize(text)
+            # Japanese leaves sherpa entirely. Its frontend phonemises with espeak,
+            # whose alphabet Kokoro's misaki-derived vocabulary cannot represent, and
+            # drops the misses — 12 phonemes from one sentence, audible as holes.
+            # plugins/ja_phonemes produces the phonemes the model was actually
+            # trained on, and plugins/kokoro_direct feeds them to the graph, because
+            # sherpa has no phoneme input path.
+            yield from self._synthesize_japanese(text)
+            return
 
         # One generate() at a time. sherpa-onnx's OfflineTts is not documented as
         # thread-safe, and dispatch() runs on a ThreadingHTTPServer thread per
@@ -1032,6 +1057,29 @@ class KokoroTTSAdapter(TTSAdapter):
         # Resample the *whole* utterance, then frame it. Doing it per 3200-byte
         # frame would restart the filter every 100 ms and inject a transient each
         # time — see utils/resample.resample_poly.
+        pcm = downsample_24k_to_16k(samples)
+        for i in range(0, len(pcm), CHUNK_BYTES):
+            yield pcm[i:i + CHUNK_BYTES]
+
+    def _synthesize_japanese(self, text: str):
+        """Kanji -> kana -> misaki phonemes -> the ONNX graph, bypassing sherpa."""
+        from plugins import ja_phonemes
+
+        kana = self._ja().to_kana_only(text)
+        phonemes = ja_phonemes.kana_to_phonemes(kana)
+        if not phonemes.strip():
+            log.warning("[tts] nothing speakable left in %r after Japanese "
+                        "normalisation", text)
+            return
+
+        with self._lock:
+            samples = self._direct().synthesize(
+                phonemes, speaker_id=self._sid, speed=self._speed)
+
+        if samples.size == 0:
+            log.warning("[tts] kokoro_direct produced no audio for %r (%r)",
+                        text, phonemes)
+            return
         pcm = downsample_24k_to_16k(samples)
         for i in range(0, len(pcm), CHUNK_BYTES):
             yield pcm[i:i + CHUNK_BYTES]

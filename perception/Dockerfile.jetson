@@ -419,24 +419,42 @@ print('[build] VITS2 frontend ok on numpy ' + numpy.__version__)"; \
 #
 # GPU variant: NVIDIA provides onnxruntime-gpu wheels for Jetson. Hosted on COS.
 # jp5.11 uses 1.15.1 (CUDA 11.4, Python 3.8, GLIBCXX_3.4.28 compatible).
-# jp6.1 reuses sherpa-onnx's bundled onnxruntime 1.18.0 (cuDNN 9 compatible) rather
-# than installing a separate wheel. The bundled version is already installed with
-# sherpa-onnx and links correctly against JP6.1's cuDNN 9.
-# The GPU wheel is ~39 MB vs ~5 MB for CPU-only, but provides CUDAExecutionProvider
-# and TensorrtExecutionProvider with ~3.6x performance improvement (JP5.11: 5ms vs 17ms,
-# JP6.1: 6ms vs 20ms per inference).
+#
+# jp6.1 needs **both halves**, and shipping either alone leaves the face plugin on
+# the CPU while claiming otherwise. Measured on Orin 6 with buffalo_sc/w600k_mbf:
+#
+#   onnxruntime==1.18.0 (PyPI, CPU build) + this layer's copy   18.53 ms   54 FPS
+#   the COS gpu wheel alone                                     19.10 ms   52 FPS
+#   the COS gpu wheel + this layer's copy                        5.89 ms  170 FPS
+#
+# They fail for opposite reasons. The PyPI wheel is a CPU build: its pybind layer
+# has no provider-bridge code, so `get_available_providers()` never lists CUDA no
+# matter what .so files sit beside it, and copying one in is a no-op. The COS wheel
+# does have the bridge, but was built against cuDNN 8 and JP6.1 ships 9, so loading
+# its provider fails with "libcudnn.so.8: cannot open shared object file".
+#
+# So: install the COS wheel for the bridge, then overwrite its cuDNN 8 provider with
+# sherpa-onnx's cuDNN 9 one in the step below. Both halves, or neither works.
+# History note, because this looked settled twice: the tree alternated between the
+# two single-halves (ae0e13a, ad4a091, cdd23fd) and merged on the CPU one.
 RUN . /etc/jetpack.env && \
     case "${JP_VERSION}" in \
         511) ORT_WHEEL="https://agi-phanthy-dev-1252788780.cos.ap-beijing.myqcloud.com/public/onnxruntime/jp511/onnxruntime_gpu-1.15.1-cp38-cp38-linux_aarch64.whl" ;; \
-        61)  ORT_WHEEL="onnxruntime==1.18.0" ;; \
+        61)  ORT_WHEEL="https://agi-phanthy-dev-1252788780.cos.ap-beijing.myqcloud.com/public/onnxruntime/jp61/onnxruntime_gpu-1.18.0-cp310-cp310-linux_aarch64.whl" ;; \
         *)   ORT_WHEEL="onnxruntime==1.18.1" ;; \
     esac && \
     pip3 install --no-cache-dir --no-deps -i ${PYPI_MIRROR} "${ORT_WHEEL}"
 
-# ── JP6.1: Enable GPU using sherpa-onnx's bundled onnxruntime ────────────────
-# sherpa-onnx 1.13.6+cuda bundles onnxruntime 1.18.0 compiled against cuDNN 9,
-# which is exactly what JP6.1 requires. We reuse its CUDA provider libraries
-# instead of compiling our own or waiting for an official wheel.
+# ── JP6.1: the second half of the GPU fix ────────────────────────────────────
+# The COS wheel installed above carries the provider bridge but was built against
+# cuDNN 8; JP6.1 ships 9, so its own provider fails to load with
+# "libcudnn.so.8: cannot open shared object file". sherpa-onnx 1.13.6+cuda bundles
+# the same provider built against cuDNN 9, so overwrite the wheel's copy with it.
+#
+# Neither half works alone — see the measurements on the wheel-selection step above.
+# Do not "simplify" this away and go back to the PyPI CPU wheel: that has no bridge
+# at all, and this copy then silently does nothing while the plugin logs
+# "device='gpu' ... falling back to cpu".
 RUN . /etc/jetpack.env && \
     if [ "${JP_VERSION}" = "61" ]; then \
         SHERPA_LIB="/usr/local/lib/python3.10/dist-packages/sherpa_onnx/lib" && \
