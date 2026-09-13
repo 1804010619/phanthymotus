@@ -237,6 +237,44 @@ class TestHookQueries(_NarrationFixture):
     def test_no_bindings_is_not_busy(self):
         self.assertFalse(hooks.notify_resource_busy('on_notify'))
 
+    def test_completed_but_unreaped_pending_is_not_busy(self):
+        """Orin5 实测的那个 bug。
+
+        完成回调只做 `_pending_actions[aid].set()`，故意不删这一项（晚到的 waiter 还要
+        读结果），真正的删除要等某个 barrier 来回收。所以一句早就播完的话会一直挂在
+        _pending_actions 里。按 key 判断"忙不忙"的话，嘴会被锁到下一次 barrier 为止 ——
+        现场是 17:03:24 播完、17:05:58 才回收，中间 2 分 34 秒的自动播报全被静默跳过。
+        """
+        self._register_mouth()
+        ev = asyncio.Event()
+        mcp_client._pending_actions['speak-1'] = ev
+        mcp_client._pending_resources['speak-1'] = frozenset({'mouth'})
+        self.assertTrue(hooks.notify_resource_busy('on_notify'))   # 播放中
+        ev.set()                                                   # 完成回调到达
+        self.assertFalse(hooks.notify_resource_busy('on_notify'))  # 嘴已经空了
+        # 该项仍在 dict 里 —— 回收是 barrier 的事，不是这个判断的事。
+        self.assertIn('speak-1', mcp_client._pending_actions)
+
+    def test_resource_actually_busy_ignores_completed(self):
+        want = frozenset({'mouth'})
+        ev = asyncio.Event()
+        mcp_client._pending_actions['a'] = ev
+        mcp_client._pending_resources['a'] = want
+        self.assertTrue(mcp_client.resource_actually_busy(want))
+        self.assertEqual(mcp_client.conflicting_pending(want), ['a'])
+        ev.set()
+        self.assertFalse(mcp_client.resource_actually_busy(want))
+        # conflicting_pending 的语义不变 —— barrier 仍要靠它找到该等/该回收的项。
+        self.assertEqual(mcp_client.conflicting_pending(want), ['a'])
+
+    def test_one_in_flight_among_completed_is_still_busy(self):
+        want = frozenset({'mouth'})
+        done, live = asyncio.Event(), asyncio.Event()
+        done.set()
+        mcp_client._pending_actions.update({'done': done, 'live': live})
+        mcp_client._pending_resources.update({'done': want, 'live': want})
+        self.assertTrue(mcp_client.resource_actually_busy(want))
+
 
 class TestBuildNarrationMessages(unittest.TestCase):
     FROZEN = {'role': 'system', 'content': 'you are a robot'}

@@ -113,6 +113,10 @@ def notify_resource_busy(hook_id: str = 'on_notify') -> bool:
     A binding that declares no `x-resource` is never "busy": call_tool_hook
     dispatches it unconditionally, so claiming otherwise here would suppress a
     narration that would in fact have been heard.
+
+    用 `resource_actually_busy` 而不是 `conflicting_pending` —— 后者会把「已经播完、
+    只是还没被 barrier 回收」的 action 也算成占用，那会让一句播报把嘴锁住好几分钟，
+    期间所有自动播报被静默跳过（Orin5 上实测 2 分 34 秒）。
     """
     import mcp_client
     bindings = _registry.get(hook_id) or []
@@ -126,7 +130,7 @@ def notify_resource_busy(hook_id: str = 'on_notify') -> bool:
         resource = (meta or {}).get('resource')
         if not resource:
             return False
-        if not mcp_client.conflicting_pending(resource):
+        if not mcp_client.resource_actually_busy(resource):
             return False
     return True
 

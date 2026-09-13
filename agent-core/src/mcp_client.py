@@ -134,6 +134,28 @@ def conflicting_pending(want: frozenset | None) -> list[str]:
     ]
 
 
+def resource_actually_busy(want: frozenset | None) -> bool:
+    """这些资源**此刻**是不是真被占着 —— 用于「现在能不能说话」这类即时判断。
+
+    与 `conflicting_pending` 的区别很关键：完成回调（/api/acp/complete 或 WS 的
+    action_complete）只做 `_pending_actions[aid].set()`，**故意不删**这一项，好让晚到的
+    waiter 还能读到结果；真正的删除发生在某个 barrier 等到它的时候。所以一个早就播完的
+    action 会一直留在 `_pending_actions` 里，直到下一次 barrier 顺手回收它。
+
+    对 barrier 本身没问题（它 await 一个已经 set 的 Event，瞬间返回并完成回收），但对
+    「嘴现在空不空」就是错的。Orin5 上实测：一句播报 17:03:19 发出、17:03:24 完成回调就
+    到了，可那一项直到 17:05:58 才被回收 —— 中间 2 分 34 秒里嘴明明是空的，却一直被判成
+    忙，期间所有自动播报被静默跳过。
+
+    因此这里要跳过 Event 已经 set 的那些：它们已经完成，只是还没被回收。
+    """
+    for aid in conflicting_pending(want):
+        ev = _pending_actions.get(aid)
+        if ev is not None and not ev.is_set():
+            return True
+    return False
+
+
 def pendings_to_wait_for(want: frozenset | None, *, owner: str,
                          concurrent: bool) -> list[str]:
     """Everything a call must wait for, in registration order.
@@ -1222,7 +1244,9 @@ async def call_tool_hook(mcp_id: str, tool_name: str, args: dict, *,
                 meta = tool_meta[candidate]
                 break
         resource = meta.get('resource')
-        if resource and conflicting_pending(resource):
+        # resource_actually_busy 而不是 conflicting_pending：已完成但还没被 barrier
+        # 回收的 action 不算占用，否则一句播报会把嘴"锁"到下一次 barrier 为止。
+        if resource and resource_actually_busy(resource):
             return {"skipped": "resource busy"}
 
     result = await call_tool_direct(mcp_id, tool_name, args)
