@@ -93,6 +93,44 @@ def get_hook_for_binding(mcp_id: str, tool: str, action: str) -> str | None:
     return None
 
 
+def has_bindings(hook_id: str) -> bool:
+    """Is anything registered under this hook at all.
+
+    A deployment with no `on_notify` binding has no channel to the user, so
+    anything that would narrate through it should no-op rather than spend an
+    LLM call producing text nobody can hear.
+    """
+    return bool(_registry.get(hook_id))
+
+
+def notify_resource_busy(hook_id: str = 'on_notify') -> bool:
+    """True if *every* binding of `hook_id` would be skipped as resource-busy.
+
+    Same tool_meta lookup `mcp_client.call_tool_hook` does (schema name first
+    with the action suffix, then without) — doing it up front lets a caller
+    avoid paying for an LLM call whose output would be dropped on the floor.
+
+    A binding that declares no `x-resource` is never "busy": call_tool_hook
+    dispatches it unconditionally, so claiming otherwise here would suppress a
+    narration that would in fact have been heard.
+    """
+    import mcp_client
+    bindings = _registry.get(hook_id) or []
+    if not bindings:
+        return False
+    for b in bindings:
+        entry = mcp_client.registry.get(b.mcp_id) or {}
+        tool_meta = entry.get('tool_meta', {})
+        meta = (tool_meta.get(f'mcp__{b.mcp_id}__{b.tool}__{b.action}')
+                or tool_meta.get(f'mcp__{b.mcp_id}__{b.tool}'))
+        resource = (meta or {}).get('resource')
+        if not resource:
+            return False
+        if not mcp_client.conflicting_pending(resource):
+            return False
+    return True
+
+
 def get_status() -> dict:
     """Return hook registry and recent fire log for diagnostics."""
     return {

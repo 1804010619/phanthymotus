@@ -396,6 +396,93 @@ def _round_already_notified(tool_calls: list) -> bool:
     return False
 
 
+def _notify_fire_spoke(results: list | None) -> bool:
+    """True if at least one on_notify binding actually reached a device.
+
+    hooks.fire returns one entry per binding: {'error': ...} on exception, else
+    {'result': <tool return>}. With barrier_aware=True a binding whose mouth was
+    already held comes back as the literal {"skipped": "resource busy"}
+    (mcp_client.call_tool_hook) — the user heard nothing new from *this* fire,
+    so it must not be counted as an interaction.
+    """
+    for r in results or []:
+        if not isinstance(r, dict) or 'error' in r:
+            continue
+        res = r.get('result')
+        if isinstance(res, dict) and ('skipped' in res or 'error' in res):
+            continue
+        return True
+    return False
+
+
+def _auto_notify_enabled() -> bool:
+    """自动播报（框架代为出声）的总开关。
+
+    event.skills (attribute) is rebound to a Tools() instance by
+    event/__init__.py, shadowing the submodule — get_notify_override is a
+    module-level function, so it must come from sys.modules.
+    """
+    import sys as _sys
+    override = _sys.modules['event.skills'].get_notify_override()
+    if override is not None:
+        return bool(override)
+    return bool(config.main.get('event', {}).get('llm', {}).get('auto_notify', True))
+
+
+def _narration_thresholds() -> tuple[int, int]:
+    """(rounds, seconds) —— 运行时覆盖（set_progress_report）优先于 DB 配置。"""
+    import sys as _sys
+    llm_cfg = config.main.get('event', {}).get('llm', {})
+    rounds = int(llm_cfg.get('narration_silence_rounds', 4))
+    seconds = int(llm_cfg.get('narration_silence_seconds', 25))
+    ov = _sys.modules['event.skills'].get_report_override()
+    if ov:
+        rounds = int(ov.get('rounds', rounds))
+        seconds = int(ov.get('seconds', seconds))
+    return rounds, seconds
+
+
+def _narration_threshold_hit(silent_rounds: int, silent_seconds: float,
+                             rounds_thr: int, seconds_thr: int) -> bool:
+    """先到者触发。两个阈值互不替代：
+
+    轮次阈值管"步骤很多但每步很快" —— 4 轮 × 3 秒的排查里用户已经 12 秒没听到动静；
+    秒数阈值管"一轮就很久" —— 一次 40 秒的导航调用只算 1 轮，轮次阈值永远够不着。
+    任一阈值 <= 0 表示该维度关闭；两个都 <= 0 表示整个机制关闭。
+
+    注意两者都只在轮间隙采样，所以一次 90 秒的工具调用期间不会触发，只会在它返回后
+    触发 —— 要覆盖调用进行中的沉默需要独立定时器，那会把汇报器重新变成后台任务并带回
+    "turn 已结束却还在说话"等一系列竞态。
+    """
+    if rounds_thr > 0 and silent_rounds >= rounds_thr:
+        return True
+    if seconds_thr > 0 and silent_seconds >= seconds_thr:
+        return True
+    return False
+
+
+def _narration_feedback_message(report: str) -> dict:
+    """回灌给主 LLM 的一条消息：你已经说过了，别再说一遍。
+
+    role 用 user 而不是 assistant —— 一条没有 tool_calls 的 assistant 消息插在工具结果
+    和下一次请求之间虽然合法，但把作者标错了。`[system notification source=...]` 这个
+    形状本文件已有四处，_scrub/_sanitize 和保存路径都认。
+    """
+    return {'role': 'user', 'content':
+            f'[system notification source=narration]\n'
+            f'已自动替你向用户播报了一句进展：「{report}」。'
+            f'不要重复这些内容；继续手头的工作。'}
+
+
+# 哑火护栏的提示语。以前模型只写 content 就 finish 还能被 content 自动播报救回来，
+# 现在那条路没了，这种 turn 会彻底没声 —— 而它恰恰是最常见的短问答形态。
+_NO_OUTPUT_RETRY_MESSAGE = (
+    '[system notification source=no_output]\n'
+    '你这一轮只写了 content，没有通过任何工具把它说出口，用户什么也没听到。\n'
+    '如果这句话是要给用户的，现在调用播报工具说出来；如果不是，直接 finish。'
+)
+
+
 def _needs_barrier(name: str, call_args: dict = None) -> tuple[bool, frozenset | None]:
     """这个 MCP 工具调用要不要 barrier，以及它想占用哪些物理资源。
 
@@ -552,6 +639,80 @@ async def _compress_turns(turns: list[list[dict]]) -> str:
         print(f'[decision] compress failed: {e}')
         # 压缩失败时，回退到简单截断
         return f'[历史摘要] 之前有 {len(turns)} 轮对话，因压缩失败仅保留最近内容。'
+
+
+# ── 主动播报（framework-generated progress narration）─────────────────────────
+
+_NARRATION_PROMPT = """[系统] 你已连续 {rounds} 轮（约 {seconds} 秒）没有对用户说过任何话，用户正在等你。
+现在只做一件事：用**一句话**向用户汇报进展，不要调用任何工具，不要输出别的内容。
+
+内容要求（按顺序，能省则省）：做到了什么 / 发现了什么 / 接下来做什么。
+- 口语，会被直接念出来。不要 markdown、编号、括号注释、工具名、文件路径。
+- 不超过 40 个字。
+- 用用户的语言。
+{last}
+如果这段过程里确实没有任何值得告诉用户的进展，只输出 SKIP 三个字母。
+
+过程记录：
+{context}
+"""
+
+# 播出去之前的硬上限。prompt 里的"不超过 40 个字"是承重的 —— 这段话会注册成一个 ACP
+# pending，超时按 len(text)/3 + 10 算，下一个需要 barrier 的工具调用（含 finish）都得
+# 等它播完。模型经常无视长度约束，所以代码侧也要截。
+_NARRATION_MAX_CHARS = 120
+
+# 「一台机器上没有任何 on_notify 绑定」只值得说一次，但必须说 —— 见 _maybe_report_progress。
+_warned_no_notify = False
+
+
+def _build_narration_messages(frozen_system: dict, turn_messages: list[dict],
+                              last_report_text: str, silent_rounds: int,
+                              silent_seconds: float, budget_chars: int) -> list[dict]:
+    """构造汇报调用的消息。
+
+    system 段直接复用主循环那一份 frozen_system：汇报因此继承机器人的人设和语言规则
+    （一个光秃秃的"你是进度播报器"会说出一个跟用户聊了半天的那个实体不像的语气），
+    而且逐字节相同意味着 provider 前缀缓存几乎免费。
+
+    上下文**取尾不取头** —— 与 _compress_turns 的 text[:30000] 相反，是刻意的：进度
+    汇报关心的是近况，历史摘要才必须保住开头。
+    """
+    text = _turns_to_text([list(turn_messages)])
+    if len(text) > budget_chars:
+        text = '...(前略)\n' + text[-budget_chars:]
+    last = (f'- 不要重复你上次已经播报过的：「{last_report_text}」' if last_report_text else '')
+    return [
+        frozen_system,
+        {'role': 'user', 'content': _NARRATION_PROMPT.format(
+            rounds=silent_rounds, seconds=int(silent_seconds), last=last, context=text)},
+    ]
+
+
+def _narration_decision(silent_rounds: int, silent_seconds: float, *,
+                        now: float, rounds_thr: int, seconds_thr: int,
+                        tool_restricted: bool, auto_notify: bool,
+                        has_bindings: bool, busy: bool, cancelled: bool) -> str:
+    """'report' | 'skip' | 'skip_busy'。纯函数，按从便宜到贵的顺序判。
+
+    'skip_busy' 与 'skip' 的区别只在调用方怎么处理计数器：嘴正忙时一次 LLM 调用都没花，
+    计数器该原样留着下一轮再试；其他 skip 是条件不满足，同样不该动计数器。
+    """
+    if rounds_thr <= 0 and seconds_thr <= 0:
+        return 'skip'
+    if tool_restricted:
+        return 'skip'
+    if not auto_notify:
+        return 'skip'
+    if not has_bindings:
+        return 'skip'
+    if not _narration_threshold_hit(silent_rounds, silent_seconds, rounds_thr, seconds_thr):
+        return 'skip'
+    if busy:
+        return 'skip_busy'
+    if cancelled:
+        return 'skip'
+    return 'report'
 
 
 # ── Tiered Retention helpers ──────────────────────────────────────────────────
@@ -851,6 +1012,7 @@ class Event:
             ('activate_skill', event.skills.activate_skill),
             ('deactivate_skill', event.skills.deactivate_skill),
             ('set_auto_notify', event.skills.set_auto_notify),
+            ('set_progress_report', event.skills.set_progress_report),
             ('task_create', event.task.task_create),
             ('task_update', event.task.task_update),
             ('task_done', event.task.task_done),
@@ -1184,6 +1346,103 @@ class Event:
         self._turns = recent_turns
         print(f'[decision] compressed: kept {len(recent_turns)} recent turns, summary={len(summary)} chars')
 
+    async def _maybe_report_progress(self, turn_messages: list[dict], frozen_system: dict,
+                                     silent_rounds: int, last_interact_ts: float,
+                                     last_report_text: str, *,
+                                     tool_restricted: bool,
+                                     cancel_event: asyncio.Event | None) -> tuple | None:
+        """连续沉默够久了就生成并播报一句进展汇报。
+
+        跑的是一次**跳出 agent loop、也跳出 subagent 体系**的一次性 LLM 调用（形状同
+        _compress_turns / subagent 的 _wrap_up）：无工具、主模型、短上下文，产出一句话。
+
+        **串行 await，不是 create_task**，四个理由：
+        1. 汇报调用要 1-3 秒，期间 finish 及其 barrier 可能已经完成，机器人会在说完
+           "找到了"之后再说"接下来我继续找"。要挡住得有 turn 代数令牌 + 退出路径取消，
+           而 _one_turn 没有 finally，TurnCancelled 会直接把后台任务漏掉。
+        2. call_tool_hook 的 busy 检查与 pending 注册相对主循环不是原子的；串行时两者
+           不可能交错，后台任务则会出现"主循环刚 dispatch speak 还没注册 → 汇报看到
+           资源空闲 → 两个一起说"。
+        3. reconsider_event 会被两处消费，破坏"同时只有一个 in-flight client.call"这个
+           RoundReconsider 整套设计所依赖的不变式。
+        4. 成本本来就小、又发生在轮间隙，而轮本身就要 3-48 秒。
+
+        返回 None 表示什么都没做（调用方保持计数器不变），否则
+        `(silent_rounds, last_interact_ts, last_report_text, spoke)` —— 前三个是新值，
+        `spoke` 表示用户是不是真听到了。SKIP / 超时 / 失败都会重置计数器（退避一个完整
+        间隔，不对着死端点每轮重试）但 `spoke=False`，哑火护栏还得管这个 turn。
+        """
+        import hooks
+        llm_cfg = config.main.get('event', {}).get('llm', {})
+        # 每次都现读，不缓存 —— 刻意不走 _one_turn 开头那份 llm_cfg（每 turn 只读一次，
+        # 也正是今天改 max_rounds 中途不生效的原因）。"多汇报一点"本身就发生在当前 turn
+        # 的某一轮，只有现读才能下一轮就生效。
+        rounds_thr, seconds_thr = _narration_thresholds()
+        silent_seconds = time.time() - last_interact_ts
+
+        decision = _narration_decision(
+            silent_rounds, silent_seconds,
+            now=time.time(), rounds_thr=rounds_thr, seconds_thr=seconds_thr,
+            tool_restricted=tool_restricted,
+            auto_notify=_auto_notify_enabled(),
+            has_bindings=hooks.has_bindings('on_notify'),
+            busy=hooks.notify_resource_busy('on_notify'),
+            cancelled=bool(cancel_event and cancel_event.is_set()),
+        )
+        if decision != 'report':
+            global _warned_no_notify
+            if (not _warned_no_notify and not hooks.has_bindings('on_notify')
+                    and (rounds_thr > 0 or seconds_thr > 0)):
+                # 否则"没有任何播报设备"和"阈值还没到"在日志里长得一模一样。
+                _warned_no_notify = True
+                print('[decision] narration disabled: no on_notify binding registered')
+            return None
+
+        now = time.time()
+        try:
+            messages = _build_narration_messages(
+                frozen_system, turn_messages, last_report_text,
+                silent_rounds, silent_seconds,
+                int(llm_cfg.get('narration_context_chars', 6000)))
+            response = await asyncio.wait_for(
+                # cancel_event 传下去（用户打断直接抛 TurnCancelled，这是对的）；
+                # reconsider_event 不传 —— 汇报很短、重跑也是一样的代价，而 steer
+                # 下一轮就会被排空。
+                client.call(message_list=messages, tool_list=[],
+                            cancel_event=cancel_event,
+                            caller_info={'agent_type': 'main_agent'}),
+                timeout=float(llm_cfg.get('narration_timeout_s', 20)))
+            report = (response.get('content') or '').strip()
+        except TurnCancelled:
+            raise
+        except asyncio.TimeoutError:
+            print('[decision] narration: LLM call timed out, backing off')
+            return 0, now, last_report_text, False
+        except Exception as e:
+            print(f'[decision] narration failed: {e}')
+            return 0, now, last_report_text, False
+
+        # SKIP 逃生口：传感器轮询那种确实没进展的时段，连说三遍"我还在查看"比沉默更糟。
+        if not report or report.strip().upper().startswith('SKIP'):
+            return 0, now, last_report_text, False
+        if len(report) > _NARRATION_MAX_CHARS:
+            report = report[:_NARRATION_MAX_CHARS]
+
+        results = await hooks.fire('on_notify', {'text': report}, barrier_aware=True)
+        if not _notify_fire_spoke(results):
+            # 竞态：前置检查时嘴还空着，真要说的时候被占了。LLM 的钱已经花了，退避一轮。
+            print(f'[decision] narration: all bindings skipped (busy) → "{report}"')
+            return 0, now, last_report_text, False
+
+        print(f'[decision] narration: {silent_rounds} silent round(s) / '
+              f'{silent_seconds:.0f}s → "{report}"')
+        await push_event({'type': 'narration', 'payload': {
+            'text': report, 'silent_rounds': silent_rounds,
+            'silent_seconds': int(silent_seconds)}})
+        # 告诉主 LLM 这句话已经替它说了，否则它下一轮很可能显式调播报工具再说一遍。
+        turn_messages.append(_narration_feedback_message(report))
+        return 0, time.time(), report, True
+
     async def _one_turn(self, trigger_event: dict, cancel_event: asyncio.Event | None = None,
                         reconsider_event: asyncio.Event | None = None):
         import time as _time
@@ -1194,6 +1453,15 @@ class Event:
         tool_restricted = bot_restricted or viewer_restricted
         bot_reply_source_ids = set(trigger_event.get('_bot_channel_message_ids', []))
         replied_message_ids: set[str] = set()
+
+        # ── 主动播报状态（函数局部 ⇒ 每个 turn 自动重置，无跨 turn 泄漏）──────
+        _silent_rounds = 0                    # 连续无面向用户输出的轮数
+        _last_interact_ts = time.time()       # 上次面向用户输出的时刻（含上次汇报）。
+                                              # 用 now 而不是 0 起步，否则每个 turn 第一轮
+                                              # 就会因为"距上次交互已过 57 年"立刻触发。
+        _last_report_text = ''                # 传给汇报调用，避免自我重复
+        _turn_interacted = False              # 整个 turn 有没有出过一次声（哑火护栏用）
+        _no_output_retried = False            # 哑火护栏只触发一次，防死循环
 
         # Reset Python sandbox namespace for this turn
         self._desktop_tools.reset_python_namespace()
@@ -1293,6 +1561,32 @@ class Event:
         round_idx = 0
         total_rounds = 0
         channel_reply_retry_consumed = False
+
+        async def _no_output_guard(text: str) -> bool:
+            """turn 要结束了，但它从头到尾一次都没出过声 —— 再给一轮。
+
+            废除 content 自动播报的配套护栏。以前"只写 content 就 finish"还能被自动播报
+            救回来，现在那条路没了，这种 turn 会彻底没声，而它恰恰是最常见的短问答形态。
+            形状照搬 _channel_tool_retry_message 那条一次性自纠：**只触发一次**，否则模型
+            顽固不调工具时会死循环。
+
+            返回 True 表示"别 break，接着走"。
+            """
+            nonlocal _no_output_retried
+            if _no_output_retried or _turn_interacted or not text:
+                return False
+            # 受限 turn 本来就不该播任何东西；没有播报通道时催也没用。
+            if tool_restricted or not _auto_notify_enabled():
+                return False
+            import hooks as _h
+            if not _h.has_bindings('on_notify'):
+                return False
+            _no_output_retried = True
+            turn_messages.append({'role': 'user', 'content': _NO_OUTPUT_RETRY_MESSAGE})
+            print('[decision] turn produced no user-facing output; retrying once')
+            await push_event({'type': 'llm_retry', 'payload': {'reason': 'no_user_output'}})
+            return True
+
         while True:
             # ── 绝对上限检查 ──────────────────────────────────────────────
             if total_rounds >= absolute_max:
@@ -1455,24 +1749,20 @@ class Event:
                     print(f'[decision]   tool_call: {t}')
 
             # ── 文字输出 ──────────────────────────────────────────────────
+            # content 不再自动播报。它曾经被 hooks.fire('on_notify') 直接念出去，两个
+            # 实测问题：模型经常整段沉默（prompt 约束不住），而它真写了的时候那是内部
+            # 推理，不是说给等着的人听的进度汇报。现在只有两条出声路径 —— 模型显式调
+            # 播报工具，或框架在连续沉默后生成的进度汇报（_maybe_report_progress）。
+            # agent_thought 照发：仪表盘仍要看到模型在想什么，只是不再念出来。
             text = response.get('content') or ''
             if text:
                 await push_event({'type': 'agent_thought', 'payload': {'text': text}})
-                if not tool_restricted and not _round_already_notified(response.get('tool_calls') or []):
-                    # event.skills (attribute) is rebound to a Tools() instance by
-                    # event/__init__.py, shadowing the submodule — get_notify_override
-                    # is a module-level function, so it must come from sys.modules.
-                    import sys as _sys
-                    override = _sys.modules['event.skills'].get_notify_override()
-                    auto_notify = override if override is not None else \
-                        config.main.get('event', {}).get('llm', {}).get('auto_notify', True)
-                    if auto_notify:
-                        import hooks
-                        # barrier_aware: on_notify narrates, it doesn't interrupt — it must
-                        # not talk over whatever's already playing, and once it does speak,
-                        # the next LLM-issued tool call must wait for it like any other
-                        # ACP-tracked action would (see hooks.fire's docstring).
-                        await hooks.fire('on_notify', {'text': text}, barrier_aware=True)
+
+            # 本轮是否发生了面向用户的输出。_round_already_notified 原本用于去重（模型
+            # 自己说过就别再自动播一遍），现在改为交互判定 —— 语义是同一个：这轮有没有
+            # 东西经由注册了 on_notify 的工具送到用户那里。
+            tool_calls = response.get('tool_calls') or []
+            _notified_by_tool = _round_already_notified(tool_calls)
 
             # ── 用量广播 ──────────────────────────────────────────────────
             _usage = response.get('_usage')
@@ -1484,10 +1774,9 @@ class Event:
                 await push_event({'type': 'llm_usage', 'payload': _usage})
 
             # ── 工具调用 ──────────────────────────────────────────────────
-            tool_calls = response.get('tool_calls') or []
 
             async def _dispatch(call: dict) -> dict:
-                nonlocal _finish_deferred
+                nonlocal _finish_deferred, _channel_replied
                 name   = call['function']['name']
                 args   = json.loads(call['function']['arguments'] or '{}')
                 # Set by either barrier branch below, when a barrier wait was cut short
@@ -1607,9 +1896,14 @@ class Event:
                 else:
                     result = f'未知工具: {name}'
 
-                if (name == 'mcp__channel__channel_reply' and args.get('source_message_id')
+                if (name == 'mcp__channel__channel_reply'
                         and isinstance(result, str) and not result.startswith('Error')):
-                    replied_message_ids.add(args['source_message_id'])
+                    # 面向用户的输出 —— 与 on_notify 绑定的工具等价，一起喂给沉默计数器。
+                    # source_message_id 只管 replied_message_ids 那本账（哪条消息回过了），
+                    # 主动发起的 channel 消息没有它，但用户一样收到了。
+                    _channel_replied = True
+                    if args.get('source_message_id'):
+                        replied_message_ids.add(args['source_message_id'])
 
                 # 性能追踪：记录工具完成
                 _t_after = time.time()
@@ -1645,6 +1939,8 @@ class Event:
             # when finish's barrier was cut short by a new message: the finish never
             # executed, so the finish detection below must not end the turn.
             _finish_deferred = False
+            # Same lifecycle: set by _dispatch when a channel_reply actually landed.
+            _channel_replied = False
             for c in tool_calls:
                 if _is_sensor(c['function']['name']):
                     _batch.append(c)
@@ -1729,8 +2025,16 @@ class Event:
                     print(warn)
                     await push_event({'type': 'error', 'payload': {'message': warn}})
                     break
+                elif await _no_output_guard(text):
+                    pass          # 护栏已经把提示写进 turn_messages，继续下一轮
                 else:
                     break
+
+            # 本轮的交互状态要在 finish 检测**之前**就记上。`speak(...) + finish()` 同轮
+            # 是常见形状，而计数器那段在循环体末尾 —— 等到那里再更新，finish 分支看到的
+            # _turn_interacted 还是 False，哑火护栏会凭空多插一轮。
+            if _notified_by_tool or _channel_replied:
+                _turn_interacted = True
 
             # ── finish 检测 ───────────────────────────────────────────────
             #
@@ -1742,7 +2046,12 @@ class Event:
             # 而 `tts(...) + finish()` 同轮是常见形状（Orin5 日志里就有），那时 results 非空、
             # 不 void，会一路落到这个 break 上。
             if _turn_ends_on_finish(tool_calls, finish_tool, _finish_deferred):
-                break
+                # 整个 turn 一次都没出过声就别急着结束 —— 见 _no_output_guard。
+                if not await _no_output_guard(text):
+                    break
+                round_idx += 1
+                total_rounds += 1
+                continue
             if _finish_deferred:
                 print('[decision] finish deferred: new message arrived during playback, '
                       'turn continues (audio keeps playing)')
@@ -1787,6 +2096,35 @@ class Event:
             # ── 取消检查点：工具执行完毕后，下一轮 LLM 调用前 ────────────────
             if cancel_event and cancel_event.is_set():
                 raise TurnCancelled("Interrupted after tool dispatch")
+
+            # ── 主动播报：连续沉默轮数 / 秒数 ─────────────────────────────────
+            #
+            # 放在这个位置是有讲究的，每一条都对应上面某个 continue / break：
+            # · 在 _round_voided 的 continue 之后 —— 作废轮没到达任何设备，不算沉默，
+            #   而且它的 response 已经被 pop 掉，快照是不一致的；
+            # · 在 finish 的 break 之后 —— 刚结束的 turn 绝不能再说"接下来我打算…"；
+            # · 在 steering 排空之后 —— 汇报能看到刚插进来的用户消息；
+            # · 在取消检查点之后 —— 不给一个即将 TurnCancelled 的 turn 花 LLM 调用；
+            # · 在 round_idx += 1 之前 —— 回灌消息赶得上下一轮的 build_continuation。
+            #
+            # truncate-and-continue / RoundReconsider / 轮作废都在此点之上 continue，
+            # 计数器天然不动 —— 那几种情况既没有面向用户的输出，也没有用户能感知到的沉默。
+            if _notified_by_tool or _channel_replied:
+                _silent_rounds = 0
+                _last_interact_ts = time.time()
+                _turn_interacted = True
+            else:
+                _silent_rounds += 1
+                _outcome = await self._maybe_report_progress(
+                    turn_messages, frozen_system, _silent_rounds,
+                    _last_interact_ts, _last_report_text,
+                    tool_restricted=tool_restricted, cancel_event=cancel_event)
+                if _outcome is not None:
+                    _silent_rounds, _last_interact_ts, _last_report_text, _spoke = _outcome
+                    # 只有真播出去了才算这个 turn 出过声。SKIP / 超时 / 失败同样会重置
+                    # 计数器（退避一个完整间隔，不对着死端点每轮重试），但用户什么也没听到，
+                    # 哑火护栏还得管这个 turn。
+                    _turn_interacted = _turn_interacted or _spoke
 
             round_idx += 1
             total_rounds += 1

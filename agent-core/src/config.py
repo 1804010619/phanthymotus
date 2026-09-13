@@ -66,6 +66,12 @@ _DB_DEFAULTS = {
             'source_ring_size': 50,             # per-source ring buffer 大小（供 raw_input_info 查询）
             'interrupt_mode': 'steer',          # 打断模式: steer | interrupt | followup
             'barge_in_threshold_ms': 500,       # 语音 barge-in 阈值（ms），低于此值视为 backchannel
+            # 主动播报：连续多久没有面向用户的输出就自动生成并播报一句进展汇报。
+            # 两个阈值先到者触发；某项为 0 表示关闭该维度，两个都为 0 表示整个机制关闭。
+            'narration_silence_rounds': 4,      # 连续 N 轮无输出（管"步骤多但每步快"）
+            'narration_silence_seconds': 25,    # 距上次输出 N 秒（管"一步就很久"）
+            'narration_context_chars': 6000,    # 喂给汇报调用的上下文预算（取 turn 尾部）
+            'narration_timeout_s': 20,          # 汇报调用硬超时，超时视为本次放弃
         },
         'subscribe_topics': [],  # DDS topics core subscribes to directly (e.g. ["/robot/mic/audio/asr_event"])
     },
@@ -299,6 +305,27 @@ def _migrate():
                              (json.dumps(sa),))
                 conn.commit()
                 print(f'[config] subagent: {", ".join(changed)}')
+
+        # event.llm 新增的主动播报键。同上面那段：_seed_defaults 是整行粒度的
+        # INSERT OR IGNORE，已部署机器上的 'event' 行早就存在，新默认值永远进不去 ——
+        # 结果会是阈值读成 0，功能静默不生效。只补缺失的键，手工调过的值不动。
+        _narration_defaults = {
+            'narration_silence_rounds': 4,
+            'narration_silence_seconds': 25,
+            'narration_context_chars': 6000,
+            'narration_timeout_s': 20,
+        }
+        row_ev = conn.execute("SELECT value FROM config WHERE key='event'").fetchone()
+        if row_ev:
+            ev = json.loads(row_ev[0])
+            llm_cfg = ev.setdefault('llm', {})
+            added = [k for k in _narration_defaults if k not in llm_cfg]
+            if added:
+                for k in added:
+                    llm_cfg[k] = _narration_defaults[k]
+                conn.execute("UPDATE config SET value=? WHERE key='event'", (json.dumps(ev),))
+                conn.commit()
+                print(f'[config] event.llm: seeded {", ".join(added)}')
 
 _migrate()
 

@@ -299,5 +299,96 @@ class TestHooksFireBarrierAware(_RegistryFixture):
         self.assertEqual(len(called), 1)
 
 
+class TestContentIsNoLongerAutoBroadcast(_RegistryFixture):
+    """content 自动播报已废除 —— 这几条是防止它被加回去的护栏。
+
+    那条路径（llm.py 里的 `if text: ... hooks.fire('on_notify', {'text': text})`）在两个
+    方面站不住：prompt 约束不住模型去写 content，而它真写了的时候那是内部推理，不是说给
+    等着的人听的进度汇报。取而代之的是框架在连续沉默后生成的专门汇报
+    （见 test_progress_narration.py）。
+
+    _round_already_notified 保留，但职责从「去重」变成「本轮有没有面向用户的输出」。
+    """
+
+    def _round_loop_source(self):
+        src = pathlib.Path(__file__).resolve().parents[1] / 'src' / 'event' / 'llm.py'
+        return src.read_text()
+
+    def test_content_is_not_wired_to_on_notify(self):
+        """整个 llm.py 里唯一 fire on_notify 的地方必须是汇报器，不是 content。"""
+        src = self._round_loop_source()
+        self.assertNotIn("hooks.fire('on_notify', {'text': text}", src)
+        # 汇报器那一处仍在，且播的是生成出来的 report 而不是模型的 content。
+        self.assertIn("hooks.fire('on_notify', {'text': report}, barrier_aware=True)", src)
+
+    def test_agent_thought_still_pushed(self):
+        """仪表盘仍要看到模型在想什么 —— 只是不再念出来。"""
+        self.assertIn("'type': 'agent_thought'", self._round_loop_source())
+
+    def test_dedup_helper_still_resolves_both_naming_conventions(self):
+        """_round_already_notified 换了用途，解析行为不能跟着退化。
+
+        split（x-action-params）和 unsplit 两种命名都要认 —— 认不出来就会把「模型刚
+        自己说完话」这一轮误判成沉默，计数器不清零，框架跟着再播一遍。
+        """
+        mcp_client.registry.update(_split_tts_registry())
+        hooks.register('dev1', 'tts', {'on_notify': {'action': 'speak'}})
+        self.assertTrue(_round_already_notified([{
+            'function': {'name': 'mcp__dev1__tts__speak',
+                         'arguments': json.dumps({'text': 'hi'})}}]))
+
+        mcp_client.registry.update(_unsplit_tts_registry())
+        hooks.register('dev2', 'tts', {'on_notify': {'action': 'speak'}})
+        self.assertTrue(_round_already_notified([{
+            'function': {'name': 'mcp__dev2__tts',
+                         'arguments': json.dumps({'action': 'speak', 'text': 'hi'})}}]))
+
+    def test_non_notify_tool_is_not_an_interaction(self):
+        mcp_client.registry.update(_split_tts_registry())
+        hooks.register('dev1', 'tts', {'on_notify': {'action': 'speak'}})
+        self.assertFalse(_round_already_notified([{
+            'function': {'name': 'mcp__dev1__tts__interrupt', 'arguments': '{}'}}]))
+        self.assertFalse(_round_already_notified([]))
+
+
+class TestNoOutputGuard(_RegistryFixture):
+    """哑火护栏：整个 turn 一次都没出声就别让它这么结束。
+
+    废除 content 自动播报的直接后果 —— 以前「只写 content 就 finish」还能被自动播报救
+    回来，现在这种 turn 会彻底没声，而它恰恰是最常见的短问答形态。
+    """
+
+    def test_retry_message_names_the_actual_problem(self):
+        from event.llm import _NO_OUTPUT_RETRY_MESSAGE as m
+        self.assertIn('source=no_output', m)
+        # 要说清"用户什么也没听到"，而不是含糊的"请调用工具"。
+        self.assertIn('用户什么也没听到', m)
+        # 也要给"这句话本来就不用说出口"留出路，否则模型会被逼着念内部推理。
+        self.assertIn('finish', m)
+
+    def test_interaction_is_recorded_before_the_finish_check(self):
+        """`speak(...) + finish()` 同轮是常见形状。
+
+        交互状态的更新如果只在循环体末尾（计数器那段），finish 分支看到的
+        _turn_interacted 还是本轮开始时的 False，护栏就会在一个明明说过话的 turn 上
+        凭空多插一轮 —— 机器人说完"好了"之后又被追问一句"你还没说出口"。
+        """
+        src = (pathlib.Path(__file__).resolve().parents[1]
+               / 'src' / 'event' / 'llm.py').read_text()
+        early = src.index('if _notified_by_tool or _channel_replied:\n                _turn_interacted = True')
+        finish_check = src.index('if _turn_ends_on_finish(')
+        self.assertLess(early, finish_check)
+
+    def test_guard_is_one_shot_by_construction(self):
+        """只触发一次 —— 模型顽固不调工具时不能变成死循环。"""
+        src = (pathlib.Path(__file__).resolve().parents[1]
+               / 'src' / 'event' / 'llm.py').read_text()
+        guard = src[src.index('async def _no_output_guard'):]
+        guard = guard[:guard.index('\n        while True:')]
+        self.assertIn('nonlocal _no_output_retried', guard)
+        self.assertIn('if _no_output_retried or _turn_interacted or not text:', guard)
+        self.assertIn('_no_output_retried = True', guard)
+
+
 if __name__ == '__main__':
     unittest.main()

@@ -222,6 +222,25 @@ def _env_dynamic() -> str:
             + '</subscribed_sensors>\n'
         )
 
+    # 主动播报当前节奏。
+    #
+    # 放这里是因为「多汇报一点」是个**相对**调整，模型得先知道现值才调得动
+    # set_progress_report。约 15 token，顺带让整个机制对模型可见。
+    narration_section = ''
+    try:
+        from event.llm import _auto_notify_enabled, _narration_thresholds
+        if not _auto_notify_enabled():
+            narration_section = '<narration>已关闭（set_auto_notify(true) 可恢复）</narration>\n'
+        else:
+            _r, _s = _narration_thresholds()
+            _parts = ([f'{_r} 轮'] if _r > 0 else []) + ([f'{_s} 秒'] if _s > 0 else [])
+            narration_section = (
+                f'<narration>每{"或".join(_parts)}无交互时自动汇报一次进展，'
+                f'用 set_progress_report 调节奏</narration>\n'
+                if _parts else '<narration>已关闭</narration>\n')
+    except Exception:
+        pass
+
     # 其他 agent。
     #
     # **放在动态段而不是静态段**：静态段在 system message 里，只在设备注册/上下线
@@ -312,7 +331,7 @@ def _env_dynamic() -> str:
             + '</peers>\n'
         )
 
-    inner = tasks_section + sensors_section + peers_section
+    inner = tasks_section + sensors_section + narration_section + peers_section
     if inner:
         return (
             f'<status time="{now}">\n'

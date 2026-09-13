@@ -5,7 +5,7 @@ event/skills.py — 技能系统（混合模式）。
   1. DB `active` 字段 — UI 控制技能对 LLM 的可见性（出现在 <skills> 列表中）
   2. 内存 `_runtime_activated` — LLM 调用 activate_skill 后才注入完整 instruction
 
-提供 activate_skill / deactivate_skill / set_auto_notify 系统工具。
+提供 activate_skill / deactivate_skill / set_auto_notify / set_progress_report 系统工具。
 """
 
 import typing
@@ -19,25 +19,28 @@ import config
 _runtime_activated: set[str] = set()
 
 # 自动播报运行时覆盖（内存态，重启清空）。None = 跟随全局配置 event.llm.auto_notify。
-# 由 set_auto_notify 工具手动设置，或在技能激活/停用时按其 narrationDefault 重新计算——
-# 两者写的是同一个变量，谁最后写就以谁为准。
+# 唯一写者是 set_auto_notify 工具 —— 技能不再预先声明要不要播报（原先的
+# narrationDefault + _recompute_notify_override 已删除）：播不播由 agent-core 在运行时
+# 自己判断，而技能切换会把模型刚设好的状态冲掉，本身就是个 bug。
 _notify_override: bool | None = None
+
+# 主动进展汇报节奏的运行时覆盖（内存态，重启清空）。None = 跟随 DB 配置
+# event.llm.narration_silence_rounds / narration_silence_seconds。
+#
+# 刻意不写 DB，三个理由：与 _notify_override 对称（同一类口头指令）；"别老打断我"
+# 说的是这个任务而不是长期方针；以及 ConfigDB 没有嵌套 setter，工具写入要整块
+# read-modify-write `event` 这一个 key，而 api/mcp_manage.py 的 config 分支和
+# topic_subscriber 改的是同一个 key 且无锁 —— 那几个写者都是人力节奏，一个 LLM 每轮
+# 都能调的工具不是。持久设置的正规入口仍然是 decision_core 卡片。
+_report_override: dict | None = None      # {'rounds': int, 'seconds': int}
 
 
 def get_notify_override() -> bool | None:
     return _notify_override
 
 
-def _recompute_notify_override():
-    """技能激活状态变化后，按当前激活技能里第一个声明了 narrationDefault 的技能
-    重新计算运行时覆盖；没有技能声明时恢复为 None（跟随全局配置）。"""
-    global _notify_override
-    for s in get_active_skills():
-        v = s.get('narrationDefault')
-        if v is not None:
-            _notify_override = bool(v)
-            return
-    _notify_override = None
+def get_report_override() -> dict | None:
+    return _report_override
 
 
 def installed_skills() -> list[dict]:
@@ -94,7 +97,6 @@ class Tools:
         if not skill:
             return f'技能 "{slug}" 不可用。可用技能: {", ".join(s["slug"] for s in avail)}'
         _runtime_activated.add(slug)
-        _recompute_notify_override()
         return f'已激活技能「{skill["name"]}」。完整指令已注入，请立即根据指令执行任务，不要 finish。'
 
     async def deactivate_skill(self,
@@ -104,14 +106,62 @@ class Tools:
         if slug not in _runtime_activated:
             return f'技能 "{slug}" 未处于激活状态。'
         _runtime_activated.discard(slug)
-        _recompute_notify_override()
         return f'已停用技能「{slug}」，其指令已从上下文移除。'
 
     async def set_auto_notify(self,
-        enabled: typing.Annotated[bool, '是否开启自动播报——把你写的 content 自动通过语音/灯效等已注册输出广播给用户'],
+        enabled: typing.Annotated[bool, '是否允许系统在你长时间不出声时自动替你播报进展'],
     ):
-        """临时开启/关闭自动播报。默认开启；进入不希望每步都被听到/看到的场景
-        （下棋、表演、需要沉浸感的角色扮演）前调用 false，结束后调用 true 恢复。"""
+        """临时开启/关闭系统的自动进展播报。默认开启；进入不希望每步都被听到/看到的
+        场景（下棋、表演、需要沉浸感的角色扮演）前调用 false，结束后调用 true 恢复。
+
+        关掉之后系统不会再替你说任何话，但你自己调播报工具说的仍然会出声。"""
         global _notify_override
         _notify_override = bool(enabled)
         return f'自动播报已{"开启" if enabled else "关闭"}。'
+
+    async def set_progress_report(self,
+        rounds: typing.Annotated[int, '连续多少轮不说话就自动汇报一次。0=关闭轮数触发，-1=保持不变'] = -1,
+        seconds: typing.Annotated[int, '距上次说话多少秒就自动汇报一次。0=关闭秒数触发，-1=保持不变'] = -1,
+        restore_default: typing.Annotated[bool, '恢复默认节奏，忽略上面两个参数'] = False,
+    ):
+        """调整主动进展汇报的节奏。长任务里你连续多轮不说话时，系统会自动替你生成并播报
+        一句进展汇报；这个工具改的是"多久算连续不说话"。
+
+        什么时候调用：用户口头提了意见时。
+        - "多汇报一点" / "我不知道你在干嘛" → 调小，如 set_progress_report(rounds=2, seconds=15)
+        - "别老打断我" / "太吵了" → 调大，如 set_progress_report(rounds=10, seconds=120)
+        - "别自动汇报了" → set_progress_report(rounds=0, seconds=0)
+        - "恢复正常" → set_progress_report(restore_default=True)
+
+        两个阈值先到者生效：轮数管"步骤多但每步快"，秒数管"一步就很久"。只改一个就只传一个。
+        设置在本次运行内有效，重启后回到默认。
+
+        注意这只改节奏、不改开关：用户要的是"一句话都别说"（下棋、表演、沉浸式角色扮演）时，
+        用 set_auto_notify(false)。
+        """
+        global _report_override
+        if restore_default:
+            _report_override = None
+            return '主动汇报节奏已恢复默认（跟随设置页的配置）。'
+        # 在现有覆盖上累积修改：只传 seconds 不该把之前设好的 rounds 冲掉。
+        cur = dict(_report_override) if _report_override else {}
+        if rounds != -1:
+            cur['rounds'] = max(0, rounds)
+        if seconds != -1:
+            cur['seconds'] = max(0, seconds)
+        if not cur:
+            return '没有改动任何设置（rounds 和 seconds 都是 -1）。要恢复默认请传 restore_default=true。'
+        _report_override = cur
+        # 延迟 import：event/llm.py 在模块加载期就 import event，顶层导入会成环。
+        # 且必须走 sys.modules —— event/__init__.py 把 `event.llm` 这个**属性**重绑成了
+        # Event() 实例，`import event.llm as x` 拿到的是实例，模块级函数不在上面。
+        import sys as _sys
+        r, s = _sys.modules['event.llm']._narration_thresholds()
+        if r <= 0 and s <= 0:
+            return '主动汇报已关闭，之后不会再自动替你播报进展。'
+        parts = []
+        if r > 0:
+            parts.append(f'连续 {r} 轮')
+        if s > 0:
+            parts.append(f'{s} 秒')
+        return f'主动汇报节奏已调整为：{"或".join(parts)}不说话就自动汇报一次（先到者生效）。'
