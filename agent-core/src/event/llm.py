@@ -444,6 +444,19 @@ def _narration_thresholds() -> tuple[int, int]:
     return 0, seconds
 
 
+def _normalize_report(text: str) -> str:
+    """比"说过没说过"时用的归一形式：去掉空白和标点，只看内容。
+
+    只做精确/归一后相等的判断，不做模糊相似度 —— 后者需要一个阈值，而阈值调错的代价是
+    把真正的新进展也压掉（用户就此听不到），比偶尔重复一句更糟。
+    """
+    return ''.join(ch for ch in (text or '') if ch.isalnum())
+
+
+def _same_as_last_report(text: str) -> bool:
+    return bool(text) and _normalize_report(text) == _normalize_report(_last_report_text_global)
+
+
 def _narration_feedback_message(report: str) -> dict:
     """回灌给主 LLM 的一条消息：你已经说过了，别再说一遍。
 
@@ -1625,6 +1638,13 @@ class Event:
 
         # SKIP 逃生口：传感器轮询那种确实没进展的时段，连说三遍"我还在查看"比沉默更糟。
         if not report or report.upper().startswith('SKIP'):
+            _restart_countdown()
+            return
+        # 和上次说的一模一样就别再说一遍。prompt 里已经写了"不要重复上次播报过的"，但
+        # Orin5 实测它照样逐字重复（两次相隔 25 秒，子代理近况没什么变化，它既没说新东西
+        # 也没按要求 SKIP）。这种事不该指望模型自觉 —— 框架能判的就框架判。
+        if _same_as_last_report(report):
+            print(f'[decision] narration: same as last, skipped → "{report}"')
             _restart_countdown()
             return
         if len(report) > _NARRATION_MAX_CHARS:

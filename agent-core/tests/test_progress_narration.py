@@ -592,6 +592,34 @@ class TestReportProgress(_Fixture):
         self.assertEqual(ell._pending_narration_feedback, [])
         self.assertIsNotNone(ell._silence_countdown)
 
+    def test_identical_repeat_is_suppressed(self):
+        """和上次说的一模一样就别再说一遍。
+
+        prompt 里写了"不要重复上次播报过的"，但 Orin5 实测它照样逐字重复（两次相隔 25 秒，
+        子代理近况没变化，它既没说新东西也没 SKIP）。框架能判的就框架判。
+        """
+        self._stub('理想L6的配置、销量、竞品和口碑都查到了，正在整理成报告。')
+        self._run()
+        self.assertEqual(len(self.fired), 1)
+        self._run()                       # 第二次生成同一句
+        self.assertEqual(len(self.fired), 1, '重复的一句不该再播一遍')
+        self.assertIsNotNone(ell._silence_countdown)   # 但要继续计时
+
+    def test_repeat_check_ignores_punctuation_and_spacing(self):
+        self._stub('找完客厅了，接下来去卧室')
+        self._run()
+        self._stub('找完客厅了  接下来去卧室。')
+        self._run()
+        self.assertEqual(len(self.fired), 1)
+
+    def test_a_genuinely_new_report_still_fires(self):
+        """归一只做相等判断，不做模糊相似度 —— 阈值调错会把真正的新进展也压掉。"""
+        self._stub('找完客厅了，接下来去卧室')
+        self._run()
+        self._stub('卧室也找完了，没找到，去阳台看看')
+        self._run()
+        self.assertEqual(len(self.fired), 2)
+
     def test_overlong_report_is_truncated(self):
         self._stub('啊' * 500)
         self._run()
