@@ -313,17 +313,30 @@ def _migrate():
             'narration_context_chars': 6000,
             'narration_timeout_s': 20,
         }
+        # 已删除的键。轮数维度取消后（纯时间触发，定时器全局负责），这个键没有任何读者，
+        # 留在库里只会让人对着设置页猜"它还管不管用"。和上面的补种合并成一次
+        # read-modify-write —— 拆成两段就要对同一行读写两次，中间还多一个失败窗口。
+        _narration_removed = ('narration_silence_rounds',)
+
         row_ev = conn.execute("SELECT value FROM config WHERE key='event'").fetchone()
         if row_ev:
             ev = json.loads(row_ev[0])
             llm_cfg = ev.setdefault('llm', {})
             added = [k for k in _narration_defaults if k not in llm_cfg]
-            if added:
-                for k in added:
-                    llm_cfg[k] = _narration_defaults[k]
+            for k in added:
+                llm_cfg[k] = _narration_defaults[k]
+            dropped = [k for k in _narration_removed if k in llm_cfg]
+            for k in dropped:
+                llm_cfg.pop(k, None)
+            if added or dropped:
                 conn.execute("UPDATE config SET value=? WHERE key='event'", (json.dumps(ev),))
                 conn.commit()
-                print(f'[config] event.llm: seeded {", ".join(added)}')
+                _msg = []
+                if added:
+                    _msg.append(f'seeded {", ".join(added)}')
+                if dropped:
+                    _msg.append(f'dropped {", ".join(dropped)}')
+                print(f'[config] event.llm: {"; ".join(_msg)}')
 
 _migrate()
 

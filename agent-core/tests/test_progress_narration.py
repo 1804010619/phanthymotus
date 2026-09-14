@@ -703,9 +703,16 @@ class TestRoundsArmIsGone(unittest.TestCase):
 
     def test_config_key_removed(self):
         src = pathlib.Path(__file__).resolve().parents[1] / 'src'
-        for rel in ('config.py', 'start.py', 'api/mcp_manage.py'):
+        for rel in ('start.py', 'api/mcp_manage.py'):
             self.assertNotIn('narration_silence_rounds', (src / rel).read_text(),
                              f'{rel} 里还有轮数配置项')
+        # config.py 里唯一允许出现的地方是迁移的删除清单 —— 它得先知道键名才能删掉它。
+        cfg = (src / 'config.py').read_text()
+        head = cfg[:cfg.index('def _migrate(')]
+        self.assertNotIn('narration_silence_rounds', head,
+                         'config.py 的默认值里还有轮数配置项')
+        self.assertIn("_narration_removed = ('narration_silence_rounds',)", cfg,
+                      '迁移里应当把这个废弃键从库里删掉')
 
 
 if __name__ == '__main__':
