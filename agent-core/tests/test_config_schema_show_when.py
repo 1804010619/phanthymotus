@@ -65,13 +65,13 @@ class TestShowWhenValuesAreStrings(unittest.TestCase):
                                  + '\n'.join(bad))
 
     def test_decision_core_narration_fields_are_gated_on_the_string(self):
-        """回归锚点：这两个字段就是被布尔条件藏掉的那两个。"""
+        """回归锚点：这个字段就是当初被布尔条件静默藏掉的那个。"""
         tree = ast.parse((_SRC / 'start.py').read_text())
         schemas = list(_literal_dicts_for_key(tree, 'configSchema'))
         props = {}
         for s in schemas:
             props.update(s.get('properties', {}))
-        for key in ('narration_silence_rounds', 'narration_silence_seconds'):
+        for key in ('narration_silence_seconds',):
             self.assertIn(key, props, f'{key} 不在 decision_core 的 configSchema 里')
             self.assertEqual(props[key].get('x-show-when'), {'auto_notify': 'true'})
             self.assertEqual(props[key]['type'], 'integer')

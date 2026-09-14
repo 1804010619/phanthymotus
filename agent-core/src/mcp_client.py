@@ -44,37 +44,52 @@ _pending_tools: dict[str, str] = {}               # action_id → tool_name (资
 _pending_resources: dict[str, frozenset | None] = {}  # action_id → 占用的物理通道
 _pending_owner: dict[str, str] = {}               # action_id → 发起它的 agent 上下文
 
-# 动作完成的订阅者。「一句话播完了」这件事原本没有单一观察点：完成回调分散在
-# start.py 的 /api/acp/complete 和下面 WS 分支两处，各自直接 .set() 那个 Event，
-# 别的模块想知道"嘴什么时候空出来"只能去轮询。沉默计时需要精确的播放结束时刻
-# （从播放**开始**计时的话，一段 134 秒的播报刚说完就会立刻判定沉默超时），
-# 所以这里把两处收敛成 mark_action_complete，并允许挂监听。
-_completion_listeners: list = []
+# 动作"有结局了"的订阅者。原本没有单一观察点：完成回调分散在 start.py 的
+# /api/acp/complete 和下面 WS 分支两处，各自直接 .set() 那个 Event；而超时/取消走的是
+# _forget_pending，跟前两者毫无关系。想知道"嘴什么时候空出来"只能去轮询。
+#
+# 沉默计时需要精确的"说完了"时刻（从**开始**播算的话，一段 134 秒的播报刚说完就会立刻
+# 判超时），所以三条路统一在这里发通知：完成走 mark_action_complete，超时/取消走
+# _forget_pending。订阅者自己再判一次资源是否真空了 —— 通知可能早于实际空闲，多个嘴
+# 同时在播时第一个完成也不等于说完了。
+_settle_listeners: list = []
 
 
-def on_action_complete(fn) -> None:
-    """注册"某个动作播完了"的回调。回调收到 action_id，异常会被吞掉并打日志 ——
-    一个监听器出问题不该影响 ACP 本身的解锁。"""
-    _completion_listeners.append(fn)
+def on_action_settled(fn) -> None:
+    """注册"某个动作有结局了"的回调（完成 / 超时 / 取消都会触发）。
+
+    回调签名 fn(action_id, resource)。异常会被吞掉并打日志 —— 一个订阅者出问题不该
+    影响 ACP 本身的解锁。
+    """
+    _settle_listeners.append(fn)
+
+
+def _notify_settled(action_id: str, resource=None) -> None:
+    """`resource` 显式传入，因为 _forget_pending 是先拆表再通知的（见那里的注释），
+    这时候已经查不到这个 action 占用过什么了。"""
+    if resource is None:
+        resource = _pending_resources.get(action_id)
+    for fn in _settle_listeners:
+        try:
+            fn(action_id, resource)
+        except Exception as e:
+            print(f'[acp] settle listener failed: {e}')
 
 
 def mark_action_complete(action_id: str, payload: dict) -> bool:
-    """把一个 pending 标记为完成：记结果、解锁等待者、通知监听者。
+    """把一个 pending 标记为完成：记结果、解锁等待者、通知订阅者。
 
-    两处完成入口（HTTP 回调 / WS action_complete 事件）都必须走这里，否则监听者会
-    漏掉其中一条路上的完成事件。注意**不删** _pending_actions 那一项 —— 晚到的
-    waiter 还要读 _pending_results，回收是 barrier 的事（见 resource_actually_busy）。
+    两处完成入口（HTTP 回调 / WS action_complete 事件）都必须走这里，否则订阅者会漏掉
+    其中一条路上的完成事件。注意**不删** _pending_actions 那一项 —— 晚到的 waiter 还要
+    读 _pending_results，回收是 barrier 的事（见 resource_actually_busy）。
     """
     if action_id not in _pending_actions:
         return False
     _pending_results[action_id] = payload
     _pending_actions[action_id].set()
-    for fn in _completion_listeners:
-        try:
-            fn(action_id)
-        except Exception as e:
-            print(f'[acp] completion listener failed: {e}')
+    _notify_settled(action_id)
     return True
+
 
 # ── 次序：谁发起的动作 ────────────────────────────────────────────────────────
 #
@@ -237,15 +252,26 @@ def _forget_pending(aids, outcome: str | None = None) -> None:
     completion callback never arrived looks, downstream, like one that played. That
     is what lets a delegation report a line as spoken when nothing was heard.
     """
+    settled = []
     for aid in aids:
         if outcome:
             _record_outcome(aid, outcome)
+        settled.append((aid, _pending_resources.get(aid)))
         _pending_actions.pop(aid, None)
         _pending_results.pop(aid, None)
         _pending_timeouts.pop(aid, None)
         _pending_tools.pop(aid, None)
         _pending_resources.pop(aid, None)
         _pending_owner.pop(aid, None)
+
+    # 超时 / 取消也是"这个动作有结局了" —— 不在这里通知的话，一次超时的播报之后再没有
+    # 任何事件会让沉默计时重新开始，播报就永久静音了。
+    #
+    # **必须在上面那些 pop 之后通知**：订阅者会去判"资源现在真空了吗"，而超时的 Event
+    # 从来没有被 set 过，只要这一项还挂在 _pending_actions 里就仍然算占用 —— 在 pop
+    # 之前通知，订阅者看到的是"还在说话"，于是什么都不做。
+    for aid, res in settled:
+        _notify_settled(aid, res)
 
 
 # Terminal state of recently finished actions, so a caller can still ask "did that

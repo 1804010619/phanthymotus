@@ -232,12 +232,11 @@ def _env_dynamic() -> str:
         if not _auto_notify_enabled():
             narration_section = '<narration>已关闭（set_auto_notify(true) 可恢复）</narration>\n'
         else:
-            _r, _s = _narration_thresholds()
-            _parts = ([f'{_r} 轮'] if _r > 0 else []) + ([f'{_s} 秒'] if _s > 0 else [])
+            _, _s = _narration_thresholds()
             narration_section = (
-                f'<narration>每{"或".join(_parts)}无交互时自动汇报一次进展，'
+                f'<narration>{_s} 秒不说话时系统会自动替你播报一次进展，'
                 f'用 set_progress_report 调节奏</narration>\n'
-                if _parts else '<narration>已关闭</narration>\n')
+                if _s > 0 else '<narration>已关闭</narration>\n')
     except Exception:
         pass
 

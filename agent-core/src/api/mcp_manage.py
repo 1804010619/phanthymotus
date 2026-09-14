@@ -882,7 +882,6 @@ async def _handle_agentcore_call(req: MCPCallRequest):
             'trigger_interval_ms': trigger_interval_ms,
             'vision_input': bool(llm_cfg.get('vision_input', False)),
             'auto_notify': bool(llm_cfg.get('auto_notify', True)),
-            'narration_silence_rounds': int(llm_cfg.get('narration_silence_rounds', 4)),
             'narration_silence_seconds': int(llm_cfg.get('narration_silence_seconds', 25)),
             # 运行时生效值（set_progress_report 的口头调整会盖住上面两个配置值，重启清空）。
             # 前端 schema 不认这个键、会忽略它 —— 它的用途是让「卡片写 4 轮、机器人实际
@@ -952,7 +951,7 @@ async def _handle_agentcore_call(req: MCPCallRequest):
             event_cfg['llm'] = llm_cfg
             config.main['event'] = event_cfg
         # 主动播报阈值（轮数 / 秒数，先到者触发；0 = 关闭该维度）
-        for _k in ('narration_silence_rounds', 'narration_silence_seconds'):
+        for _k in ('narration_silence_seconds',):
             _v = req.arguments.get(_k)
             if _v is not None:
                 event_cfg = config.main.get('event', {})
