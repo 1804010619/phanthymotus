@@ -898,15 +898,14 @@ def _active_work_detail() -> tuple:
         blocks.append(head + ('\n' + label + '\n' + body if body else ''))
     text = '\n\n'.join(blocks)
 
-    # 三种阶段，调用方据此决定说不说、怎么说：
-    #   new      有新动作 —— 讲增量
-    #   stalled  做过事、但卡在一个长单步上（实测写一份 454 行报告 107 秒没产出 turn）
-    #   starting 刚派出去，一条活动记录都没有
-    if not any(d.get('stalled') for d in digests):
-        return text, 'new'
-    if any(d.get('turns') for d in digests):
-        return text, 'stalled'
-    return text, 'starting'
+    # 只分两种，调用方据此决定"这次说不说"：
+    #   new   有新动作 —— 照播，讲增量
+    #   idle  一个 turn 都没新增 —— 也要播（刚派出去、或卡在一个长单步上，用户都该知道
+    #         还在进行），但**只播一次**，否则就回到每 15 秒念一遍同样的话。
+    #
+    # 不再细分"刚开始"和"卡住了"：两者给模型的约束是同一条（别编造），而它们的区别
+    # 上下文本身已经写明 —— 刚开始的没有活动记录，卡住的带着"仍在同一步上"的标注。
+    return text, ('idle' if any(d.get('stalled') for d in digests) else 'new')
 
 
 
@@ -1648,12 +1647,12 @@ class Event:
             if phase == 'new':
                 _stall_notified = False
             else:
-                # 一个 turn 都没新增 —— 刚派出去（starting），或卡在一个很长的单步里
-                # （stalled，实测写一份 454 行报告 107 秒没产出）。两种都该让用户知道
-                # "已经在做了"，但**各自只说一次**，之后等真有新动作了再说，不然又变成
-                # 每 15 秒念一遍同样的话。
+                # 一个 turn 都没新增 —— 刚派出去，或卡在一个很长的单步里（实测写一份
+                # 454 行报告 107 秒没产出）。这两种用户都该知道"还在进行"，所以要播；
+                # 但**只播一次**，等它真有新动作了再说，否则就回到每 15 秒念一遍同样的话
+                # （Tianyi 上连着三条越说越像，就是这么来的）。
                 if _stall_notified:
-                    print(f'[decision] narration skipped: {phase}, already noted')
+                    print('[decision] narration skipped: no new progress, already noted')
                     _restart_countdown()
                     return
                 _stall_notified = True
@@ -1662,15 +1661,10 @@ class Event:
         llm_cfg = config.main.get('event', {}).get('llm', {})
         _narration_inflight = True
         try:
-            if phase == 'starting':
-                _extra = ('\n注意：它刚开始，还没有产出任何结果。用一句话让用户知道'
-                          '**已经着手了、正在做什么**，不要编造任何进展或数据。')
-            elif phase == 'stalled':
-                _extra = ('\n注意：这段时间它没有新动作，一直卡在同一步上。用一句话让用户'
-                          '知道**还在进行、在做哪一步**，不要复述你上次说过的内容，也不要'
-                          '编造新进展。')
-            else:
-                _extra = ''
+            _extra = ('' if phase == 'new' else
+                      '\n注意：这段时间它没有产出新东西 —— 可能刚着手，也可能卡在同一步上。'
+                      '用一句话让用户知道**还在进行、正在做哪一步**，'
+                      '不要编造任何进展或数据。')
             messages = _build_narration_messages(
                 frozen_system=prompt_mod.build_system(
                     mcp_client.registry, self._bound_tool_names()),
