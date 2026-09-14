@@ -2441,17 +2441,31 @@ async function _checkEditStatus() {
 // phase so it also covers the sidebar and the tool-config modals — someone filling
 // in a config form for two minutes is editing, and must not be timed out.
 //
-// 15s is well under the TTL so a dropped ping or a throttled timer costs nothing.
-// Panning and zooming renew twice over: they also hit the debounced layout save,
-// which the server counts as activity too.
+// 15s is well under the TTL so a dropped ping costs nothing. Panning and zooming
+// renew twice over: they also hit the debounced layout save, which the server
+// counts as activity too.
+//
+// Throttling is trailing-edge, not drop-on-the-floor. Discarding a throttled ping
+// would measure the 60s from the last *ping* instead of the last *action*: act at
+// t=0 and again at t=14, and the lock would die at t=60 — 46s after you last
+// touched it. The trailing timer guarantees a renewal lands within 15s of any
+// action, so every action really does buy a full minute.
 const _KEEP_ALIVE_MS = 15000;
 let _lastPingAt = 0;
+let _pingTimer = null;
 
-async function _pingEdit() {
+function _pingEdit() {
   if (!_isEditor) return;
-  const now = Date.now();
-  if (now - _lastPingAt < _KEEP_ALIVE_MS) return;
-  _lastPingAt = now;
+  const wait = _KEEP_ALIVE_MS - (Date.now() - _lastPingAt);
+  if (wait <= 0) { _sendPing(); return; }
+  if (!_pingTimer) {
+    _pingTimer = setTimeout(() => { _pingTimer = null; _sendPing(); }, wait);
+  }
+}
+
+async function _sendPing() {
+  if (!_isEditor) return;
+  _lastPingAt = Date.now();
   try {
     const resp = await fetch('/api/canvas/keep-edit', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
