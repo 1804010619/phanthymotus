@@ -608,9 +608,7 @@ async def acp_complete(request: fastapi.Request):
         return {'ok': False, 'error': 'action_id required'}
 
     # 通道1: 解锁 sync() 等待
-    if action_id in mcp_client._pending_actions:
-        mcp_client._pending_results[action_id] = body
-        mcp_client._pending_actions[action_id].set()
+    mcp_client.mark_action_complete(action_id, body)
 
     # 通道2: 进 event_bus → steering 注入 LLM
     import event_bus

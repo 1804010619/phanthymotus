@@ -103,6 +103,25 @@ def has_bindings(hook_id: str) -> bool:
     return bool(_registry.get(hook_id))
 
 
+def notify_resources(hook_id: str = 'on_notify') -> frozenset:
+    """这个 hook 的绑定一共会占用哪些物理通道。
+
+    用来判断一个刚完成的 action「是不是面向用户的输出」—— 不能按工具名猜，
+    机器人的嘴叫 tts / speaker / audio_play 各有各的叫法（见 peer/tools.py 的教训）。
+    """
+    import mcp_client
+    out: set = set()
+    for b in _registry.get(hook_id) or []:
+        entry = mcp_client.registry.get(b.mcp_id) or {}
+        tool_meta = entry.get('tool_meta', {})
+        meta = (tool_meta.get(f'mcp__{b.mcp_id}__{b.tool}__{b.action}')
+                or tool_meta.get(f'mcp__{b.mcp_id}__{b.tool}'))
+        res = (meta or {}).get('resource')
+        if res:
+            out |= set(res)
+    return frozenset(out)
+
+
 def notify_resource_busy(hook_id: str = 'on_notify') -> bool:
     """True if *every* binding of `hook_id` would be skipped as resource-busy.
 

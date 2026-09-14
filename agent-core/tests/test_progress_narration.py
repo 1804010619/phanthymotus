@@ -280,7 +280,7 @@ class TestBuildNarrationMessages(unittest.TestCase):
     FROZEN = {'role': 'system', 'content': 'you are a robot'}
 
     def _turn(self, n):
-        return [{'role': 'user', 'content': f'msg{i} ' + 'x' * 200} for i in range(n)]
+        return '\n'.join(f'[user] msg{i} ' + 'x' * 200 for i in range(n))
 
     def test_shape_and_system_reuse(self):
         msgs = _build_narration_messages(self.FROZEN, self._turn(2), '', 4, 30.0, 6000)
@@ -291,8 +291,7 @@ class TestBuildNarrationMessages(unittest.TestCase):
 
     def test_keeps_tail_drops_head(self):
         # 与 _compress_turns 的 text[:30000] 相反：进度汇报关心的是近况。
-        turn = [{'role': 'user', 'content': 'HEAD' + 'x' * 20000},
-                {'role': 'user', 'content': 'TAILMARKER'}]
+        turn = 'HEAD' + 'x' * 20000 + '\nTAILMARKER'
         body = _build_narration_messages(self.FROZEN, turn, '', 4, 30.0, 500)[1]['content']
         self.assertIn('TAILMARKER', body)
         self.assertNotIn('HEAD', body)
@@ -484,19 +483,25 @@ class TestSkillsNoLongerPredeclareNarration(_NarrationFixture):
 # ── 汇报器（异步） ────────────────────────────────────────────────────────
 
 class _FakeEvent:
-    """只借 Event 的 _maybe_report_progress，不起整个 agent loop。"""
+    """真正的 Event 实例，只是不跑 __init__ —— 汇报这条路只用到 _turns 和两个方法。"""
 
     def __init__(self):
         import sys as _sys
-        ell = _sys.modules['event.llm']   # the *module*; the attribute is an Event()
-        self._m = ell.Event._maybe_report_progress.__get__(self, _FakeEvent)
+        ell = _sys.modules['event.llm']          # the *module*; the attribute is an Event()
+        self._ev = ell.Event.__new__(ell.Event)
+        self._ev._turns = []
+        self._ell = ell
 
     def run(self, turn_messages, **kw):
         frozen = {'role': 'system', 'content': 'sys'}
-        return asyncio.run(self._m(
+        ell = self._ell
+        # 时钟是模块级的：把上次输出推到很久以前，让秒数臂满足。
+        ell._last_output_ts = time.time() - kw.pop('silent_for', 100)
+        ell._last_report_text_global = kw.pop('last_report_text', '')
+        if kw.pop('threshold_not_reached', False):
+            ell._last_output_ts = time.time()
+        return asyncio.run(self._ev._maybe_report_progress(
             turn_messages, frozen, kw.pop('silent_rounds', 4),
-            kw.pop('last_interact_ts', time.time() - 100),
-            kw.pop('last_report_text', ''),
             tool_restricted=kw.pop('tool_restricted', False),
             cancel_event=kw.pop('cancel_event', None)))
 
@@ -509,13 +514,13 @@ class TestReporter(_NarrationFixture):
                           narration_silence_seconds=25, narration_timeout_s=5,
                           narration_context_chars=6000)
         import client
-        import sys as _sys
-        ell = _sys.modules['event.llm']
-        self._ell = ell
+        self._ell = sys.modules['event.llm']
         self._client = client
         self._saved_call = client.call
         self._saved_fire = hooks.fire
-        self._saved_push = ell.push_event
+        self._saved_push = self._ell.push_event
+        self._saved_ts = self._ell._last_output_ts
+        self._saved_txt = self._ell._last_report_text_global
         self.fired = []
         self.pushed = []
 
@@ -527,12 +532,15 @@ class TestReporter(_NarrationFixture):
             self.pushed.append(ev)
 
         hooks.fire = _fire
-        ell.push_event = _push
+        self._ell.push_event = _push
 
     def tearDown(self):
+        self._ell._cancel_narration_timer()
         self._client.call = self._saved_call
         hooks.fire = self._saved_fire
         self._ell.push_event = self._saved_push
+        self._ell._last_output_ts = self._saved_ts
+        self._ell._last_report_text_global = self._saved_txt
         super().tearDown()
 
     def _stub_call(self, content=None, *, raises=None, hang=False, record=None):
@@ -549,11 +557,7 @@ class TestReporter(_NarrationFixture):
     def test_happy_path_fires_and_feeds_back(self):
         self._stub_call('客厅找完了，接下来去卧室')
         msgs = []
-        out = _FakeEvent().run(msgs)
-        rounds, ts, text, spoke = out
-        self.assertTrue(spoke)
-        self.assertEqual(rounds, 0)
-        self.assertEqual(text, '客厅找完了，接下来去卧室')
+        self.assertTrue(_FakeEvent().run(msgs))
         self.assertEqual(self.fired[0][0], 'on_notify')
         self.assertEqual(self.fired[0][1], {'text': '客厅找完了，接下来去卧室'})
         # 必须走 barrier-aware：既不能盖过正在播的音频，也不能被下一个工具盖掉。
@@ -562,6 +566,30 @@ class TestReporter(_NarrationFixture):
         self.assertEqual(len(msgs), 1)
         self.assertIn('source=narration', msgs[0]['content'])
         self.assertTrue(any(e['type'] == 'narration' for e in self.pushed))
+        self.assertEqual(self._ell._last_report_text_global, '客厅找完了，接下来去卧室')
+
+    def test_clock_is_not_reset_at_broadcast_start(self):
+        """播报刚发出时沉默还没开始 —— 起点是它**播完**的那一刻。
+
+        在这里就把时钟清零的话，一段 134 秒的播报刚说完就已经"沉默 0 秒"，下一次判断
+        会立刻又满足阈值。真正的锚点是 ACP 完成回调。
+        """
+        self._stub_call('我在找')
+
+        # 模拟 call_tool_hook：播报发出后注册一个 ACP pending（设备声明了 x-completion）。
+        async def _fire(hook_id, params=None, **kw):
+            self.fired.append((hook_id, params, kw))
+            mcp_client._pending_actions['spk'] = asyncio.Event()
+            mcp_client._pending_resources['spk'] = frozenset({'mouth'})
+            return [{'result': {'action_id': 'spk'}}]
+        hooks.fire = _fire
+
+        self.assertTrue(_FakeEvent().run([], silent_for=100))
+        # 正在播 ⇒ 沉默还没开始，时钟冻结在 0，而不是被"开始播"清零后继续跑。
+        self.assertEqual(self._ell.silent_seconds(), 0.0)
+        mcp_client.mark_action_complete('spk', {'status': 'completed'})
+        # 播完那一刻才是沉默的起点。
+        self.assertLess(self._ell.silent_seconds(), 5)
 
     def test_toolless_main_model_call(self):
         """跳出 agent loop 的一次性调用：无工具、system 段复用、不指定别的模型。"""
@@ -574,52 +602,47 @@ class TestReporter(_NarrationFixture):
         # steer 不该作废一次本来就很短的汇报；它下一轮会被排空。
         self.assertIsNone(rec[0]['kw'].get('reconsider_event'))
 
-    def test_skip_does_not_fire(self):
+    def test_skip_does_not_fire_and_backs_off(self):
         self._stub_call('SKIP')
         msgs = []
-        rounds, ts, text, spoke = _FakeEvent().run(msgs, last_report_text='上次说的')
-        self.assertFalse(spoke)
+        self.assertFalse(_FakeEvent().run(msgs, last_report_text='上次说的'))
         self.assertEqual(self.fired, [])
-        self.assertEqual(rounds, 0)          # 退避一个完整间隔
-        self.assertEqual(text, '上次说的')    # 上次的话留着，别丢
         self.assertEqual(msgs, [])
+        self.assertEqual(self._ell._last_report_text_global, '上次说的')   # 别丢
+        self.assertLess(self._ell.silent_seconds(), 5)                    # 退避一整个间隔
 
     def test_empty_response_does_not_fire(self):
         self._stub_call('')
-        _, _, _, spoke = _FakeEvent().run([])
-        self.assertFalse(spoke)
+        self.assertFalse(_FakeEvent().run([]))
         self.assertEqual(self.fired, [])
 
-    def test_llm_failure_backs_off(self):
+    def test_llm_failure_backs_off_a_full_interval(self):
+        """失败后必须退满一个间隔 —— 否则定时器会被 max(1.0,...) 兜成每秒重试。"""
         self._stub_call(raises=RuntimeError('endpoint down'))
-        rounds, ts, text, spoke = _FakeEvent().run([])
-        self.assertFalse(spoke)
+        self.assertFalse(_FakeEvent().run([]))
         self.assertEqual(self.fired, [])
-        # 计数器归零 ⇒ 下一轮不会再撞一次，不对着死端点每轮重试。
-        self.assertEqual(rounds, 0)
+        self.assertLess(self._ell.silent_seconds(), 5)
 
     def test_timeout_is_bounded(self):
         self._set_llm_cfg(narration_timeout_s=1)
         self._stub_call(hang=True)
         t0 = time.time()
-        rounds, _, _, spoke = _FakeEvent().run([])
+        self.assertFalse(_FakeEvent().run([]))
         self.assertLess(time.time() - t0, 5)
-        self.assertFalse(spoke)
         self.assertEqual(self.fired, [])
 
     def test_overlong_report_is_truncated(self):
         self._stub_call('啊' * 500)
-        _, _, text, spoke = _FakeEvent().run([])
-        self.assertTrue(spoke)
+        self.assertTrue(_FakeEvent().run([]))
         # 这段话会注册成 ACP pending，超时按长度算，下一个工具调用都得等它播完。
-        self.assertLessEqual(len(text), self._ell._NARRATION_MAX_CHARS)
+        self.assertLessEqual(len(self.fired[0][1]['text']), self._ell._NARRATION_MAX_CHARS)
 
     def test_busy_mouth_skips_before_spending_an_llm_call(self):
         called = []
         self._stub_call('不该被调用', record=called)
         mcp_client._pending_actions['speak-1'] = asyncio.Event()
         mcp_client._pending_resources['speak-1'] = frozenset({'mouth'})
-        self.assertIsNone(_FakeEvent().run([]))
+        self.assertFalse(_FakeEvent().run([]))
         self.assertEqual(called, [])
         self.assertEqual(self.fired, [])
 
@@ -632,49 +655,43 @@ class TestReporter(_NarrationFixture):
             return [{'result': {'skipped': 'resource busy'}}]
         hooks.fire = _fire
         msgs = []
-        rounds, _, text, spoke = _FakeEvent().run(msgs, last_report_text='旧的')
-        self.assertFalse(spoke)
-        self.assertEqual(text, '旧的')
+        self.assertFalse(_FakeEvent().run(msgs, last_report_text='旧的'))
+        self.assertEqual(self._ell._last_report_text_global, '旧的')
         self.assertEqual(msgs, [])      # 没播出去就不该回灌
 
-    def test_threshold_not_reached_returns_none(self):
+    def test_threshold_not_reached_does_nothing(self):
         called = []
         self._stub_call('不该被调用', record=called)
-        out = _FakeEvent().run([], silent_rounds=1, last_interact_ts=time.time())
-        self.assertIsNone(out)
+        self.assertFalse(_FakeEvent().run([], silent_rounds=1, threshold_not_reached=True))
         self.assertEqual(called, [])
 
-    def test_auto_notify_off_returns_none(self):
+    def test_auto_notify_off_does_nothing(self):
         called = []
         self._stub_call('不该被调用', record=called)
         skills_mod._notify_override = False
-        self.assertIsNone(_FakeEvent().run([]))
+        self.assertFalse(_FakeEvent().run([]))
         self.assertEqual(called, [])
 
-    def test_tool_restricted_returns_none(self):
+    def test_tool_restricted_does_nothing(self):
         called = []
         self._stub_call('不该被调用', record=called)
-        self.assertIsNone(_FakeEvent().run([], tool_restricted=True))
+        self.assertFalse(_FakeEvent().run([], tool_restricted=True))
         self.assertEqual(called, [])
 
-    def test_no_bindings_returns_none(self):
+    def test_no_bindings_does_nothing(self):
         called = []
         self._stub_call('不该被调用', record=called)
         hooks._registry.clear()
-        self.assertIsNone(_FakeEvent().run([]))
+        self.assertFalse(_FakeEvent().run([]))
         self.assertEqual(called, [])
 
     def test_verbal_retune_takes_effect_immediately(self):
         """「多汇报一点」发生在当前 turn 的某一轮，下一轮就得按新阈值判。"""
         called = []
         self._stub_call('好', record=called)
-        # 默认 4 轮 / 25 秒：1 轮 + 刚刚交互过 ⇒ 不触发
-        self.assertIsNone(_FakeEvent().run([], silent_rounds=1,
-                                           last_interact_ts=time.time()))
+        self.assertFalse(_FakeEvent().run([], silent_rounds=1, threshold_not_reached=True))
         asyncio.run(skills_tools.set_progress_report(rounds=1))
-        out = _FakeEvent().run([], silent_rounds=1, last_interact_ts=time.time())
-        self.assertIsNotNone(out)
-        self.assertTrue(out[3])
+        self.assertTrue(_FakeEvent().run([], silent_rounds=1, threshold_not_reached=True))
 
 
 class TestSilenceWatchdog(_NarrationFixture):
@@ -769,6 +786,81 @@ class TestSilenceWatchdog(_NarrationFixture):
         """turn 结束后子代理接着跑，是同一件事的延续 —— "别重复上次说的"要跨 turn 成立。"""
         self._ell._remember_report('已经查完财报了')
         self.assertEqual(self._ell._last_report_text_global, '已经查完财报了')
+
+    def test_report_without_acp_tracking_does_not_spin(self):
+        """播报没注册 ACP pending 时，时钟必须由播报自己锚住。
+
+        设备不声明 x-completion 是合法的，那样 call_tool_hook 就不会注册 pending，
+        嘴永远不"忙"，也永远不会有完成回调。如果播完既不锚时钟又指望别人来锚，时钟就
+        一直停在"早就超阈"，定时器每次醒来都判定该播 —— 实测 0.6 秒里播了 250 次。
+        """
+        self._register_mouth()
+        self._set_llm_cfg(auto_notify=True, narration_silence_seconds=2,
+                          narration_silence_rounds=0, narration_timeout_s=5)
+        import client
+        saved_call, saved_fire, saved_push = client.call, hooks.fire, self._ell.push_event
+        fired = []
+
+        async def _fire(h, p=None, **k):
+            fired.append(p['text'])
+            return [{'result': {'ok': True}}]      # 没有 action_id ⇒ 不注册 pending
+
+        async def _call(**kw):
+            return {'content': '进度'}
+
+        async def _push(e):
+            pass
+
+        client.call, hooks.fire, self._ell.push_event = _call, _fire, _push
+        try:
+            inst = self._ell.Event.__new__(self._ell.Event)
+            inst._turns = []
+            self._ell._last_output_ts = time.time() - 300
+            asyncio.run(inst._emit_progress_report(
+                {'role': 'system', 'content': 's'}, 'ctx',
+                silent_rounds=0, cancel_event=None, label=''))
+        finally:
+            client.call, hooks.fire, self._ell.push_event = saved_call, saved_fire, saved_push
+        self.assertEqual(len(fired), 1)
+        # 关键断言：播完之后时钟被锚在现在，下一次判断不会立刻又满足。
+        self.assertLess(self._ell.silent_seconds(), 5)
+
+    def test_clock_is_frozen_while_speaking(self):
+        """播放期间沉默恒为 0 —— 沉默是从"说完"开始算的。
+
+        不冻结的话，一段 134 秒的播报（Orin5 上真实出现过）刚说完，silent_seconds()
+        已经是 134，下一次判断立刻满足任何阈值，于是话音刚落就又播一句进度。
+        """
+        self._register_mouth()
+        self._ell._last_output_ts = time.time() - 300
+        self.assertGreater(self._ell.silent_seconds(), 290)
+
+        mcp_client._pending_actions['speak-1'] = asyncio.Event()   # 开始播
+        mcp_client._pending_resources['speak-1'] = frozenset({'mouth'})
+        self.assertEqual(self._ell.silent_seconds(), 0.0)
+
+        mcp_client._pending_actions['speak-1'].set()                # 播完
+        self.assertLess(self._ell.silent_seconds(), 5,
+                        '播完之后沉默应从 0 重新计，而不是接着之前的 300 秒')
+
+    def test_completion_callback_anchors_the_clock(self):
+        """ACP 完成回调是沉默起点的权威锚 —— 两处完成入口都要经过它。"""
+        self._register_mouth()
+        mcp_client._pending_actions['speak-9'] = asyncio.Event()
+        mcp_client._pending_resources['speak-9'] = frozenset({'mouth'})
+        self._ell._last_output_ts = time.time() - 300
+        ok = mcp_client.mark_action_complete('speak-9', {'status': 'completed'})
+        self.assertTrue(ok)
+        self.assertLess(self._ell.silent_seconds(), 5)
+
+    def test_completion_of_a_non_output_action_does_not_anchor(self):
+        """走路走完了不是"跟用户说了话"，不该重置沉默时钟。"""
+        self._register_mouth()
+        mcp_client._pending_actions['move-1'] = asyncio.Event()
+        mcp_client._pending_resources['move-1'] = frozenset({'legs'})
+        self._ell._last_output_ts = time.time() - 300
+        mcp_client.mark_action_complete('move-1', {'status': 'completed'})
+        self.assertGreater(self._ell.silent_seconds(), 290)
 
     def test_new_request_restarts_the_silence_epoch(self):
         """旧任务的定时器不能对着刚起步的新任务开火。
