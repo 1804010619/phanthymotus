@@ -669,7 +669,7 @@ class TestReportProgress(_Fixture):
 class TestSetProgressReport(_Fixture):
     def setUp(self):
         super().setUp()
-        self._cfg(narration_silence_seconds=25)
+        self._cfg(narration_silence_seconds=15)
 
     def _call(self, **kw):
         return asyncio.run(skills_tools.set_progress_report(**kw))
@@ -707,7 +707,7 @@ class TestSetProgressReport(_Fixture):
         out = self._call(restore_default=True)
         self.assertIn('恢复默认', out)
         self.assertIsNone(skills_mod.get_report_override())
-        self.assertEqual(_narration_thresholds()[1], 25)
+        self.assertEqual(_narration_thresholds()[1], 15)
 
     def test_negative_clamps_to_zero(self):
         self._call(seconds=-5)

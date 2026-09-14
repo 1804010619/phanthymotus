@@ -56,26 +56,38 @@ class TestNarrationKeyMigration(unittest.TestCase):
         """轮数维度已取消 —— 这个键必须从库里清掉，不是留着当孤儿。"""
         llm = _run_migrate_on({'llm': {
             'narration_silence_rounds': 4,
-            'narration_silence_seconds': 25,
+            'narration_silence_seconds': 15,
             'prompt_system': './resource/memory/prompt_system.md',
         }})
         self.assertNotIn('narration_silence_rounds', llm)
-        self.assertEqual(llm['narration_silence_seconds'], 25)
+        self.assertEqual(llm['narration_silence_seconds'], 15)
 
     def test_seeds_missing_keys(self):
         """已部署机器上的 'event' 行早就存在，靠 INSERT OR IGNORE 补不进新默认值。"""
         llm = _run_migrate_on({'llm': {'prompt_system': './resource/memory/prompt_system.md'}})
-        self.assertEqual(llm['narration_silence_seconds'], 25)
+        self.assertEqual(llm['narration_silence_seconds'], 15)
         self.assertEqual(llm['narration_context_chars'], 6000)
         self.assertEqual(llm['narration_timeout_s'], 20)
 
     def test_does_not_clobber_a_hand_tuned_value(self):
-        """手工调过的值不动 —— 只补缺失的键。"""
+        """手工调过的值不动 —— 只补缺失的键、只改还停在旧默认上的。"""
         llm = _run_migrate_on({'llm': {
             'narration_silence_seconds': 90,
             'prompt_system': './resource/memory/prompt_system.md',
         }})
         self.assertEqual(llm['narration_silence_seconds'], 90)
+
+    def test_retunes_a_value_still_sitting_on_the_old_default(self):
+        """沉默阈值 25 → 15。
+
+        25 是几小时前由这段迁移自己种进去的，不是谁选的 —— 停在 25 的机器要跟着改，
+        否则它们会永远停在一个没人选过的旧默认上（Tianyi 就是这么来的）。
+        """
+        llm = _run_migrate_on({'llm': {
+            'narration_silence_seconds': 25,
+            'prompt_system': './resource/memory/prompt_system.md',
+        }})
+        self.assertEqual(llm['narration_silence_seconds'], 15)
 
     def test_is_idempotent(self):
         """跑第二遍不该再改动任何东西（每次启动都会跑一次）。"""

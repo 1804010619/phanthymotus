@@ -437,7 +437,7 @@ def _narration_thresholds() -> tuple[int, int]:
     """
     import sys as _sys
     llm_cfg = config.main.get('event', {}).get('llm', {})
-    seconds = int(llm_cfg.get('narration_silence_seconds', 25))
+    seconds = int(llm_cfg.get('narration_silence_seconds', 15))
     ov = _sys.modules['event.skills'].get_report_override()
     if ov:
         seconds = int(ov.get('seconds', seconds))

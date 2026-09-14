@@ -882,7 +882,7 @@ async def _handle_agentcore_call(req: MCPCallRequest):
             'trigger_interval_ms': trigger_interval_ms,
             'vision_input': bool(llm_cfg.get('vision_input', False)),
             'auto_notify': bool(llm_cfg.get('auto_notify', True)),
-            'narration_silence_seconds': int(llm_cfg.get('narration_silence_seconds', 25)),
+            'narration_silence_seconds': int(llm_cfg.get('narration_silence_seconds', 15)),
             # 运行时生效值（set_progress_report 的口头调整会盖住上面两个配置值，重启清空）。
             # 前端 schema 不认这个键、会忽略它 —— 它的用途是让「卡片写 4 轮、机器人实际
             # 按 10 轮跑」这件事在接口和日志里可见，而不是停留在某个进程的内存里。

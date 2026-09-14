@@ -68,7 +68,7 @@ _DB_DEFAULTS = {
             'barge_in_threshold_ms': 500,       # 语音 barge-in 阈值（ms），低于此值视为 backchannel
             # 主动播报：距上次面向用户的输出多久没动静就自动生成并播报一句进展汇报。
             # 0 = 关闭。播放期间不计时（正在说话时根本没有计时器）。
-            'narration_silence_seconds': 25,
+            'narration_silence_seconds': 15,
             'narration_context_chars': 6000,    # 喂给汇报调用的上下文预算（取 turn 尾部）
             'narration_timeout_s': 20,          # 汇报调用硬超时，超时视为本次放弃
         },
@@ -309,7 +309,7 @@ def _migrate():
         # INSERT OR IGNORE，已部署机器上的 'event' 行早就存在，新默认值永远进不去 ——
         # 结果会是阈值读成 0，功能静默不生效。只补缺失的键，手工调过的值不动。
         _narration_defaults = {
-            'narration_silence_seconds': 25,
+            'narration_silence_seconds': 15,
             'narration_context_chars': 6000,
             'narration_timeout_s': 20,
         }
@@ -317,6 +317,13 @@ def _migrate():
         # 留在库里只会让人对着设置页猜"它还管不管用"。和上面的补种合并成一次
         # read-modify-write —— 拆成两段就要对同一行读写两次，中间还多一个失败窗口。
         _narration_removed = ('narration_silence_rounds',)
+
+        # 改过的默认值：沉默阈值 25 → 15 秒。25 是几小时前由上面这段自己种进去的，不是
+        # 谁选的，所以停在 25 的机器要跟着改；手工调过（比如 90）的不动。同 subagent 那段
+        # 的做法，(旧默认, 新默认)。
+        _stale_narration_defaults = {
+            'narration_silence_seconds': (25, 15),
+        }
 
         row_ev = conn.execute("SELECT value FROM config WHERE key='event'").fetchone()
         if row_ev:
@@ -328,7 +335,12 @@ def _migrate():
             dropped = [k for k in _narration_removed if k in llm_cfg]
             for k in dropped:
                 llm_cfg.pop(k, None)
-            if added or dropped:
+            retuned = []
+            for k, (old_v, new_v) in _stale_narration_defaults.items():
+                if llm_cfg.get(k) == old_v:
+                    llm_cfg[k] = new_v
+                    retuned.append(f'{k} {old_v} -> {new_v}')
+            if added or dropped or retuned:
                 conn.execute("UPDATE config SET value=? WHERE key='event'", (json.dumps(ev),))
                 conn.commit()
                 _msg = []
@@ -336,6 +348,8 @@ def _migrate():
                     _msg.append(f'seeded {", ".join(added)}')
                 if dropped:
                     _msg.append(f'dropped {", ".join(dropped)}')
+                if retuned:
+                    _msg.append(f'retuned {", ".join(retuned)}')
                 print(f'[config] event.llm: {"; ".join(_msg)}')
 
 _migrate()
