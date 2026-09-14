@@ -38,9 +38,18 @@ from .models import (
     ReviewError,
     ReviewJob,
     Stage,
+    TestResult,
     build_label,
 )
 from .components import build_context
+from .tester import (
+    TEST_IDX_BASE,
+    failure_context,
+    plan_suites,
+    run_suite,
+    summarize_for_review,
+    test_log_filename,
+)
 from .pr_context import PRContext, build_pr_context
 from .review_agent import PRFacts, ReviewAgent
 from .review_trace import ReviewTrace
@@ -243,10 +252,26 @@ async def _run_once(
         job.build_results = results
         await store.save_job(job)
 
+        # Posted before the tests run, not after: a build failure is the thing
+        # the author most needs to see immediately, and tests can take minutes.
+        # _report edits one comment in place, so the update below replaces this
+        # body rather than adding a second comment.
         await _report(
             job, github_client,
             comments.format_build_result(job.pr_head_sha, results),
         )
+
+        # Tests run before the build-failure return, so a job where core built
+        # and perception did not still gets core's suite. plan_suites only
+        # picks components whose own build succeeded.
+        test_results = await _run_tests(job, results, worktree, config, store)
+        if test_results:
+            await _report(
+                job, github_client,
+                comments.format_build_result(
+                    job.pr_head_sha, results, tests=test_results
+                ),
+            )
 
         if any(not r.success for r in results):
             # A real build failure — terminal and already reported. Not
@@ -326,6 +351,10 @@ async def _run_once(
                     infra_files=infra,
                     shared_base_files=shared,
                     context=pr_ctx,
+                    test_summary=summarize_for_review(job.test_results),
+                    test_failure_text=failure_context(
+                        job.test_results, config.test_context_max_chars
+                    ),
                 ),
                 # Records what the loop did, streamed to disk so the dashboard
                 # can follow a review in progress rather than only see the
@@ -453,6 +482,85 @@ def _build_plan(
         else:
             plan.append((target, None, ""))
     return plan
+
+
+async def _run_tests(
+    job: ReviewJob,
+    build_results: list[BuildResult],
+    worktree: Path,
+    config: Config,
+    store: JobStore,
+) -> list[TestResult]:
+    """Run the suites for whatever this job built. Never raises.
+
+    Non-blocking has to mean non-blocking: a bug in the junit parser, a docker
+    daemon hiccup, an unreadable log — none of it may cost the PR its review,
+    which is the thing the author actually asked for.
+    """
+    if not config.tests_enabled or job.skip_tests:
+        return []
+    try:
+        return await _execute_tests(job, build_results, worktree, config, store)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.exception(f"Job {job.id}: test stage failed, continuing to review")
+        return []
+
+
+async def _execute_tests(
+    job: ReviewJob,
+    build_results: list[BuildResult],
+    worktree: Path,
+    config: Config,
+    store: JobStore,
+) -> list[TestResult]:
+    """Run each planned suite in sequence, persisting each result.
+
+    Same discipline as _execute_builds: stage detail per suite, a placeholder
+    row written before the run so the dashboard has a log pane to tail, then an
+    overwrite with the verdict.
+    """
+    plan = plan_suites(build_results, config)
+    if not plan:
+        return []
+
+    log_dir = store.log_dir_for(job.id)
+    log_dir.mkdir(parents=True, exist_ok=True)
+    junit_dir = log_dir / "tests"
+
+    results: list[TestResult] = []
+    for n, (component, image_ref, skip_reason) in enumerate(plan):
+        idx = TEST_IDX_BASE + n
+        log_path = log_dir / test_log_filename(idx, component)
+
+        if skip_reason:
+            result = TestResult(
+                component=component, status="skipped", skip_reason=skip_reason
+            )
+            await store.save_test_result(job.id, idx, result)
+            results.append(result)
+            continue
+
+        job.set_stage(Stage.TESTING, f"{n + 1}/{len(plan)} {component}")
+        await store.save_job(job)
+        await store.save_test_result(
+            job.id, idx,
+            TestResult(
+                component=component, status=None, image_tag=image_ref,
+                log_path=str(log_path),
+            ),
+        )
+
+        result = await run_suite(
+            component, image_ref, job.id, worktree, config, log_path, junit_dir
+        )
+        await store.save_test_result(job.id, idx, result)
+        results.append(result)
+
+    job.test_results = results
+    await store.save_job(job)
+    return results
 
 
 async def _execute_builds(
