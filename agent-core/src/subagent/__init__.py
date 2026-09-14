@@ -19,16 +19,22 @@ def _get_active_subagents() -> list[SubagentStatus]:
     return _manager_instance.list_active()
 
 
-def _get_active_digests(max_turns: int = 3) -> list[dict]:
+def _get_active_digests(max_turns: int = 3, since: dict | None = None) -> list[dict]:
     """running 子代理的**近况**：目标 + 最近几轮的真实消息。
 
     进度播报专用。只给 SubagentStatus（目标 + 轮数）的话，汇报器手里除了目标本身什么
     都没有，只能把目标换个说法念一遍 —— Orin5 实测播出来的就是"投研报告还在调研中，
-    完成后告诉你结果"，等于没说。它需要看到子代理**具体搜了什么、拿到了什么**，才谈得上
-    "做了什么 / 发现了什么 / 接下来做什么"。
+    完成后告诉你结果"，等于没说。
 
-    返回原始 turns，由调用方决定怎么渲染和截断（agent-core 那边用 _turns_to_text，
-    工具结果会被截到 200 字符）。
+    `since` 是 {agent_id: 上次已经喂过的 turn 数}，只返回那之后的新 turn。不给这个的话
+    每次都是一个前后重叠的滑动窗口，模型只能把累积状态重新总结一遍 —— Tianyi 实测连着
+    三条播报越说越像，第三条几乎是第二条加一个词，末尾都靠"马上整理成报告"凑数。
+
+    水位用 **turn 数**而不是 rounds_completed：两者不保证一一对应（一轮可能不产生 turn），
+    而这里要回答的恰恰是"哪几条我还没喂过"。子代理自己的上下文压缩会裁掉旧 turn，那时
+    水位会大于列表长度，切片自然为空 —— 退化成"这次没有新东西"，比重复播一遍安全。
+
+    返回的 `turn_count` 是当前总 turn 数，调用方拿它更新水位。
     """
     if _manager_instance is None:
         return []
@@ -37,13 +43,21 @@ def _get_active_digests(max_turns: int = 3) -> list[dict]:
         if agent.status != 'running':
             continue
         try:
-            turns = list(agent.context.turns)[-max_turns:]
+            turns = list(agent.context.turns)
         except Exception:
             turns = []
+        if since is None:
+            picked = turns[-max_turns:] if max_turns > 0 else []
+        else:
+            fresh = turns[since.get(agent.id, 0):]
+            if not fresh:
+                continue                 # 上次喂过之后没有新 turn，没什么可说的
+            picked = fresh[-max_turns:] if max_turns > 0 else []
         out.append({
             'id': agent.id,
             'goal': agent.spec.goal,
             'rounds': agent.rounds_completed,
-            'turns': turns,
+            'turn_count': len(turns),
+            'turns': picked,
         })
     return out

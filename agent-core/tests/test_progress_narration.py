@@ -91,6 +91,8 @@ class _Fixture(unittest.TestCase):
         ell._last_report_text_global = ''
         ell._last_turn_restricted = False
         del ell._pending_narration_feedback[:]
+        self._saved_rounds = dict(ell._reported_turns)
+        ell._reported_turns.clear()
 
     def tearDown(self):
         ell._stop_countdown()
@@ -109,6 +111,8 @@ class _Fixture(unittest.TestCase):
         config.main['event'] = self._saved_event
         subagent._manager_instance = self._saved_mgr
         ell._event_instance = self._saved_inst
+        ell._reported_turns.clear()
+        ell._reported_turns.update(self._saved_rounds)
 
     # -- helpers ---------------------------------------------------------
     def _register_mouth(self, *, resource=frozenset({'mouth'})):
@@ -137,7 +141,14 @@ class _Fixture(unittest.TestCase):
 
     def _work(self, running=True, turns=None):
         """模拟一个在跑的子代理。`turns` 给它一段真实活动记录 —— 汇报器要靠这个才说得出
-        "做了什么/发现了什么"，只有目标和轮数的话它只能把目标换个说法念一遍。"""
+        "做了什么/发现了什么"，只有目标和轮数的话它只能把目标换个说法念一遍。
+
+        默认给一条：真实场景里"在跑"的子代理总是做过点什么。turns 为空表示刚派出去还没
+        动作，那种情况现在会被"没有新进展"直接挡掉、连 LLM 调用都不花，要测那条走
+        _work(turns=[])。
+        """
+        if turns is None:
+            turns = [[{'role': 'tool', 'content': 'BASEFINDING'}]]
         st = 'running' if running else 'completed'
         _S = type('S', (), {'id': 'ab12', 'status': st,
                             'rounds_completed': 3, 'goal': '长任务'})
@@ -149,6 +160,7 @@ class _Fixture(unittest.TestCase):
         _M = type('M', (), {'_agents': {'ab12': _Agent()},
                             'list_active': lambda self_: [_S()]})
         subagent._manager_instance = _M()
+        return _Agent
 
 
 # ── 纯谓词 ────────────────────────────────────────────────────────────────
@@ -525,6 +537,55 @@ class TestReportProgress(_Fixture):
         self.assertIn('WebSearch', body)
         self.assertIn('21.5 亿', body)
 
+    def test_only_new_activity_since_last_report_is_sent(self):
+        """每次只讲**上次汇报之后**新发生的事。
+
+        不做增量的话，上下文是个前后重叠的滑动窗口，模型只能把累积状态重新总结一遍 ——
+        Tianyi 实测连着三条播报越说越像，第三条几乎是第二条加一个词，末尾都靠"马上整理
+        成报告"凑数。
+        """
+        agent = self._work(turns=[[{'role': 'tool', 'content': 'OLDFINDING'}]])
+        rec = []
+        self._stub('第一条', record=rec)
+        self._run()
+        self.assertIn('OLDFINDING', rec[0]['messages'][1]['content'])
+
+        # 子代理又往前跑了一轮，追加一条新 turn
+        agent.rounds_completed = 5
+        agent.context = type('Ctx', (), {'turns': [
+            [{'role': 'tool', 'content': 'OLDFINDING'}],
+            [{'role': 'tool', 'content': 'NEWFINDING'}]]})()
+        rec2 = []
+        self._stub('第二条', record=rec2)
+        self._run()
+        body = rec2[0]['messages'][1]['content']
+        self.assertIn('NEWFINDING', body)
+        self.assertNotIn('OLDFINDING', body)
+
+    def test_a_just_spawned_subagent_spends_no_llm_call(self):
+        """刚派出去、还什么都没做 —— 没有素材可说，别花调用去挤一句空话。"""
+        self._work(turns=[])
+        called = []
+        self._stub('不该被调用', record=called)
+        self._run()
+        self.assertEqual(called, [])
+        self.assertEqual(self.fired, [])
+        self.assertIsNotNone(ell._silence_countdown)
+
+    def test_no_new_progress_spends_no_llm_call(self):
+        """上次汇报之后子代理没往前走 → 不值得再挤一句车轱辘话。"""
+        self._work(turns=[[{'role': 'tool', 'content': 'FINDING'}]])
+        self._stub('第一条')
+        self._run()
+        self.assertEqual(len(self.fired), 1)
+
+        called = []
+        self._stub('不该被调用', record=called)
+        self._run()                      # 轮数没变
+        self.assertEqual(called, [], '没有新进展就不该再花一次 LLM 调用')
+        self.assertEqual(len(self.fired), 1)
+        self.assertIsNotNone(ell._silence_countdown)
+
     def test_stale_main_history_is_not_in_the_context(self):
         """这条路汇报的是在跑的子代理，主 agent 的旧对话是另一个话题。
 
@@ -618,8 +679,13 @@ class TestReportProgress(_Fixture):
 
     def test_a_genuinely_new_report_still_fires(self):
         """归一只做相等判断，不做模糊相似度 —— 阈值调错会把真正的新进展也压掉。"""
+        agent = self._work(turns=[[{'role': 'tool', 'content': '客厅'}]])
         self._stub('找完客厅了，接下来去卧室')
         self._run()
+        # 有新进展（多了一条 turn），内容也确实变了 → 必须照播
+        agent.context = type('Ctx', (), {'turns': [
+            [{'role': 'tool', 'content': '客厅'}],
+            [{'role': 'tool', 'content': '卧室'}]]})()
         self._stub('卧室也找完了，没找到，去阳台看看')
         self._run()
         self.assertEqual(len(self.fired), 2)

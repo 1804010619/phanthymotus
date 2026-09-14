@@ -649,11 +649,17 @@ _NARRATION_PROMPT = """[系统] 你已经有一段时间没有对用户说过任
 2. 其中值得说的发现 —— 具体的数字、名称、结论
 3. 接下来要做什么
 
+下面的"过程记录"只包含**上次汇报之后新发生的事**，所以直接讲这些新东西就行，
+不用再把之前说过的重复一遍、也不用做总结。
+
 反面例子（这几种都等于没说，不要输出）：
 - "还在处理中，完成后告诉你"
 - "正在整理信息，马上就好"
 - "任务进行中，请稍候"
 共同毛病是：把目标换个说法念了一遍，用户听完还是不知道进行到哪了。
+
+结尾也不要凑话。"马上整理成报告""很快就好""稍后告诉你"这类收尾没有任何信息量，
+说完最后一件具体的事就停住。
 
 正面例子：
 - "财报和机构评级都查到了，营收同比涨了一倍，还差估值那部分"
@@ -721,6 +727,10 @@ _last_turn_restricted: bool = False
 # 消息会造出 assistant(tool_calls) → user → tool 的序列，多数 provider 直接拒。改成排队，
 # 由轮循环在排空 steering 的同一个安全点一起灌进去。
 _pending_narration_feedback: list = []
+# 上次已经喂给汇报器的 turn 数（按子代理）。只把那之后的新 turn 喂过去 —— 不然每次都是
+# 一个前后重叠的滑动窗口，模型只能把累积状态重新总结一遍，越说越像（Tianyi 实测连着三条
+# 播报，第三条几乎是第二条加一个词，末尾都靠"马上整理成报告"凑数）。
+_reported_turns: dict = {}
 
 
 def _remember_report(text: str) -> None:
@@ -870,7 +880,7 @@ def _active_work_detail() -> str:
     """
     try:
         import subagent
-        digests = subagent._get_active_digests()
+        digests = subagent._get_active_digests(since=_reported_turns)
     except Exception:
         digests = []
     if not digests:
@@ -1612,7 +1622,13 @@ class Event:
             #
             # 子代理刚起步、digest 还空时，上下文就只剩目标 —— 那时按 prompt 的要求应当
             # 输出 SKIP（没有具体进展就别说），这比报一个陈旧话题好。
-            context = '当前还在进行的工作：\n' + (_active_work_detail() or '\n'.join(work))
+            detail = _active_work_detail()
+            if not detail:
+                # 有活在干，但上次汇报之后它没往前走 —— 没有新东西可说。别花一次 LLM
+                # 调用去挤一句车轱辘话，等下一个间隔再看。
+                _restart_countdown()
+                return
+            context = '当前还在进行的工作：\n' + detail
 
         llm_cfg = config.main.get('event', {}).get('llm', {})
         _narration_inflight = True
@@ -1663,6 +1679,17 @@ class Event:
             return
 
         _remember_report(report)
+        # 推进水位：下次只讲这之后新发生的事。
+        try:
+            import subagent as _sa
+            _live = {_d['id']: _d['turn_count']
+                     for _d in _sa._get_active_digests(max_turns=0)}
+            _reported_turns.update(_live)
+            # 干完的子代理没必要一直留在水位表里
+            for _gone in [k for k in _reported_turns if k not in _live]:
+                _reported_turns.pop(_gone, None)
+        except Exception:
+            pass
         # 这次播报本身就是一次"开始说话"，走同一个回调：停止计时；若它没有 ACP 跟踪
         # （设备没声明 x-completion），当场重新计时，否则等它的"说完"事件。
         _on_speaking_started()
