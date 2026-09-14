@@ -59,6 +59,11 @@ function _summarize(event) {
     case 'mcp_call':       return `${p.tool || ''}(${_trunc(JSON.stringify(p.args || {}), 80)})`;
     case 'mcp_result':     return `← ${_trunc(JSON.stringify(p.result), 100)}`;
     case 'agent_thought':  return p.text || '';
+    // 单独一类，不并进 agent_thought：本功能最坏的失败模式是汇报里编造一个不存在的
+    // 发现，得能和模型自己的想法分开看才抓得住。
+    // 轮数维度已删（纯时间触发），payload 里只剩秒数 —— 再读 silent_rounds 会渲染成
+    // 「静默undefined轮」。in_turn 区分"turn 还在跑"和"turn 结束后子代理还在干"。
+    case 'narration':      return `📢 ${p.text || ''} (静默${p.silent_seconds}s${p.in_turn ? '' : '·后台'})`;
     case 'asr_result':     return `"${p.text || ''}"`;
     case 'trigger':        return p.text || _trunc(JSON.stringify(p), 60);
     case 'peer_pair_request': return `${p.display_name || p.peer_id?.slice(0, 12) || 'peer'} 请求配对 · 验证码 ${p.code}`;

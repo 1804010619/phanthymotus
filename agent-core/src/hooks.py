@@ -93,6 +93,67 @@ def get_hook_for_binding(mcp_id: str, tool: str, action: str) -> str | None:
     return None
 
 
+def has_bindings(hook_id: str) -> bool:
+    """Is anything registered under this hook at all.
+
+    A deployment with no `on_notify` binding has no channel to the user, so
+    anything that would narrate through it should no-op rather than spend an
+    LLM call producing text nobody can hear.
+    """
+    return bool(_registry.get(hook_id))
+
+
+def notify_resources(hook_id: str = 'on_notify') -> frozenset:
+    """这个 hook 的绑定一共会占用哪些物理通道。
+
+    用来判断一个刚完成的 action「是不是面向用户的输出」—— 不能按工具名猜，
+    机器人的嘴叫 tts / speaker / audio_play 各有各的叫法（见 peer/tools.py 的教训）。
+    """
+    import mcp_client
+    out: set = set()
+    for b in _registry.get(hook_id) or []:
+        entry = mcp_client.registry.get(b.mcp_id) or {}
+        tool_meta = entry.get('tool_meta', {})
+        meta = (tool_meta.get(f'mcp__{b.mcp_id}__{b.tool}__{b.action}')
+                or tool_meta.get(f'mcp__{b.mcp_id}__{b.tool}'))
+        res = (meta or {}).get('resource')
+        if res:
+            out |= set(res)
+    return frozenset(out)
+
+
+def notify_resource_busy(hook_id: str = 'on_notify') -> bool:
+    """True if *every* binding of `hook_id` would be skipped as resource-busy.
+
+    Same tool_meta lookup `mcp_client.call_tool_hook` does (schema name first
+    with the action suffix, then without) — doing it up front lets a caller
+    avoid paying for an LLM call whose output would be dropped on the floor.
+
+    A binding that declares no `x-resource` is never "busy": call_tool_hook
+    dispatches it unconditionally, so claiming otherwise here would suppress a
+    narration that would in fact have been heard.
+
+    用 `resource_actually_busy` 而不是 `conflicting_pending` —— 后者会把「已经播完、
+    只是还没被 barrier 回收」的 action 也算成占用，那会让一句播报把嘴锁住好几分钟，
+    期间所有自动播报被静默跳过（Orin5 上实测 2 分 34 秒）。
+    """
+    import mcp_client
+    bindings = _registry.get(hook_id) or []
+    if not bindings:
+        return False
+    for b in bindings:
+        entry = mcp_client.registry.get(b.mcp_id) or {}
+        tool_meta = entry.get('tool_meta', {})
+        meta = (tool_meta.get(f'mcp__{b.mcp_id}__{b.tool}__{b.action}')
+                or tool_meta.get(f'mcp__{b.mcp_id}__{b.tool}'))
+        resource = (meta or {}).get('resource')
+        if not resource:
+            return False
+        if not mcp_client.resource_actually_busy(resource):
+            return False
+    return True
+
+
 def get_status() -> dict:
     """Return hook registry and recent fire log for diagnostics."""
     return {

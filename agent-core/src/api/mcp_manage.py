@@ -873,13 +873,21 @@ async def _handle_agentcore_call(req: MCPCallRequest):
         llm_cfg = event_cfg.get('llm', {})
         trigger_interval_ms = llm_cfg.get('trigger_interval_ms', 1000)
         topic_in_list = [{'topic': t, 'format': 'data/json'} for t in sub_topics] if sub_topics else [{'topic': '', 'format': 'data/json'}]
+        # 延迟 import：event.llm 拉起整个 agent loop，模块顶层导入会成环。
+        from event.llm import _narration_thresholds
         return {'code': 200, 'data': {
             'description': '决策核心 — 接收多路 DDS 输入，LLM 推理后执行动作',
             'topic_in': topic_in_list,
             'topic_out': [{'topic': '/decision_core', 'format': 'data/json'}],
             'trigger_interval_ms': trigger_interval_ms,
             'vision_input': bool(llm_cfg.get('vision_input', False)),
-            'auto_notify': bool(llm_cfg.get('auto_notify', True)),
+            'auto_narration': bool(llm_cfg.get('auto_narration', True)),
+            'narration_silence_seconds': int(llm_cfg.get('narration_silence_seconds', 15)),
+            # 运行时生效值（set_progress_report 的口头调整会盖住上面两个配置值，重启清空）。
+            # 前端 schema 不认这个键、会忽略它 —— 它的用途是让「卡片写 4 轮、机器人实际
+            # 按 10 轮跑」这件事在接口和日志里可见，而不是停留在某个进程的内存里。
+            'narration_effective': dict(zip(('rounds', 'seconds'),
+                                            _narration_thresholds())),
         }}
 
     elif action == 'config':
@@ -935,13 +943,22 @@ async def _handle_agentcore_call(req: MCPCallRequest):
             event_cfg['llm'] = llm_cfg
             config.main['event'] = event_cfg
         # 自动播报开关
-        auto_notify = req.arguments.get('auto_notify')
-        if auto_notify is not None:
+        auto_narration = req.arguments.get('auto_narration')
+        if auto_narration is not None:
             event_cfg = config.main.get('event', {})
             llm_cfg = event_cfg.get('llm', {})
-            llm_cfg['auto_notify'] = bool(auto_notify)
+            llm_cfg['auto_narration'] = bool(auto_narration)
             event_cfg['llm'] = llm_cfg
             config.main['event'] = event_cfg
+        # 主动播报阈值（轮数 / 秒数，先到者触发；0 = 关闭该维度）
+        for _k in ('narration_silence_seconds',):
+            _v = req.arguments.get(_k)
+            if _v is not None:
+                event_cfg = config.main.get('event', {})
+                llm_cfg = event_cfg.get('llm', {})
+                llm_cfg[_k] = max(0, int(_v))
+                event_cfg['llm'] = llm_cfg
+                config.main['event'] = event_cfg
         # Save search config to desktop_tools.search
         search_type = req.arguments.get('search_type')
         if search_type is not None:

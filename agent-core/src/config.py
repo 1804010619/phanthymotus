@@ -66,6 +66,12 @@ _DB_DEFAULTS = {
             'source_ring_size': 50,             # per-source ring buffer 大小（供 raw_input_info 查询）
             'interrupt_mode': 'steer',          # 打断模式: steer | interrupt | followup
             'barge_in_threshold_ms': 500,       # 语音 barge-in 阈值（ms），低于此值视为 backchannel
+            # 主动播报：距上次面向用户的输出多久没动静就自动生成并播报一句进展汇报。
+            # 0 = 关闭。播放期间不计时（正在说话时根本没有计时器）。
+            'auto_narration': True,             # 长时间不出声时由系统代为播报进展的总开关
+            'narration_silence_seconds': 15,
+            'narration_context_chars': 6000,    # 喂给汇报调用的上下文预算（取 turn 尾部）
+            'narration_timeout_s': 20,          # 汇报调用硬超时，超时视为本次放弃
         },
         'subscribe_topics': [],  # DDS topics core subscribes to directly (e.g. ["/robot/mic/audio/asr_event"])
     },
@@ -299,6 +305,63 @@ def _migrate():
                              (json.dumps(sa),))
                 conn.commit()
                 print(f'[config] subagent: {", ".join(changed)}')
+
+        # event.llm 新增的主动播报键。同上面那段：_seed_defaults 是整行粒度的
+        # INSERT OR IGNORE，已部署机器上的 'event' 行早就存在，新默认值永远进不去 ——
+        # 结果会是阈值读成 0，功能静默不生效。只补缺失的键，手工调过的值不动。
+        _narration_defaults = {
+            'auto_narration': True,
+            'narration_silence_seconds': 15,
+            'narration_context_chars': 6000,
+            'narration_timeout_s': 20,
+        }
+        # 已删除的键。轮数维度取消后（纯时间触发，定时器全局负责），这个键没有任何读者，
+        # 留在库里只会让人对着设置页猜"它还管不管用"。和上面的补种合并成一次
+        # read-modify-write —— 拆成两段就要对同一行读写两次，中间还多一个失败窗口。
+        # auto_notify 换名成 auto_narration，**不继承旧值**。
+        #
+        # 旧键的含义是"把模型写的 content 自动念出来"。有人（比如 Tianyi）因为那功能念的是
+        # 内部推理而把它关掉了 —— 一个完全合理的决定。现在 content 自动播报已经废除，同一个
+        # 键被重新定义成"框架进度播报的总开关"，于是那个旧决定会静默地把一个它从没评价过的
+        # 新功能也关死，而设置页上看不出任何异常（Tianyi 就是人工打开才恢复的）。
+        #
+        # 语义变了就换键：新键按默认值 True 生效，旧键删掉。这是替操作员重新做决定，但
+        # 他当初拒绝的那个东西已经不存在了，让一个作废的决定继续生效更糟。
+        _narration_removed = ('narration_silence_rounds', 'auto_notify')
+
+        # 改过的默认值：沉默阈值 25 → 15 秒。25 是几小时前由上面这段自己种进去的，不是
+        # 谁选的，所以停在 25 的机器要跟着改；手工调过（比如 90）的不动。同 subagent 那段
+        # 的做法，(旧默认, 新默认)。
+        _stale_narration_defaults = {
+            'narration_silence_seconds': (25, 15),
+        }
+
+        row_ev = conn.execute("SELECT value FROM config WHERE key='event'").fetchone()
+        if row_ev:
+            ev = json.loads(row_ev[0])
+            llm_cfg = ev.setdefault('llm', {})
+            added = [k for k in _narration_defaults if k not in llm_cfg]
+            for k in added:
+                llm_cfg[k] = _narration_defaults[k]
+            dropped = [k for k in _narration_removed if k in llm_cfg]
+            for k in dropped:
+                llm_cfg.pop(k, None)
+            retuned = []
+            for k, (old_v, new_v) in _stale_narration_defaults.items():
+                if llm_cfg.get(k) == old_v:
+                    llm_cfg[k] = new_v
+                    retuned.append(f'{k} {old_v} -> {new_v}')
+            if added or dropped or retuned:
+                conn.execute("UPDATE config SET value=? WHERE key='event'", (json.dumps(ev),))
+                conn.commit()
+                _msg = []
+                if added:
+                    _msg.append(f'seeded {", ".join(added)}')
+                if dropped:
+                    _msg.append(f'dropped {", ".join(dropped)}')
+                if retuned:
+                    _msg.append(f'retuned {", ".join(retuned)}')
+                print(f'[config] event.llm: {"; ".join(_msg)}')
 
 _migrate()
 
