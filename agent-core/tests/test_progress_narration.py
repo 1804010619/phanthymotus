@@ -677,5 +677,105 @@ class TestReporter(_NarrationFixture):
         self.assertTrue(out[3])
 
 
+class TestSilenceWatchdog(_NarrationFixture):
+    """以播报为锚的定时器 —— 轮循环那套采样不到的两种情况。
+
+    Orin5 实测：主 agent 17:22:31 派了异步子代理，17:22:48 就 finish 了，子代理独自跑了
+    2 分半 12 轮，期间零播报 —— 计数器是 _one_turn 的局部变量，没有 turn 就没有轮，那段
+    检查一次都不执行。另一次是单轮跑了 3 分半，轮间隙压根没到来。
+    """
+
+    def setUp(self):
+        super().setUp()
+        self._ell = sys.modules['event.llm']
+        self._saved_ts = self._ell._last_output_ts
+        self._saved_report = self._ell._last_report_text_global
+
+    def tearDown(self):
+        self._ell._cancel_narration_timer()
+        self._ell._last_output_ts = self._saved_ts
+        self._ell._last_report_text_global = self._saved_report
+        super().tearDown()
+
+    def test_note_output_resets_the_clock(self):
+        self._ell._last_output_ts = time.time() - 300
+        self.assertGreater(self._ell.silent_seconds(), 290)
+        asyncio.run(self._noop_note())
+        self.assertLess(self._ell.silent_seconds(), 5)
+
+    async def _noop_note(self):
+        self._ell._note_user_output()
+
+    def test_arming_twice_keeps_only_the_latest(self):
+        """"新播报取消旧定时" —— 否则几次输出会排出一串定时器，各自到点各播一句。"""
+        async def go():
+            self._ell._arm_narration_timer()
+            first = self._ell._narration_timer
+            self._ell._arm_narration_timer()
+            second = self._ell._narration_timer
+            await asyncio.sleep(0)
+            return first, second
+        first, second = asyncio.run(go())
+        self.assertIsNot(first, second)
+        self.assertTrue(first.cancelled() or first.done())
+
+    def test_no_active_work_spends_nothing(self):
+        """活干完了就该安静 —— 而且连 LLM 调用都不该花。下次出声会重新上表。"""
+        self._register_mouth()
+        self._set_llm_cfg(auto_notify=True, narration_silence_seconds=15)
+        self.assertEqual(self._ell._active_work_summary(), [],
+                         '这个 fixture 里不该有活在跑')
+
+        import client
+        called = []
+        saved_call, saved_fire = client.call, hooks.fire
+
+        async def _call(**kw):
+            called.append(1)
+            return {'content': 'x'}
+
+        async def _fire(*a, **k):
+            called.append('fire')
+            return []
+
+        client.call, hooks.fire = _call, _fire
+        try:
+            inst = self._ell.Event.__new__(self._ell.Event)
+            inst._turns = []
+            asyncio.run(inst._report_progress_out_of_turn())
+        finally:
+            client.call, hooks.fire = saved_call, saved_fire
+        self.assertEqual(called, [])
+
+    def test_active_work_lists_running_subagents(self):
+        class _S:
+            id, status, rounds_completed, goal = 'ab12', 'running', 7, '写一份英伟达投研报告'
+
+        import subagent
+        saved = subagent._manager_instance
+        class _M:
+            def list_active(self_): return [_S()]
+        subagent._manager_instance = _M()
+        try:
+            work = self._ell._active_work_summary()
+        finally:
+            subagent._manager_instance = saved
+        self.assertEqual(len(work), 1)
+        self.assertIn('ab12', work[0])
+        self.assertIn('7 轮', work[0])
+        self.assertIn('英伟达', work[0])
+
+    def test_report_text_survives_across_turns(self):
+        """turn 结束后子代理接着跑，是同一件事的延续 —— "别重复上次说的"要跨 turn 成立。"""
+        self._ell._remember_report('已经查完财报了')
+        self.assertEqual(self._ell._last_report_text_global, '已经查完财报了')
+
+    def test_timer_survives_without_event_loop(self):
+        """启动早期/测试里没有运行中的 loop，上表不能把调用方炸掉。"""
+        self._ell._cancel_narration_timer()
+        self._ell._arm_narration_timer()      # 同步上下文，无 loop
+        self.assertIsNone(self._ell._narration_timer)
+
+
 if __name__ == '__main__':
     unittest.main()

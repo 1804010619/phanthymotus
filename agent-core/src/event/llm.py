@@ -666,6 +666,106 @@ _NARRATION_MAX_CHARS = 120
 _warned_no_notify = False
 
 
+# ── 沉默看门狗：把"上次出声到现在多久"提成全局状态 ──────────────────────────
+#
+# 轮循环里的计数器是 _one_turn 的局部变量，只在轮间隙采样。Orin5 实测这漏掉两种情况，
+# 而它们恰恰是最需要播报的长程任务形态：
+#
+#   1. 主 agent 派了异步子代理就 finish 了（17:22:31 spawn → 17:22:48 turn complete），
+#      子代理独自跑了 2 分半 12 轮。没有 turn 就没有轮，那段检查一次都不执行。
+#   2. 单轮特别长（实测有一轮 3 分半），轮间隙压根没到来。
+#
+# 所以改成以**播报为锚**的定时器：每次出声结束开始计时，到点还有活在干就再汇报一次；
+# 期间只要有任何面向用户的输出，这次定时作废、从新的输出结束重新计。不是轮询 ——
+# 没有固定心跳，空闲时一个 task 都不占。
+_last_output_ts: float = 0.0
+_narration_timer: 'asyncio.Task | None' = None
+_narration_inflight: bool = False
+# 最后一次汇报的内容，跨 turn 保留 —— 看门狗那条路没有 turn 可以挂它，而"别重复上次
+# 说过的话"在两条路之间同样要成立（turn 结束后子代理接着跑，是同一件事的延续）。
+_last_report_text_global: str = ''
+
+
+def _remember_report(text: str) -> None:
+    global _last_report_text_global
+    _last_report_text_global = text
+
+
+def _note_user_output() -> None:
+    """刚刚有东西送达用户 —— 重置沉默时钟，并把定时器挪到这次输出之后。"""
+    global _last_output_ts
+    _last_output_ts = time.time()
+    _arm_narration_timer()
+
+
+def silent_seconds() -> float:
+    """距上次面向用户的输出过了多久。从没出过声时按进程启动算。"""
+    global _last_output_ts
+    if not _last_output_ts:
+        _last_output_ts = time.time()
+    return time.time() - _last_output_ts
+
+
+def _cancel_narration_timer() -> None:
+    global _narration_timer
+    if _narration_timer is not None and not _narration_timer.done():
+        _narration_timer.cancel()
+    _narration_timer = None
+
+
+def _arm_narration_timer() -> None:
+    """上表。重复调用只保留最后一次 —— 这就是"新播报取消旧定时"。"""
+    global _narration_timer
+    _cancel_narration_timer()
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        _narration_timer = None      # 没有运行中的事件循环（测试/启动早期）
+        return                       # 先判再建协程，否则留下一个 never awaited
+    _narration_timer = loop.create_task(_narration_timer_body())
+
+
+async def _narration_timer_body() -> None:
+    import hooks
+    try:
+        while True:
+            _, seconds_thr = _narration_thresholds()
+            if seconds_thr <= 0:
+                return
+            await asyncio.sleep(max(1.0, seconds_thr - silent_seconds()))
+            if silent_seconds() < seconds_thr:
+                continue          # 期间又出过声，重新算
+            # 「从播报结束开始计时」：到点时如果还在说，沉默根本没开始 ——
+            # 等这句说完，再重新计满一个完整间隔。
+            if hooks.notify_resource_busy('on_notify'):
+                while hooks.notify_resource_busy('on_notify'):
+                    await asyncio.sleep(0.5)
+                _note_user_output()   # 说完的这一刻才是沉默的起点
+                return                # _note_user_output 已经重新上表
+            break
+        inst = _event_instance
+        if inst is not None:
+            await inst._report_progress_out_of_turn()
+    except asyncio.CancelledError:
+        pass
+    except Exception as e:
+        print(f'[decision] narration timer error: {e}')
+
+
+def _active_work_summary() -> list[str]:
+    """当前还有什么活在干。空列表 = 闲着，没什么可汇报的。"""
+    lines = []
+    try:
+        import subagent
+        for s in subagent._get_active_subagents():
+            if s.status in ('running', 'pending'):
+                lines.append(f'子代理 [{s.id}] {s.status}，已跑 {s.rounds_completed} 轮：'
+                             f'{(s.goal or "")[:120]}')
+    except Exception:
+        pass
+    return lines
+
+
 def _build_narration_messages(frozen_system: dict, turn_messages: list[dict],
                               last_report_text: str, silent_rounds: int,
                               silent_seconds: float, budget_chars: int) -> list[dict]:
@@ -1372,7 +1472,10 @@ class Event:
         `spoke` 表示用户是不是真听到了。SKIP / 超时 / 失败都会重置计数器（退避一个完整
         间隔，不对着死端点每轮重试）但 `spoke=False`，哑火护栏还得管这个 turn。
         """
+        global _narration_inflight
         import hooks
+        if _narration_inflight:
+            return None          # 看门狗那条路正在汇报，别叠第二句
         llm_cfg = config.main.get('event', {}).get('llm', {})
         # 每次都现读，不缓存 —— 刻意不走 _one_turn 开头那份 llm_cfg（每 turn 只读一次，
         # 也正是今天改 max_rounds 中途不生效的原因）。"多汇报一点"本身就发生在当前 turn
@@ -1434,6 +1537,9 @@ class Event:
             print(f'[decision] narration: all bindings skipped (busy) → "{report}"')
             return 0, now, last_report_text, False
 
+        _remember_report(report)
+        _note_user_output()
+
         print(f'[decision] narration: {silent_rounds} silent round(s) / '
               f'{silent_seconds:.0f}s → "{report}"')
         await push_event({'type': 'narration', 'payload': {
@@ -1442,6 +1548,70 @@ class Event:
         # 告诉主 LLM 这句话已经替它说了，否则它下一轮很可能显式调播报工具再说一遍。
         turn_messages.append(_narration_feedback_message(report))
         return 0, time.time(), report, True
+
+    async def _report_progress_out_of_turn(self) -> None:
+        """没有主 turn 在跑（或这一轮特别长）时的进度同步。
+
+        由沉默看门狗调用。与 _maybe_report_progress 的区别只在**上下文从哪来**：
+        那边有活的 turn_messages，这边没有，只能拿最近几轮历史 + 还在跑的子代理状态
+        拼一个交代。播报通道、单飞、gate 都是同一套。
+        """
+        global _narration_inflight
+        import hooks
+        work = _active_work_summary()
+        if not work:
+            return          # 活干完了，没什么好报的；下次出声会重新上表
+        if _narration_inflight:
+            return
+        rounds_thr, seconds_thr = _narration_thresholds()
+        if seconds_thr <= 0 or not _auto_notify_enabled():
+            return
+        if not hooks.has_bindings('on_notify') or hooks.notify_resource_busy('on_notify'):
+            return
+
+        _narration_inflight = True
+        try:
+            llm_cfg = config.main.get('event', {}).get('llm', {})
+            history = _turns_to_text(self._turns[-3:]) if self._turns else ''
+            budget = int(llm_cfg.get('narration_context_chars', 6000))
+            if len(history) > budget:
+                history = '...(前略)\n' + history[-budget:]
+            context = '当前还在进行的工作：\n' + '\n'.join(work) + '\n\n之前的过程：\n' + history
+            frozen = prompt_mod.build_system(mcp_client.registry, self._bound_tool_names())
+            messages = [frozen, {'role': 'user', 'content': _NARRATION_PROMPT.format(
+                rounds='几', seconds=int(silent_seconds()),
+                last=(f'- 不要重复你上次已经播报过的：「{_last_report_text_global}」'
+                      if _last_report_text_global else ''),
+                context=context)}]
+            response = await asyncio.wait_for(
+                client.call(message_list=messages, tool_list=[],
+                            caller_info={'agent_type': 'main_agent'}),
+                timeout=float(llm_cfg.get('narration_timeout_s', 20)))
+            report = (response.get('content') or '').strip()
+            if not report or report.upper().startswith('SKIP'):
+                _arm_narration_timer()      # 这次没什么好说的，下个间隔再看
+                return
+            if len(report) > _NARRATION_MAX_CHARS:
+                report = report[:_NARRATION_MAX_CHARS]
+            results = await hooks.fire('on_notify', {'text': report}, barrier_aware=True)
+            if not _notify_fire_spoke(results):
+                _arm_narration_timer()
+                return
+            _remember_report(report)
+            print(f'[decision] narration (out of turn): {silent_seconds():.0f}s silent, '
+                  f'{len(work)} active → "{report}"')
+            await push_event({'type': 'narration', 'payload': {
+                'text': report, 'silent_rounds': 0,
+                'silent_seconds': int(silent_seconds()), 'out_of_turn': True}})
+            _note_user_output()
+        except Exception as e:
+            print(f'[decision] narration (out of turn) failed: {e}')
+            _arm_narration_timer()
+        finally:
+            _narration_inflight = False
+
+    def _bound_tool_names(self) -> set:
+        return {s['name'] for s in self._get_bound_tool_schemas()}
 
     async def _one_turn(self, trigger_event: dict, cancel_event: asyncio.Event | None = None,
                         reconsider_event: asyncio.Event | None = None):
@@ -2111,13 +2281,14 @@ class Event:
             # 计数器天然不动 —— 那几种情况既没有面向用户的输出，也没有用户能感知到的沉默。
             if _notified_by_tool or _channel_replied:
                 _silent_rounds = 0
-                _last_interact_ts = time.time()
+                _note_user_output()          # 全局沉默时钟 + 定时器重新上表
+                _last_interact_ts = _last_output_ts
                 _turn_interacted = True
             else:
                 _silent_rounds += 1
                 _outcome = await self._maybe_report_progress(
                     turn_messages, frozen_system, _silent_rounds,
-                    _last_interact_ts, _last_report_text,
+                    _last_output_ts, _last_report_text_global,
                     tool_restricted=tool_restricted, cancel_event=cancel_event)
                 if _outcome is not None:
                     _silent_rounds, _last_interact_ts, _last_report_text, _spoke = _outcome
@@ -2158,6 +2329,12 @@ class Event:
         }})
         _turn_elapsed = _time.perf_counter() - _turn_t0
         print(f'[decision] turn complete: {_turn_elapsed:.2f}s total, {total_rounds + 1} rounds')
+
+        # Turn 结束但活未必干完 —— 主 agent 派个异步子代理就 finish 是常见形状
+        # （Orin5：17:22:31 spawn → 17:22:48 turn complete → 子代理又跑了 2 分半）。
+        # 这里上表，之后就由看门狗按沉默时长接着管。没有活在干时它自己会退场。
+        if _active_work_summary():
+            _arm_narration_timer()
 
         # 性能追踪：提交 spans
         _turn_end_ts = time.time()
