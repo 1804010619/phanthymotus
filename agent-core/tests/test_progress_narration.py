@@ -304,7 +304,7 @@ class TestStateMachine(_Fixture):
     def setUp(self):
         super().setUp()
         self._register_mouth()
-        self._cfg(narration_silence_seconds=30, auto_notify=True)
+        self._cfg(narration_silence_seconds=30, auto_narration=True)
 
     def test_speaking_started_stops_countdown_while_tracked(self):
         async def go():
@@ -446,7 +446,7 @@ class TestReportProgress(_Fixture):
     def setUp(self):
         super().setUp()
         self._register_mouth()
-        self._cfg(auto_notify=True, narration_silence_seconds=30,
+        self._cfg(auto_narration=True, narration_silence_seconds=30,
                   narration_timeout_s=5, narration_context_chars=6000)
         self._work()
         self._saved_call = client.call
@@ -780,7 +780,7 @@ class TestReportProgress(_Fixture):
         self.assertEqual(called, [])
         self.assertIsNone(ell._silence_countdown)
 
-    def test_auto_notify_off_stops(self):
+    def test_auto_narration_off_stops(self):
         called = []
         self._stub('不该被调用', record=called)
         skills_mod._notify_override = False
@@ -875,17 +875,17 @@ class TestSetProgressReport(_Fixture):
 class TestSkillsNoLongerPredeclareNarration(_Fixture):
     """技能不再预先声明要不要播报 —— 播不播由 agent-core 运行时自己判断。"""
 
-    def test_skill_toggle_does_not_clobber_set_auto_notify(self):
-        asyncio.run(skills_tools.set_auto_notify(False))
+    def test_skill_toggle_does_not_clobber_set_auto_narration(self):
+        asyncio.run(skills_tools.set_auto_narration(False))
         saved = config.main.get('skills', {})
         try:
             config.main['skills'] = {'installed': [{
                 'slug': 'chess', 'name': '下棋', 'active': True,
                 'instruction': 'x', 'oneLiner': 'y', 'narrationDefault': True}]}
             asyncio.run(skills_tools.activate_skill(slug='chess'))
-            self.assertFalse(ell._auto_notify_enabled())
+            self.assertFalse(ell._narration_enabled())
             asyncio.run(skills_tools.deactivate_skill(slug='chess'))
-            self.assertFalse(ell._auto_notify_enabled())
+            self.assertFalse(ell._narration_enabled())
         finally:
             config.main['skills'] = saved
 
@@ -921,8 +921,8 @@ class TestRoundsArmIsGone(unittest.TestCase):
         head = cfg[:cfg.index('def _migrate(')]
         self.assertNotIn('narration_silence_rounds', head,
                          'config.py 的默认值里还有轮数配置项')
-        self.assertIn("_narration_removed = ('narration_silence_rounds',)", cfg,
-                      '迁移里应当把这个废弃键从库里删掉')
+        self.assertIn("'narration_silence_rounds'", cfg.split('_narration_removed')[1][:200],
+                      '迁移的删除清单里应当有这个废弃键')
 
 
 if __name__ == '__main__':

@@ -5,7 +5,7 @@ event/skills.py — 技能系统（混合模式）。
   1. DB `active` 字段 — UI 控制技能对 LLM 的可见性（出现在 <skills> 列表中）
   2. 内存 `_runtime_activated` — LLM 调用 activate_skill 后才注入完整 instruction
 
-提供 activate_skill / deactivate_skill / set_auto_notify / set_progress_report 系统工具。
+提供 activate_skill / deactivate_skill / set_auto_narration / set_progress_report 系统工具。
 """
 
 import typing
@@ -18,8 +18,8 @@ import config
 # LLM 按需激活的 slugs（内存态，重启清空）
 _runtime_activated: set[str] = set()
 
-# 自动播报运行时覆盖（内存态，重启清空）。None = 跟随全局配置 event.llm.auto_notify。
-# 唯一写者是 set_auto_notify 工具 —— 技能不再预先声明要不要播报（原先的
+# 自动播报运行时覆盖（内存态，重启清空）。None = 跟随全局配置 event.llm.auto_narration。
+# 唯一写者是 set_auto_narration 工具 —— 技能不再预先声明要不要播报（原先的
 # narrationDefault + _recompute_notify_override 已删除）：播不播由 agent-core 在运行时
 # 自己判断，而技能切换会把模型刚设好的状态冲掉，本身就是个 bug。
 _notify_override: bool | None = None
@@ -108,7 +108,7 @@ class Tools:
         _runtime_activated.discard(slug)
         return f'已停用技能「{slug}」，其指令已从上下文移除。'
 
-    async def set_auto_notify(self,
+    async def set_auto_narration(self,
         enabled: typing.Annotated[bool, '是否允许系统在你长时间不出声时自动替你播报进展'],
     ):
         """临时开启/关闭系统的自动进展播报。默认开启；进入不希望每步都被听到/看到的
@@ -136,7 +136,7 @@ class Tools:
         就又触发一次。设置在本次运行内有效，重启后回到默认。
 
         注意这只改节奏、不改开关：用户要的是"一句话都别说"（下棋、表演、沉浸式角色扮演）时，
-        用 set_auto_notify(false)。
+        用 set_auto_narration(false)。
         """
         global _report_override
         import sys as _sys

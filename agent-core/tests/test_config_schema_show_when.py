@@ -1,7 +1,7 @@
 """
 test_config_schema_show_when.py — x-show-when 的值必须是字符串。
 
-踩过的坑：给 decision_core 的两个主动播报阈值加了 `'x-show-when': {'auto_notify': True}`
+踩过的坑：给 decision_core 的两个主动播报阈值加了 `'x-show-when': {'auto_narration': True}`
 （Python 布尔），字段在卡片上**永远不显示**，而且完全没有报错 —— 看起来就像功能没做。
 
 原因在渲染侧（web/js/sidebar.js）：boolean 字段渲染成一个 `<select>`，option 的 value 是
@@ -73,7 +73,7 @@ class TestShowWhenValuesAreStrings(unittest.TestCase):
             props.update(s.get('properties', {}))
         for key in ('narration_silence_seconds',):
             self.assertIn(key, props, f'{key} 不在 decision_core 的 configSchema 里')
-            self.assertEqual(props[key].get('x-show-when'), {'auto_notify': 'true'})
+            self.assertEqual(props[key].get('x-show-when'), {'auto_narration': 'true'})
             self.assertEqual(props[key]['type'], 'integer')
 
 

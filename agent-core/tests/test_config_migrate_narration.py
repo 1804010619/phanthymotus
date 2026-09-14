@@ -89,6 +89,29 @@ class TestNarrationKeyMigration(unittest.TestCase):
         }})
         self.assertEqual(llm['narration_silence_seconds'], 15)
 
+    def test_auto_notify_false_does_not_carry_over(self):
+        """旧键关着，新功能**不该**跟着被关死。
+
+        auto_notify 原本管的是"把模型写的 content 自动念出来"。Tianyi 上有人因为那功能念
+        的是内部推理而关掉它 —— 完全合理。现在 content 自动播报已废除，同一个键若被重新
+        定义成"进度播报总开关"，那个旧决定就会静默地把一个它从没评价过的新功能也关死，
+        而设置页上看不出任何异常。所以换键：新键按默认 True 生效，旧键删掉。
+        """
+        llm = _run_migrate_on({'llm': {
+            'auto_notify': False,
+            'prompt_system': './resource/memory/prompt_system.md',
+        }})
+        self.assertNotIn('auto_notify', llm, '作废的旧键要从库里删掉')
+        self.assertIs(llm['auto_narration'], True, '新功能按自己的默认值生效')
+
+    def test_an_explicit_new_key_is_respected(self):
+        """换键只影响旧值继承；有人明确关了新键就得听他的。"""
+        llm = _run_migrate_on({'llm': {
+            'auto_narration': False,
+            'prompt_system': './resource/memory/prompt_system.md',
+        }})
+        self.assertIs(llm['auto_narration'], False)
+
     def test_is_idempotent(self):
         """跑第二遍不该再改动任何东西（每次启动都会跑一次）。"""
         base = {'llm': {'narration_silence_rounds': 4,

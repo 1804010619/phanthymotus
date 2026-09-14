@@ -228,9 +228,9 @@ def _env_dynamic() -> str:
     # set_progress_report。约 15 token，顺带让整个机制对模型可见。
     narration_section = ''
     try:
-        from event.llm import _auto_notify_enabled, _narration_thresholds
-        if not _auto_notify_enabled():
-            narration_section = '<narration>已关闭（set_auto_notify(true) 可恢复）</narration>\n'
+        from event.llm import _narration_enabled, _narration_thresholds
+        if not _narration_enabled():
+            narration_section = '<narration>已关闭（set_auto_narration(true) 可恢复）</narration>\n'
         else:
             _, _s = _narration_thresholds()
             narration_section = (

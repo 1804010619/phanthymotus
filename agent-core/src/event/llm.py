@@ -415,8 +415,12 @@ def _notify_fire_spoke(results: list | None) -> bool:
     return False
 
 
-def _auto_notify_enabled() -> bool:
+def _narration_enabled() -> bool:
     """自动播报（框架代为出声）的总开关。
+
+    键名是 auto_narration 而不是旧的 auto_notify：旧键管的是"把 content 念出来"，那个
+    功能已经废除。沿用旧键会让当初为了"别念内部推理"而关掉它的机器人，静默地把这个新
+    功能也一起关死 —— 见 config.py 里 _narration_removed 那段。
 
     event.skills (attribute) is rebound to a Tools() instance by
     event/__init__.py, shadowing the submodule — get_notify_override is a
@@ -426,7 +430,7 @@ def _auto_notify_enabled() -> bool:
     override = _sys.modules['event.skills'].get_notify_override()
     if override is not None:
         return bool(override)
-    return bool(config.main.get('event', {}).get('llm', {}).get('auto_notify', True))
+    return bool(config.main.get('event', {}).get('llm', {}).get('auto_narration', True))
 
 
 def _narration_thresholds() -> tuple[int, int]:
@@ -1263,7 +1267,7 @@ class Event:
             ('update_memory', event.memory.update),
             ('activate_skill', event.skills.activate_skill),
             ('deactivate_skill', event.skills.deactivate_skill),
-            ('set_auto_notify', event.skills.set_auto_notify),
+            ('set_auto_narration', event.skills.set_auto_narration),
             ('set_progress_report', event.skills.set_progress_report),
             ('task_create', event.task.task_create),
             ('task_update', event.task.task_update),
@@ -1646,8 +1650,8 @@ class Event:
             # 受限 turn 派出去的活，不该由我们代为出声
             _narration_gate('last turn was tool-restricted', stop=True)
             return
-        if not _auto_notify_enabled():
-            _narration_gate('auto_notify off', stop=True)
+        if not _narration_enabled():
+            _narration_gate('auto_narration off', stop=True)
             return
         if not hooks.has_bindings('on_notify'):
             global _warned_no_notify
@@ -1931,7 +1935,7 @@ class Event:
             if _no_output_retried or _turn_interacted or not text:
                 return False
             # 受限 turn 本来就不该播任何东西；没有播报通道时催也没用。
-            if tool_restricted or not _auto_notify_enabled():
+            if tool_restricted or not _narration_enabled():
                 return False
             import hooks as _h
             if not _h.has_bindings('on_notify'):
