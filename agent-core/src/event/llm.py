@@ -1225,17 +1225,34 @@ class Event:
             full_name = f"mcp__{mcp_id}__{tool_name}"
             if card_id:
                 self._bound_instance_ids[full_name] = card_id
+            # present_to_llm 而不是直接用生料：它负责滤掉 processor 的系统 action
+            # （start/stop/config/info —— 插件生命周期归画布管，不归 LLM 管）并注入
+            # concurrent 参数。这两件事原本只写在 mcp_client.all_schemas() 里，而
+            # all_schemas() 全仓库只有 peer 那一处调用，主链路走的是这里 —— 于是
+            # Orin5 上用户说"别说了"时模型调了 tts(action="stop")（把话题订阅节点整个
+            # 拆了，本该是 interrupt），而 system prompt 教了一整段的 concurrent 参数
+            # 在任何工具上都不存在。
+            _meta = info.get('tool_meta', {})
+            _split = info.get('split_map', {})
             schema = info.get('schemas', {}).get(full_name)
             if schema:
-                schemas.append(schema)
+                presented = mcp_client.present_to_llm(schema, _meta.get(full_name))
+                if presented is not None:
+                    schemas.append(presented)
             else:
                 # 检查是否有拆分的子工具（x-action-params 拆分）
                 for split_name in info.get('tool_groups', {}).get(tool_name, []):
                     s = info.get('schemas', {}).get(split_name)
-                    if s:
-                        schemas.append(s)
-                        if card_id:
-                            self._bound_instance_ids[split_name] = card_id
+                    if not s:
+                        continue
+                    presented = mcp_client.present_to_llm(
+                        s, _meta.get(split_name),
+                        split_action=_split.get(split_name, {}).get('action'))
+                    if presented is None:
+                        continue
+                    schemas.append(presented)
+                    if card_id:
+                        self._bound_instance_ids[split_name] = card_id
 
         # Peer tools are deliberately **not** added here. They reach the model
         # through the `peer_tools` / `peer_call` pair instead (peer/delegation.py),

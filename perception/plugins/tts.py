@@ -163,7 +163,9 @@ TOOLS = [
         "name": "tts",
         "type": "processor",
         "multiInstance": True,
-        "description": "TTS — start/stop speech synthesis, speak text, or get status",
+        "description": "TTS — 把文本说出来（speak），或立即掐断正在说的话（interrupt）。"
+                       "注意 stop 是停掉整个插件节点、不是停住这句话；"
+                       "要让机器人别说了用 interrupt。",
         "inputSchema": {
             "type": "object",
             "properties": {

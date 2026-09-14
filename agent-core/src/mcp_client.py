@@ -895,29 +895,62 @@ async def call_tool(full_name: str, args: dict) -> str:
 _SYSTEM_ACTIONS = {'start', 'stop', 'info', 'config'}
 
 
+def present_to_llm(schema: dict, meta: dict | None, split_action: str | None = None) -> dict | None:
+    """把一个注册表里的原始 schema 变成可以交给 LLM 的形状。返回 None = 不该暴露。
+
+    两件事：**滤掉 processor 的系统 action**，以及**注入 concurrent 参数**。
+
+    必须是所有"把工具交给模型"的路径共用的唯一入口。这个过滤原本只写在 all_schemas()
+    里，而主 agent loop 走的是 event/llm.py 的 _get_bound_tool_schemas()（直接取
+    info['schemas'][name] 生料），all_schemas() 全仓库只有 peer 那一处调用 —— 于是过滤
+    **从来没有在主链路生效过**。
+
+    后果实测到两个：
+    · Orin5 上用户说"好了别说了"，模型调了 tts(action="stop")。它看到的 enum 就是
+      ["start","stop","speak","info","config","interrupt"]，描述还写着 "start/stop
+      speech synthesis" —— 选 stop 是最自然的读法。但 stop 会 _dispose_node() 把
+      话题订阅节点整个拆掉，而"停住这句话"应该是 interrupt。
+    · concurrent 参数只在 all_schemas() 里注入，所以主链路上**任何工具都没有这个参数**，
+      而 system prompt 花了一整段教模型怎么用它。
+
+    `split_action`：x-action-params 拆出来的子工具，action 编码在 schema 名里而不是
+    参数里，只能靠它判断这个子工具是不是系统 action。
+    """
+    meta = meta or {}
+    tool_type = meta.get('type')
+
+    if tool_type == 'processor':
+        if split_action is not None:
+            if split_action in _SYSTEM_ACTIONS:
+                return None          # 拆分子工具本身就是系统 action，不暴露
+        elif meta.get('action_enum'):
+            user_actions = [a for a in meta['action_enum'] if a not in _SYSTEM_ACTIONS]
+            if not user_actions:
+                return None          # 无用户 action，整个工具不暴露给 LLM
+            props = schema.get('parameters', {}).get('properties', {})
+            if 'action' in props:
+                schema = {**schema, 'parameters': {
+                    **schema['parameters'],
+                    'properties': {**props,
+                                   'action': {**props['action'], 'enum': user_actions}},
+                }}
+    return with_parallel_param(schema, tool_type)
+
+
 def all_schemas() -> list[dict]:
-    """返回所有在线 MCP 工具的 OpenAI function calling schema 列表（过滤 processor 系统 action）。"""
+    """返回所有在线 MCP 工具的 OpenAI function calling schema 列表。"""
     schemas = []
     for info in registry.values():
         if not info.get('online'):
             continue
         tool_meta = info.get('tool_meta', {})
+        split_map = info.get('split_map', {})
         for name, schema in info['schemas'].items():
-            meta = tool_meta.get(name, {})
-            # Processor 类型：过滤系统 action
-            if meta.get('type') == 'processor' and meta.get('action_enum'):
-                user_actions = [a for a in meta['action_enum'] if a not in _SYSTEM_ACTIONS]
-                if not user_actions:
-                    continue  # 无用户 action，不暴露给 LLM
-                # 复制 schema，修改 action enum 只保留用户可调用的
-                schema = {**schema, 'parameters': {
-                    **schema['parameters'],
-                    'properties': {
-                        **schema['parameters']['properties'],
-                        'action': {**schema['parameters']['properties']['action'], 'enum': user_actions}
-                    }
-                }}
-            schemas.append(with_parallel_param(schema, meta.get('type')))
+            presented = present_to_llm(
+                schema, tool_meta.get(name),
+                split_action=split_map.get(name, {}).get('action') if name in split_map else None)
+            if presented is not None:
+                schemas.append(presented)
     return schemas
 
 
