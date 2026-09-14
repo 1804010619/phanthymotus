@@ -731,6 +731,10 @@ _pending_narration_feedback: list = []
 # 一个前后重叠的滑动窗口，模型只能把累积状态重新总结一遍，越说越像（Tianyi 实测连着三条
 # 播报，第三条几乎是第二条加一个词，末尾都靠"马上整理成报告"凑数）。
 _reported_turns: dict = {}
+# 这次"停滞"是否已经播过一次。子代理卡在一个长单步里时（Tianyi 实测写一份 454 行报告
+# 花了 107 秒、一个 turn 都没产出），该说一句"还在干什么"让用户安心 —— 但**只说一次**，
+# 之后等它真有新动作了再说，不然又回到每 15 秒念一遍同样的话。
+_stall_notified: bool = False
 
 
 def _remember_report(text: str) -> None:
@@ -870,7 +874,7 @@ def _active_work_summary() -> list[str]:
     return lines
 
 
-def _active_work_detail() -> str:
+def _active_work_detail() -> tuple:
     """还在跑的活的**近况**，喂给汇报器。
 
     只喂目标 + 轮数的话，汇报器手里除了目标本身什么都没有，只能把目标换个说法念一遍。
@@ -884,13 +888,20 @@ def _active_work_detail() -> str:
     except Exception:
         digests = []
     if not digests:
-        return ''
+        return '', False
+    # 一条活动记录都没有 = 刚派出去还什么都没做，没有素材可说。这和"做过事、现在卡在
+    # 一个长单步上"要分开：后者该说一句让用户安心，前者说什么都是空话。
+    if not any(d.get('turns') for d in digests):
+        return '', False
     blocks = []
     for d in digests:
         head = f"子代理 [{d['id']}] 已跑 {d['rounds']} 轮，目标：{(d['goal'] or '')[:120]}"
         body = _turns_to_text(d['turns']) if d['turns'] else ''
-        blocks.append(head + ('\n它最近做的事：\n' + body if body else ''))
-    return '\n\n'.join(blocks)
+        label = '它最近做的事（这段时间没有新动作，仍在同一步上）：' if d.get('stalled') \
+            else '它最近做的事：'
+        blocks.append(head + ('\n' + label + '\n' + body if body else ''))
+    # 全部停滞 ⇒ 没有任何新进展，调用方据此决定说不说
+    return '\n\n'.join(blocks), all(d.get('stalled') for d in digests)
 
 
 
@@ -1608,6 +1619,7 @@ class Event:
             return
 
         # 上下文
+        stalled = False
         live = self._current_turn if turn_alive else None
         if live:
             context = _turns_to_text([list(live)])
@@ -1622,21 +1634,41 @@ class Event:
             #
             # 子代理刚起步、digest 还空时，上下文就只剩目标 —— 那时按 prompt 的要求应当
             # 输出 SKIP（没有具体进展就别说），这比报一个陈旧话题好。
-            detail = _active_work_detail()
+            global _stall_notified
+            detail, stalled = _active_work_detail()
             if not detail:
-                # 有活在干，但上次汇报之后它没往前走 —— 没有新东西可说。别花一次 LLM
-                # 调用去挤一句车轱辘话，等下一个间隔再看。
+                print('[decision] narration skipped: no active work detail')
                 _restart_countdown()
                 return
+            if stalled:
+                # 一个 turn 都没新增。可能是刚派出去，也可能正卡在一个很长的单步里
+                # （Tianyi 实测写一份 454 行报告花了 107 秒）。后者恰恰最该出声，所以
+                # 说一句 —— 但**整个停滞期只说一次**，之后等它真有新动作了再说，不然
+                # 又变成每 15 秒念一遍同样的话。
+                if _stall_notified:
+                    print('[decision] narration skipped: no new progress (already noted)')
+                    _restart_countdown()
+                    return
+                _stall_notified = True
+            else:
+                _stall_notified = False
             context = '当前还在进行的工作：\n' + detail
 
         llm_cfg = config.main.get('event', {}).get('llm', {})
         _narration_inflight = True
         try:
+            if turn_alive:
+                _extra = ''
+            elif stalled:
+                _extra = ('\n注意：这段时间它没有新动作，一直卡在同一步上。用一句话让用户'
+                          '知道**还在进行、在做哪一步**，不要复述你上次说过的内容，也不要'
+                          '编造新进展。')
+            else:
+                _extra = ''
             messages = _build_narration_messages(
                 frozen_system=prompt_mod.build_system(
                     mcp_client.registry, self._bound_tool_names()),
-                context=context, last_report_text=_last_report_text_global,
+                context=context + _extra, last_report_text=_last_report_text_global,
                 budget_chars=int(llm_cfg.get('narration_context_chars', 6000)))
             response = await asyncio.wait_for(
                 # reconsider_event 不传 —— 汇报很短、重跑也是一样的代价，而 steer

@@ -26,7 +26,8 @@ def _get_active_digests(max_turns: int = 3, since: dict | None = None) -> list[d
     都没有，只能把目标换个说法念一遍 —— Orin5 实测播出来的就是"投研报告还在调研中，
     完成后告诉你结果"，等于没说。
 
-    `since` 是 {agent_id: 上次已经喂过的 turn 数}，只返回那之后的新 turn。不给这个的话
+    `since` 是 {agent_id: 上次已经喂过的 turn 数}，优先返回那之后的新 turn；一个 turn
+    都没新增时标 `stalled=True` 并回退到最近几条（它可能正卡在一个很长的单步里）。不给这个的话
     每次都是一个前后重叠的滑动窗口，模型只能把累积状态重新总结一遍 —— Tianyi 实测连着
     三条播报越说越像，第三条几乎是第二条加一个词，末尾都靠"马上整理成报告"凑数。
 
@@ -39,6 +40,7 @@ def _get_active_digests(max_turns: int = 3, since: dict | None = None) -> list[d
     if _manager_instance is None:
         return []
     out = []
+    stalled: list = []
     for agent in getattr(_manager_instance, '_agents', {}).values():
         if agent.status != 'running':
             continue
@@ -51,13 +53,19 @@ def _get_active_digests(max_turns: int = 3, since: dict | None = None) -> list[d
         else:
             fresh = turns[since.get(agent.id, 0):]
             if not fresh:
-                continue                 # 上次喂过之后没有新 turn，没什么可说的
-            picked = fresh[-max_turns:] if max_turns > 0 else []
+                # 上次喂过之后没有新 turn。**不等于没事干** —— 它可能正卡在一个很长的
+                # 单步里（Tianyi 实测写一份 454 行报告花了 107 秒，期间一个 turn 都没
+                # 产出）。这里照样返回，但标成 stalled，由调用方决定说不说、怎么说。
+                stalled.append(agent.id)
+                picked = turns[-max_turns:] if max_turns > 0 else []
+            else:
+                picked = fresh[-max_turns:] if max_turns > 0 else []
         out.append({
             'id': agent.id,
             'goal': agent.spec.goal,
             'rounds': agent.rounds_completed,
             'turn_count': len(turns),
             'turns': picked,
+            'stalled': agent.id in stalled,
         })
     return out

@@ -93,6 +93,8 @@ class _Fixture(unittest.TestCase):
         del ell._pending_narration_feedback[:]
         self._saved_rounds = dict(ell._reported_turns)
         ell._reported_turns.clear()
+        self._saved_stall = ell._stall_notified
+        ell._stall_notified = False
 
     def tearDown(self):
         ell._stop_countdown()
@@ -113,6 +115,7 @@ class _Fixture(unittest.TestCase):
         ell._event_instance = self._saved_inst
         ell._reported_turns.clear()
         ell._reported_turns.update(self._saved_rounds)
+        ell._stall_notified = self._saved_stall
 
     # -- helpers ---------------------------------------------------------
     def _register_mouth(self, *, resource=frozenset({'mouth'})):
@@ -568,23 +571,44 @@ class TestReportProgress(_Fixture):
         called = []
         self._stub('不该被调用', record=called)
         self._run()
-        self.assertEqual(called, [])
+        self.assertEqual(called, [], '没有任何活动记录就没有素材，不该花调用')
         self.assertEqual(self.fired, [])
         self.assertIsNotNone(ell._silence_countdown)
 
-    def test_no_new_progress_spends_no_llm_call(self):
-        """上次汇报之后子代理没往前走 → 不值得再挤一句车轱辘话。"""
+    def test_stall_is_announced_once_then_stays_quiet(self):
+        """子代理卡在一个长单步里时，该说一句让用户安心 —— 但只说一次。
+
+        Tianyi 实测：写一份 454 行报告花了 107 秒，期间一个 turn 都没产出。上一版把这种
+        情况判成"没什么可说的"直接静默，用户那 107 秒里什么都听不到 —— 而那恰恰是这个
+        功能最该出声的时候。反过来每 15 秒念一遍同样的话也不行，所以整个停滞期只播一次。
+        """
         self._work(turns=[[{'role': 'tool', 'content': 'FINDING'}]])
         self._stub('第一条')
         self._run()
         self.assertEqual(len(self.fired), 1)
 
+        # 卡住了：turn 数没变
+        self._stub('还在写报告')
+        self._run()
+        self.assertEqual(len(self.fired), 2, '第一次停滞应该说一句')
+
         called = []
         self._stub('不该被调用', record=called)
-        self._run()                      # 轮数没变
-        self.assertEqual(called, [], '没有新进展就不该再花一次 LLM 调用')
-        self.assertEqual(len(self.fired), 1)
+        self._run()
+        self.assertEqual(called, [], '同一次停滞不该再花第二次 LLM 调用')
+        self.assertEqual(len(self.fired), 2)
         self.assertIsNotNone(ell._silence_countdown)
+
+    def test_stall_notice_resets_when_work_moves_again(self):
+        """停滞过后又有新动作 → 下次再卡住时还能再说一次。"""
+        agent = self._work(turns=[[{'role': 'tool', 'content': 'A'}]])
+        self._stub('一'); self._run()
+        self._stub('二'); self._run()            # 停滞播报
+        self.assertTrue(ell._stall_notified)
+        agent.context = type('Ctx', (), {'turns': [
+            [{'role': 'tool', 'content': 'A'}], [{'role': 'tool', 'content': 'B'}]]})()
+        self._stub('三'); self._run()            # 有新动作
+        self.assertFalse(ell._stall_notified, '有新进展后停滞标志要复位')
 
     def test_stale_main_history_is_not_in_the_context(self):
         """这条路汇报的是在跑的子代理，主 agent 的旧对话是另一个话题。
