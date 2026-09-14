@@ -859,14 +859,17 @@ def _on_speaking_started() -> None:
 def _on_speaking_finished() -> None:
     """某个动作播完了（完成回调 / 超时 / 取消都会走到这里）。
 
-    自己再判一次 _mouth_busy()：多个嘴同时在播时，第一个完成不等于说完了；这一处判定
-    同时覆盖"通知早于实际空闲"的所有情况。
+    **嘴还忙也照样上表**，不要在这里 return。这条早先是"忙就直接返回"，留下一条死路：
+    嘴上可能还挂着别人的动作（天轶的驱动自己也注册 mouth 动作，barrier 日志里见过
+    ['28', 'speak-…', 'tts-…'] 三个一起 want=mouth），那个动作的完成若没被观察到，就
+    再也没有人来重新计时 —— 只能等轮边界兜底。实测因此空了 70 秒。
+
+    "正在说话时不该汇报"这件事由到点时的 mouth busy gate 负责，那条会重新计时而不是
+    停表，所以放它过来是安全的：计时继续跑，说完了自然就播。
     """
-    if _mouth_busy():
-        return
     if _active_work_summary() or _turn_running():
         _restart_countdown()
-    else:
+    elif not _mouth_busy():
         _stop_countdown()
 
 
@@ -1637,6 +1640,10 @@ class Event:
         global _narration_inflight
         import hooks
         if _narration_inflight:
+            # 另一次汇报正在飞（LLM 调用最长 20 秒，期间完成回调可能又上了一次表）。
+            # **必须重新计时**：这个 task 到此就结束了，不重排的话没有任何东西会再触发
+            # 汇报，等于永久静音到下一个轮边界。
+            _narration_gate('another report in flight', stop=False)
             return
         # gate。顺序按从便宜到贵排。
         _, seconds_thr = _narration_thresholds()

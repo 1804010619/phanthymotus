@@ -346,8 +346,17 @@ class TestStateMachine(_Fixture):
             return ell._silence_countdown
         self.assertIsNone(asyncio.run(go()))
 
-    def test_speaking_finished_ignored_while_another_mouth_still_playing(self):
-        """多设备：第一个说完不等于说完了。"""
+    def test_speaking_finished_still_arms_while_another_mouth_plays(self):
+        """多设备：第一个说完时**照样上表**，不能因为嘴还忙就不计时。
+
+        这条原来断言的是相反的（忙 → 不上表），那是一条死路：嘴上可能挂着别人的动作
+        （天轶的驱动自己也注册 mouth 动作，barrier 日志里见过 ['28','speak-…','tts-…']
+        三个一起 want=mouth），那个动作的完成若没被观察到，就再也没有人来重新计时 ——
+        只能等轮边界兜底。实测因此空了 70 秒。
+
+        "正在说话时不该汇报"由到点时的 mouth busy gate 负责，那条**重新计时而不是停表**，
+        所以放它过来是安全的。
+        """
         self._work()
 
         async def go():
@@ -357,7 +366,27 @@ class TestStateMachine(_Fixture):
             a.set()
             ell._on_speaking_finished()
             return ell._silence_countdown
-        self.assertIsNone(asyncio.run(go()))
+        self.assertIsNotNone(asyncio.run(go()))
+
+    def test_inflight_skip_rearms_instead_of_dying(self):
+        """另一次汇报在飞时早退，**必须重新计时**。
+
+        定时器 task 到此就结束了；不重排的话没有任何东西会再触发汇报 —— 等于永久静音到
+        下一个轮边界。这条和上一条是同一次事故的两个嫌疑人，都是无日志的静默死路。
+        """
+        self._work()
+
+        async def go():
+            # inflight 早退是 _report_progress 的第一句，不需要接好线的实例。
+            inst = ell.Event.__new__(ell.Event)
+            ell._narration_inflight = True
+            try:
+                ell._stop_countdown()
+                await inst._report_progress()
+                return ell._silence_countdown
+            finally:
+                ell._narration_inflight = False
+        self.assertIsNotNone(asyncio.run(go()))
 
     def test_settle_listener_fires_for_user_facing_action(self):
         """完成回调 → 走到 _on_speaking_finished。两处完成入口都经过 mark_action_complete。"""
