@@ -565,15 +565,24 @@ class TestReportProgress(_Fixture):
         self.assertIn('NEWFINDING', body)
         self.assertNotIn('OLDFINDING', body)
 
-    def test_a_just_spawned_subagent_spends_no_llm_call(self):
-        """刚派出去、还什么都没做 —— 没有素材可说，别花调用去挤一句空话。"""
+    def test_a_just_spawned_subagent_is_announced_once(self):
+        """刚派出去还没产出 —— 也要说一句"已经着手了"，但同样只说一次。
+
+        用户刚提完需求接着一片安静时，"已经开始查了、还在等第一批结果"本身就是信息。
+        """
         self._work(turns=[])
+        rec = []
+        self._stub('已经开始查了，还在等第一批结果', record=rec)
+        self._run()
+        self.assertEqual(len(self.fired), 1)
+        # 这一句必须明确禁止编造进展 —— 此时确实什么结果都没有
+        self.assertIn('不要编造任何进展或数据', rec[0]['messages'][1]['content'])
+
         called = []
         self._stub('不该被调用', record=called)
         self._run()
-        self.assertEqual(called, [], '没有任何活动记录就没有素材，不该花调用')
-        self.assertEqual(self.fired, [])
-        self.assertIsNotNone(ell._silence_countdown)
+        self.assertEqual(called, [], '刚开始这件事说一次就够了')
+        self.assertEqual(len(self.fired), 1)
 
     def test_stall_is_announced_once_then_stays_quiet(self):
         """子代理卡在一个长单步里时，该说一句让用户安心 —— 但只说一次。
