@@ -525,17 +525,21 @@ class TestReportProgress(_Fixture):
         self.assertIn('WebSearch', body)
         self.assertIn('21.5 亿', body)
 
-    def test_current_work_survives_truncation(self):
-        """超预算时取尾不取头 —— 最该保住的"当前在干什么"必须在最后。"""
-        self._cfg(narration_context_chars=300)
-        self.inst._turns = [[{'role': 'user', 'content': 'OLDHISTORY' + 'x' * 5000}]]
+    def test_stale_main_history_is_not_in_the_context(self):
+        """这条路汇报的是在跑的子代理，主 agent 的旧对话是另一个话题。
+
+        Orin5 实测：11:24:13 刚派出"调研比亚迪海豹"的子代理，11:24:31 播出来的却是
+        "理想L6和问界M7的配置对比数据都查到了"——说的是上一个已经结束的任务。旧历史
+        混进来不只是噪声，它会直接把汇报带跑偏。
+        """
+        self.inst._turns = [[{'role': 'user', 'content': 'OLDTOPIC理想L6'}]]
         self._work(turns=[[{'role': 'tool', 'content': 'FRESHFINDING'}]])
         rec = []
         self._stub('好了', record=rec)
         self._run()
         body = rec[0]['messages'][1]['content']
         self.assertIn('FRESHFINDING', body)
-        self.assertNotIn('OLDHISTORY', body)
+        self.assertNotIn('OLDTOPIC', body)
 
     def test_skip_does_not_fire_but_restarts(self):
         """**防永久静音**：SKIP 也要重新计时，否则这条路就此断掉。"""

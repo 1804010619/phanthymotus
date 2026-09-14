@@ -1602,12 +1602,17 @@ class Event:
         if live:
             context = _turns_to_text([list(live)])
         else:
-            history = _turns_to_text(self._turns[-3:]) if self._turns else ''
-            detail = _active_work_detail()
-            # 顺序讲究：上下文超预算时是**取尾不取头**，所以把最该保住的"当前在干什么"
-            # 放最后，早先的历史放前面，被截掉的先是旧history。
-            context = (('早先的过程：\n' + history + '\n\n' if history else '')
-                       + '当前还在进行的工作：\n' + (detail or '\n'.join(work)))
+            # **只给当前这件活的材料，不给主 agent 的历史。**
+            #
+            # 这条路汇报的对象就是还在跑的子代理，而 self._turns 里装的是主 agent 之前
+            # 聊过的（往往是已经做完的上一个任务）—— 那是另一个话题，放进来纯属噪声，
+            # 而且实测会把汇报带跑偏：Orin5 上 11:24:13 刚派出"调研比亚迪海豹"的子代理，
+            # 11:24:31 播出来的却是"理想L6和问界M7的配置对比数据都查到了"，说的是上一个
+            # 已经结束的任务。
+            #
+            # 子代理刚起步、digest 还空时，上下文就只剩目标 —— 那时按 prompt 的要求应当
+            # 输出 SKIP（没有具体进展就别说），这比报一个陈旧话题好。
+            context = '当前还在进行的工作：\n' + (_active_work_detail() or '\n'.join(work))
 
         llm_cfg = config.main.get('event', {}).get('llm', {})
         _narration_inflight = True
