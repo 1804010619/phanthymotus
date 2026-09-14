@@ -135,13 +135,19 @@ class _Fixture(unittest.TestCase):
         mcp_client._pending_resources[aid] = resource
         return evt
 
-    def _work(self, running=True):
-        class _S:
-            id, status, rounds_completed, goal = 'ab12', 'running' if running else 'completed', 3, '长任务'
-
-        class _M:
-            def list_active(self_):
-                return [_S()]
+    def _work(self, running=True, turns=None):
+        """模拟一个在跑的子代理。`turns` 给它一段真实活动记录 —— 汇报器要靠这个才说得出
+        "做了什么/发现了什么"，只有目标和轮数的话它只能把目标换个说法念一遍。"""
+        st = 'running' if running else 'completed'
+        _S = type('S', (), {'id': 'ab12', 'status': st,
+                            'rounds_completed': 3, 'goal': '长任务'})
+        _Ctx = type('Ctx', (), {'turns': list(turns or [])})
+        _Agent = type('Agent', (), {
+            'id': 'ab12', 'status': st, 'rounds_completed': 3,
+            'spec': type('Spec', (), {'goal': '长任务'})(),
+            'context': _Ctx()})
+        _M = type('M', (), {'_agents': {'ab12': _Agent()},
+                            'list_active': lambda self_: [_S()]})
         subagent._manager_instance = _M()
 
 
@@ -497,8 +503,39 @@ class TestReportProgress(_Fixture):
         rec = []
         self._stub('好了', record=rec)
         self._run()
-        self.assertIn('ab12', rec[0]['messages'][1]['content'])
-        self.assertIn('长任务', rec[0]['messages'][1]['content'])
+        body = rec[0]['messages'][1]['content']
+        self.assertIn('ab12', body)
+        self.assertIn('长任务', body)
+
+    def test_context_carries_what_the_subagent_actually_did(self):
+        """只给目标 + 轮数的话，汇报器只能把目标换个说法念一遍。
+
+        Orin5 实测播出来的就是"投研报告还在调研中，完成后我会第一时间告诉你结果"——
+        用户听完仍然不知道进行到哪了。它需要看到子代理具体搜了什么、拿到了什么。
+        """
+        self._work(turns=[[
+            {'role': 'assistant', 'tool_calls': [
+                {'function': {'name': 'WebSearch', 'arguments': '{}'}}]},
+            {'role': 'tool', 'content': '票房 21.5 亿，豆瓣 8.7'},
+        ]])
+        rec = []
+        self._stub('好了', record=rec)
+        self._run()
+        body = rec[0]['messages'][1]['content']
+        self.assertIn('WebSearch', body)
+        self.assertIn('21.5 亿', body)
+
+    def test_current_work_survives_truncation(self):
+        """超预算时取尾不取头 —— 最该保住的"当前在干什么"必须在最后。"""
+        self._cfg(narration_context_chars=300)
+        self.inst._turns = [[{'role': 'user', 'content': 'OLDHISTORY' + 'x' * 5000}]]
+        self._work(turns=[[{'role': 'tool', 'content': 'FRESHFINDING'}]])
+        rec = []
+        self._stub('好了', record=rec)
+        self._run()
+        body = rec[0]['messages'][1]['content']
+        self.assertIn('FRESHFINDING', body)
+        self.assertNotIn('OLDHISTORY', body)
 
     def test_skip_does_not_fire_but_restarts(self):
         """**防永久静音**：SKIP 也要重新计时，否则这条路就此断掉。"""

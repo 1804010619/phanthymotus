@@ -626,15 +626,35 @@ async def _compress_turns(turns: list[list[dict]]) -> str:
 
 # ── 主动播报（framework-generated progress narration）─────────────────────────
 
-_NARRATION_PROMPT = """[系统] 你已经有一段时间没有对用户说过任何话了，用户正在等你。
-现在只做一件事：用**一句话**向用户汇报进展，不要调用任何工具，不要输出别的内容。
+_NARRATION_PROMPT = """[系统] 你已经有一段时间没有对用户说过任何话了，用户正在等你，
+而且他看不到你的屏幕、不知道你在做什么。用**一句话**告诉他进展。
 
-内容要求（按顺序，能省则省）：做到了什么 / 发现了什么 / 接下来做什么。
+只输出那一句话。不要调用任何工具，不要写别的内容。
+
+必须落到**具体的事实**上，按这个顺序（没有的就跳过，不要硬凑）：
+1. 已经做完了什么 —— 查了什么、看到了什么、去了哪
+2. 其中值得说的发现 —— 具体的数字、名称、结论
+3. 接下来要做什么
+
+反面例子（这几种都等于没说，不要输出）：
+- "还在处理中，完成后告诉你"
+- "正在整理信息，马上就好"
+- "任务进行中，请稍候"
+共同毛病是：把目标换个说法念了一遍，用户听完还是不知道进行到哪了。
+
+正面例子：
+- "财报和机构评级都查到了，营收同比涨了一倍，还差估值那部分"
+- "客厅和厨房都找过了没有，接下来去卧室"
+- "第一家店关门了，正在查附近还有哪几家"
+
+其他要求：
 - 口语，会被直接念出来。不要 markdown、编号、括号注释、工具名、文件路径。
-- 不超过 40 个字。
+- 不超过 40 个字。宁可只说一件具体的事，也不要三件都含糊带过。
 - 用用户的语言。
+- 只说过程记录里**真实发生过**的事，没查到的别编。
 {last}
-如果这段过程里确实没有任何值得告诉用户的进展，只输出 SKIP 三个字母。
+如果过程记录里确实还没有任何具体进展（比如刚开始、还没拿到任何结果），
+只输出 SKIP 三个字母 —— 这种时候沉默比说一句空话好。
 
 过程记录：
 {context}
@@ -809,7 +829,12 @@ def _turn_running() -> bool:
 
 
 def _active_work_summary() -> list[str]:
-    """当前还有什么活在干。空列表 = 闲着，没什么可汇报的。"""
+    """当前还有什么活在干。空列表 = 闲着，没什么可汇报的。
+
+    给 gate 判"有没有活"，也当上下文的兜底 —— 所以带上目标：拿不到 _active_work_detail()
+    时（子代理刚起、manager 形状不对），这行是汇报器仅有的素材，连目标都没有就只能说
+    "还在处理中"。
+    """
     lines = []
     try:
         import subagent
@@ -820,6 +845,30 @@ def _active_work_summary() -> list[str]:
     except Exception:
         pass
     return lines
+
+
+def _active_work_detail() -> str:
+    """还在跑的活的**近况**，喂给汇报器。
+
+    只喂目标 + 轮数的话，汇报器手里除了目标本身什么都没有，只能把目标换个说法念一遍。
+    Orin5 实测播出来的是"投研报告还在调研中，完成后告诉你结果"——用户听完仍然不知道
+    进行到哪了。要说清"做了什么 / 发现了什么 / 接下来做什么"，就得让它看到子代理具体
+    搜了什么、拿到了什么。
+    """
+    try:
+        import subagent
+        digests = subagent._get_active_digests()
+    except Exception:
+        digests = []
+    if not digests:
+        return ''
+    blocks = []
+    for d in digests:
+        head = f"子代理 [{d['id']}] 已跑 {d['rounds']} 轮，目标：{(d['goal'] or '')[:120]}"
+        body = _turns_to_text(d['turns']) if d['turns'] else ''
+        blocks.append(head + ('\n它最近做的事：\n' + body if body else ''))
+    return '\n\n'.join(blocks)
+
 
 
 def _build_narration_messages(*, frozen_system: dict, context: str,
@@ -1541,8 +1590,11 @@ class Event:
             context = _turns_to_text([list(live)])
         else:
             history = _turns_to_text(self._turns[-3:]) if self._turns else ''
-            context = ('当前还在进行的工作：\n' + '\n'.join(work)
-                       + '\n\n之前的过程：\n' + history)
+            detail = _active_work_detail()
+            # 顺序讲究：上下文超预算时是**取尾不取头**，所以把最该保住的"当前在干什么"
+            # 放最后，早先的历史放前面，被截掉的先是旧history。
+            context = (('早先的过程：\n' + history + '\n\n' if history else '')
+                       + '当前还在进行的工作：\n' + (detail or '\n'.join(work)))
 
         llm_cfg = config.main.get('event', {}).get('llm', {})
         _narration_inflight = True
