@@ -92,10 +92,10 @@ class _Fixture(unittest.TestCase):
         ell._last_report_text_global = ''
         ell._last_turn_restricted = False
         del ell._pending_narration_feedback[:]
-        self._saved_rounds = dict(ell._reported_turns)
-        ell._reported_turns.clear()
-        self._saved_stall = ell._idle_since
-        ell._idle_since = None
+        self._saved_rounds = dict(ell._reported_rounds)
+        ell._reported_rounds.clear()
+        self._saved_stall = ell._last_progress_ts
+        ell._last_progress_ts = None
         self._saved_turn_msgs = ell._reported_turn_msgs
         ell._reported_turn_msgs = 0
         self._saved_busy = collector._busy
@@ -118,9 +118,9 @@ class _Fixture(unittest.TestCase):
         config.main['event'] = self._saved_event
         subagent._manager_instance = self._saved_mgr
         ell._event_instance = self._saved_inst
-        ell._reported_turns.clear()
-        ell._reported_turns.update(self._saved_rounds)
-        ell._idle_since = self._saved_stall
+        ell._reported_rounds.clear()
+        ell._reported_rounds.update(self._saved_rounds)
+        ell._last_progress_ts = self._saved_stall
         ell._reported_turn_msgs = self._saved_turn_msgs
         collector._busy = self._saved_busy
 
@@ -149,7 +149,7 @@ class _Fixture(unittest.TestCase):
         mcp_client._pending_resources[aid] = resource
         return evt
 
-    def _work(self, running=True, turns=None):
+    def _work(self, running=True, turns=None, rounds=3):
         """模拟一个在跑的子代理。`turns` 给它一段真实活动记录 —— 汇报器要靠这个才说得出
         "做了什么/发现了什么"，只有目标和轮数的话它只能把目标换个说法念一遍。
 
@@ -161,10 +161,10 @@ class _Fixture(unittest.TestCase):
             turns = [[{'role': 'tool', 'content': 'BASEFINDING'}]]
         st = 'running' if running else 'completed'
         _S = type('S', (), {'id': 'ab12', 'status': st,
-                            'rounds_completed': 3, 'goal': '长任务'})
+                            'rounds_completed': rounds, 'goal': '长任务'})
         _Ctx = type('Ctx', (), {'turns': list(turns or [])})
         _Agent = type('Agent', (), {
-            'id': 'ab12', 'status': st, 'rounds_completed': 3,
+            'id': 'ab12', 'status': st, 'rounds_completed': rounds,
             'spec': type('Spec', (), {'goal': '长任务'})(),
             'context': _Ctx()})
         _M = type('M', (), {'_agents': {'ab12': _Agent()},
@@ -560,8 +560,8 @@ class TestReportProgress(_Fixture):
         self._run()
         self.assertIn('OLDFINDING', rec[0]['messages'][1]['content'])
 
-        # 子代理又往前跑了一轮，追加一条新 turn
-        agent.rounds_completed = 5
+        # 子代理又往前跑了一轮（rounds 3 → 4），追加一条新 turn
+        agent.rounds_completed = 4
         agent.context = type('Ctx', (), {'turns': [
             [{'role': 'tool', 'content': 'OLDFINDING'}],
             [{'role': 'tool', 'content': 'NEWFINDING'}]]})()
@@ -572,23 +572,48 @@ class TestReportProgress(_Fixture):
         self.assertIn('NEWFINDING', body)
         self.assertNotIn('OLDFINDING', body)
 
-    def test_a_just_spawned_subagent_is_announced_once(self):
-        """刚派出去还没产出 —— 也要说一句"已经着手了"，但同样只说一次。
+    def test_a_just_spawned_subagent_is_announced(self):
+        """刚派出去还没产出 —— 也要说一句"已经着手了"。
 
         用户刚提完需求接着一片安静时，"已经开始查了、还在等第一批结果"本身就是信息。
         """
-        self._work(turns=[])
+        self._work(turns=[], rounds=0)
         rec = []
         self._stub('已经开始查了，还在等第一批结果', record=rec)
         self._run()
         self.assertEqual(len(self.fired), 1)
-        # 这一句必须明确禁止编造进展 —— 此时确实什么结果都没有
+        # 此时确实什么结果都没有，必须明确禁止编造
         self.assertIn('不要编造任何进展或数据', rec[0]['messages'][1]['content'])
 
         rec2 = []
         self._stub('还在等结果，已经半分钟了', record=rec2)
         self._run()
         self.assertEqual(len(self.fired), 2, '还没产出时也要继续播，带上等了多久')
+
+    def test_context_compression_does_not_look_like_no_progress(self):
+        """子代理压缩自己的上下文时，turns 列表会**变短** —— 不能因此判成没进展。
+
+        Orin5 实测：round 6 时 msgs 从 21 掉到 18。水位若记的是 turns 列表长度，一压缩就
+        大于长度、切片为空，于是轮数明明在涨（6→7→8）却连着几条播报都说"没出新结果"、
+        还带着荒谬的"已经跑了 0 秒"。水位记轮数就不会 —— rounds_completed 单调递增。
+        """
+        agent = self._work(turns=[[{'role': 'tool', 'content': f'T{i}'} for i in range(5)]],
+                           rounds=5)
+        rec = []
+        self._stub('第一条', record=rec)
+        self._run()
+        self.assertEqual(len(self.fired), 1)
+
+        # 轮数前进，但上下文被压缩、turns 变短
+        agent.rounds_completed = 6
+        agent.context = type('Ctx', (), {'turns': [
+            [{'role': 'tool', 'content': 'COMPRESSED_NEW'}]]})()
+        rec2 = []
+        self._stub('第二条', record=rec2)
+        self._run()
+        body = rec2[0]['messages'][1]['content']
+        self.assertIn('COMPRESSED_NEW', body)
+        self.assertNotIn('没有产出新东西', body, '轮数涨了就是有新进展，不该判成卡住')
 
     def test_stall_keeps_reporting_with_elapsed_time(self):
         """卡住期间照常每个间隔播一句，但必须带上已经卡了多久。
@@ -614,16 +639,23 @@ class TestReportProgress(_Fixture):
         self._run()
         self.assertEqual(len(self.fired), 3, '卡住期间要继续播，不是只播一次')
 
-    def test_idle_clock_resets_when_work_moves_again(self):
-        """有新动作后"卡了多久"要从头算，否则下次卡住会报一个虚高的时长。"""
+    def test_progress_clock_advances_only_on_real_progress(self):
+        """"多久没出新结果"要从上次真有进展算起，不是从进入卡顿那一刻算起。
+
+        记成后者的话，第一条卡顿播报会在同一次调用里先把它设成 now、再拿它算时长，
+        播出来就是"已经跑了 0 秒没出新结果"（Orin5 实测原话），自相矛盾。
+        """
         agent = self._work(turns=[[{'role': 'tool', 'content': 'A'}]])
         self._stub('一'); self._run()
-        self._stub('二'); self._run()                     # 进入卡住
-        self.assertIsNotNone(ell._idle_since)
-        agent.context = type('Ctx', (), {'turns': [
-            [{'role': 'tool', 'content': 'A'}], [{'role': 'tool', 'content': 'B'}]]})()
-        self._stub('三'); self._run()                     # 有新动作
-        self.assertIsNone(ell._idle_since, '有新进展后卡顿计时要清零')
+        first = ell._last_progress_ts
+        self.assertIsNotNone(first)
+
+        self._stub('二'); self._run()                     # 卡住：轮数没变
+        self.assertEqual(ell._last_progress_ts, first, '卡顿期间这个时刻不该被刷新')
+
+        agent.rounds_completed = 5                        # 真的往前跑了
+        self._stub('三'); self._run()
+        self.assertGreater(ell._last_progress_ts, first, '有新进展后要重新计')
 
     def test_in_turn_context_is_also_incremental(self):
         """turn 内那条路同样只讲上次汇报之后新增的消息。

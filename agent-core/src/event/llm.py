@@ -762,21 +762,23 @@ _last_turn_restricted: bool = False
 # 消息会造出 assistant(tool_calls) → user → tool 的序列，多数 provider 直接拒。改成排队，
 # 由轮循环在排空 steering 的同一个安全点一起灌进去。
 _pending_narration_feedback: list = []
-# 上次已经喂给汇报器的 turn 数（按子代理）。只把那之后的新 turn 喂过去 —— 不然每次都是
-# 一个前后重叠的滑动窗口，模型只能把累积状态重新总结一遍，越说越像（Tianyi 实测连着三条
-# 播报，第三条几乎是第二条加一个词，末尾都靠"马上整理成报告"凑数）。
-_reported_turns: dict = {}
+# 上次汇报时每个子代理跑到第几轮。只讲那之后的新进展 —— 不然每次都是一个前后重叠的滑动
+# 窗口，模型只能把累积状态重新总结一遍，越说越像（Tianyi 实测连着三条播报，第三条几乎是
+# 第二条加一个词，末尾都靠"马上整理成报告"凑数）。
+#
+# 记轮数而不是 turns 列表长度：后者会被子代理自己的上下文压缩改短（Orin5 实测 round 6 时
+# msgs 从 21 掉到 18），一压缩水位就大于长度、切片为空，轮数明明在涨却被判成"没出新结果"。
+_reported_rounds: dict = {}
 # turn 内已经喂过汇报器的消息条数。和子代理那边的水位是同一件事的两半 —— 之前只做了
 # 子代理那半，turn 内每次仍把整个 turn 喂过去，模型就从里面自己挑，两次播报之间会跳掉
 # 中间过程（Tianyi 实测：说完"正在从百度百科提取照片"，下一句直接变成"首都之窗的页面
 # 抓下来了"，而百度百科 403 被拒这条线索用户从没听到，听着很割裂）。
 _reported_turn_msgs: int = 0
-# 这次"没有新产出"是从什么时候开始的（time.time()），有新动作时清空。
+# **上次看到新进展的时刻**。卡顿时用它算"多久没出新结果"。
 #
-# 卡顿期间照常每个间隔播一句，但必须带上**已经卡了多久** —— 用户在长时间静默里真正想
-# 知道的不是"在做什么"（上一句已经说过），而是"是不是卡死了"，而经过的时长恰恰回答这个。
-# 有了它每句话天然不同，也就不会变成 15 秒念一遍同一句。
-_idle_since: float | None = None
+# 不能记成"进入 idle 的时刻"：那样第一条卡顿播报会在同一次调用里先把它设成 now、再拿它
+# 算时长，播出来就是"已经跑了 0 秒没出新结果"（Orin5 实测原话），自相矛盾。
+_last_progress_ts: float | None = None
 
 
 def _remember_report(text: str) -> None:
@@ -926,7 +928,7 @@ def _active_work_detail() -> tuple:
     """
     try:
         import subagent
-        digests = subagent._get_active_digests(since=_reported_turns)
+        digests = subagent._get_active_digests(since=_reported_rounds)
     except Exception:
         digests = []
     if not digests:
@@ -1667,7 +1669,7 @@ class Event:
             return
 
         # 上下文
-        global _idle_since, _reported_turn_msgs
+        global _last_progress_ts, _reported_turn_msgs
         phase = 'new'
         live = self._current_turn if turn_alive else None
         if live:
@@ -1683,10 +1685,8 @@ class Event:
             else:
                 phase = 'idle'
                 context = _turns_to_text([list(live)[-3:]])
-            if phase == 'new':
-                _idle_since = None
-            elif _idle_since is None:
-                _idle_since = time.time()
+            if phase == 'new' or _last_progress_ts is None:
+                _last_progress_ts = time.time()
         else:
             # **只给当前这件活的材料，不给主 agent 的历史。**
             #
@@ -1702,10 +1702,8 @@ class Event:
             if not detail:
                 _narration_gate('no work detail', stop=False)
                 return
-            if phase == 'new':
-                _idle_since = None
-            elif _idle_since is None:
-                _idle_since = time.time()
+            if phase == 'new' or _last_progress_ts is None:
+                _last_progress_ts = time.time()
             context = '当前还在进行的工作：\n' + detail
 
         llm_cfg = config.main.get('event', {}).get('llm', {})
@@ -1714,7 +1712,7 @@ class Event:
             if phase == 'new':
                 _extra = ''
             else:
-                _waited = _human_duration(time.time() - (_idle_since or time.time()))
+                _waited = _human_duration(time.time() - (_last_progress_ts or time.time()))
                 _extra = ('\n注意：这段时间它没有产出新东西 —— 可能刚着手，也可能卡在同一步上。'
                           f'距离上一次有新动作已经过去 {_waited}。用一句话让用户知道'
                           '**还在进行、正在做哪一步、已经等了多久**，'
@@ -1772,12 +1770,12 @@ class Event:
         # 推进水位：下次只讲这之后新发生的事。
         try:
             import subagent as _sa
-            _live = {_d['id']: _d['turn_count']
+            _live = {_d['id']: _d['rounds']
                      for _d in _sa._get_active_digests(max_turns=0)}
-            _reported_turns.update(_live)
+            _reported_rounds.update(_live)
             # 干完的子代理没必要一直留在水位表里
-            for _gone in [k for k in _reported_turns if k not in _live]:
-                _reported_turns.pop(_gone, None)
+            for _gone in [k for k in _reported_rounds if k not in _live]:
+                _reported_rounds.pop(_gone, None)
         except Exception:
             pass
         # 这次播报本身就是一次"开始说话"，走同一个回调：停止计时；若它没有 ACP 跟踪

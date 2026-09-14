@@ -23,24 +23,22 @@ def _get_active_digests(max_turns: int = 3, since: dict | None = None) -> list[d
     """running 子代理的**近况**：目标 + 最近几轮的真实消息。
 
     进度播报专用。只给 SubagentStatus（目标 + 轮数）的话，汇报器手里除了目标本身什么
-    都没有，只能把目标换个说法念一遍 —— Orin5 实测播出来的就是"投研报告还在调研中，
-    完成后告诉你结果"，等于没说。
+    都没有，只能把目标换个说法念一遍。
 
-    `since` 是 {agent_id: 上次已经喂过的 turn 数}，优先返回那之后的新 turn；一个 turn
-    都没新增时标 `stalled=True` 并回退到最近几条（它可能正卡在一个很长的单步里）。不给这个的话
-    每次都是一个前后重叠的滑动窗口，模型只能把累积状态重新总结一遍 —— Tianyi 实测连着
-    三条播报越说越像，第三条几乎是第二条加一个词，末尾都靠"马上整理成报告"凑数。
+    `since` 是 {agent_id: 上次汇报时它跑到第几轮}，用来判断"有没有新进展"并只取新的那
+    几条。
 
-    水位用 **turn 数**而不是 rounds_completed：两者不保证一一对应（一轮可能不产生 turn），
-    而这里要回答的恰恰是"哪几条我还没喂过"。子代理自己的上下文压缩会裁掉旧 turn，那时
-    水位会大于列表长度，切片自然为空 —— 退化成"这次没有新东西"，比重复播一遍安全。
+    **水位用 rounds_completed，不用 turns 列表长度。** 后者会被子代理自己的上下文压缩
+    改短（Orin5 实测 round 6 时 msgs 从 21 掉到 18），一压缩水位就大于列表长度、切片为
+    空，于是轮数明明在涨（6→7→8）却被判成"没出新结果"，播报连着几条都说"还没有新结果"。
+    rounds_completed 单调递增，"轮数涨了"就是"有新进展"最直接的定义。
 
-    返回的 `turn_count` 是当前总 turn 数，调用方拿它更新水位。
+    turns 仍然用来取**内容**：新跑了 n 轮就取最后 n 条（上限 max_turns）。列表被压缩过
+    也没关系 —— `turns[-n:]` 有多少取多少。
     """
     if _manager_instance is None:
         return []
     out = []
-    stalled: list = []
     for agent in getattr(_manager_instance, '_agents', {}).values():
         if agent.status != 'running':
             continue
@@ -48,24 +46,21 @@ def _get_active_digests(max_turns: int = 3, since: dict | None = None) -> list[d
             turns = list(agent.context.turns)
         except Exception:
             turns = []
-        if since is None:
-            picked = turns[-max_turns:] if max_turns > 0 else []
+        rounds = agent.rounds_completed
+        fresh = rounds - since.get(agent.id, 0) if since is not None else None
+        stalled = fresh is not None and fresh <= 0
+        if max_turns <= 0:
+            picked = []
+        elif stalled or fresh is None:
+            picked = turns[-max_turns:]
         else:
-            fresh = turns[since.get(agent.id, 0):]
-            if not fresh:
-                # 上次喂过之后没有新 turn。**不等于没事干** —— 它可能正卡在一个很长的
-                # 单步里（Tianyi 实测写一份 454 行报告花了 107 秒，期间一个 turn 都没
-                # 产出）。这里照样返回，但标成 stalled，由调用方决定说不说、怎么说。
-                stalled.append(agent.id)
-                picked = turns[-max_turns:] if max_turns > 0 else []
-            else:
-                picked = fresh[-max_turns:] if max_turns > 0 else []
+            picked = turns[-min(fresh, max_turns):]
         out.append({
             'id': agent.id,
             'goal': agent.spec.goal,
-            'rounds': agent.rounds_completed,
+            'rounds': rounds,
             'turn_count': len(turns),
             'turns': picked,
-            'stalled': agent.id in stalled,
+            'stalled': stalled,
         })
     return out
