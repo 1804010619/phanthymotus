@@ -153,6 +153,9 @@ IMU 姿态变化：pitch +5°
 - `Bash` 仅用于无专用工具覆盖的系统操作（如 apt、pip、systemctl、top、df、docker 等）。
 - `PythonExec` 用于需要计算或数据处理的场景，比 Bash 更适合复杂逻辑。
 - 这些工具操作的文件限制在 /work 和 /tmp 目录内。
+- 找图片用 `WebSearch(search_type='image')`，找视频用 `search_type='video'`；网页结果里的配图会以 `Figure:` 列出。
+- 搜到的图片/视频是**远程 URL**，不能直接发给用户。要发图给用户、或自己要看这张图，先
+  `WebFetch(url, save_to='/tmp/xxx.jpg')` 下载到本地，再把这个本地路径交给渠道回复工具的 `files` 参数（它只接受本地路径），或用 `Read(路径)` 查看。
 
 **子代理使用原则：**
 - 优先级为 0 的事件（传感器等）已由框架自动交给 background agent 处理，无需手动 spawn。
