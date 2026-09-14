@@ -93,8 +93,8 @@ class _Fixture(unittest.TestCase):
         del ell._pending_narration_feedback[:]
         self._saved_rounds = dict(ell._reported_turns)
         ell._reported_turns.clear()
-        self._saved_stall = ell._stall_notified
-        ell._stall_notified = False
+        self._saved_stall = ell._idle_since
+        ell._idle_since = None
 
     def tearDown(self):
         ell._stop_countdown()
@@ -115,7 +115,7 @@ class _Fixture(unittest.TestCase):
         ell._event_instance = self._saved_inst
         ell._reported_turns.clear()
         ell._reported_turns.update(self._saved_rounds)
-        ell._stall_notified = self._saved_stall
+        ell._idle_since = self._saved_stall
 
     # -- helpers ---------------------------------------------------------
     def _register_mouth(self, *, resource=frozenset({'mouth'})):
@@ -578,46 +578,45 @@ class TestReportProgress(_Fixture):
         # 这一句必须明确禁止编造进展 —— 此时确实什么结果都没有
         self.assertIn('不要编造任何进展或数据', rec[0]['messages'][1]['content'])
 
-        called = []
-        self._stub('不该被调用', record=called)
+        rec2 = []
+        self._stub('还在等结果，已经半分钟了', record=rec2)
         self._run()
-        self.assertEqual(called, [], '刚开始这件事说一次就够了')
-        self.assertEqual(len(self.fired), 1)
+        self.assertEqual(len(self.fired), 2, '还没产出时也要继续播，带上等了多久')
 
-    def test_stall_is_announced_once_then_stays_quiet(self):
-        """子代理卡在一个长单步里时，该说一句让用户安心 —— 但只说一次。
+    def test_stall_keeps_reporting_with_elapsed_time(self):
+        """卡住期间照常每个间隔播一句，但必须带上已经卡了多久。
 
-        Tianyi 实测：写一份 454 行报告花了 107 秒，期间一个 turn 都没产出。上一版把这种
-        情况判成"没什么可说的"直接静默，用户那 107 秒里什么都听不到 —— 而那恰恰是这个
-        功能最该出声的时候。反过来每 15 秒念一遍同样的话也不行，所以整个停滞期只播一次。
+        Tianyi 实测：写一份 454 行报告花了 107 秒，期间一个 turn 都没产出。只播一次的话
+        用户要静默 92 秒；每次原句重复又是噪音。时长是真正的新信息 —— 用户想知道的是
+        "有没有卡死"，而不是"在做什么"（上一句已经说过了）。
         """
         self._work(turns=[[{'role': 'tool', 'content': 'FINDING'}]])
-        self._stub('第一条')
-        self._run()
+        self._stub('第一条'); self._run()
         self.assertEqual(len(self.fired), 1)
 
-        # 卡住了：turn 数没变
-        self._stub('还在写报告')
+        rec = []
+        self._stub('还在写报告，已经一分钟了', record=rec)
         self._run()
-        self.assertEqual(len(self.fired), 2, '第一次停滞应该说一句')
+        self.assertEqual(len(self.fired), 2, '卡住的第一句')
+        body = rec[0]['messages'][1]['content']
+        self.assertIn('已经等了多久', body)
+        self.assertIn('距离上一次有新动作已经过去', body)
 
-        called = []
-        self._stub('不该被调用', record=called)
+        rec2 = []
+        self._stub('还在写报告，已经两分钟了', record=rec2)
         self._run()
-        self.assertEqual(called, [], '同一次停滞不该再花第二次 LLM 调用')
-        self.assertEqual(len(self.fired), 2)
-        self.assertIsNotNone(ell._silence_countdown)
+        self.assertEqual(len(self.fired), 3, '卡住期间要继续播，不是只播一次')
 
-    def test_stall_notice_resets_when_work_moves_again(self):
-        """停滞过后又有新动作 → 下次再卡住时还能再说一次。"""
+    def test_idle_clock_resets_when_work_moves_again(self):
+        """有新动作后"卡了多久"要从头算，否则下次卡住会报一个虚高的时长。"""
         agent = self._work(turns=[[{'role': 'tool', 'content': 'A'}]])
         self._stub('一'); self._run()
-        self._stub('二'); self._run()            # 停滞播报
-        self.assertTrue(ell._stall_notified)
+        self._stub('二'); self._run()                     # 进入卡住
+        self.assertIsNotNone(ell._idle_since)
         agent.context = type('Ctx', (), {'turns': [
             [{'role': 'tool', 'content': 'A'}], [{'role': 'tool', 'content': 'B'}]]})()
-        self._stub('三'); self._run()            # 有新动作
-        self.assertFalse(ell._stall_notified, '有新进展后停滞标志要复位')
+        self._stub('三'); self._run()                     # 有新动作
+        self.assertIsNone(ell._idle_since, '有新进展后卡顿计时要清零')
 
     def test_stale_main_history_is_not_in_the_context(self):
         """这条路汇报的是在跑的子代理，主 agent 的旧对话是另一个话题。

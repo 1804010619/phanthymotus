@@ -457,6 +457,17 @@ def _same_as_last_report(text: str) -> bool:
     return bool(text) and _normalize_report(text) == _normalize_report(_last_report_text_global)
 
 
+def _human_duration(seconds: float) -> str:
+    """把秒数说成人话。播报是念出来的 —— "107 秒"没人这么讲。"""
+    s = max(0, int(seconds))
+    if s < 60:
+        return f'{s} 秒'
+    m, rest = divmod(s, 60)
+    if m < 60:
+        return f'{m} 分钟' if rest < 15 else f'{m} 分半' if rest < 45 else f'{m + 1} 分钟'
+    return f'{m // 60} 小时 {m % 60} 分钟' if m % 60 else f'{m // 60} 小时'
+
+
 def _narration_feedback_message(report: str) -> dict:
     """回灌给主 LLM 的一条消息：你已经说过了，别再说一遍。
 
@@ -731,10 +742,12 @@ _pending_narration_feedback: list = []
 # 一个前后重叠的滑动窗口，模型只能把累积状态重新总结一遍，越说越像（Tianyi 实测连着三条
 # 播报，第三条几乎是第二条加一个词，末尾都靠"马上整理成报告"凑数）。
 _reported_turns: dict = {}
-# 这次"停滞"是否已经播过一次。子代理卡在一个长单步里时（Tianyi 实测写一份 454 行报告
-# 花了 107 秒、一个 turn 都没产出），该说一句"还在干什么"让用户安心 —— 但**只说一次**，
-# 之后等它真有新动作了再说，不然又回到每 15 秒念一遍同样的话。
-_stall_notified: bool = False
+# 这次"没有新产出"是从什么时候开始的（time.time()），有新动作时清空。
+#
+# 卡顿期间照常每个间隔播一句，但必须带上**已经卡了多久** —— 用户在长时间静默里真正想
+# 知道的不是"在做什么"（上一句已经说过），而是"是不是卡死了"，而经过的时长恰恰回答这个。
+# 有了它每句话天然不同，也就不会变成 15 秒念一遍同一句。
+_idle_since: float | None = None
 
 
 def _remember_report(text: str) -> None:
@@ -1638,33 +1651,30 @@ class Event:
             #
             # 子代理刚起步、digest 还空时，上下文就只剩目标 —— 那时按 prompt 的要求应当
             # 输出 SKIP（没有具体进展就别说），这比报一个陈旧话题好。
-            global _stall_notified
             detail, phase = _active_work_detail()
             if not detail:
                 print('[decision] narration skipped: no active work detail')
                 _restart_countdown()
                 return
+            global _idle_since
             if phase == 'new':
-                _stall_notified = False
-            else:
-                # 一个 turn 都没新增 —— 刚派出去，或卡在一个很长的单步里（实测写一份
-                # 454 行报告 107 秒没产出）。这两种用户都该知道"还在进行"，所以要播；
-                # 但**只播一次**，等它真有新动作了再说，否则就回到每 15 秒念一遍同样的话
-                # （Tianyi 上连着三条越说越像，就是这么来的）。
-                if _stall_notified:
-                    print('[decision] narration skipped: no new progress, already noted')
-                    _restart_countdown()
-                    return
-                _stall_notified = True
+                _idle_since = None
+            elif _idle_since is None:
+                _idle_since = time.time()
             context = '当前还在进行的工作：\n' + detail
 
         llm_cfg = config.main.get('event', {}).get('llm', {})
         _narration_inflight = True
         try:
-            _extra = ('' if phase == 'new' else
-                      '\n注意：这段时间它没有产出新东西 —— 可能刚着手，也可能卡在同一步上。'
-                      '用一句话让用户知道**还在进行、正在做哪一步**，'
-                      '不要编造任何进展或数据。')
+            if phase == 'new':
+                _extra = ''
+            else:
+                _waited = _human_duration(time.time() - (_idle_since or time.time()))
+                _extra = ('\n注意：这段时间它没有产出新东西 —— 可能刚着手，也可能卡在同一步上。'
+                          f'距离上一次有新动作已经过去 {_waited}。用一句话让用户知道'
+                          '**还在进行、正在做哪一步、已经等了多久**，'
+                          '把时长说出来（用户想知道的是有没有卡死），'
+                          '不要编造任何进展或数据。')
             messages = _build_narration_messages(
                 frozen_system=prompt_mod.build_system(
                     mcp_client.registry, self._bound_tool_names()),
