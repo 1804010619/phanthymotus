@@ -770,6 +770,42 @@ class TestSilenceWatchdog(_NarrationFixture):
         self._ell._remember_report('已经查完财报了')
         self.assertEqual(self._ell._last_report_text_global, '已经查完财报了')
 
+    def test_new_request_restarts_the_silence_epoch(self):
+        """旧任务的定时器不能对着刚起步的新任务开火。
+
+        场景：上个任务播报完上了表（比如 25s 后到点），任务随即结束、机器闲着，几秒后来
+        了个新请求。旧定时器如果还活着，到点时看到的是**新任务**的子代理，就会给一个刚
+        跑了几秒的任务播进度 —— 而这时新 turn 的第一轮还在路上，这句罐头汇报会抢在真正
+        的回答前面出声。
+        """
+        self._ell._last_output_ts = time.time() - 24     # 上个任务 24 秒前说过话
+        self.assertGreater(self._ell.silent_seconds(), 20)
+        self._ell._reset_silence_clock()                  # 新请求进来
+        self.assertLess(self._ell.silent_seconds(), 1)    # 纪元从现在重新开始
+
+    def test_reset_is_skipped_for_self_originated_turns(self):
+        """子代理完成 / ACP 回调触发的 turn 是同一件事的延续，重置会把沉默一直往后推。"""
+        self.assertTrue(self._ell._trigger_is_self_originated(
+            {'payload': {'sources': ['subagent:ab12/report']}}))
+        self.assertFalse(self._ell._trigger_is_self_originated(
+            {'payload': {'sources': ['dds:/remote_control/message']}}))
+        # 混在一起时保守处理：有一个来自外部就算外部请求。
+        self.assertFalse(self._ell._trigger_is_self_originated(
+            {'payload': {'sources': ['acp:speak-1', 'dds:/remote_control/message']}}))
+
+    def test_idle_turn_end_cancels_a_live_timer(self):
+        """活干完了要显式取消 —— 只是"不重新上表"会留下一个睡着的表去伏击下个任务。"""
+        async def go():
+            self._ell._arm_narration_timer()
+            t = self._ell._narration_timer
+            self.assertIsNotNone(t)
+            self._ell._cancel_narration_timer()
+            await asyncio.sleep(0)
+            return t
+        t = asyncio.run(go())
+        self.assertTrue(t.cancelled() or t.done())
+        self.assertIsNone(self._ell._narration_timer)
+
     def test_timer_survives_without_event_loop(self):
         """启动早期/测试里没有运行中的 loop，上表不能把调用方炸掉。"""
         self._ell._cancel_narration_timer()

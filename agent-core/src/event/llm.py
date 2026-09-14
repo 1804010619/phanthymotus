@@ -698,6 +698,23 @@ def _note_user_output() -> None:
     _arm_narration_timer()
 
 
+def _reset_silence_clock() -> None:
+    """把沉默的起点挪到现在，但**不**声称刚出过声。
+
+    用于新一轮外部请求开始。沉默时钟量的是"用户等了多久没动静"，而用户刚把话说完，
+    这次请求的正常响应时延不该被算成上一件事的沉默。
+
+    不加这个会出一类很难查的串台：上一个任务播报完上了表（比如 25 秒后到点），任务随即
+    结束、机器闲着，几秒后来了个新请求 —— 旧定时器从没被取消，到点时 _active_work_summary()
+    看到的是**新任务**的子代理，于是给一个刚跑了几秒的任务播了句进度。更糟的是这时新
+    turn 的第一轮还在路上，这句进度会和真正的回答抢嘴，用户先听到一句罐头汇报、再听到
+    答案。
+    """
+    global _last_output_ts
+    _last_output_ts = time.time()
+    _arm_narration_timer()
+
+
 def silent_seconds() -> float:
     """距上次面向用户的输出过了多久。从没出过声时按进程启动算。"""
     global _last_output_ts
@@ -1624,6 +1641,11 @@ class Event:
         bot_reply_source_ids = set(trigger_event.get('_bot_channel_message_ids', []))
         replied_message_ids: set[str] = set()
 
+        # 外部请求 = 新的沉默纪元。自己触发的 turn（子代理完成 / ACP 回调 / 定时器）是
+        # 同一件事的延续，重置了反而会把它们的沉默一直往后推。见 _reset_silence_clock。
+        if not _trigger_is_self_originated(trigger_event):
+            _reset_silence_clock()
+
         # ── 主动播报状态（函数局部 ⇒ 每个 turn 自动重置，无跨 turn 泄漏）──────
         _silent_rounds = 0                    # 连续无面向用户输出的轮数
         _last_interact_ts = time.time()       # 上次面向用户输出的时刻（含上次汇报）。
@@ -2332,9 +2354,14 @@ class Event:
 
         # Turn 结束但活未必干完 —— 主 agent 派个异步子代理就 finish 是常见形状
         # （Orin5：17:22:31 spawn → 17:22:48 turn complete → 子代理又跑了 2 分半）。
-        # 这里上表，之后就由看门狗按沉默时长接着管。没有活在干时它自己会退场。
+        # 这里上表，之后就由看门狗按沉默时长接着管。
+        #
+        # 没有活在干时必须**显式取消**，不能只是"不重新上表"：turn 里上的那个表还在睡，
+        # 它会一直活到下一个任务，然后对着刚起步几秒的新任务播一句进度。
         if _active_work_summary():
             _arm_narration_timer()
+        else:
+            _cancel_narration_timer()
 
         # 性能追踪：提交 spans
         _turn_end_ts = time.time()
