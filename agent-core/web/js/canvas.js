@@ -32,6 +32,11 @@ let _allMcps    = [];
 // also sent on the /ws/motus connection — the backend releases this session's
 // lock shortly after that socket drops, so closing/killing the tab frees the
 // canvas without depending on an unload handler firing.
+//
+// The lock also expires after 60s of *idleness*, tab open or not. Holding it
+// therefore means proving activity: _pingEdit below renews it from real user
+// input. Nothing else may renew — a poll that renewed would make an open tab
+// immortal, which is the bug this replaces.
 const _sessionId = sessionId();
 let _isEditor = false;
 let _currentEditor = null;  // session_id of current editor (null = no one)
@@ -2387,14 +2392,17 @@ function _applyEditorState(editor, reason) {
   _isEditor = editor === _sessionId;
   _updateEditorUI();
 
-  if (!editor) {
-    if (!wasEditor) {
-      // Canvas just went free — pick up whatever the last editor left behind.
-      _scheduleReload(reason === 'release');
-      if (reason === 'release') _showToast('画布编辑权已释放，可点击「编辑」接管');
-    }
-  } else if (wasEditor && !_isEditor) {
-    _showToast('编辑权已被释放，画布转为只读');
+  if (wasEditor && !_isEditor) {
+    // We just lost it. The idle timer needs its own wording: "已被释放" reads as
+    // someone else having done it and leaves the user with no idea why the canvas
+    // went read-only under them.
+    _showToast(reason === 'idle'
+      ? '超过 1 分钟无操作，编辑权已自动释放，点击「编辑」可重新获取'
+      : '编辑权已被释放，画布转为只读');
+  } else if (!editor && !wasEditor) {
+    // Canvas just went free — pick up whatever the last editor left behind.
+    _scheduleReload(reason === 'release');
+    if (reason === 'release') _showToast('画布编辑权已释放，可点击「编辑」接管');
   }
 }
 
@@ -2422,9 +2430,43 @@ async function _checkEditStatus() {
     const data = await resp.json();
     const editor = data.editor || null;
     if (editor === _currentEditor) return;   // no change — don't re-render or reload
-    _applyEditorState(editor, '');
+    // The server echoes why it was freed, so a client whose WS is down (the case
+    // this poll exists for) still gets the right explanation.
+    _applyEditorState(editor, data.reason || '');
   } catch { /* silent */ }
 }
+
+// ── Activity heartbeat ───────────────────────────────────────────────────────
+// Renews the 60s idle TTL from real input only. Bound on document in the capture
+// phase so it also covers the sidebar and the tool-config modals — someone filling
+// in a config form for two minutes is editing, and must not be timed out.
+//
+// 15s is well under the TTL so a dropped ping or a throttled timer costs nothing.
+// Panning and zooming renew twice over: they also hit the debounced layout save,
+// which the server counts as activity too.
+const _KEEP_ALIVE_MS = 15000;
+let _lastPingAt = 0;
+
+async function _pingEdit() {
+  if (!_isEditor) return;
+  const now = Date.now();
+  if (now - _lastPingAt < _KEEP_ALIVE_MS) return;
+  _lastPingAt = now;
+  try {
+    const resp = await fetch('/api/canvas/keep-edit', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ session_id: _sessionId }),
+    });
+    if (resp.status === 409) {
+      // Already expired or reassigned — adopt the truth instead of acting editor.
+      const data = await resp.json().catch(() => ({}));
+      _applyEditorState(data.editor || null, data.editor ? '' : 'idle');
+    }
+  } catch { /* silent — the poll will reconcile */ }
+}
+
+['pointerdown', 'keydown', 'wheel'].forEach(ev =>
+  document.addEventListener(ev, _pingEdit, { capture: true, passive: true }));
 
 async function _reloadLayout() {
   try {
@@ -2472,5 +2514,6 @@ window.addEventListener('beforeunload', _releaseBeacon);
 // re-read the real state instead of trusting the stale in-memory flag.
 window.addEventListener('pageshow', (e) => { if (e.persisted) _checkEditStatus(); });
 
-// Periodically check edit status (piggyback on existing polling interval)
+// Periodically re-read the lock state. Purely a read: it must not renew the idle
+// TTL (the server no longer lets it), or an open tab would never time out.
 setInterval(_checkEditStatus, 10000);

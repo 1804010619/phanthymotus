@@ -424,6 +424,10 @@ async def lifespan(app):
     # 定期刷新 agent-core 自身注册（30s）
     asyncio.create_task(_heartbeat_core_mcp())
 
+    # 画布编辑锁：闲置 60s 自动释放（惰性检查兜不住被浏览器节流的后台标签页）
+    from api import canvas as canvas_api
+    canvas_api.start_editor_sweeper()
+
     # 启动 DDS topic 订阅（依据 config event.subscribe_topics）
     topics = config.main.get('event', {}).get('subscribe_topics', [])
     topic_subscriber.start(topics, asyncio.get_event_loop())
