@@ -557,18 +557,22 @@ class FaceDB:
         return record
 
     def enroll_unknown(self, embedding: np.ndarray) -> dict:
-        """Create an anonymous `unknown-N` entry for a face nobody has named."""
+        """Create an anonymous entry for a face nobody has named.
+
+        It gets an ordinary `p-N` id like everyone else — `named=False` is what
+        marks it anonymous, not the id format.
+        """
         return self.add("", [embedding], named=False)
 
     def promote(
         self, person_id: str, name: str, profile: Any = None, merge: bool = True
     ) -> dict:
-        """Turn an `unknown-N` entry into a named person, **keeping its id**.
+        """Turn an anonymous entry into a named person, **keeping its id**.
 
-        The id is deliberately preserved rather than reissued as `p-N`: it is
-        what already appeared on the activity stream and in the agent's
-        conversation history for every earlier sighting, and rewriting it would
-        orphan all of that.
+        The id is deliberately preserved rather than reissued: it is what
+        already appeared on the activity stream and in the agent's conversation
+        history for every earlier sighting, and rewriting it would orphan all of
+        that.
         """
         return self.update_person(person_id, name=name, profile=profile, merge=merge)
 
