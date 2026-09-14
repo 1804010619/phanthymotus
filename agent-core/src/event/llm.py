@@ -457,6 +457,26 @@ def _same_as_last_report(text: str) -> bool:
     return bool(text) and _normalize_report(text) == _normalize_report(_last_report_text_global)
 
 
+_last_narration_gate: str = ''
+
+
+def _narration_gate(reason: str, *, stop: bool) -> None:
+    """记下这次为什么没播，并按 reason 决定停表还是重新计时。
+
+    只在**原因变化时**打印 —— 每 15 秒刷一行同样的话没人看，但一次都不打印就会像
+    Orin5 这次一样：子代理跑了 9 轮、一条 narration 没有、也没有任何 skipped 记录，
+    完全无从判断是"计时死了"还是"被 gate 挡了"。
+    """
+    global _last_narration_gate
+    if reason != _last_narration_gate:
+        _last_narration_gate = reason
+        print(f'[decision] narration gate: {reason}')
+    if stop:
+        _stop_countdown()
+    else:
+        _restart_countdown()
+
+
 def _human_duration(seconds: float) -> str:
     """把秒数说成人话。播报是念出来的 —— "107 秒"没人这么讲。"""
     s = max(0, int(seconds))
@@ -1610,18 +1630,19 @@ class Event:
         # gate。顺序按从便宜到贵排。
         _, seconds_thr = _narration_thresholds()
         if seconds_thr <= 0:
-            _stop_countdown()
+            _narration_gate('disabled (seconds=0)', stop=True)
             return
         work = _active_work_summary()
         turn_alive = _turn_running()
         if not work and not turn_alive:
-            _stop_countdown()          # 活干完了，没什么好报的
+            _narration_gate('no active work', stop=True)   # 活干完了，没什么好报的
             return
         if _last_turn_restricted and not turn_alive:
-            _stop_countdown()          # 受限 turn 派出去的活，不该由我们代为出声
+            # 受限 turn 派出去的活，不该由我们代为出声
+            _narration_gate('last turn was tool-restricted', stop=True)
             return
         if not _auto_notify_enabled():
-            _stop_countdown()
+            _narration_gate('auto_notify off', stop=True)
             return
         if not hooks.has_bindings('on_notify'):
             global _warned_no_notify
@@ -1629,10 +1650,11 @@ class Event:
                 # 否则"没有任何播报设备"和"阈值还没到"在日志里长得一模一样。
                 _warned_no_notify = True
                 print('[decision] narration disabled: no on_notify binding registered')
-            _stop_countdown()
+            _narration_gate('no on_notify binding', stop=True)
             return
         if _mouth_busy():
-            _restart_countdown()       # 正在说话，这一轮不该到点；重新计
+            # 正在说话，这一轮不该到点；重新计
+            _narration_gate('mouth busy', stop=False)
             return
 
         # 上下文
@@ -1653,8 +1675,7 @@ class Event:
             # 输出 SKIP（没有具体进展就别说），这比报一个陈旧话题好。
             detail, phase = _active_work_detail()
             if not detail:
-                print('[decision] narration skipped: no active work detail')
-                _restart_countdown()
+                _narration_gate('no work detail', stop=False)
                 return
             global _idle_since
             if phase == 'new':
@@ -1720,6 +1741,8 @@ class Event:
             _restart_countdown()
             return
 
+        global _last_narration_gate
+        _last_narration_gate = ''
         _remember_report(report)
         # 推进水位：下次只讲这之后新发生的事。
         try:
