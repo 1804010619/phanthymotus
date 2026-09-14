@@ -37,6 +37,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / 'src'))
 os.environ.setdefault('DB_PATH', os.path.join(tempfile.mkdtemp(), 'test.db'))
 
 import client  # noqa: E402
+import collector  # noqa: E402
 import config  # noqa: E402
 import hooks  # noqa: E402
 import mcp_client  # noqa: E402
@@ -95,6 +96,10 @@ class _Fixture(unittest.TestCase):
         ell._reported_turns.clear()
         self._saved_stall = ell._idle_since
         ell._idle_since = None
+        self._saved_turn_msgs = ell._reported_turn_msgs
+        ell._reported_turn_msgs = 0
+        self._saved_busy = collector._busy
+        collector._busy = False
 
     def tearDown(self):
         ell._stop_countdown()
@@ -116,6 +121,8 @@ class _Fixture(unittest.TestCase):
         ell._reported_turns.clear()
         ell._reported_turns.update(self._saved_rounds)
         ell._idle_since = self._saved_stall
+        ell._reported_turn_msgs = self._saved_turn_msgs
+        collector._busy = self._saved_busy
 
     # -- helpers ---------------------------------------------------------
     def _register_mouth(self, *, resource=frozenset({'mouth'})):
@@ -617,6 +624,42 @@ class TestReportProgress(_Fixture):
             [{'role': 'tool', 'content': 'A'}], [{'role': 'tool', 'content': 'B'}]]})()
         self._stub('三'); self._run()                     # 有新动作
         self.assertIsNone(ell._idle_since, '有新进展后卡顿计时要清零')
+
+    def test_in_turn_context_is_also_incremental(self):
+        """turn 内那条路同样只讲上次汇报之后新增的消息。
+
+        Tianyi 实测：说完"正在从百度百科提取照片"，下一句直接变成"首都之窗的页面抓下来
+        了" —— 中间百度百科 403 被拒这条线索用户从没听到，两句听着像两件不相干的事。
+        原因是 turn 内每次把整个 turn 喂过去，模型自己挑，就会跳掉中间过程。
+        """
+        collector._busy = True           # turn 在跑 → 走 turn 内那条路
+        self.inst._current_turn = [{'role': 'tool', 'content': 'STEP_ONE'}]
+        rec = []
+        self._stub('第一步做完了', record=rec)
+        self._run()
+        self.assertIn('STEP_ONE', rec[0]['messages'][1]['content'])
+
+        self.inst._current_turn.append({'role': 'tool', 'content': 'STEP_TWO'})
+        rec2 = []
+        self._stub('第二步也做完了', record=rec2)
+        self._run()
+        body = rec2[0]['messages'][1]['content']
+        self.assertIn('STEP_TWO', body)
+        self.assertNotIn('STEP_ONE', body, 'turn 内也要只喂增量')
+
+    def test_in_turn_watermark_resets_on_new_turn(self):
+        """新 turn 水位要清零 —— 否则上个 turn 的条数会把新 turn 的开头整段吃掉。"""
+        collector._busy = True
+        self.inst._current_turn = [{'role': 'tool', 'content': 'A'},
+                                   {'role': 'tool', 'content': 'B'}]
+        self._stub('一'); self._run()
+        self.assertEqual(ell._reported_turn_msgs, 2)
+        ell._reported_turn_msgs = 0                      # _one_turn 开头做的事
+        self.inst._current_turn = [{'role': 'tool', 'content': 'NEWTURN'}]
+        rec = []
+        self._stub('新一轮', record=rec)
+        self._run()
+        self.assertIn('NEWTURN', rec[0]['messages'][1]['content'])
 
     def test_stale_main_history_is_not_in_the_context(self):
         """这条路汇报的是在跑的子代理，主 agent 的旧对话是另一个话题。

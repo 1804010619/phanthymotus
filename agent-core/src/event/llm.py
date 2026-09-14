@@ -762,6 +762,11 @@ _pending_narration_feedback: list = []
 # 一个前后重叠的滑动窗口，模型只能把累积状态重新总结一遍，越说越像（Tianyi 实测连着三条
 # 播报，第三条几乎是第二条加一个词，末尾都靠"马上整理成报告"凑数）。
 _reported_turns: dict = {}
+# turn 内已经喂过汇报器的消息条数。和子代理那边的水位是同一件事的两半 —— 之前只做了
+# 子代理那半，turn 内每次仍把整个 turn 喂过去，模型就从里面自己挑，两次播报之间会跳掉
+# 中间过程（Tianyi 实测：说完"正在从百度百科提取照片"，下一句直接变成"首都之窗的页面
+# 抓下来了"，而百度百科 403 被拒这条线索用户从没听到，听着很割裂）。
+_reported_turn_msgs: int = 0
 # 这次"没有新产出"是从什么时候开始的（time.time()），有新动作时清空。
 #
 # 卡顿期间照常每个间隔播一句，但必须带上**已经卡了多久** —— 用户在长时间静默里真正想
@@ -1658,10 +1663,26 @@ class Event:
             return
 
         # 上下文
-        phase = 'new'          # turn 内那条路不分阶段，上下文就是当前 turn 本身
+        global _idle_since, _reported_turn_msgs
+        phase = 'new'
         live = self._current_turn if turn_alive else None
         if live:
-            context = _turns_to_text([list(live)])
+            # 只讲**上次汇报之后新增的那几条**，理由同子代理那边：喂整个 turn 的话模型
+            # 会从里面自己挑，两次之间跳掉中间过程，听着像两件不相干的事。
+            #
+            # turn_messages 会被 compaction / truncate 改短，那时水位大于长度、切片为空
+            # —— 退化成"这次没有新动作"，和子代理那边同样的安全降级。
+            fresh = list(live)[_reported_turn_msgs:]
+            if fresh:
+                phase = 'new'
+                context = _turns_to_text([fresh])
+            else:
+                phase = 'idle'
+                context = _turns_to_text([list(live)[-3:]])
+            if phase == 'new':
+                _idle_since = None
+            elif _idle_since is None:
+                _idle_since = time.time()
         else:
             # **只给当前这件活的材料，不给主 agent 的历史。**
             #
@@ -1677,7 +1698,6 @@ class Event:
             if not detail:
                 _narration_gate('no work detail', stop=False)
                 return
-            global _idle_since
             if phase == 'new':
                 _idle_since = None
             elif _idle_since is None:
@@ -1743,6 +1763,7 @@ class Event:
 
         global _last_narration_gate
         _last_narration_gate = ''
+        _reported_turn_msgs = len(self._current_turn or [])
         _remember_report(report)
         # 推进水位：下次只讲这之后新发生的事。
         try:
@@ -1780,6 +1801,9 @@ class Event:
         tool_restricted = bot_restricted or viewer_restricted
         bot_reply_source_ids = set(trigger_event.get('_bot_channel_message_ids', []))
         replied_message_ids: set[str] = set()
+
+        global _reported_turn_msgs
+        _reported_turn_msgs = 0    # 新 turn，水位清零，否则上个 turn 的条数会吃掉开头
 
         # 任务开始 → 开始计时。用 _start_countdown（"已在计时则不动"）而不是重新计：
         # 上一件事已经沉默了 20 秒的话，新任务不该把它再往后推一个完整间隔。
