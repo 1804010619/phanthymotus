@@ -97,7 +97,7 @@ def driver(monkeypatch):
                 return {'code': 200, 'data': {'error': 'Missing input_topic'}}
             return {'code': 200, 'data': {'state': 'running'}}
         if action == 'info':
-            data = {'state': 'running', 'topic_out': _topic_out(card_id, args)}
+            data = {'state': 'running', 'topic_out': _topic_out(card_id, args, req.tool)}
             topic_in = _topic_in(card_id)
             if topic_in is not None:
                 data['topic_in'] = topic_in
@@ -119,11 +119,13 @@ def driver(monkeypatch):
             return [{'topic': t, 'format': 'data/json'} for t in sent[:1]]
         return None
 
-    def _topic_out(card_id, args):
-        if card_id == ASR:
-            # Derived. `info` is asked with the input the card was started with;
-            # without one there is nothing to derive from and perception would
-            # answer its fallback, which for ASR is no topic at all.
+    def _topic_out(card_id, args, tool=''):
+        if tool == 'asr':
+            # Derived from the input, exactly as perception does — and from the
+            # *tool* name, with no trace of the instance, which is why two asr
+            # cards on one source derive the same topic. `info` is asked with
+            # the input the card was started with; without one there is nothing
+            # to derive from and perception would answer no topic at all.
             src = args.get('input_topic') or started_input.get(card_id) or ''
             return [{'topic': f'{src}/asr', 'format': 'data/json'}] if src else []
         static = {
@@ -327,6 +329,44 @@ def test_a_multi_input_card_is_also_given_the_singular_argument(driver):
     _start(_two_sources_into(GREEDY, 'decision_core'))
     assert driver.starts[GREEDY]['input_topic'] == \
         driver.starts[GREEDY]['input_topics'][0]
+
+
+# ── two cards deriving the same output topic ─────────────────────────────────
+
+def test_two_cards_of_one_tool_on_one_source_clash(driver):
+    """`{input}/asr` carries no trace of the instance, so both cards claim it.
+
+    The canvas allows the second card (the duplicate guard is skipped for
+    multiInstance tools) and perception gives each its own node, so both publish
+    to the one topic and every utterance arrives twice.
+    """
+    asr2 = 'card-asr-2'
+    layout = {
+        'cards': [_card(MIC, 'mic', [{'topic': '/ubuntu/mic/audio',
+                                      'format': 'audio/pcm-16k'}]),
+                  _card(ASR, 'asr', []), _card(asr2, 'asr', [])],
+        'connections': [_conn(MIC, ASR, '/ubuntu/mic/audio'),
+                        _conn(MIC, asr2, '/ubuntu/mic/audio')],
+    }
+    assert _start(layout) is False
+    errors = _errors(driver.events)
+    assert len(errors) == 1, 'reported once, on the second card'
+    assert '/ubuntu/mic/audio/asr' in errors[0]['message']
+
+
+def test_two_cards_of_one_tool_on_different_sources_are_fine(driver):
+    """Different inputs derive different topics — the supported arrangement."""
+    layout = {
+        'cards': [_card(MIC, 'mic', [{'topic': '/ubuntu/mic/audio',
+                                      'format': 'audio/pcm-16k'}]),
+                  _card(RM, 'remote_message', [{'topic': '/remote_control/message',
+                                                'format': 'data/json'}]),
+                  _card(ASR, 'asr', []), _card('card-asr-2', 'asr', [])],
+        'connections': [_conn(MIC, ASR, '/ubuntu/mic/audio'),
+                        _conn(RM, 'card-asr-2', '/remote_control/message')],
+    }
+    assert _start(layout) is True
+    assert not _errors(driver.events)
 
 
 # ── fallbacks, for a source that cannot answer ───────────────────────────────

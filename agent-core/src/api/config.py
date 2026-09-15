@@ -425,6 +425,35 @@ async def _do_start_project_impl():
     # Resolved topic_out per card (populated after starting sources)
     resolved_topics: dict[str, list] = {}
 
+    def _topic_clash(card_id: str, info: dict):
+        """Another card already publishing a topic this one just claimed.
+
+        A derived output topic is `{input_topic}/{tool}` — the tool name, with
+        no trace of the instance (perception/plugins/asr.py, tts.py). Two cards
+        of the same multiInstance tool fed by the same source therefore derive
+        the *same* output topic, and the canvas permits exactly that: the
+        duplicate-card guard is skipped for multiInstance tools. Both instances
+        get their own ROS node (node_key is the instance id) and both publish to
+        the one topic, so every utterance arrives twice and the bus registration
+        silently reassigns the topic to whichever card registered last.
+
+        Compared against cards that have already started, which the dependency
+        order makes meaningful: the collision is reported on the second card,
+        naming the first.
+
+        Returns `(other_card_id, [shared topics])` or None.
+        """
+        mine = {t['topic'] for t in (info.get('topic_out') or []) if t.get('topic')}
+        if not mine:
+            return None
+        for other_id, out in resolved_topics.items():
+            if other_id == card_id:
+                continue
+            shared = mine & {t.get('topic') for t in out if t.get('topic')}
+            if shared:
+                return other_id, sorted(shared)
+        return None
+
     async def _try_resolve(mcp_id: str, tool_name: str, card_id: str,
                            info_args: dict) -> dict:
         """_resolve_and_register, with its failure kept non-fatal."""
@@ -522,8 +551,22 @@ async def _do_start_project_impl():
                     # and a card that dropped one must not have been announced
                     # ready first.
                     info = await _try_resolve(mcp_id, tool_name, card_id, info_args)
+                    clash = _topic_clash(card_id, info)
                     dropped = _dropped_inputs(info, wanted)
-                    if dropped:
+                    if clash:
+                        other_id, shared = clash
+                        other = next((c for c in cards if c.get('id') == other_id), None)
+                        message = (f'{tool_name} 和 {(other or {}).get("toolName", "?")} '
+                                   f'都发布到 {", ".join(shared)} —— 两张卡片会同时往同一个 '
+                                   f'topic 发数据，下游会收到重复的内容。请让它们接不同的输入')
+                        print(f'[start-project] {tool_name} ({mcp_id}) topic clash with '
+                              f'{other_id}: {shared}')
+                        await push_event({'type': 'project_start_item', 'payload': {
+                            'tool': tool_name, 'mcp_id': mcp_id, 'status': 'error',
+                            'message': message,
+                        }})
+                        errors.append(tool_name)
+                    elif dropped:
                         kept = [t for t in wanted if t not in dropped]
                         message = (f'{tool_name} 只消费了 {", ".join(kept)}，'
                                    f'忽略了 {", ".join(dropped)} —— 该工具一次只接一路输入，'
