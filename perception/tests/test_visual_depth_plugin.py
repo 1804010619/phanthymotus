@@ -513,3 +513,146 @@ def test_calibration_reaches_the_published_depth_map():
     assert _wait_until(lambda: bool(depth_pub.messages))
     values = np.frombuffer(zlib.decompress(depth_pub.messages[0]), dtype="<u2")
     assert values[0] == 3000          # 1.5 m * e^ln2 → 3.0 m → 3000 mm
+
+
+# ── calibrate action ─────────────────────────────────────────────────────────
+
+def test_fit_cal_b_is_the_geometric_mean_ratio():
+    """A 2x-over and a 2x-under reading must cancel, which only happens in log
+    space — an arithmetic mean of ratios would not."""
+    assert depth_plugin.fit_cal_b([4.0, 1.0], [2.0, 2.0]) == pytest.approx(0.0)
+    assert depth_plugin.fit_cal_b([4.0], [2.0]) == pytest.approx(np.log(0.5))
+
+
+def test_fit_cal_b_rejects_unusable_pairs():
+    with pytest.raises(ValueError):
+        depth_plugin.fit_cal_b([0.0], [2.0])
+
+
+def test_sample_region_depth_uses_the_median_of_the_centre_box():
+    depth = np.full((H, W), 9.0, dtype=np.float32)
+    cx, cy = W // 2, H // 2
+    depth[cy - 40:cy + 40, cx - 50:cx + 50] = 2.0      # the target
+    assert depth_plugin.sample_region_depth(depth, "center") == pytest.approx(2.0)
+    # `full` sees mostly background, so it must NOT report the target.
+    assert depth_plugin.sample_region_depth(depth, "full") == pytest.approx(9.0)
+
+
+def test_sample_region_depth_ignores_invalid_pixels():
+    depth = np.zeros((H, W), dtype=np.float32)
+    cx, cy = W // 2, H // 2
+    depth[cy - 40:cy + 40, cx - 50:cx + 50] = 3.0
+    assert depth_plugin.sample_region_depth(depth, "center") == pytest.approx(3.0)
+
+
+def test_sample_region_depth_rejects_an_unknown_region():
+    with pytest.raises(ValueError):
+        depth_plugin.sample_region_depth(np.ones((H, W), dtype=np.float32), "behind")
+
+
+def _calibratable(tmp_path, predicted=4.0):
+    """A plugin whose engine reports a constant `predicted` metres everywhere."""
+    return _photo_plugin(tmp_path, depth=np.full((H, W), predicted, dtype=np.float32))
+
+
+def test_calibrate_from_a_photo_fits_and_applies_immediately(tmp_path):
+    plugin, _ = _calibratable(tmp_path, predicted=4.0)
+    result = plugin.dispatch("visual_depth", {
+        "action": "calibrate", "distance_m": 2.0, "image_path": _write_frame(tmp_path)})
+
+    assert result["ok"] is True
+    assert result["cal_a"] == 1.0
+    assert result["cal_b"] == pytest.approx(np.log(0.5), abs=1e-4)
+    assert result["samples"] == 1
+    assert result["sample"]["predicted_m"] == pytest.approx(4.0)
+    assert result["residuals"][0]["corrected_m"] == pytest.approx(2.0, abs=0.01)
+    assert result["calibration"] == "site"
+    # In-memory only — saying so is the difference between a calibration that
+    # survives a restart and one that quietly does not.
+    assert "cal_a / cal_b" in result["persist"]
+
+
+def test_calibrate_answers_in_the_new_scale_afterwards(tmp_path):
+    plugin, _ = _calibratable(tmp_path, predicted=4.0)
+    plugin.dispatch("visual_depth", {
+        "action": "calibrate", "distance_m": 2.0, "image_path": _write_frame(tmp_path)})
+    after = plugin.dispatch("visual_depth", {
+        "action": "recognize_by_photo", "image_path": _write_frame(tmp_path)})
+    assert after["nearest"] == pytest.approx(2.0, abs=0.01)
+
+
+def test_repeated_calibration_refits_rather_than_compounding(tmp_path):
+    """Fitting against already-corrected depth would converge on the first
+    guess; the node keeps the raw map precisely so it does not."""
+    plugin, _ = _calibratable(tmp_path, predicted=4.0)
+    photo = _write_frame(tmp_path)
+    first = plugin.dispatch("visual_depth", {
+        "action": "calibrate", "distance_m": 2.0, "image_path": photo})
+    second = plugin.dispatch("visual_depth", {
+        "action": "calibrate", "distance_m": 2.0, "image_path": photo})
+    assert second["samples"] == 2
+    assert second["cal_b"] == pytest.approx(first["cal_b"], abs=1e-6)
+
+
+def test_calibrate_reset_returns_to_the_engine_default(tmp_path):
+    plugin, _ = _calibratable(tmp_path, predicted=4.0)
+    plugin.dispatch("visual_depth", {
+        "action": "calibrate", "distance_m": 2.0, "image_path": _write_frame(tmp_path)})
+    result = plugin.dispatch("visual_depth", {"action": "calibrate", "reset": True})
+    assert result["samples"] == 0
+    assert (result["cal_a"], result["cal_b"]) == (1.0, 0.0)
+    assert result["calibration"] == "model-default"
+
+
+def test_calibrate_requires_a_distance(tmp_path):
+    plugin, _ = _calibratable(tmp_path)
+    result = plugin.dispatch("visual_depth", {
+        "action": "calibrate", "image_path": _write_frame(tmp_path)})
+    assert result["ok"] is False
+    assert "distance_m is required" in result["detail"]
+
+
+def test_calibrate_rejects_a_nonsense_distance(tmp_path):
+    plugin, _ = _calibratable(tmp_path)
+    result = plugin.dispatch("visual_depth", {
+        "action": "calibrate", "distance_m": -1, "image_path": _write_frame(tmp_path)})
+    assert result["ok"] is False
+
+
+def test_calibrate_without_a_frame_or_a_photo_says_so():
+    plugin, _ = _plugin(model=_FakeModel())
+    result = plugin.dispatch("visual_depth", {"action": "calibrate", "distance_m": 2.0})
+    assert result["ok"] is False
+    assert "start this card on a camera" in result["detail"]
+
+
+def test_calibrate_uses_the_live_frame_of_a_running_instance():
+    plugin, executor = _plugin(cfg={"fps": 1000},
+                               model=_FakeModel(depth=np.full((H, W), 4.0, dtype=np.float32)))
+    plugin.dispatch("visual_depth", {"action": "start", "input_topic": "/cam/rgb"})
+    node = executor.nodes[0]
+    _feed(node)
+    depth_pub = next(p for p in node.publishers if p.topic.endswith("/depth"))
+    assert _wait_until(lambda: bool(depth_pub.messages))
+
+    result = plugin.dispatch("visual_depth", {"action": "calibrate", "distance_m": 2.0})
+    assert result["ok"] is True
+    assert result["cal_b"] == pytest.approx(np.log(0.5), abs=1e-4)
+    # Applied to the running node too, without a restart.
+    assert node._cal_b == pytest.approx(np.log(0.5), abs=1e-4)
+
+
+def test_calibration_advice_escalates_with_the_evidence(tmp_path):
+    plugin, _ = _calibratable(tmp_path, predicted=4.0)
+    photo = _write_frame(tmp_path)
+    one = plugin.dispatch("visual_depth", {
+        "action": "calibrate", "distance_m": 2.0, "image_path": photo})
+    assert "只固定了整体比例" in one["message"]
+
+    two = plugin.dispatch("visual_depth", {
+        "action": "calibrate", "distance_m": 2.1, "image_path": photo})
+    assert "距离都差不多" in two["message"]     # no spread — not yet informative
+
+    three = plugin.dispatch("visual_depth", {
+        "action": "calibrate", "distance_m": 8.0, "image_path": photo})
+    assert "error_pct" in three["message"]

@@ -96,6 +96,13 @@ _PUB_QOS = QoSProfile(
     durability=DurabilityPolicy.VOLATILE,
 )
 
+# Fraction of the frame the `center` target box covers, per axis. Small enough
+# that a calibration target fills it, large enough to average over noise.
+_TARGET_BOX = 0.2
+
+CALIBRATION_REGIONS = ("center", "left", "right", "full")
+
+
 TOOLS = [
     {
         "name": "visual_depth",
@@ -110,6 +117,7 @@ TOOLS = [
                     "enum": [
                         "start", "stop", "info", "config",
                         "recognize_by_photo", "recognize_by_url",
+                        "calibrate",
                     ],
                     "description": "Action to perform"
                 },
@@ -124,6 +132,9 @@ TOOLS = [
                 # path perception can open, with no shared mount.
                 "image_path": {"type": "string", "format": "file", "accept": "image/*", "uploadTo": "mcp", "description": "图片文件。从卡片上传，或填一个容器可读的路径（如 /uploads/scene.jpg）。常见格式都支持，过大的图会本地缩放"},
                 "url": {"type": "string", "description": "图片的 http(s) 地址，如 https://example.com/scene.jpg。下载后本地解码，格式限制同 image_path"},
+                "distance_m": {"type": "number", "description": "标定用：目标到镜头的真实距离（米），用卷尺量。目标要占满取样区域的一大半"},
+                "region": {"type": "string", "enum": list(CALIBRATION_REGIONS), "description": "标定用：在画面的哪一块取样。默认 center（画面正中 20% 的方框）"},
+                "reset": {"type": "boolean", "description": "标定用：清空所有标定样本，恢复成 engine 自带的标定"},
             },
             "required": ["action"],
             "x-action-params": {
@@ -138,6 +149,15 @@ TOOLS = [
                 "recognize_by_url": {
                     "params": ["url"],
                     "description": "看一张图片 URL 的远近 — 与 recognize_by_photo 相同，只是图片来自 http(s) 而非本地文件",
+                },
+                "calibrate": {
+                    "params": ["distance_m", "region", "image_path", "url", "reset"],
+                    "description": (
+                        "用已知距离校准这台相机。把一个目标放在镜头前量出真实距离，"
+                        "填 distance_m 调用一次；多量几个距离（近的、远的）会一起拟合，更稳。"
+                        "结果立刻生效，但要写进卡片配置的 cal_a / cal_b 才能在重启后保留。"
+                        "reset=true 清空重来"
+                    ),
                 },
             },
         },
@@ -192,6 +212,66 @@ def apply_site_calibration(depth_m: np.ndarray, cal_a: float, cal_b: float) -> n
     return np.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0)
 
 
+def fit_cal_b(predicted_m, measured_m) -> float:
+    """b = mean(log gt − log pred), with a pinned at 1.0. The whole estimator.
+
+    This is exactly what ultralytics fits. Its `select_calibration`
+    (models/yolo/depth/calibrate.py) scores two candidates — identity and
+    "scale-only" (a=1, b=mean(log_gt − log_pred)) — and its docstring records
+    that an affine log-slope candidate *was* evaluated and removed, because the
+    extra parameter overfits within-dataset and hurts cross-distribution. So
+    `cal_a` stays a knob for a fit obtained elsewhere, but nothing here or in
+    ultralytics ever fits it.
+
+    Geometric mean, not arithmetic: the error that matters is multiplicative
+    (δ1 is a ratio test), so a 4 m reading that should be 2 m and a 1 m reading
+    that should be 2 m have to cancel, and in log space they do.
+
+    Why we cannot just call ultralytics' own calibrate() on a robot: it wants a
+    `.pt` checkpoint, torch, ultralytics itself, and a dataloader yielding
+    ground-truth depth *maps*. The runtime image has none of those — it carries
+    a TensorRT engine and nothing else. Reference distances typed in by whoever
+    is standing next to the robot are the data that actually exists here.
+    """
+    pred = np.asarray(predicted_m, dtype=np.float64).ravel()
+    gt = np.asarray(measured_m, dtype=np.float64).ravel()
+    valid = np.isfinite(pred) & np.isfinite(gt) & (pred > 0) & (gt > 0)
+    if not valid.any():
+        raise ValueError("no usable (predicted, measured) pair — both must be > 0")
+    return float(np.mean(np.log(gt[valid]) - np.log(pred[valid])))
+
+
+def _calibration_message(samples: list) -> str:
+    """What the operator should do next, given how much evidence there is.
+
+    One sample fixes the average scale and nothing else; it is worth having and
+    worth not trusting too far. The advice is to add a second reading at a
+    clearly different distance, because that is what reveals whether the error
+    is a constant factor (which this can fix) or grows with range (which it
+    cannot — `a` is pinned at 1.0, following ultralytics).
+    """
+    count = len(samples)
+    if count == 1:
+        return (
+            "已用 1 个样本标定。这只固定了整体比例 —— 建议再在一个明显不同的距离"
+            "（比如一近一远）量一次：两个样本才能看出误差是固定倍数（能修）还是"
+            "随距离变化（修不了，a 固定为 1.0）。"
+        )
+    distances = [s["measured_m"] for s in samples]
+    spread = max(distances) / max(min(distances), 1e-6)
+    if spread < 1.5:
+        return (
+            f"已用 {count} 个样本标定，但它们的距离都差不多"
+            f"（{min(distances):.2f}–{max(distances):.2f} 米）。"
+            "再取一个差距大些的距离，才知道这个比例在远处还成不成立。"
+        )
+    return (
+        f"已用 {count} 个样本标定，覆盖 {min(distances):.2f}–{max(distances):.2f} 米。"
+        "看一下 residuals 里各点的 error_pct：都小就说明这台相机的误差确实是一个"
+        "固定倍数，标定管用。"
+    )
+
+
 def _calibration_from_cfg(cfg: dict, default: tuple[float, float] = (1.0, 0.0)) -> tuple[float, float]:
     """Read (cal_a, cal_b) from a config, honouring the legacy `depth_scale`.
 
@@ -207,6 +287,32 @@ def _calibration_from_cfg(cfg: dict, default: tuple[float, float] = (1.0, 0.0)) 
         if legacy > 0:
             cal_b = float(np.log(legacy))
     return cal_a, cal_b
+
+
+def sample_region_depth(depth_m: np.ndarray, region: str = "center") -> float:
+    """One representative distance for a named part of the frame.
+
+    Median, not mean: a calibration target rarely fills the box exactly, and
+    whatever is behind it at the edges would drag a mean off. The median holds
+    as long as the target covers more than half the box, which is the
+    instruction given to the operator.
+    """
+    if region not in CALIBRATION_REGIONS:
+        raise ValueError(f"region must be one of {CALIBRATION_REGIONS}, got {region!r}")
+    height, width = depth_m.shape[:2]
+    if region == "full":
+        patch = depth_m
+    elif region == "center":
+        half_w, half_h = width * _TARGET_BOX / 2, height * _TARGET_BOX / 2
+        cx, cy = width / 2, height / 2
+        patch = depth_m[int(cy - half_h):int(cy + half_h), int(cx - half_w):int(cx + half_w)]
+    else:
+        third = round(width / 3)
+        patch = depth_m[:, :third] if region == "left" else depth_m[:, 2 * third:]
+    valid = patch[np.isfinite(patch) & (patch > 0)]
+    if valid.size == 0:
+        raise ValueError(f"no valid depth in the {region} region of this frame")
+    return float(np.median(valid))
 
 
 # ── Depth encoding ───────────────────────────────────────────────────────────
@@ -404,6 +510,9 @@ class _DepthNode(Node):
         self._last_inference_time = 0.0
         self._frame_count = 0
         self._running = False
+        # Most recent decoded depth, BEFORE site calibration — the frame the
+        # `calibrate` action fits against. One array, replaced per frame.
+        self._last_raw_depth: Optional[np.ndarray] = None
         # See perception/README.md § "Plugin Concurrency" — every dispatch runs
         # on its own ThreadingHTTPServer thread and the canvas issues
         # config→start→stop→start within seconds.
@@ -490,8 +599,13 @@ class _DepthNode(Node):
                 if frame is None:
                     continue
                 outputs, meta = self._model.infer(frame)
-                depth_m = apply_site_calibration(
-                    decode_depth(outputs, meta), self._cal_a, self._cal_b)
+                raw = decode_depth(outputs, meta)
+                # Kept *uncalibrated* so `calibrate` can refit from a live
+                # frame repeatedly without compounding its own correction —
+                # fitting against already-corrected depth converges on
+                # whatever the first guess was.
+                self._last_raw_depth = raw
+                depth_m = apply_site_calibration(raw, self._cal_a, self._cal_b)
                 # Resampled here, not by the model: the renderer's canvas is
                 # fixed at 640x480 and a mismatch is dropped silently.
                 if depth_m.shape != (DEPTH_HEIGHT, DEPTH_WIDTH):
@@ -541,6 +655,10 @@ class VideoDepthPerceptionPlugin:
         self._plugin_cfg = dict(plugin_cfg or {})
         self._fps = int(plugin_cfg.get("fps", 2))
         self._cal_a, self._cal_b = _calibration_from_cfg(plugin_cfg)
+        # (measured_m, predicted_m) reference readings from the `calibrate`
+        # action, in call order. Refit from scratch on every addition, so a
+        # bad sample can be undone with reset rather than compounding.
+        self._cal_samples: list[dict] = []
         self._max_depth_m = float(plugin_cfg.get("max_depth_m", 20.0))
         self._model = None  # lazy load
         self._model_loading = False
@@ -602,6 +720,84 @@ class VideoDepthPerceptionPlugin:
         return result
 
     # ── one-shot depth description ───────────────────────────────────────────
+
+    # ── site calibration from known distances ────────────────────────────────
+
+    def _raw_depth_for_calibration(self, args: dict, instance_id: str):
+        """An uncalibrated depth map to fit against, plus where it came from.
+
+        Prefers an explicitly supplied photo, because "here is a picture of a
+        target at 2.0 m" is reproducible; otherwise takes the running
+        instance's most recent frame, which is what someone standing in front
+        of the robot actually has.
+        """
+        if args.get("image_path") or args.get("url") or args.get("image_url"):
+            cfg = dict(self._plugin_cfg)
+            data, source = load_image_bytes(args, cfg, url_action="calibrate")
+            import cv2
+            frame = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
+            if frame is None:
+                raise BadInput("could not decode that file as an image", source)
+            from plugins.vision_runtime import decode_depth
+            outputs, meta = self._require_engine().infer(frame)
+            return decode_depth(outputs, meta), source
+
+        with self._nodes_lock:
+            node = self._nodes.get(instance_id) if instance_id else None
+            if node is None:
+                node = self._nodes.get(_DEFAULT_INSTANCE)
+            if node is None and len(self._nodes) == 1:
+                node = next(iter(self._nodes.values()))
+        if node is None:
+            raise ValueError(
+                "nothing to calibrate against — start this card on a camera "
+                "first, or pass image_path / url"
+            )
+        raw = node._last_raw_depth
+        if raw is None:
+            raise ValueError(
+                f"{node._input_topic or 'this card'} has not produced a frame yet"
+            )
+        return raw, node._input_topic or "(on-demand)"
+
+    def _apply_calibration(self, cal_a: float, cal_b: float) -> None:
+        """Set the fit here and on every running node, without a restart."""
+        self._cal_a, self._cal_b = cal_a, cal_b
+        with self._nodes_lock:
+            nodes = list(self._nodes.values())
+        for node in nodes:
+            node._cal_a, node._cal_b = cal_a, cal_b
+
+    def _calibration_report(self, extra: Optional[dict] = None) -> dict:
+        """Current fit plus how well it matches the samples it was fit on."""
+        residuals = []
+        for sample in self._cal_samples:
+            corrected = sample["predicted_m"] ** self._cal_a * float(np.exp(self._cal_b))
+            residuals.append({
+                "measured_m": sample["measured_m"],
+                "corrected_m": round(corrected, 3),
+                "error_pct": round(abs(corrected - sample["measured_m"])
+                                   / sample["measured_m"] * 100, 1),
+            })
+        report = {
+            "ok": True,
+            "cal_a": round(self._cal_a, 6),
+            "cal_b": round(self._cal_b, 6),
+            "calibration": self._calibration_label(),
+            "samples": len(self._cal_samples),
+            "residuals": residuals,
+            # The fit lives in memory. Saying so is the difference between a
+            # calibration that survives a restart and one that quietly does not.
+            "persist": (
+                "生效了，但只在内存里。要长期保留，把 cal_a / cal_b 填进卡片配置"
+                "（config action 或卡片的配置弹窗）。"
+            ),
+        }
+        if residuals:
+            report["max_error_pct"] = max(r["error_pct"] for r in residuals)
+        if extra:
+            report.update(extra)
+        return report
 
     def _calibration_label(self) -> str:
         """Which fit produced these metres — the engine's, or a site refit."""
@@ -840,6 +1036,51 @@ class VideoDepthPerceptionPlugin:
             if "max_depth_m" in cfg:
                 self._max_depth_m = float(cfg["max_depth_m"])
             return {"status": "configured", "config": cfg}
+
+        elif action == "calibrate":
+            if args.get("reset"):
+                self._cal_samples = []
+                self._apply_calibration(*_calibration_from_cfg(self._plugin_cfg))
+                return self._calibration_report({"message": "标定已清空，恢复成 engine 自带的标定"})
+
+            distance = args.get("distance_m")
+            if distance in (None, ""):
+                return {"ok": False, "reason": "bad_input",
+                        "detail": "distance_m is required — measure the real distance "
+                                  "to the target with a tape and pass it in metres. "
+                                  "Use reset=true to clear an existing calibration."}
+            distance = float(distance)
+            if distance <= 0:
+                return {"ok": False, "reason": "bad_input",
+                        "detail": f"distance_m must be positive, got {distance}"}
+
+            region = args.get("region") or "center"
+            try:
+                raw, source = self._raw_depth_for_calibration(args, instance_id)
+                predicted = sample_region_depth(raw, region)
+            except BadInput as error:
+                return error.as_result()
+            except Exception as error:  # noqa: BLE001 — surfaced to the caller
+                return {"ok": False, "reason": "bad_input", "detail": str(error)}
+
+            self._cal_samples.append({
+                "measured_m": distance,
+                "predicted_m": round(predicted, 3),
+                "region": region,
+                "source": source,
+            })
+            # Refit over every sample, not incrementally: `a` is pinned at 1.0
+            # and `b` is a mean, so the whole history is one cheap pass and a
+            # reset genuinely undoes things.
+            cal_b = fit_cal_b([s["predicted_m"] for s in self._cal_samples],
+                              [s["measured_m"] for s in self._cal_samples])
+            self._apply_calibration(1.0, cal_b)
+            log.info(f"[visual_depth] calibrated: {len(self._cal_samples)} sample(s) "
+                     f"→ cal_a=1.0 cal_b={cal_b:.4f}")
+            return self._calibration_report({
+                "sample": self._cal_samples[-1],
+                "message": _calibration_message(self._cal_samples),
+            })
 
         elif action == "recognize_by_photo":
             return self._recognize_image(args, url_action="recognize_by_url")
