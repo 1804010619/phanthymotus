@@ -104,6 +104,11 @@ class Config:
     # Tests — run inside the images built from the PR. See tester.py.
     tests_enabled: bool = True
     test_components: tuple[str, ...] = ("agent-core", "perception")
+    # Deliberately far above what a suite costs, because these bound a wedged
+    # container, not a slow one. Measured on the perception suite (787 tests):
+    # 34s native on Orin 6, 61s under qemu on the x86 build host — emulation is
+    # ~1.8x, not the order of magnitude it is easy to assume, so there is no
+    # reason to exclude an arm64 image from an x86 host.
     test_timeout_seconds: int = 3600
     # Generous because the first run on a host pulls a multi-GB arm64 image
     # before pytest prints anything at all.
