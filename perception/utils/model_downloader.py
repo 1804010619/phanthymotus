@@ -959,3 +959,98 @@ def ensure_kokoro_model(model_dir: str, device: str = "gpu") -> str:
         entry,
     )
     return target
+
+
+# ── Vision engines (vop detection, vdp monocular depth) ─────────────────────
+#
+# Both plugins run a prebuilt TensorRT engine, so these follow OCR's shape:
+# one bundle per JetPack family, selected by the TensorRT that is actually
+# importable. Engines are not portable across TensorRT majors.
+#
+# Unlike OCR's, these engines are produced by `ultralytics.YOLO.export(
+# format="engine")` rather than trtexec, because the plugins load them back
+# through `YOLO("...engine")` and that loader requires the metadata the
+# ultralytics exporter embeds. An engine built by trtexec deserializes fine but
+# is rejected on load, so tools/export_vision_engines.py is the only supported
+# way to produce these files.
+#
+# vop's bundle carries `vocab.json` next to the engine. The open-vocabulary
+# class list is frozen into the weights at export time (ultralytics: once
+# exported, `set_classes()` fails), so the plugin has no way to read back what
+# it is actually able to detect — it has to be told. Shipping the list with the
+# engine keeps the two from drifting: whatever the plugin reports, and rejects,
+# is what that exact engine was built with.
+VISION_MODEL_BASE = os.environ.get("VISION_MODEL_BASE_URL", f"{COS_BASE}/vision")
+
+VOP_MODEL_BUNDLES = {
+    "jp61": {
+        "base_url": f"{VISION_MODEL_BASE}/yoloe-26s-seg/tensorrt-jp61-trt10.3-orin-640",
+        "files": {
+            "yoloe-26s-seg.engine": {"size": 0, "sha256": ""},
+            "vocab.json": {"size": 0, "sha256": ""},
+        },
+    },
+    "jp511": {
+        "base_url": f"{VISION_MODEL_BASE}/yoloe-26s-seg/tensorrt-jp511-trt8.5-orin-640",
+        "files": {
+            "yoloe-26s-seg.engine": {"size": 0, "sha256": ""},
+            "vocab.json": {"size": 0, "sha256": ""},
+        },
+    },
+}
+
+DEPTH_MODEL_BUNDLES = {
+    "jp61": {
+        "base_url": f"{VISION_MODEL_BASE}/yolo26n-depth/tensorrt-jp61-trt10.3-orin-640",
+        "files": {
+            "yolo26n-depth.engine": {"size": 0, "sha256": ""},
+        },
+    },
+    "jp511": {
+        "base_url": f"{VISION_MODEL_BASE}/yolo26n-depth/tensorrt-jp511-trt8.5-orin-640",
+        "files": {
+            "yolo26n-depth.engine": {"size": 0, "sha256": ""},
+        },
+    },
+}
+
+
+def _ensure_vision_bundle(
+    kind: str, bundles: dict, model_dir: str, family: str | None = None
+) -> dict[str, str]:
+    """Shared body of ensure_vop_model / ensure_depth_model.
+
+    Refuses an unpinned entry rather than downloading it, for the reason
+    ensure_kokoro_model states: every other model here is size+SHA256 verified,
+    and a placeholder would be the one hole in that. A bundle whose pins are
+    still zero has not been published yet.
+    """
+    model_dir = require_models_subpath(model_dir)
+    key = select_bundle_family(bundles, family)
+    entry = bundles[key]
+    unpinned = [
+        name for name, meta in entry["files"].items()
+        if not meta.get("sha256") or not meta.get("size")
+    ]
+    if unpinned:
+        raise RuntimeError(
+            f"{kind.upper()}_MODEL_BUNDLES[{key!r}] has no pinned size/sha256 for "
+            f"{sorted(unpinned)} — build the engine with "
+            "tools/export_vision_engines.py on a host of that JetPack line, "
+            "publish it to COS, and record the size and SHA256 of the *uploaded* "
+            "copy here"
+        )
+    log.info(f"[model_downloader] {kind}: using {key} bundle")
+    return ensure_verified_bundle(
+        f"{kind}/{key}", model_dir, entry["base_url"], entry["files"]
+    )
+
+
+def ensure_vop_model(model_dir: str, family: str | None = None) -> dict[str, str]:
+    """Ensure the vop detection engine + its frozen vocabulary are present."""
+    return _ensure_vision_bundle("vop", VOP_MODEL_BUNDLES, model_dir, family)
+
+
+def ensure_depth_model(model_dir: str, family: str | None = None) -> dict[str, str]:
+    """Ensure the monocular depth engine matching the runtime TensorRT is present."""
+    return _ensure_vision_bundle("depth", DEPTH_MODEL_BUNDLES, model_dir, family)

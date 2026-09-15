@@ -1996,12 +1996,118 @@ transcribed and TTS still speaks with the card running.
 
 ---
 
+## Vision: `vop` (detection) and `vdp` (depth)
+
+Both run a **prebuilt TensorRT engine** fetched as a pinned bundle
+(`utils/model_downloader.py` → `ensure_vop_model` / `ensure_depth_model`), the
+same distribution shape OCR uses. Neither loads a `.pt` at runtime, and neither
+falls back to PyTorch if the bundle is missing — it fails loudly instead.
+
+### Why TensorRT, measured
+
+On an Orin NX 8GB, `yolo26n-depth` at 640:
+
+| Path | ms/frame |
+|------|----------|
+| PyTorch eager fp16, jp6.1 (torch 2.5) | 39.3 |
+| PyTorch eager fp16, jp5.11 (torch 2.0, py3.8) | 68.0 |
+| TensorRT fp16, pure GPU time (trtexec) | **4.9** |
+
+The gap is kernel-launch overhead, not arithmetic — which is why in eager mode
+`n` and `s`, and 640 and 768, all landed within a few ms of each other, and a
+plain `yolo26n` detector measured *slower* than the depth model. Any model
+comparison run in eager mode on this hardware is measuring Python, not the
+network.
+
+### vop's vocabulary is frozen at export time
+
+`YOLOE-26` is open-vocabulary, but ultralytics bakes the class list into the
+weights when it exports; on an exported model `set_classes()` raises. So:
+
+* the `set_classes` action is **gone from the tool schema** and `dispatch`
+  answers it with an error naming the baked vocabulary;
+* a `classes:` key in yaml or on a canvas card makes `config` **fail** rather
+  than apply the rest and drop `classes` on the floor;
+* `info` reports `vocabulary_frozen`, the full class list, and — if something
+  asked for classes this build cannot honour — `ignored_config_classes`.
+
+This is deliberate. A card that silently detects a different set than its
+config states is much worse than one that refuses.
+
+To change what vop detects: edit `ROBOT_EXTRA` in
+`tools/export_vision_engines.py`, rebuild on a host of each JetPack line,
+republish, re-pin. The vocabulary ships beside the engine as `vocab.json` so
+the plugin never restates it.
+
+Legacy model names (`yolov8s-worldv2`, `yolov8s-world`, `yoloe-26s`) still
+resolve — a card saved before the switch must not come back as `state: error`.
+
+### vdp's depth is relative until it is calibrated
+
+The released weights predict on an unbounded log scale. Absolute metres need
+`model.calibrate()` against the actual camera. Until then every payload carries
+`"scale": "relative"` and `info` warns. Do not set `calibrated: true` to make
+the warning go away — downstream code will plan around invented units.
+
+`vdp` is **off by default**: it is a second resident engine, and on the 8 GB
+Orins memory, not GPU time, is what runs out.
+
+### Building the engines
+
+```bash
+# ON a host of the target JetPack line — engines are not portable across
+# TensorRT majors (jp5.11 = TRT 8.5, jp6.1 = TRT 10.x).
+python3 tools/export_vision_engines.py --out /tmp/engines --workspace 2
+```
+
+Two traps, both observed:
+
+* **It must be ultralytics' exporter, not trtexec.** The plugins load engines
+  through `YOLO("....engine")`, which requires the metadata ultralytics embeds.
+  A trtexec-built engine deserializes fine and is then rejected on load.
+* **Cap the builder workspace.** Jetson memory is shared between CPU and GPU;
+  an unbounded workspace got the jp5.11 build OOM-killed mid-`[GpuLayer]` with
+  no Python traceback — just `Killed`. `--workspace 2` is the default here for
+  that reason.
+
+Then upload to COS and pin size + SHA256 in `utils/model_downloader.py` — of
+the copy **downloaded back from COS**, not the local file, for the reason the
+other bundles in that file state.
+
+---
+
 ## Topic Naming
 
 | Direction | Topic pattern | Format |
 |-----------|--------------|--------|
 | Input (mic) | `/{namespace}/mic/audio` or `/{namespace}/ext_mic/{id}/audio` | `audio/pcm-16k` |
 | Output (ASR result) | `{input_topic}/asr` | `data/json` |
+| Output (vop) | `{input_topic}/objects` | `data/json` |
+| Output (vdp depth map) | `{input_topic}/depth` | `image/depth-zlib` |
+| Output (vdp summary) | `{input_topic}/depth_summary` | `data/json` |
+
+The depth map is **640x480 uint16 millimetres, zlib level 1**, published as a
+`CompressedImage` with `format="16UC1; compressedDepth zlib"`. The size is not
+negotiable: agent-core's `DepthZlibRenderer`
+(`web/js/renderers/camera.js`) allocates a fixed 640x480 canvas and returns
+early when the decompressed buffer is shorter, so a map published at the
+model's own resolution renders as a blank panel and logs nothing anywhere.
+`plugins/vdp.py` resamples before publishing and `encode_depth` refuses any
+other shape.
+
+Depth summary JSON:
+```json
+{
+  "scale": "relative",
+  "unit": "relative",
+  "nearest_by_region": {"left": 1.42, "center": 3.10, "right": null},
+  "range": [0.51, 18.3],
+  "valid_fraction": 0.98,
+  "timestamp": 1234567890.123
+}
+```
+`scale` is `"relative"` unless the camera has been calibrated; `null` for a
+region means it had no valid pixels.
 
 ASR result JSON:
 ```json

@@ -129,10 +129,30 @@ plugins:
   vop:
     enabled: true
     namespace: ""       # auto-detect from hostname if empty
-    model: "yolov8s-worldv2"
+    # Runs a prebuilt TensorRT engine. `yolov8s-worldv2` still resolves here for
+    # cards saved before the switch, but the engine it loads is this one.
+    model: "yoloe-26s-seg"
     confidence: 0.3
-    classes: []         # empty = default broad set
     fps: 5
+    # NOTE: there is no `classes` key any more. The engine's open-vocabulary
+    # class list is frozen when the engine is exported, so it cannot be changed
+    # from here or at runtime; setting it makes the plugin refuse the config
+    # rather than silently ignore it. To change what vop can detect, edit
+    # tools/export_vision_engines.py, rebuild, and republish the bundle.
+
+  vdp:
+    # Monocular depth. Off by default: it is a second engine resident alongside
+    # vop/OCR/ASR/TTS, and on the 8 GB Orins memory — not GPU time — is the
+    # binding constraint. Turn it on where something actually consumes depth.
+    enabled: false
+    namespace: ""       # auto-detect from hostname if empty
+    fps: 2
+    # Uncalibrated output is RELATIVE, not metres, and is labelled as such in
+    # every published payload. Calibrate against the real camera before
+    # flipping `calibrated`, or downstream code will plan around made-up units.
+    depth_scale: 1.0
+    calibrated: false
+    max_depth_m: 20.0
 
   ocr:
     enabled: true

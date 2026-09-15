@@ -126,6 +126,25 @@ class PerceptionBundle:
             self._plugins.append(plugin)
             log.info("VideoObjectPerceptionPlugin loaded (namespace=%s)", namespace)
 
+        if plugins_cfg.get("vdp", {}).get("enabled", False):
+            import re, socket
+            namespace = plugins_cfg["vdp"].get("namespace", "").strip()
+            if not namespace:
+                namespace = re.sub(r"[^a-zA-Z0-9_]", "_", socket.gethostname())
+            from plugins.vdp import VideoDepthPerceptionPlugin
+            # Guarded like TTSPlugin and FaceRecognitionPlugin: this one needs a
+            # TensorRT engine bundle for the running JetPack line, and a machine
+            # that cannot fetch it must still get ASR/TTS/VOP/OCR. The card
+            # simply does not appear, which is visible in the dashboard.
+            try:
+                self._plugins.append(
+                    VideoDepthPerceptionPlugin(plugins_cfg["vdp"], namespace, executor)
+                )
+                log.info("VideoDepthPerceptionPlugin loaded (namespace=%s)", namespace)
+            except Exception:
+                log.error("VideoDepthPerceptionPlugin failed to load; continuing without depth",
+                          exc_info=True)
+
         if plugins_cfg.get("ocr", {}).get("enabled", False):
             from plugins.ocr import OCRPlugin
             self._plugins.append(OCRPlugin(plugins_cfg["ocr"], executor))
