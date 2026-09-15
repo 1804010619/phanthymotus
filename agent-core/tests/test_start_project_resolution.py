@@ -44,6 +44,11 @@ MIC, ASR, CORE, RM = 'card-mic', 'card-asr', 'card-core', 'card-rm'
 # or one whose output genuinely cannot be inferred. The fallback chain and the
 # unresolved-input check are the only things that can speak for it.
 SILENT = 'card-silent'
+# A card whose driver refuses the start with a bare `{"error": ...}` and no
+# `state` — the shape unitree/{g1,r1,go2}/device.py use for "Missing
+# input_topic". mcp_call_tool returns every ordinary tool result as code 200,
+# so nothing about the transport marks this as a failure.
+REFUSER = 'card-refuser'
 
 # decision_core precedes asr, as it does on R1: cards are listed in the order
 # they were created and asr was added four days later.
@@ -79,6 +84,11 @@ def driver(monkeypatch):
         if action == 'start':
             starts[card_id] = args
             started_input[card_id] = args.get('input_topic') or ''
+            # A Unitree speaker refuses a start it cannot bind, and says so the
+            # way those drivers do: a bare `error` key, no `state`, and the
+            # JSON-RPC call itself succeeds.
+            if card_id == REFUSER:
+                return {'code': 200, 'data': {'error': 'Missing input_topic'}}
             return {'code': 200, 'data': {'state': 'running'}}
         if action == 'info':
             return {'code': 200, 'data': {'state': 'running',
@@ -207,6 +217,39 @@ def test_one_unresolved_input_out_of_two_is_not_silently_dropped(driver):
     }
     assert _start(layout) is False
     assert CORE not in driver.starts
+
+
+# ── a driver that refuses the start without setting `state` ──────────────────
+
+def test_a_bare_error_answer_fails_the_card(driver):
+    """`{"error": ...}` with no `state` is a refusal, not a successful start.
+
+    Only `state` was read, so this answer fell through to the ready branch: the
+    Unitree speaker came up bound to nothing, start-project reported all green,
+    and the robot was silent with nothing in any log.
+    """
+    layout = {
+        'cards': [_card(REFUSER, 'speaker')],
+        'connections': [],
+    }
+    assert _start(layout) is False
+    errors = _errors(driver.events)
+    assert len(errors) == 1
+    assert errors[0]['tool'] == 'speaker'
+    assert 'Missing input_topic' in errors[0]['message']
+
+
+def test_an_error_key_alongside_a_live_state_is_only_a_message(driver):
+    """A running instance that also reports `error` must not be failed.
+
+    Drivers use the key for both refusal and commentary, so letting it condemn
+    a card that has explicitly said `state: running` would turn a dropped-frame
+    warning into a rolled-back project.
+    """
+    state, message = config_api.tool_state_of(
+        {'code': 200, 'data': {'state': 'running', 'error': 'last frame dropped'}})
+    assert state == 'running'
+    assert message == 'last frame dropped'
 
 
 # ── fallbacks, for a source that cannot answer ───────────────────────────────

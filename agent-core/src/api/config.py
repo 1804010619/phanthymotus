@@ -193,6 +193,62 @@ async def _do_start_project():
         _start_project_lock = False
 
 
+def payload_of(result) -> dict:
+    """Unwrap an MCP call result of either shape into a dict.
+
+    Module-level rather than a closure so the state rules below can be tested
+    directly; nothing here depends on a running start-project.
+    """
+    import json as _json
+    if result.get('code') != 200:
+        return {}
+    payload = result.get('data')
+    if isinstance(payload, list) and payload:
+        try:
+            payload = _json.loads(payload[0].get('text', '{}'))
+        except Exception:
+            payload = {}
+    elif isinstance(payload, str):
+        try:
+            payload = _json.loads(payload)
+        except Exception:
+            payload = {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def tool_state_of(result) -> tuple[str | None, str]:
+    """Pull (state, message) out of an MCP call result of either shape.
+
+    A tool that answers `{"error": "..."}` with no `state` has failed. Only
+    `state` used to be read, and mcp_call_tool returns every ordinary tool
+    result as `code: 200` — so such an answer fell through to the ready branch
+    in _start_and_resolve and was reported 已就绪. On a Unitree speaker that
+    could not bind its input that is exactly what happens: the driver
+    (unitree/{g1,r1,go2}/device.py) returns `{"error": "Missing input_topic"}`,
+    the project came up green, and the robot was silent with nothing in any
+    log. The same answer during a `loading` poll used to read as "still
+    loading" and sat there until the 15-minute timeout.
+
+    `error` decides only when `state` is absent. A tool that reports both —
+    `{"state": "running", "error": "last frame dropped"}` — is describing a
+    live instance, and letting the key alone condemn it would turn a warning
+    into a failed start. Drivers that do mean failure and say so properly
+    (engineai/t800, noetix/bumi) set `state` and are unaffected.
+    """
+    if result.get('code') != 200:
+        return None, str(result.get('message') or '')[:200]
+    payload = payload_of(result)
+    if not payload:
+        return None, ''
+    message = str(
+        payload.get('error') or payload.get('message') or payload.get('desc') or ''
+    )[:200]
+    state = payload.get('state')
+    if state is None and payload.get('error'):
+        state = 'error'
+    return state, message
+
+
 async def _do_start_project_impl():
     """启动所有 canvas cards — 前端按钮和 auto-start 共用此函数。
 
@@ -211,38 +267,9 @@ async def _do_start_project_impl():
     from api.mcp_manage import mcp_call_tool, MCPCallRequest
     from api.motus_stream import push_event
     import asyncio as _asyncio
-    import json as _json
 
     LOADING_POLL_S = 3
     LOADING_TIMEOUT_S = 900
-
-    def _payload(result) -> dict:
-        """Unwrap an MCP call result of either shape into a dict."""
-        if result.get('code') != 200:
-            return {}
-        payload = result.get('data')
-        if isinstance(payload, list) and payload:
-            try:
-                payload = _json.loads(payload[0].get('text', '{}'))
-            except Exception:
-                payload = {}
-        elif isinstance(payload, str):
-            try:
-                payload = _json.loads(payload)
-            except Exception:
-                payload = {}
-        return payload if isinstance(payload, dict) else {}
-
-    def _tool_state(result) -> tuple[str | None, str]:
-        """Pull (state, message) out of an MCP call result of either shape."""
-        if result.get('code') != 200:
-            return None, str(result.get('message') or '')[:200]
-        payload = _payload(result)
-        if not payload:
-            return None, ''
-        return payload.get('state'), str(
-            payload.get('error') or payload.get('message') or payload.get('desc') or ''
-        )[:200]
 
     async def _resolve_and_register(mcp_id: str, tool_name: str, card_id: str,
                                    info_args: dict) -> dict:
@@ -258,7 +285,7 @@ async def _do_start_project_impl():
             tool=tool_name, arguments={'action': 'info', 'instance_id': card_id,
                                        **info_args},
         ))
-        data = _payload(info)
+        data = payload_of(info)
         topic_out = data.get('topic_out') or []
         if topic_out:
             resolved_topics[card_id] = topic_out
@@ -289,7 +316,7 @@ async def _do_start_project_impl():
             except Exception as error:
                 print(f'[start-project] {tool_name} info during load failed: {error}')
                 continue
-            state, message = _tool_state(info)
+            state, message = tool_state_of(info)
             if state == 'loading' or state is None:
                 # Relay the tool's own phase text as it changes. The card sits
                 # here for minutes on a cold model, and "模型加载中" for the whole
@@ -384,20 +411,12 @@ async def _do_start_project_impl():
             req = MCPCallRequest(tool=tool_name, arguments=args)
             result = await mcp_call_tool(mcp_id, req)
             if result.get('code') == 200:
-                # Check if tool reported an error state in its response
-                resp_data = result.get('data')
-                tool_state = None
-                tool_message = ''
-                if isinstance(resp_data, dict):
-                    tool_state = resp_data.get('state')
-                    tool_message = resp_data.get('message', '')
-                elif isinstance(resp_data, list) and resp_data:
-                    try:
-                        parsed = _json.loads(resp_data[0].get('text', '{}')) if isinstance(resp_data[0], dict) else {}
-                        tool_state = parsed.get('state')
-                        tool_message = parsed.get('message', '')
-                    except Exception:
-                        pass
+                # Check if tool reported an error state in its response.
+                # _tool_state rather than a second inline parse: this copy read
+                # only `state` and only `message`, so it missed both a driver's
+                # bare `{"error": ...}` and the reason text such drivers put
+                # under `error` — the operator got 已就绪 and no explanation.
+                tool_state, tool_message = tool_state_of(result)
 
                 if tool_state == 'error':
                     print(f'[start-project] {tool_name} ({mcp_id}) self-check failed: {tool_message}')
