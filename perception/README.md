@@ -2134,6 +2134,56 @@ parameterisation, so a `model.calibrate()` result pastes in unchanged. The old
 when `a == 1` — it is still read, mapped onto `cal_b = log(depth_scale)`, so an
 existing card keeps its behaviour.
 
+### Calibrating on the robot: the `calibrate` action
+
+ultralytics' own `model.calibrate()` **cannot run here**. It wants a `.pt`
+checkpoint, torch, ultralytics itself, and a dataloader yielding ground-truth
+depth *maps* (`calibrate_checkpoint`, `models/yolo/depth/calibrate.py`). The
+runtime image carries a TensorRT engine and none of the rest.
+
+What it actually computes, though, is small. `select_calibration` scores two
+candidates and keeps the better one:
+
+| candidate | a | b |
+|---|---|---|
+| identity | 1.0 | 0.0 |
+| scale-only | 1.0 | `mean(log gt − log pred)` |
+
+**`a` is never fitted.** Its docstring records that an affine log-slope
+candidate was evaluated and removed, because the extra parameter overfits
+within-dataset and hurts cross-distribution generalisation. So `cal_a` stays a
+knob for a fit obtained elsewhere, and nothing fits it — here or upstream.
+
+That leaves one number, and the data for it is something a person standing next
+to the robot already has: a tape measure.
+
+```
+calibrate  distance_m=2.0                  # target in the centre box, 2 m away
+calibrate  distance_m=6.0                  # again at a clearly different range
+calibrate  reset=true                      # back to the engine's own fit
+calibrate  distance_m=2.0 image_path=...   # or fit from a photo
+```
+
+Each call samples the current frame (median over `region`, default the centre
+20% box), appends a `(predicted, measured)` pair, and **refits over every
+sample from scratch** — so a bad reading is undone by `reset`, not compounded.
+The node keeps the most recent **uncalibrated** depth map for exactly this
+reason: fitting against already-corrected depth converges on whatever the first
+guess was.
+
+The result applies immediately, to running nodes too, **in memory only**. The
+reply says so and prints the `cal_a` / `cal_b` to paste into the card config —
+that is the difference between a calibration that survives a restart and one
+that quietly does not.
+
+The reply also carries `residuals` (per-sample `error_pct` after the fit) and
+advice that escalates with the evidence: one sample fixes the average scale and
+nothing else; two samples at *similar* distances still say nothing about range;
+two at clearly different distances are what reveal whether the error is a
+constant factor (fixable) or grows with distance (not fixable with `a` pinned
+at 1.0 — at that point the honest answer is a different model or a real depth
+sensor).
+
 `visual_depth` is **on by default**, but its engine loads lazily on the first
 `start` — an enabled card that nothing has wired up costs nothing. The cost
 arrives with the first subscriber: it is a second resident engine, and on the
