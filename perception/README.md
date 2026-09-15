@@ -75,6 +75,609 @@ The VAD parameters can be adjusted per ASR canvas card via the instance config (
 
 ---
 
+## TTS Engines
+
+`tts_engine` (configSchema on the `tts` tool, and `plugins.tts.engine` in
+`config.yaml`) selects the voice. Engines are named **`<model>-<languages>`** —
+the same shape `asr_model` uses (`x-asr-zh-en`, `paraformer-zh-en`, `zipformer-en`),
+because the dashboard renders the raw enum string, so these two dropdowns sit side
+by side in front of the same operator. Language codes, not country codes: `zh`, not
+`cn`. Naming an engine after its *runtime* was the previous mistake — `matcha-zh-en`
+and `mms-th` both run on sherpa-onnx, so `sherpa_onnx` identified neither.
+
+| `tts_engine` | model | languages | runtime | model dir |
+|---|---|---|---|---|
+| `vits2-zh-en` (default) | VITS2 16 kHz | 中 / 英, code-switching | TensorRT | `/models/vits2` |
+| `matcha-zh-en` | matcha-icefall-zh-en + vocos | 中 / 英 | ONNX Runtime | `/models/sherpa-onnx/tts` |
+| `mms-th` | MMS-TTS-THAI-MALE-NARRATOR | ไทย only | ONNX Runtime | `/models/mms-th` |
+| `kokoro-multi` | Kokoro-82M v1.0 | 英 / 中 / 日 / 西 / 法 / 意 / 葡 / 印地, code-switching | ONNX Runtime | `/models/kokoro-multi/<device>` |
+
+`vits2_trt` and `sherpa_onnx` still resolve, via `ENGINE_ALIASES` in
+`plugins/tts.py`, and underscores fold to hyphens first so `vits2_zh_en` works too.
+The aliases are not decoration: both old names are already persisted in ConfigDB
+rows and in `config.yaml` on every deployed robot, and `_select_engine` raises on an
+unknown engine — so dropping them would put every existing TTS card into
+`state: error` on the next restart.
+
+Only one engine is resident at a time. Switching disposes the outgoing one's nodes
+first, because two live publishers on one audio topic play both voices at once.
+
+### Chinese number normalisation is applied by us, never by `rule_fsts`
+
+Affects both sherpa-onnx engines that can speak Chinese (`matcha-zh-en`,
+`kokoro-multi`). Both pass **`rule_fsts=""`** and call `plugins/zh_text_norm.py`
+instead. Do not "simplify" that back.
+
+sherpa-onnx applies every FST in `rule_fsts` to the **whole text before its frontend
+decides what is Chinese** (`offline-tts-kokoro-impl.h`: the `tn_list_` loop runs, and
+only then `ConvertTextToTokenIds`). The frontend routes on `[一-鿿]`. So handing it
+the ZH number/date/phone FSTs rewrites every digit into Chinese characters *first*,
+and the frontend then reads them in Chinese — regardless of `lang`, in every language:
+
+| input | with `rule_fsts` | fixed |
+|---|---|---|
+| `...opened in 2026.` | `...opened in 二千零二十六.` | unchanged, espeak reads it |
+| `We have 25 exhibits today.` | `We have 二十五 exhibits today.` | unchanged |
+| `Hola, tenemos 25 exposiciones hoy.` | `Hola, tenemos 二十五 exposiciones.` | unchanged |
+
+The FSTs are not the problem and must not be dropped — for Chinese they are
+load-bearing and good: `2026年` → `二零二六年`, `2026年1月15日` →
+`二零二六年一月十五日`, `第25个展品` → `第二十五个展品`, `延迟200毫秒` →
+`延迟二百毫秒`.
+
+So `zh_text_norm` runs them in Python, before sherpa sees the text, and only on the
+Chinese parts. **A digit run is Chinese when either neighbour is** — which gets both
+directions right in a way that gating on `tts_language` could not:
+
+```
+"延迟 200 毫秒"        -> Chinese on both sides   -> 二百
+"共25 items"           -> Chinese only before     -> 二十五
+"In 2026 我们开业"     -> Chinese only after      -> 二零二六
+"we have 25 exhibits"  -> Chinese on neither      -> left to espeak
+```
+
+Two details are load-bearing and pinned by `tests/test_zh_text_norm.py`, which needs
+no model and no `kaldifst`:
+
+- **Whole segments go to the FST, never the bare digits.** `date-zh.fst` has to see
+  the `年` to produce `二零二六年` instead of the quantity form `二千零二十六`.
+- **The CJK range is the same one sherpa routes on** (`一-鿿`). If the two
+  disagreed, text could be normalised here and then routed to espeak anyway.
+
+`matcha-zh-en` has no language field at all, which is the other reason the decision is
+made per number rather than per engine setting.
+
+`kaldifst` reaches the image through `plugins/vits2_tts_trt/requirements.jetson.txt`,
+installed when `ENABLE_VITS2_TRT=1` (the Dockerfile default). Without it this degrades
+to a **warning, not a refusal**: Chinese digits get read by espeak in the selected
+voice — wrong, but audible and confined to numbers. Contrast the Thai frontend, which
+*does* refuse without pythainlp, because there the digits vanish from the audio
+entirely.
+
+Known limitation, sherpa's FSTs rather than this code: `电话13800138000` becomes
+`一百三十八亿零一十三万八千` — `phone-zh.fst` does not match a bare number, so
+`number-zh.fst` reads it as a quantity. And a bare `2026.` with no `年` reads as
+`二千零二十六`; the year form needs the context character.
+
+### `kokoro-multi`, the multilingual voice
+
+[Kokoro-82M](https://huggingface.co/hexgrad/Kokoro-82M) **v1.0**, added because
+`vits2-zh-en` is a Chinese male voice whose English is the weaker half, and there was
+no engine good enough to put in front of an English-speaking audience. 82 M
+parameters, Apache-2.0, and it needs no new framework: sherpa-onnx already ships
+`OfflineTtsKokoroModelConfig`, so this engine added **no Dockerfile change** — only
+Python, a COS artefact and tests.
+
+Named `kokoro-multi`, not `kokoro-zh-en`: it has voices for nine languages, and a
+name claiming two would mislead every operator reading the dropdown. `multi` is also
+what upstream calls the release (`kokoro-multi-lang-v1_0`).
+
+**Language is a runtime dropdown, and switching it is free.** `tts_language`
+(`plugins.tts.language` in `config.yaml`) takes `en-us`, `en-gb`, `zh`, `ja`, `es`,
+`fr`, `it`, `pt-br` or `hi`. sherpa-onnx reads it from
+`GenerationConfig.extra["lang"]` on *every* `generate()` call, so it is a scale on
+the resident model exactly like `speed` — it is deliberately **absent from
+`_session_keys`**, because putting it there would tear down and reload a 310 MB fp32
+CUDA session every time someone changed the dropdown. Verified on the shipped wheels
+for both Python ABIs (cp38/jp5.11 and cp310/jp6.1): `extra` accepts a plain dict and
+round-trips.
+
+**What the field actually selects is the espeak-ng voice for the *non-Chinese* runs
+of the text.** Chinese is phonemised from `lexicon-zh.txt` on every setting, because
+that branch of sherpa-onnx's frontend never consults `lang`. Two consequences:
+
+- Mixed zh/en in one sentence code-switches on its own, with no Python-side
+  detection — `KokoroMultiLangLexicon` splits the text on Chinese vs non-Chinese
+  character runs and phonemises each separately.
+- **`zh` maps to an English espeak voice on purpose**, and is not redundant with
+  `en-us`: it only decides how *embedded Latin* in a Chinese sentence is read, and
+  English is the right answer. Digits are already converted to Chinese characters
+  upstream by the ZH rule FSTs.
+
+**The espeak voice names in `LANGUAGE_VOICES` are measured, not guessed.** Getting
+one wrong fails in two ways, both silent on the robot:
+
+| configured | espeak voice | what a guess did |
+|---|---|---|
+| `en-gb` | `en-gb-x-rp` | plain `en-GB` is **not a voice espeak-ng ships** → "Failed to set eSpeak-ng voice", **no audio at all** |
+| `pt-br` | `pt-BR` | — |
+| `fr` | `fr` | `fr-FR` **silently truncates**: 18280 samples where `fr` gave 63277 on the same sentence, nothing raised, nothing logged |
+
+espeak matching is case-insensitive, which is why `en-us` resolves to `en-US` and
+made `en-gb` look like it ought to work. Hence a closed map rather than passing the
+configured label through, and a construction-time probe that refuses to load if the
+resolved voice produces no audio.
+
+**`speaker_id` is an index within the selected language, not a global voice number.**
+`speaker_id: 0` is the first voice of whatever `tts_language` is set to, so switching
+language moves the voice with it and the two cannot end up disagreeing. The model's
+own numbering is not learnable — Japanese starts at 37 and Spanish is 28, 29 **and**
+53 — and exposing it made it easy to pick an American voice, switch to Japanese, and
+wonder why the result sounded wrong. That class of mistake is now unrepresentable
+rather than warned about.
+
+| `tts_language` | voices | `speaker_id: 0` is |
+|---|---|---|
+| `en-us` | 20 | `af_alloy` (`af_heart` is 3, `af_bella` 2 — the highest-graded) |
+| `en-gb` | 8 | `bf_alice` |
+| `zh` | 8 | `zf_xiaobei` |
+| `ja` | 5 | `jf_alpha` |
+| `hi` | 4 | `hf_alpha` |
+| `es` / `pt-br` | 3 | `ef_dora` / `pf_dora` |
+| `it` | 2 | `if_sara` |
+| `fr` | 1 | `ff_siwis` |
+
+Out of range at load is a `ValueError` naming the language and its count. Out of
+range *after* a language switch clamps to voice 0 with a warning instead — language
+is a free per-utterance setting and must not be able to fail, and `fr` has exactly
+one voice. The requested index is remembered, so switching back restores it. Logs and
+`info` report the resolved name (`af_heart`), not the number.
+
+> **Only `en-us`, `en-gb`, `zh` and `ja` have been exercised on device.**
+> sherpa-onnx's own documentation says of this model "it is a multi-lingual model,
+> but we only add English and Chinese support for it" — Kokoro was trained with
+> misaki G2P, and for `es` / `fr` / `it` / `pt-br` / `hi` the espeak phoneme set is
+> not guaranteed to be the one the acoustic model learned. All of them produce audio
+> of a plausible length; treat those five as best-effort until someone who reads the
+> language has heard them.
+
+#### Measured on Orin 6 (jp6.1), fp32 on gpu
+
+| lang | sid | audio | synth | RTF | resample |
+|---|---|---|---|---|---|
+| `en-us` | 3 | 8.46 s | 0.78 s | **0.092** | 26 ms |
+| `en-gb` | 26 | 10.62 s | 0.85 s | 0.080 | 36 ms |
+| `zh` | 47 | 9.02 s | 0.89 s | 0.099 | 27 ms |
+| `ja` | 37 | 6.44 s | 0.54 s | 0.085 | 18 ms |
+| `es` / `fr` / `it` / `pt-br` / `hi` | — | ~4-6 s | 0.31-0.44 s | 0.070-0.083 | 11-22 ms |
+
+Session build 2.6 s (well inside `ENGINE_SWITCH_WAIT_S = 20`), warmup probe 0.93 s,
+and the resampler costs 3-4% of synthesis — not worth a polyphase rewrite.
+
+**`cpu` is not viable for streaming.** int8 on the same box measured **RTF 1.6** —
+slower than real time, so the audio cannot keep up with the frame clock. That is why
+`ENGINE_DEVICE_DEFAULTS` puts this engine on **gpu**; `cpu` exists for hosts with no
+CUDA wheel and for offline synthesis, not for live speech. (Note the dashboard form
+still renders the schema's `cpu` default, since JSON Schema cannot express a
+per-engine one.)
+
+**It is the only engine whose sample rate is not the pipeline's** — Kokoro is
+24 kHz, everything downstream is 16 kHz, and `AudioChunk` has no way to be told
+otherwise (the rate lives inside the `audio/pcm-16k` format string, and the
+publisher's pacing derives from `SAMPLE_RATE`). So the adapter downsamples
+internally, in `utils/resample.py`: 24000 → 16000 is exactly 2:3, so it upsamples by
+2, lowpasses at 8 kHz with a 97-tap Blackman-windowed sinc, and decimates by 3 —
+numpy only, because scipy would pull its own numpy pin and every plugin
+requirements file here exists partly to prevent that. Nothing outside the adapter
+knows Kokoro is 24 kHz.
+
+Checked against `scipy.signal.resample_poly` on a real 8.5 s utterance: correlation
+**0.999997**, peak error −39.6 dB, and the residual confined to the 7–8 kHz
+transition band (error/signal 3.8e-3 there against ~1e-6 below 6 kHz). The ~2-5% DC
+offset in the output is **Kokoro's own** — the raw 24 kHz is +0.0236 and the
+resampled 16 kHz is +0.0236, which is what a unity-DC-gain lowpass should do.
+
+Two details in that resampler are load-bearing and are pinned by
+`tests/test_resample.py`: the whole utterance is resampled *before* being framed
+(doing it per 3200-byte frame restarts the filter every 100 ms, which is ten clicks
+a second), and clipping happens in float before the int16 cast (`astype(np.int16)`
+on an out-of-range value wraps, turning an overshoot into a full-scale *opposite*
+polarity tick on the loudest part of the utterance). A third was found by those
+tests rather than by ear: `np.convolve(mode="same")` returns
+`max(len(signal), len(taps))`, so an utterance shorter than the 97-tap filter came
+back padded out to 97 samples of filter tail — which a punctuation-only chunk hits.
+
+**`device` selects different weight files here, not just a provider.** `gpu` gets
+fp32 and `cpu` gets int8, because `provider_for_device` refuses int8 on CUDA (the
+CUDA provider falls back to CPU per quantised node). So the two are separate pinned
+archives that unpack into `/models/kokoro-multi/gpu` and `.../cpu` — flipping the
+field downloads the other one and leaves the first in place.
+
+The release is repacked from sherpa-onnx's `kokoro-multi-lang-v1_0` by
+`tools/repack_kokoro_v1_0.py` and mirrored to COS, pinned by size + SHA256 like
+every other model here. Two things upstream ships are dropped:
+
+- `lexicon-us-en.txt` / `lexicon-gb-en.txt` (11.6 MB) — **unreachable.** For
+  non-Chinese runs sherpa-onnx short-circuits to espeak whenever `lang` is
+  non-empty, and `lang` falls back to the model's own `meta_data.voice` (`"en-us"`)
+  when unset, so it never is. English pronunciation here comes from espeak-ng, not
+  from a dictionary.
+- `dict/` (14 MB, the jieba dictionary) — ignored since sherpa-onnx v1.12.15, which
+  logs "you don't need to provide dict_dir" if you pass one.
+
+`lexicon-zh.txt` stays: the Chinese branch does *not* consult `lang`, so it is
+genuinely used. The three ZH rule FSTs stay for number/date/phone normalisation.
+Result: **~358 MB unpacked on gpu, ~157 MB on cpu** (from 384 MB / 183 MB upstream).
+
+`_validate_kokoro_manifest` checks the release *before* `OfflineTts` is
+constructed, and one of those checks is not optional: for a `version >= 2` Kokoro
+model with **both `lexicon` and `lang` empty**, sherpa-onnx's `InitFrontend` calls
+`SHERPA_ONNX_EXIT(-1)` — a **process exit**, so `main.py`'s try/except around the
+TTS plugin cannot turn it into a card in `state: error`; it takes ASR, VOP and OCR
+down with it. Same hazard `_validate_thai_manifest` exists for. It also refuses a
+`model_version` of 1 (v0.19 ignores `lang`, so the dropdown would be visibly present
+and silently inert) and any `sample_rate` other than 24000.
+
+### `ja`: why it is hard, and how far this gets
+
+Two separate problems, and the second is only partly solved.
+
+**1. Raw Japanese is read in Mandarin.** sherpa-onnx's Kokoro frontend splits text on
+`[一-鿿]` and sends that range to `ConvertChineseToTokenIDs`, which reads
+`lexicon-zh.txt`. **That function never receives the requested language.** Japanese
+kanji are inside the range (`今` U+4ECA, `私` U+79C1, `何` U+4F55), so kanji are
+pronounced in Mandarin whatever `tts_language` says. Measured on Orin 6:
+
+| text | `ja` | `en-us` | `es` | `fr` |
+|---|---|---|---|---|
+| `今日私何` (kanji only) | 30682 | 30682 | 30682 | 30682 |
+| `こんにちは` (kana only) | 28908 | 114986 | — | — |
+
+Identical sample counts for kanji under every language; kana change 4x. `lang` has no
+effect on kanji at all.
+
+**2. Kana are read with holes.** Kokoro's 114-token table *is* the misaki phoneme
+inventory — it contains `ʣ ʥ ʦ ʨ ᵝ`, so the model was trained to speak Japanese. But
+it has no `ʑ`, and espeak-ja emits exactly that for じ, plus combining diacritics
+`U+0308` and `U+031E`. sherpa phonemises with espeak and looks the result up in a
+misaki-derived table, silently discarding what is missing: **12 phonemes dropped from
+one sentence**, audible as gaps, and unintelligible.
+
+**The root cause of (2) is that upstream Kokoro and sherpa-onnx use different G2P.**
+Upstream drives Kokoro with misaki, whose phonemes are the table the model was trained
+on. sherpa-onnx uses espeak-ng, whose inventory does not match. This is not a
+limitation of the model.
+
+`plugins/ja_text_norm.py` works around both: kanji→kana via Janome, dates and counters
+by rule, then **kana→Hepburn romaji**, so nothing is left in the CJK range and the
+text is phonemised by a Latin-script voice whose output Kokoro can represent.
+`LANGUAGE_VOICES["ja"]` is therefore `"it"`, not `"ja"` — the voice is chosen for its
+**phoneme inventory**, not its language. Measured on the reported sentence:
+
+| | dropped | duration |
+|---|---|---|
+| kana + espeak `ja` | **12** | 12.11 s |
+| romaji + espeak `ja` | 0 | 14.78 s — spelled out letter by letter |
+| **romaji + espeak `it`** | **0** | **7.85 s** |
+
+Two details cost more than they look:
+
+- **Word boundaries.** Japanese has none, but the romaji is read by a Latin-script
+  voice, and one unbroken `kyoowanisennijuurokunen…` is a single enormous word whose
+  stress espeak has to guess: 7.62 s unspaced against 4.60 s spaced. Janome has
+  already found the morpheme boundaries, so they are kept — except before a lone
+  `ウ`/`ー`, since Janome splits `マショウ` into `マショ`+`ウ` and a space there gives
+  `masho u` rather than `mashoo`.
+- **Long vowels are doubled, not written as digraphs.** `キョウ` becomes `kyoo`, never
+  `kyou`, which Italian and Spanish read as two syllables.
+
+Also corrected here: the particle `は` is *read* `ハ` but *pronounced* わ — `今日は` is
+`kyoo wa`, never `kyoo ha` — and full-width `。！？` become ASCII so espeak can find
+sentence boundaries.
+
+> **Honest limit: this sounds like a non-native speaker reading Japanese.** Verified by
+> ear, not inferred. Zero phonemes are dropped and it is intelligible, which the kana
+> version was not, but Italian phonemes are not Japanese ones. Making it sound native
+> needs misaki-compatible phonemes reaching the model, which sherpa-onnx offers no path
+> for today — its only phoneme-level entry point is the lexicon, and
+> `ConvertNonChineseToTokenIDs` bypasses the lexicon whenever `lang` is non-empty,
+> which it always is because it falls back to the model's own `meta_data.voice`.
+>
+> An earlier version of this section claimed the output was "unmistakably Japanese".
+> That was inferred from "no kanji left in the text" without listening, and it was
+> wrong.
+
+#### Superseded: Japanese now bypasses sherpa entirely (`plugins/kokoro_direct.py`)
+
+The romaji route above is what the accent limit was measured on. It is no longer the
+shipping path — the limit was the *phoneme alphabet*, so the fix is to stop letting
+espeak choose it. `kokoro_direct.py` loads the same `model.onnx` with onnxruntime and
+feeds it misaki phonemes directly, the way upstream Kokoro is driven:
+
+```
+kana --(plugins/ja_phonemes.py, vendored misaki mora table)--> phonemes --> tokens.txt ids --> ONNX
+```
+
+The mora table is pinned to misaki at **`fdc9c5e5e` (2025-01-13)**, the commit that
+matches Kokoro v1.0. This pin is the whole point and `pip install misaki` is the wrong
+thing to do here — current misaki targets a newer Kokoro with a larger vocabulary:
+
+| misaki `ja.py` | distinct phonemes | missing from our `tokens.txt` |
+|---|---|---|
+| **2025-01-13 (pinned)** | 31 | **0** |
+| 2025-04-05 (what pip gives) | 39 | 12 — `G K g ƫ ᶀ ᶁ ᶃ ᶄ ᶆ ᶈ ᶉ` |
+
+A test asserts every phoneme the table can emit exists in `tokens.txt`. The absence of
+that assertion is what let the original 12-drop bug ship.
+
+**This session is CPU-only by construction, and that is not a tuning decision.** On
+jp6.1 the standalone onnxruntime (1.18.0) and sherpa's bundled one (1.18.1) share a
+single `libonnxruntime_providers_cuda.so` — the Dockerfile copies sherpa's into
+`onnxruntime/capi/` to get the face plugin onto the GPU, and the soname collides so the
+first `dlopen` wins. Separate graphs coexist fine, but a *second* CUDA session on the
+**Kokoro** graph fails in whichever runtime did not load the provider, symmetrically:
+
+| order | result |
+|---|---|
+| sherpa's CUDA session first | the standalone one fails, error names `/home/tian/Yxh/…` |
+| the standalone one first | **sherpa** fails, error names `/home/yifanl/…` |
+
+both with `Error mapping output names: Could not find OrtValue with name
+'/Squeeze_2_output_0'`. Order does not save it; staying off CUDA does. `KokoroDirect`
+therefore takes **no device argument**, so it cannot be asked.
+
+The cost is confined to Japanese, and it is affordable. Measured on Orin 6, one process,
+Japanese synthesized first so its CPU session is live throughout:
+
+| language | runtime | RTF |
+|---|---|---|
+| en-us / en-gb | sherpa, cuda | 0.31 / 0.21 |
+| zh | sherpa, cuda | 0.14 |
+| es / fr / it / pt-br / hi | sherpa, cuda | 0.10 – 0.11 |
+| **ja** | **direct ONNX, cpu** | **0.54** |
+
+Real time with margin, and the other eight languages keep the GPU. Threads are the only
+lever left for Japanese and they matter — `intra_op_num_threads` defaults to one per
+core (RTF 0.52); the ORT default of 2 gives 1.17, i.e. slower than real time.
+
+**Pitch accent is not implemented and cannot be with this model.** The pinned misaki has
+no accent code at all (it arrived in 2025-04, alongside the larger vocabulary above),
+and sherpa's v1.1 token table is a symlink to v1.0's. Japanese here is correctly
+*phonemised* but flat. Fixing it needs a newer Kokoro, which is a different change.
+
+### Chinese: use `vits2-zh-en`, and why Kokoro's Chinese is not broken
+
+Chinese takes a different path from Japanese and loses nothing. `Skip unknown phonemes`
+counts on Orin 6:
+
+| text | dropped |
+|---|---|
+| Chinese, ordinary | **0** |
+| Chinese with embedded English | **0** |
+| Chinese, rare characters (`饕餮纹鼎鬲甗簋簠盨匜盘`) | **0** |
+| English | **0** |
+| Japanese kana (for contrast) | **12** |
+
+`ConvertChineseToTokenIDs` reads `lexicon-zh.txt`, whose entries are already misaki
+phonemes (`七 ʨ ʰ i →`), and never touches espeak — so there is no bug here to fix.
+What remains is that Kokoro is one 82 M model covering nine languages, while
+`vits2-zh-en` is a **purpose-trained 16 kHz Chinese voice** and is already the default
+engine. Prefer it for Chinese; `kokoro-multi` exists for English.
+
+### `mms-th`, and why it cannot be handed raw text
+
+The Thai voice is an ONNX export of
+[VIZINTZOR/MMS-TTS-THAI-MALE-NARRATOR](https://huggingface.co/VIZINTZOR/MMS-TTS-THAI-MALE-NARRATOR),
+a fine-tune of Meta's MMS VITS — 36 M parameters, **natively 16 kHz** (which is why
+this voice and not the more popular `FEMALEV2`, which is 22.05 kHz and would need a
+resampler), end-to-end so there is no vocoder, and character-level so there is no
+lexicon and no espeak-ng data. Produced by `tools/export_mms_thai_onnx.py`.
+
+**Licence: CC-BY-NC-4.0, inherited from `facebook/mms-tts`. Non-commercial.**
+Re-evaluate before shipping it in a product. Every small Thai model with usable
+quality has the same constraint — the MMS family and Piper's `th_TH-tsync2` are all
+CC-BY-NC — and the only permissively-licensed alternative found was
+`VachaSpeech-0.6B` (Apache-2.0), a 0.6 B autoregressive model that is not viable on
+CPU and marginal on an Orin GPU.
+
+The tokenizer is character-level over exactly **71 characters** and skips
+everything else. sherpa-onnx records the loss as a C++ stderr line that never
+reaches the Python logger or the dashboard; the audio simply comes back short. So
+`plugins/thai_frontend.py` is **not optional**, and three of the omissions are not
+guessable:
+
+- **`ำ` (U+0E33 SARA AM) is not in the table**, but `ํ` (U+0E4D) and `า` (U+0E32)
+  are. MMS was trained on text spelling the vowel as that pair, so every `ำ` is
+  rewritten — otherwise น้ำ, ทำ, คำ, สำหรับ and a large part of the language lose
+  their vowel. Measured: "น้ำ ทำ คำ สำหรับ น้ำหนัก" logs five skipped U+0E33 and
+  synthesizes 1.34 s; rewritten it is 1.51 s and those five vowels are audible.
+- **`ๆ`** (maiyamok) is absent, so `ต่างๆ` is expanded to the repeated word.
+- **Of the Arabic digits only `0 1 2 4` are present** — `3` and `5`-`9` are not, and
+  neither are the Thai digits `๐`-`๙`. No numeral can be passed through; every
+  number becomes words.
+
+Mixed text is transliterated into Thai script rather than routed to another engine,
+so the deployment keeps one voice: numbers via `pythainlp`, Chinese via
+`pypinyin` → `wunsen`, Latin via a hand lexicon then a `khanaa`-based rule
+fallback. **`wunsen` does not handle English** — it covers Japanese, Korean,
+Mandarin and Vietnamese only — so the Latin path is the rule table in
+`thai_frontend.py`, and a name it gets wrong belongs in `_LATIN_LEXICON`, not in
+the rules. The consequence to be clear about: English inside a Thai sentence is
+spoken with a Thai accent by the Thai voice, not natively. Native pronunciation
+would need both engines resident at once, which the facade forbids.
+
+`tests/test_thai_frontend.py` guards one property above all — every character the
+frontend emits is one the model can pronounce. That is the assertion that catches a
+silent drop.
+
+### The dry-run probe is per adapter
+
+`_TTSNode.start()` refuses to report `running` until the adapter has synthesized a
+short probe. That probe used to be a literal `"."` for every engine — and this
+frontend normalises punctuation to a space and then strips it, so the probe reached
+the Thai model as an empty string and **every** start on the robot answered
+`TTS dry-run produced no audio` while the model itself was fine.
+
+It is now `TTSAdapter.dry_run_text`, overridden to `ก` for `mms-th` (measured
+0.384 s of audio, 108 ms to synthesize — the cheapest probe that still proves the
+model runs). `MmsThaiTTSAdapter.__init__` also refuses to construct if the frontend
+normalises its own probe away, so a future frontend change that swallows it fails at
+load, naming the cause, instead of at every start.
+
+A related silence surfaced in the same session: a start deferred during an engine
+build is replayed afterwards, and `dispatch` **reports** failure rather than raising
+it — `start()` returns `{"state": "error"}`. The replay loop only caught exceptions,
+so a replayed start that failed logged nothing at all and looked like a successful
+one. It now inspects the result and logs the engine's own message.
+
+### `config` must not rebuild the session it just built
+
+`SherpaOnnxTTSPlugin`'s config action used to call `_build_tts_adapter`
+**unconditionally** and then dispose every node. On Orin5 an identical, no-op
+config measured **2.6–2.8 s** for `mms-th` — a full ONNX session teardown, reload
+and archive re-verification — and the card then had to `start` again. The dashboard
+re-applies a card's config around a speak, so that landed on *every* utterance:
+"every speak takes 5 s".
+
+It now rebuilds only when a key the session is built from actually changed
+(`device`, `speaker_id`, `model_dir`, `thai_phrase_spacing`), comparing normalised
+values so the dashboard's `speed: 1` does not read as a change against a stored
+`1.0`. `speed` is applied with `set_speed()` on the resident model — which is what
+`vits2` has always done ("avoids tearing down a resident model for a slider
+change"), and why only the two sherpa-onnx engines were slow. **`matcha-zh-en`
+benefits identically; `vits2-zh-en` never had the bug.**
+
+Measured after the fix: repeated identical config **2 ms**, and speak → first
+`AudioChunk` on the topic **226–333 ms**.
+
+Two things this exposed:
+
+- `TTSPlugin._config` carried a hardcoded `("speaker_id", "speed", "device")` into
+  a newly built engine and so dropped `thai_phrase_spacing`. The engine came up
+  without it and the next config saw a change and rebuilt — one extra 2.7 s per
+  switch. The list is now derived from `configSchema` (`SHARED_CONFIG_KEYS`).
+- The config filter dropped every falsy value, so `thai_phrase_spacing: False` and
+  `speaker_id: 0` were unsendable — phrase spacing could be turned on and never
+  off. `_session_keys()` now decides presence per key.
+
+### Warmup applies to the sherpa-onnx engines too
+
+`plugins.tts.warmup` in `config.yaml` existed all along and only the VITS2 plugin
+honoured it. Unpaid, the first utterance carried two separate costs, both measured
+on Orin5:
+
+| cost | measured | note |
+|---|---|---|
+| CUDA kernels + memory pool | 1695 ms | first utterance 2361 ms vs 342 ms for the second |
+| pythainlp lazy corpus load | **3183 ms** | `normalize()`'s first call; 0.2 ms after |
+
+The frontend is the larger of the two and is pure CPU. `TTSAdapter.warmup()`
+synthesizes `dry_run_text`, which goes through the adapter's own frontend and so
+covers both; measured 1.29 s at load on device.
+
+### Throughput, and why `device: cpu` is not viable for Thai
+
+Measured on Orin5 for a 5 s Thai utterance:
+
+| device | RTF | first frame (warm) |
+|---|---|---|
+| `gpu` (cuda) | **0.07 – 0.13** | 342 – 665 ms |
+| `cpu` | **0.96 – 1.04** | ~5000 ms |
+
+On CPU this model is barely realtime — no headroom, and first audio arrives about
+when the utterance would have ended. Use `device: gpu` for `mms-th`. (An earlier
+note here cited RTF 0.31 for CPU; that was measured on an x86/arm64 dev laptop, not
+on an Orin, and is not representative.)
+
+Total wall time from speak to the *last* frame is necessarily ≥ the audio duration:
+the node paces publication at exactly realtime, deliberately — see
+`FRAME_INTERVAL_S`, where over-delivering by 30 ms per frame made the browser player
+rewind its schedule and play overlapped at 1.43x.
+
+### The Thai deps are pinned per Python version, and `requires_python` lies
+
+jp6.1 is cp310, **jp5.11 is cp38**, and both `pythainlp` and `khanaa` declare
+`requires_python >= 3.7` while shipping code that cannot be imported on 3.8. Each
+annotates a module-level name with a PEP 585 builtin generic — `_THAI_DICT:
+dict[str, list]`, `def find_same_sound_consonant(...) -> list[str]` — and those are
+evaluated at runtime, so the import raises:
+
+```
+TypeError: 'type' object is not subscriptable
+```
+
+pip installs them happily first. This is why the jp5.11 build failed on the first
+attempt with `pythainlp==5.2.0`, and why reading a changelog is not verification
+here — the metadata is simply wrong.
+
+| package | cp38 (jp5.11) | cp310+ (jp6.1) | newer versions on cp38 |
+|---|---|---|---|
+| `pythainlp` | `5.0.4` | `5.3.7` | 5.0.5+ all raise the TypeError |
+| `khanaa` | `0.0.6` | `0.1.1` | 0.1.0+ raise it |
+
+Both older pins also have **different APIs**, and both differences are absorbed in
+`plugins/thai_frontend.py` rather than pushed onto callers:
+
+- `khanaa` 0.0.6 spells with `SpellWord().spell_out(...)` where 0.1.1 uses
+  `Kham(...).form`. `_load_khanaa` returns one uniform callable for either. Verified
+  on cp38 that they agree — `สต+เอะ+ก+tone 3` → `เสต๊ก`, `บ+อู` → `บู`.
+- `pythainlp` 5.0.4 has no `expand_maiyamok`, and its `maiyamok` takes a token list
+  where 5.3.7's takes a string (passing a string raises `IndexError`). So the
+  frontend expands `ๆ` itself, which also fixes a leading `ๆ` that 5.0.4's helper
+  crashes on.
+
+The loaders catch `Exception`, not `ImportError`: a pure-Python package failing at
+import time with a `TypeError` is exactly the case here, and an `ImportError`-only
+guard let it escape `normalize()` and kill the utterance.
+
+Verified by running the real frontend inside the actual jp5.11 perception image
+(Python 3.8.10) — output is byte-identical to cp312 for every case, including
+`Bumi` → `บูมิ`, `WiFi` → `ไวไฟ`, `你好` → `หนี ห่าว` and `ต่างๆ` → `ต่างต่าง`. There
+is no degraded JetPack line.
+
+The image therefore carries a build-time self-check *after* the source COPY that
+runs `normalize()` on the shipped interpreter and asserts the vocabulary invariant.
+Importing the dependencies is a weaker test: it passes while an API difference is
+still waiting to crash on one line only.
+
+The adapter also refuses to construct without `pythainlp`. The frontend's
+per-transliterator fallbacks are deliberately quiet, but losing number conversion
+is not survivable — the digits `3` and `5`-`9` are not in the token table, so they
+vanish from the audio and the card would report `running` while mispronouncing every
+utterance carrying a number.
+
+### Adding a Thai voice, or replacing this one
+
+```bash
+pip3 install torch transformers onnx onnxruntime soundfile   # not in the image
+python3 tools/export_mms_thai_onnx.py --repo <hf-repo> --out /tmp/thai-tts
+```
+
+The script refuses a checkpoint that is not 16 kHz or not single-speaker, and its
+self-check fails if the ONNX output is silent, disagrees with torch on duration, or
+ignores `length_scale` (which would make the card's `speed` field decoration).
+
+Two metadata keys decide whether the result loads at all, and getting either wrong
+is worse than an ordinary error:
+
+- **`frontend` must be exactly `characters`.** sherpa-onnx's
+  `OfflineTtsVitsImpl::InitFrontend` dispatches on that string; anything else
+  reaches the lexicon branch, which logs "Not a model using characters as modeling
+  unit" and calls `SHERPA_ONNX_EXIT(-1)` — a **process exit**, so `main.py`'s
+  try/except around the TTS plugin cannot turn it into a card in `state: error`,
+  and ASR, VOP and OCR go down with it. `_validate_thai_manifest` checks the
+  release's `manifest.json` before constructing `OfflineTts` so this fails as an
+  exception instead.
+- **`comment` must not contain `piper`, `coqui` or `Inflect`.** Those select
+  different, shorter ONNX input layouts in `OfflineTtsVitsModel::Run`.
+
+Then tar `model.onnx`, `tokens.txt`, `manifest.json` and `LICENSE`, upload to
+`public/` with credentials from `resource-center/deploy/values.env`
+(`prisma/articles/upload-figs.js` cannot — it only accepts image extensions and
+forces its own key shape), **re-download from COS and hash that copy**, and paste
+the verified `size`/`sha256` into `THAI_TTS_ARCHIVE`. Hashing the local file you
+uploaded defeats the point of the pin, which is to catch a bad transfer.
+
 ## sherpa-onnx Device Selection
 
 `device: cpu | gpu` (under `plugins.asr` and `plugins.tts` in `config.yaml`, and on
@@ -108,9 +711,10 @@ on gpu ASR was enough to exhaust memory: perception was restarted in a loop, Age
 Core could not reach port 15720, and the dashboard rolled the project back and the
 cards vanished. Budget for it before enabling.
 
-TTS is simpler: Matcha is fp32 only, so both devices load the same files and
-`device` only picks the provider (gpu measured ~4.3x). The `vits2_trt` engine
-ignores `device` entirely — it is a TensorRT engine and never touches ONNX Runtime.
+TTS is simpler: Matcha and the Thai MMS model are fp32 only, so both devices load
+the same files and `device` only picks the provider (Matcha measured ~4.3x). The
+`vits2-zh-en` engine ignores `device` entirely — it is a TensorRT engine and never
+touches ONNX Runtime.
 
 `device: gpu` also needs a CUDA sherpa-onnx wheel. Both Jetson images install one —
 jp5.11 and jp6.1 each have their own build, because the wheel is tied to a
@@ -337,7 +941,7 @@ fp16 weights, and the registry test rejects it.
   `_vad_segment_sync`). silero infers one 512-sample window at a time — too little
   work to amortise a kernel launch plus two copies per 32 ms of audio — and in
   `_vad_worker` it would hold a second CUDA context in a child process.
-- **`vits2_trt` TTS**, as above: TensorRT, not ONNX Runtime.
+- **`vits2-zh-en` TTS**, as above: TensorRT, not ONNX Runtime.
 
 ### GPU bundle distribution
 
@@ -683,6 +1287,442 @@ the dashboard read "running", and there was no sound.
 and `stop` whatever left it (`api/config.py: stop_removed_cards`). So when you see
 an orphan, check both sides: the plugin's locking *and* whether a `stop` for that
 instance_id ever showed up in the log.
+
+---
+
+## Face Recognition
+
+`plugins/face.py` — a `processor` card named **`face_recognition`**. Subscribes to an
+`image/jpeg` topic, publishes identities on `{input_topic}/face` as `data/json`, and
+enrols new people from a photo, the live stream, or a batch package.
+
+### Models
+
+InsightFace **buffalo_sc**, the smallest pack that still ships landmarks (alignment
+needs them):
+
+| File | Size | Role |
+|------|------|------|
+| `det_500m.onnx` | 2.5 MB | SCRFD-500M-BNKPS — detection + 5 keypoints |
+| `w600k_mbf.onnx` | 13 MB | ArcFace MobileFaceNet — 512-d embedding |
+
+Both run on the **standalone `onnxruntime`**, which is a second, independent ONNX
+Runtime from the one compiled into the sherpa-onnx wheel (ASR/TTS reach only that
+one; there is no supported way to run our own models on it).
+
+`device: auto | cpu | gpu`, default **auto** — use the GPU when the installed
+onnxruntime offers a CUDA or TensorRT provider, else CPU. `auto` resolving to cpu
+is not warned about, because it is the expected outcome on this image: it ships
+the **CPU wheel**, so today `auto` always means cpu. An explicit `gpu` that cannot
+be honoured warns and degrades. A per-JetPack `onnxruntime-gpu` wheel on COS is
+the follow-up, mirroring `SHERPA_GPU_WHEEL` in `Dockerfile.jetson`; nothing else
+has to change when it lands, because `auto` will pick it up.
+
+#### The onnxruntime version is pinned, and 1.19.x must not be used
+
+**One version for both JetPack lines: 1.18.1.** That is what sherpa-onnx bundles on
+jp6.1 (`sherpa_onnx/lib/libonnxruntime.so.1.18.1`), so on that line the two mapped
+runtimes are ABI-identical. It runs on jp5.11 too — its cp38 aarch64 wheel is
+manylinux_2_28 and focal has glibc 2.31 — verified on Orin5 (Ubuntu 20.04, glibc
+2.31, Python 3.8) building a session and inferring. A per-line split was tried
+first and dropped: nothing required it, and one version is one thing to reason
+about.
+
+`ORT_VERSION` is an `ARG` on the onnxruntime step itself, **not** in
+`/etc/jetpack.env`, because that file is layer 2 — see § Where this layer sits.
+
+**onnxruntime 1.19.2 abort()s the whole perception process** during
+`InferenceSession()` on a Jetson where some cores are parked. It enumerates
+`/sys/devices/system/cpu/present` and pins threads to every core in it; on Tianyi
+in MODE_30W (`present` 0-11, `online` 0-7) `pthread_setaffinity_np` returns EINVAL
+and a `std::vector` index then goes out of range:
+
+```
+pthread_setaffinity_np failed for thread: 31, index: 1, mask: {9, }, error code: 22
+stl_vector.h:1123 ... Assertion '__n < this->size()' failed.  Fatal Python error: Aborted
+```
+
+Measured on Tianyi: 1.19.2 aborts with **every** `SessionOptions` combination,
+including none at all, so no amount of configuration avoids it; 1.18.1, 1.17.3 and
+1.16.3 each build a session and return all 9 SCRFD outputs. The build asserts the
+installed version is not 1.19.x, and `warn_on_parked_cores()` logs the
+present/online mismatch at load time — an abort leaves no Python traceback, so the
+precondition has to be in the log *before* the session is created.
+
+Orin6 has `present == online`, so this never reproduces there. Judge it on a robot
+whose power mode parks cores.
+
+#### Where this layer sits, and why that matters more than it looks
+
+The onnxruntime step is the **last of the dependency layers**, below everything
+ASR/TTS/VOP/OCR share and above only the `COPY` of application code.
+
+That placement is the whole safety story. A layer inserted higher up invalidates
+the Docker cache for every layer below it, and several of those install
+**unpinned** — `ultralytics` and `phonemizer` have no version constraint — so they
+silently re-resolve to whatever is newest on the next build. An earlier revision of
+this change put `ORT_VERSION` in `/etc/jetpack.env` near the top of the file, and
+that alone moved `ultralytics` 8.4.138 → 8.4.142 in the built image, with nothing
+to do with face recognition. Measured by diffing `pip freeze` between the old and
+new images.
+
+So the rule for this layer: it must stay below every shared layer, and anything it
+needs must be resolved *in* it. Against `main` the Dockerfile diff is a single
+additive hunk — 74 lines added, **0 removed** — so no shared layer's inputs change
+and no other algorithm's dependencies can drift because of it.
+
+#### Its dependencies are deliberately not installed
+
+`pip install --no-deps`. A resolved install pulls in protobuf, coloredlogs,
+humanfriendly and flatbuffers — and measured on the jp6.1 image, **protobuf was
+not present at all** beforehand, so a plain install would introduce protobuf
+7.36.1 into an image where rapidocr, TensorRT and ROS2 all live. None of it is
+needed for inference: verified on Tianyi that with `--no-deps` and none of those
+packages present, `InferenceSession` builds and `run()` returns all 9 outputs. So
+this layer adds exactly one package and touches nothing else — numpy included,
+which matters because the torch/cv2/rapidocr stack is built against a specific
+numpy C-ABI.
+
+The `insightface` package is deliberately not a dependency: it wants onnx,
+scikit-image, scikit-learn and Cython to wrap ~200 lines of pre/post-processing.
+Those 200 lines are in `plugins/face_runtime.py` instead — the SCRFD decode there
+(strides 8/16/32, 2 anchors per location, distance-coded boxes and keypoints) is a
+wire format, not a design choice, and was verified against the real model:
+`det_500m.onnx` has 9 outputs and `12800 = 80x80x2` rows for stride 8 at 640px.
+
+Alignment uses an explicit Umeyama similarity fit, **not**
+`cv2.estimateAffinePartial2D`: that runs RANSAC/LMEDS, and on exactly five
+correspondences a robust estimator can discard a point and return a different
+transform run to run, which would make one photo produce different embeddings.
+
+#### Re-hosting the models
+
+`FACE_MODEL_BASE` points at COS, not the upstream GitHub release: the release URL
+redirects to a signed, expiring `release-assets.githubusercontent` URL that cannot
+be pinned, and the robots have no reliable route to GitHub. To refresh, download
+`buffalo_sc.zip` from the insightface v0.7 release, upload the two `.onnx` files to
+`public/face/buffalo_sc/` with credentials from `resource-center/deploy/values.env`
+(`prisma/articles/upload-figs.js` cannot do it — it only accepts image extensions
+and forces its own key shape), then re-download from COS and paste the *verified*
+`size`/`sha256` into `FACE_MODEL_FILES`.
+
+### The person record: `name` vs `profile`
+
+The split is about **what gets published**:
+
+| field | type | in the per-frame payload | what it is |
+|---|---|---|---|
+| `id` | str | yes | `p-N` (named) or `unknown-N` |
+| `name` | str | yes | 姓名, structured. A non-blank name is what makes an entry *named* |
+| `profile` | object | yes | 非结构化: gender, appearance, notes, tags - whatever the operator wants the agent to have in context |
+| `registered_at` | float | no | when the identity was created |
+| `last_seen_at` | float | no | most recent sighting |
+
+The timestamps are deliberately out of the payload: they change every frame (or
+never), and "when was this person around" is a question the **visit log** answers
+properly and a per-frame field cannot.
+
+A `profile` sent as a plain string is stored as `{"note": ...}` rather than
+rejected - an LLM will occasionally send prose where an object is expected.
+
+A database written by the pre-split build migrates on load: the old free-text
+`profile` becomes `name`, the old structured `meta` becomes `profile`, and
+`created_at` becomes `registered_at`. `persons.json` carries `version: 2`.
+
+### 访问记录表 - the visit log
+
+`visits.jsonl`, one line per **visit**, where a visit is a contiguous presence:
+
+```json
+{"person_id": "p-1", "name": "小王", "first_seen": 1788780000.0,
+ "last_seen": 1788783600.0, "sightings": 3417, "topic": "/cam/rgb"}
+```
+
+`list_visits` takes `person_id`, `since`, `until`, `limit`, `offset`. `since` and
+`until` accept epoch seconds **or** ISO-8601 (`2026-09-07T15:00`), because an
+operator asking "who was here at 3pm" thinks in wall-clock and an LLM will send a
+string. Filtering is by **overlap, not containment**: somebody present
+14:50-15:10 *was* there at 15:00, and a query for 15:00-15:05 has to say so.
+
+Three design points that are not obvious:
+
+**One row per visit, not per frame.** At the default 1 detection/second a
+per-frame log would be 86 400 writes a day per person onto eMMC, carrying no
+information a visit does not.
+
+**`visit_gap_s` is 10 minutes.** A visit closes only after the person has been
+unseen that long. A short gap would fragment one afternoon in the office into
+dozens of rows every time somebody turned their head.
+
+**Open visits are checkpointed, because that 10-minute gap is a data-loss
+window.** Somebody present all afternoon is a single visit held in memory for
+hours, and a robot that loses power would lose the whole record - not just the
+tail. So `visits-open.json` is rewritten at most every `visit_checkpoint_s`
+(60 s), bounding the loss to a minute of `last_seen`/`sightings`. On startup a
+checkpointed visit is **resumed** if its subject was seen recently, or closed and
+appended if they left while the process was down. The checkpoint is written
+*after* the append when a visit closes, so a crash in between replays a closed
+visit rather than dropping it - a duplicate is recoverable, a loss is not.
+Stopping an instance force-closes its open visits for the same reason.
+
+`list_visits` also returns visits still in progress, flagged `open: true`, so the
+10-minute close latency does not hide who is in the room right now.
+
+### Actions: register vs recognize
+
+Symmetric by suffix, and the two halves differ in more than direction:
+
+| | photo | stream | corpus |
+|---|---|---|---|
+| **register** (writes) | `register_by_photo` | `register_by_stream` | `register_by_corpus` |
+| **recognize** (read-only) | `recognize_by_photo` | `recognize_by_stream` | - |
+
+`recognize_*` is **read-only**: it neither auto-enrols the stranger it failed to
+match nor records a sighting. Asking "who is this" must not quietly change the
+answer. It also does **not** apply `subject_dominance`: that gate exists because
+enrolment has to resolve to exactly one person, whereas a query can just report
+everyone it sees. So a two-person photo is answered with two identities by
+`recognize_by_photo` and refused with `ambiguous_subject` by `register_by_photo` -
+same input, opposite handling, both correct.
+
+An unmatched face comes back as `person_id: null` with a `best_score`, which is
+the number an operator needs to decide whether `match_threshold` is too strict.
+
+`recognize_by_stream` scans the last **1 s** by default (not the 3 s enrolment
+window - the question is "who is in front of me now"), reports each person once at
+their best score across those frames, and falls back to reporting the clearest
+unidentified face so the answer is "someone I do not know" rather than "nobody".
+
+### Identity database
+
+`plugins/face_db.py`, default `/models/face_db` — `/models` is the only host-mounted
+writable path this container has (`deploy/service.yml`).
+
+Two files, and **`persons.json` is the commit point**: it names the
+`embeddings-<n>.npy` it belongs to, is replaced last, and the superseded matrix is
+unlinked only after that succeeds. Writing `embeddings.npy` in place instead means
+two `os.replace` calls with a window where the row count and the owner list
+disagree — which silently misattributes every identity after the missing row.
+
+Matching is one `matrix @ embedding`: both sides are L2-normalised, so the dot
+product *is* the cosine and no `sklearn` is needed. Rows are per **sample**, and a
+person's score is their best sample — a mean-vector centroid would blur the pose
+variation that several enrolment photos exist to capture, and could push a real
+match below threshold when a second photo is added.
+
+Ids are `p-N` for named people and `unknown-N` for strangers, from monotonic
+counters that never decrease: a retired id must not resolve to a different person
+later, because it may already be on the activity stream and in the agent's history.
+
+### Recognising
+
+Published payload (`{input_topic}/face`):
+
+```json
+{"ts": 1788777509.34, "count": 1, "latency_ms": 28,
+ "faces": [{"person_id": "p-1", "name": "小王", "profile": {"gender": "male"},
+            "known": true, "score": 0.61, "bbox": [207, 186, 149, 206],
+            "det_score": 0.811, "blur": 1484.2, "min_side_px": 149,
+            "quality": "ok"}]}
+```
+
+A stranger who clears the quality gate is auto-enrolled and reported as
+`unknown-N`, with the **same id on every later sighting and after a restart** —
+which is what makes `register_by_stream` able to name them retroactively.
+
+Detection runs at **`detect_fps`** — 检测频率, detections per second, default
+**1.0**, fractional allowed (`0.5` = once every two seconds, `0` = every frame the
+camera delivers). It is per-instance, so two cameras can run at different
+cadences. Expressed as a frequency rather than a minimum interval because that is
+what an operator reasons about, and it stays meaningful when the camera's own rate
+changes. (`min_interval_ms`, the knob this replaced, is still honoured when
+`detect_fps` is absent, so a canvas saved by an earlier build keeps working.)
+
+A face that *fails* the gate is reported with `person_id: null`, `quality: "low"`
+and a `reason`, and is neither matched nor enrolled. Matching a blurred 30 px face
+is a coin flip, and enrolling one would spend an `unknown-N` slot forever on a
+smear that never matches anything again. Relax `min_face_px` / `blur_min` if you
+want identities at greater distance.
+
+`match_threshold` defaults to **0.35**. Measured separations on this model, same
+photo transformed: same face at half resolution **0.983**, same face +35
+brightness **0.979**, a different person **-0.108**. Real same-person /
+different-photo scores sit well below the first two, so **tune this against your own
+faces and record what you saw** — 0.35 is a starting point, not a measurement.
+
+### Registering, and why it fails
+
+Any channel can fail for mundane physical reasons, so all three return
+`{"ok": false, "reason": ..., "detail": ...}` rather than raising:
+
+| `reason` | Condition |
+|----------|-----------|
+| `no_face` | no detection anywhere in the input |
+| `low_quality` | best face fails `det_thresh` / `min_face_px` / `blur_min`; the detail names each gate with the measured value |
+| `ambiguous_subject` | ≥2 faces pass the gate and the primary is not `subject_dominance`x the runner-up; every candidate's bbox and score is returned |
+| `no_frames` | no running instance, or nothing in the window |
+| `bad_input` | undecodable image, unreachable URL, unreadable package, path outside `image_roots` |
+
+A real `low_quality` detail, from the group photo in the end-to-end check:
+
+```
+no clear face: face 53 px < 64 px (move closer); sharpness 41.4 < 60.0 (hold still)
+```
+
+Prominence is area discounted 40% for being off-centre — pure area picks the
+bystander standing nearer the lens edge, pure centrality picks a distant face
+framed dead-on.
+
+| Action | Input |
+|--------|-------|
+| `register_by_photo` | `image_path` — uploaded from the card, or written to `/uploads` (see below) — plus `name` and `profile` |
+| `register_by_stream` | `instance_id` + `name`; analyses **every frame in the last `enroll_window_s`** (default 3 s, up to `enroll_max_analyzed` of them, newest first) |
+| `register_by_corpus` | `package`: a directory, `.zip` or `.tar.gz`, by path or URL |
+
+#### Getting a photo *into* this container
+
+Not obvious, and it produced two real failures before being fixed.
+
+perception and agent-core share **no filesystem**: agent-core mounts
+`/opt/phanthy-motus` and `/opt/phanthy-motus/data`, perception mounts `/dev` and
+`/opt/embodied/models`. The intersection is empty, and each container's `/tmp`
+and `/work` is its own. So an LLM that downloads a photo inside agent-core and
+passes `image_path: /work/daiwen.jpg` names a file that genuinely exists — just
+not here. That was failure one. Its next attempt, `image_b64`, failed too: the
+photo was 43 800 base64 characters, which does not survive being carried through
+a model's own context, so what arrived was truncated.
+
+**base64 input has been removed**, and files now move through a proxy:
+
+```
+browser / LLM ──upload──▶ agent-core  POST /api/mcp/{mcp_id}/file/upload
+                              │  looks the target's address up in the MCP
+                              │  registry, streams the body on in 1 MiB chunks
+                              ▼
+                          perception  POST /file/upload
+                              │  writes to file_intake.dir (/models/uploads)
+                              ▼
+                     ◀──reply── {"path": "/models/uploads/2026-09-08/alice.jpg"}
+                          that path is used verbatim as image_path
+```
+
+The reply carries the path **in the receiving container's own namespace**, so
+there is one viewpoint and nothing to translate. No shared mount is involved,
+which also means no container has to be recreated to enable it.
+
+The address comes from the MCP registry — every service reports `url` when it
+registers — so this one route covers perception, actucore and every driver even
+though their ports all differ. `utils/file_intake.py` is stdlib-only for the same
+reason: the drivers run a bare `ThreadingHTTPServer`, so they can adopt the
+identical endpoint in about five lines.
+
+On the card, `image_path` is declared `"format": "file"` with
+`"uploadTo": "mcp"`, which is what routes the canvas file picker through the
+proxy instead of agent-core's own `/api/file/upload`. Omitting `uploadTo` keeps
+the old behaviour, which is correct for a tool agent-core serves itself
+(`remote_image`, `remote_audio`).
+
+Details worth knowing about the receiving end:
+
+* **Size is capped while writing**, not after, so an oversized body is never
+  fully committed to disk or held in memory. Files land under a `.part` name and
+  are renamed, so a reader listing the directory never sees half a file.
+* **Filenames are reduced to one component** and keep CJK characters — the
+  people using this name their files in Chinese — after NFC normalisation, so a
+  macOS upload and a Linux one produce the same name rather than two files that
+  look identical.
+* **`subdir` is refused rather than sanitised** if it contains a separator.
+  Sanitising turned `../escape` into `.._escape`, a valid name, so the write
+  succeeded somewhere the caller did not ask for and nothing said so.
+* **Uploads are pruned after `retention_days`** (7). They are a transfer buffer,
+  not storage: enrolment keeps the *embedding* and never the photo, so without
+  this the directory grows forever on a 57 GB eMMC.
+* **Auth is by reachability, not a secret.** The endpoint honours `ACCESS_TOKEN`
+  if the service has one, but perception is not given one today (verified on
+  Tianyi) — and the port already serves `tools/call`, so anything that can reach
+  it can already drive the plugin.
+
+Verified on Tianyi: 200 KB of random binary round-trips byte-identically through
+the real endpoint with a Chinese filename, returning `/…/2026-09-08/戴文渊.jpg`.
+
+Passing `image_b64` now returns a `bad_input` naming the mechanism that works,
+and a path outside `image_roots` says to upload through the proxy or use
+`register_by_url` — an LLM told only "cannot read" retries with another
+invisible path, which is exactly what happened.
+
+`register_by_stream` averages the agreeing frames rather than trusting one
+grab, and refuses with `ambiguous_subject` when fewer than half the usable frames
+agree with each other — two people taking turns being the dominant face would
+otherwise be enrolled as one identity matching neither.
+
+Enrolment never silently duplicates. A new face matching an existing **named**
+person is added as another sample (`merged: true`); matching an **`unknown-N`**
+promotes that entry **keeping its id** (`promoted: true`), so earlier sightings stay
+attributable.
+
+#### Batch package layout
+
+Images plus an optional `manifest.json`, in either shape:
+
+```json
+[{"file": "alice.jpg", "name": "Alice from ops", "person": "alice", "profile": {"badge": "A7"}}]
+{"alice.jpg": "Alice from ops"}
+```
+
+Fallbacks in order: a sidecar `alice.json` / `alice.txt`, then the filename stem. A
+shared `person` key merges several photos into one identity. Archive members that
+are absolute, contain `..`, or are not regular files are skipped and logged.
+
+The result carries **one record per photo**, so a 40-person batch says exactly which
+people registered and why each of the rest did not:
+
+```json
+{"ok": true, "total": 40, "registered": 37, "failed": 3,
+ "results": [{"file": "alice.jpg", "ok": true, "person_id": "p-9"},
+             {"file": "bob.jpg", "ok": false, "reason": "low_quality", "detail": "..."},
+             {"file": "team.jpg", "ok": false, "reason": "ambiguous_subject", "candidates": [...]}]}
+```
+
+Synchronous, capped at `max_batch` (200); over the cap it returns `bad_input` naming
+the count rather than hanging the MCP client.
+
+### Roster CRUD
+
+`list_persons` (`named` = all/named/unknown, `query` over id+name+profile,
+`limit`, `offset`), `get_person`, `update_person` (`name`, `profile`,
+`profile_delete[]`, `merge` — default merges, `merge: false` replaces), `forget`
+(or `named: "unknown"` to clear every anonymous entry), and `list_visits`.
+Setting a non-blank `name` on an `unknown-N` names it in place, keeping the id.
+Reads never return embeddings.
+
+`unknown_capacity` (default 500, editable on the card) bounds automatic enrolment
+only; lowering it evicts the excess immediately, oldest `last_seen_at` first, and
+reports how many went. Named people are never candidates.
+
+### Tool-name dispatch
+
+`face_recognition` is the first `PREFIX` containing an underscore.
+`PerceptionBundle.dispatch`/`owns` used to split on the first `_` and compare that
+to `PREFIX`, which made such a name undispatchable — it resolved to a plugin called
+`face`, matched nothing, and reported the tool as unknown. Both now go through
+`_plugin_for`, which matches the **longest** prefix; `tests/test_bundle_dispatch.py`
+pins that and that the two functions can never disagree.
+
+### Verifying
+
+The pytest suite fakes the analyzer — a host-side suite must not need models or
+onnxruntime — and covers the lifecycle, all five reason codes, `unknown-N`
+stability and promotion, id retirement, capacity eviction, profile CRUD, the
+visit log (sessionisation, checkpoint recovery, overlap queries), batch
+per-item results and zip traversal (`tests/test_face_plugin.py`,
+`tests/test_face_db.py`).
+
+What that cannot cover is the decode itself, so it was checked separately against
+the real models: a known similarity transform recovered to 4e-6, all 5 landmarks
+inside their bbox on real photos, and the identity separations quoted above. On
+hardware, confirm `info` goes `loading → ready`, that `{topic}/face` publishes,
+and — because two ONNX Runtimes share the process — that an ASR utterance is still
+transcribed and TTS still speaks with the card running.
 
 ---
 

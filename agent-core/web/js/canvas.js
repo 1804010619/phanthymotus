@@ -11,6 +11,8 @@
  * Cards: pointer-capture drag within viewport (world coords)
  */
 
+import { showToast } from './toast.js';
+
 import { showTopicDetail } from './detail-panel.js';
 import { showToolDetail, isToolConfigured, isInstanceConfigured, openInstanceConfigModal, hasSharedRequired } from './sidebar.js';
 import { toggleMicStream, isMicActive } from './mic-stream.js';
@@ -64,15 +66,10 @@ async function _ensureEdit() {
   }
 }
 
+// Thin wrapper over the shared implementation so every existing call site
+// keeps working unchanged; the canvas still hosts its toast inside _canvasEl.
 function _showToast(msg) {
-  const old = document.getElementById('canvas-toast');
-  if (old) old.remove();
-  const toast = document.createElement('div');
-  toast.id = 'canvas-toast';
-  toast.textContent = msg;
-  toast.style.cssText = 'position:absolute;bottom:80px;left:50%;transform:translateX(-50%);width:fit-content;max-width:80%;background:rgba(28,25,23,.85);color:#fff;padding:10px 20px;border-radius:20px;font-size:13px;z-index:9999;pointer-events:none;opacity:0;animation:canvas-toast-in 2.5s ease forwards;';
-  _canvasEl.appendChild(toast);
-  setTimeout(() => toast.remove(), 2600);
+  showToast(msg, _canvasEl);
 }
 
 // Connection state
@@ -780,7 +777,9 @@ function _buildCardEl({ id, mcpId, toolName, driverName, x, y, topicIn: savedTop
           inputHtml = `<select class="canvas-field-input" data-key="${_esc(key)}">${opts}</select>`;
         } else if (def.format === 'file') {
           const accept = def.accept || '*/*';
-          inputHtml = `<div class="canvas-field-file"><input type="hidden" class="canvas-field-input" data-key="${_esc(key)}"><button type="button" class="canvas-file-btn" data-accept="${_esc(accept)}">Choose File</button><span class="canvas-file-name"></span></div>`;
+          const uploadDir = def.uploadDir || '';
+          const uploadTo = def.uploadTo || '';
+          inputHtml = `<div class="canvas-field-file"><input type="hidden" class="canvas-field-input" data-key="${_esc(key)}"><button type="button" class="canvas-file-btn" data-accept="${_esc(accept)}"${uploadDir ? ` data-upload-dir="${_esc(uploadDir)}"` : ''}${uploadTo ? ` data-upload-to="${_esc(uploadTo)}"` : ''}>Choose File</button><span class="canvas-file-name"></span></div>`;
         } else {
           const type = def.type === 'number' || def.type === 'integer' ? 'number' : 'text';
           const desc = def.description || '';
@@ -871,25 +870,52 @@ function _buildCardEl({ id, mcpId, toolName, driverName, x, y, topicIn: savedTop
         const fileInput = document.createElement('input');
         fileInput.type = 'file';
         fileInput.accept = btn.dataset.accept || '*/*';
+        // Two destinations, and which is correct depends on who reads the file.
+        //
+        //   uploadTo: 'mcp'  → POST /api/mcp/<id>/file/upload, which streams the
+        //     bytes to the service owning this tool. That service writes them
+        //     where it can see them and returns *its own* absolute path. This is
+        //     the only thing that works when the tool runs in another container:
+        //     agent-core and perception share no filesystem, so a path minted
+        //     here is meaningless there.
+        //   default → agent-core's own /tmp/uploads, right for a tool that
+        //     agent-core serves itself (remote_image, remote_audio).
+        const uploadTo = btn.dataset.uploadTo || '';
+        const uploadDir = btn.dataset.uploadDir || '/tmp/uploads';
         fileInput.onchange = async () => {
           if (!fileInput.files[0]) return;
           btn.textContent = 'Uploading...';
           const form = new FormData();
           form.append('file', fileInput.files[0]);
-          form.append('path', '/tmp/uploads');
+          let endpoint = '/api/file/upload';
+          if (uploadTo === 'mcp') {
+            endpoint = `/api/mcp/${encodeURIComponent(mcpId)}/file/upload`;
+          } else {
+            form.append('path', uploadDir);
+          }
           try {
-            const res = await fetch('/api/file/upload', { method: 'POST', body: form });
+            const res = await fetch(endpoint, { method: 'POST', body: form });
             const data = await res.json();
             if (data.code === 200) {
-              hiddenInput.value = '/tmp/uploads/' + fileInput.files[0].name;
+              // The proxy replies with the receiving container's own path; the
+              // local endpoint does not, so derive it as before.
+              hiddenInput.value = uploadTo === 'mcp'
+                ? ((data.data && data.data.path) || '')
+                : uploadDir.replace(/\/$/, '') + '/' + fileInput.files[0].name;
               nameSpan.textContent = fileInput.files[0].name;
               btn.textContent = 'Re-select';
             } else {
+              // Surface the reason: the proxy distinguishes "the service is not
+              // listening" (an image predating the endpoint) from "it refused
+              // the file", and a bare "Failed" hides which.
               btn.textContent = 'Failed';
+              btn.title = data.message || '';
+              console.warn('[canvas] upload failed:', data.message || data);
               setTimeout(() => { btn.textContent = 'Choose File'; }, 2000);
             }
           } catch (err) {
             btn.textContent = 'Error';
+            btn.title = String(err);
             setTimeout(() => { btn.textContent = 'Choose File'; }, 2000);
           }
         };
@@ -920,7 +946,9 @@ function _buildCardEl({ id, mcpId, toolName, driverName, x, y, topicIn: savedTop
         inputHtml = `<select class="canvas-field-input" data-key="${_esc(key)}">${opts}</select>`;
       } else if (def.format === 'file') {
         const accept = def.accept || '*/*';
-        inputHtml = `<div class="canvas-field-file"><input type="hidden" class="canvas-field-input" data-key="${_esc(key)}"><button class="canvas-file-btn" data-accept="${_esc(accept)}">选择文件</button><span class="canvas-file-name"></span></div>`;
+        const uploadDir = def.uploadDir || '';
+        const uploadTo = def.uploadTo || '';
+        inputHtml = `<div class="canvas-field-file"><input type="hidden" class="canvas-field-input" data-key="${_esc(key)}"><button class="canvas-file-btn" data-accept="${_esc(accept)}"${uploadDir ? ` data-upload-dir="${_esc(uploadDir)}"` : ''}${uploadTo ? ` data-upload-to="${_esc(uploadTo)}"` : ''}>选择文件</button><span class="canvas-file-name"></span></div>`;
       } else {
         const type = def.type === 'number' || def.type === 'integer' ? 'number' : 'text';
         const desc = def.description || '';
@@ -989,6 +1017,13 @@ function _buildCardEl({ id, mcpId, toolName, driverName, x, y, topicIn: savedTop
             if (!key || key === 'action') return;
             field.style.display = paramKeys.includes(key) ? '' : 'none';
           });
+          // Showing/hiding fields changes the card's height, which moves every
+          // port on it. _redrawConnections reads live getBoundingClientRect,
+          // so it is correct whenever it runs — it just was not running here,
+          // leaving connection lines anchored to where the ports used to be.
+          // Most visible on a tool whose actions differ a lot in parameter
+          // count (face_recognition: 4 params for list_persons, 0 for stop).
+          _redrawConnections();
         };
         actionSelect.addEventListener('change', async () => {
           if (!(await _ensureEdit())) {
@@ -1057,17 +1092,23 @@ function _buildCardEl({ id, mcpId, toolName, driverName, x, y, topicIn: savedTop
         const fileInput = document.createElement('input');
         fileInput.type = 'file';
         fileInput.accept = btn.dataset.accept || '*/*';
+        // Where the upload lands. Defaults to agent-core's own /tmp/uploads,
+        // which is right for a tool served by agent-core itself (remote_image,
+        // remote_audio). A tool in *another* container cannot see that path, so
+        // its schema declares `uploadDir` pointing at a directory both
+        // containers mount — see perception's face_recognition card.
+        const uploadDir = btn.dataset.uploadDir || '/tmp/uploads';
         fileInput.onchange = async () => {
           if (!fileInput.files[0]) return;
           btn.textContent = 'Uploading...';
           const form = new FormData();
           form.append('file', fileInput.files[0]);
-          form.append('path', '/tmp/uploads');
+          form.append('path', uploadDir);
           try {
             const res = await fetch('/api/file/upload', { method: 'POST', body: form });
             const data = await res.json();
             if (data.code === 200) {
-              hiddenInput.value = '/tmp/uploads/' + fileInput.files[0].name;
+              hiddenInput.value = uploadDir.replace(/\/$/, '') + '/' + fileInput.files[0].name;
               nameSpan.textContent = fileInput.files[0].name;
               btn.textContent = 'Re-select';
             } else {
@@ -1955,8 +1996,17 @@ function _revalidateDerivedTopics() {
     // persisted — so re-derive it whenever the card has an input to derive from.
     // Once per card per page load: _fetchTopicsFromDriver drops a repeat request
     // for the same input.
+    // `want` is '' both when nothing feeds this card and when its source has not
+    // resolved yet, and those want opposite treatment: the first should be asked
+    // now (the driver answers with its default output), the second must wait or
+    // it would adopt that default over the topic it is about to derive. Treating
+    // them alike is what this function was written to fix but did not: TTS lost
+    // its inbound connection, so want was '' with hasReal true, and the guard
+    // below skipped it — the card kept '/remote_control/message/tts' while the
+    // driver published on '/perception/tts', and the panel stayed empty.
+    const inputless = !_connections.some(c => c.toCardId === card.id);
     if (known === undefined) {
-      if (want || !hasReal) _fetchTopicsFromDriver(card, want);
+      if (want || inputless || !hasReal) _fetchTopicsFromDriver(card, want);
       continue;
     }
     if (known !== want) _fetchTopicsFromDriver(card, want);
