@@ -249,6 +249,45 @@ def tool_state_of(result) -> tuple[str | None, str]:
     return state, message
 
 
+def _bound_inputs(info: dict) -> list:
+    """The input topics a started tool says it actually bound, per its info().
+
+    Only entries carrying a real `topic`. A multiInstance tool's schema declares
+    format-only inputs, and a tool that binds nothing reports the same shape —
+    neither is an answer to "which of these did you take".
+    """
+    return [t.get('topic') for t in (info.get('topic_in') or []) if t.get('topic')]
+
+
+def _dropped_inputs(info: dict, wanted: list) -> list:
+    """Which of the topics we handed a card it did not bind.
+
+    The canvas lets an operator draw several connections into one card, and
+    _resolve_input_topics faithfully passes every one of them. Almost nothing
+    downstream consumes more than the first: no driver reads `input_topics` at
+    all, perception's tts/ocr/face don't either, and asr/vop/visual_depth read
+    it only to take `topics_list[0]`. Today the extra connections are simply
+    not there at runtime, and the card reports 已就绪 — the operator sees two
+    lines on the canvas and one of them does nothing.
+
+    Judged on what the tool reports, not on a list of tools known to be
+    single-input: agentcore genuinely does subscribe to all of them and says
+    so, so it passes without needing an exemption, and a plugin that gains real
+    multi-input support stops being flagged the moment its info() reflects it.
+
+    Silent when there is nothing to judge on — fewer than two topics sent, or a
+    tool that reports no bound input at all. Absence of an answer is not
+    evidence of dropping, and a start-project that rolls back on a tool's
+    reticence would be worse than the bug.
+    """
+    if len(wanted) < 2:
+        return []
+    bound = _bound_inputs(info)
+    if not bound:
+        return []
+    return [t for t in wanted if t not in bound]
+
+
 async def _do_start_project_impl():
     """启动所有 canvas cards — 前端按钮和 auto-start 共用此函数。
 
@@ -386,6 +425,15 @@ async def _do_start_project_impl():
     # Resolved topic_out per card (populated after starting sources)
     resolved_topics: dict[str, list] = {}
 
+    async def _try_resolve(mcp_id: str, tool_name: str, card_id: str,
+                           info_args: dict) -> dict:
+        """_resolve_and_register, with its failure kept non-fatal."""
+        try:
+            return await _resolve_and_register(mcp_id, tool_name, card_id, info_args)
+        except Exception as error:
+            print(f'[start-project] {tool_name} info() failed: {error}')
+            return {}
+
     async def _start_and_resolve(card, input_topic: str = '', input_topics: list = None):
         """Start a card, then call info() to get its resolved topic_out."""
         mcp_id = card.get('mcpId', '')
@@ -400,10 +448,29 @@ async def _do_start_project_impl():
 
         args = {'action': 'start', 'instance_id': card_id}
         info_args: dict = {}
+        wanted: list = []
         if input_topics and len(input_topics) > 1:
+            wanted = list(input_topics)
             args['input_topics'] = input_topics
             info_args['input_topics'] = input_topics
+            # Send the singular form as well, naming the first input. No driver
+            # reads `input_topics` at all (grep phanthymotus-driver: zero hits)
+            # and perception's tts/ocr/face don't either, so the plural-only
+            # argument reached them as no input whatsoever — a multi-input card
+            # started bound to nothing. Consumers that do read the list check
+            # `input_topic` first and would have taken `topics_list[0]` anyway,
+            # so this changes nothing for them; agentcore merges the two and
+            # subscribes to the union.
+            #
+            # This is a floor, not multi-input support: a tool that binds only
+            # the first is still wrong, and _dropped_inputs below fails it. The
+            # point is that it fails saying which topic was ignored, instead of
+            # the driver's "Missing input_topic", which names neither the cause
+            # nor the card's second connection.
+            args['input_topic'] = input_topics[0]
+            info_args['input_topic'] = input_topics[0]
         elif input_topic:
+            wanted = [input_topic]
             args['input_topic'] = input_topic
             info_args['input_topic'] = input_topic
 
@@ -424,6 +491,10 @@ async def _do_start_project_impl():
                         'tool': tool_name, 'mcp_id': mcp_id, 'status': 'error', 'message': tool_message,
                     }})
                     errors.append(tool_name)
+                    # Kept for a failed card too, as before: the project is about
+                    # to roll back, but changing that here would be an unrelated
+                    # behaviour change riding along with this fix.
+                    await _try_resolve(mcp_id, tool_name, card_id, info_args)
                 elif tool_state == 'loading':
                     # The tool accepted the start but is not usable yet — it is
                     # fetching or building a model (perception TTS/OCR do this;
@@ -441,17 +512,33 @@ async def _do_start_project_impl():
                     _asyncio.create_task(
                         _settle_loading_item(mcp_id, tool_name, card_id, info_args)
                     )
+                    # Resolve topic_out for the downstream cards and register it
+                    # on the bus. Non-fatal: a card that cannot answer info()
+                    # still runs.
+                    await _try_resolve(mcp_id, tool_name, card_id, info_args)
                 else:
-                    print(f'[start-project] started {tool_name} ({mcp_id})')
-                    await push_event({'type': 'project_start_item', 'payload': {
-                        'tool': tool_name, 'mcp_id': mcp_id, 'status': 'ready',
-                    }})
-                # Resolve topic_out for the downstream cards and register it on
-                # the bus. Non-fatal: a card that cannot answer info() still runs.
-                try:
-                    await _resolve_and_register(mcp_id, tool_name, card_id, info_args)
-                except Exception as error:
-                    print(f'[start-project] {tool_name} info() failed: {error}')
+                    # info() has to run *before* the verdict, not after it: it is
+                    # what reveals which of the inputs the tool actually bound,
+                    # and a card that dropped one must not have been announced
+                    # ready first.
+                    info = await _try_resolve(mcp_id, tool_name, card_id, info_args)
+                    dropped = _dropped_inputs(info, wanted)
+                    if dropped:
+                        kept = [t for t in wanted if t not in dropped]
+                        message = (f'{tool_name} 只消费了 {", ".join(kept)}，'
+                                   f'忽略了 {", ".join(dropped)} —— 该工具一次只接一路输入，'
+                                   f'请把多余的连线拆到另一张卡片上')
+                        print(f'[start-project] {tool_name} ({mcp_id}) dropped inputs: {dropped}')
+                        await push_event({'type': 'project_start_item', 'payload': {
+                            'tool': tool_name, 'mcp_id': mcp_id, 'status': 'error',
+                            'message': message,
+                        }})
+                        errors.append(tool_name)
+                    else:
+                        print(f'[start-project] started {tool_name} ({mcp_id})')
+                        await push_event({'type': 'project_start_item', 'payload': {
+                            'tool': tool_name, 'mcp_id': mcp_id, 'status': 'ready',
+                        }})
             else:
                 # `message` is where mcp_call_tool puts the human-readable
                 # reason; `data` is None on those responses, so reading data

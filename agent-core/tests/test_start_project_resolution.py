@@ -49,6 +49,12 @@ SILENT = 'card-silent'
 # input_topic". mcp_call_tool returns every ordinary tool result as code 200,
 # so nothing about the transport marks this as a failure.
 REFUSER = 'card-refuser'
+# Two cards that differ only in how much of their input they actually take.
+# GREEDY subscribes to every topic it was handed and reports all of them, the
+# way decision_core does; PICKY takes the first and reports only that, the way
+# every driver and perception's tts/ocr/face do.
+GREEDY = 'card-greedy'
+PICKY = 'card-picky'
 
 # decision_core precedes asr, as it does on R1: cards are listed in the order
 # they were created and asr was added four days later.
@@ -91,9 +97,27 @@ def driver(monkeypatch):
                 return {'code': 200, 'data': {'error': 'Missing input_topic'}}
             return {'code': 200, 'data': {'state': 'running'}}
         if action == 'info':
-            return {'code': 200, 'data': {'state': 'running',
-                                          'topic_out': _topic_out(card_id, args)}}
+            data = {'state': 'running', 'topic_out': _topic_out(card_id, args)}
+            topic_in = _topic_in(card_id)
+            if topic_in is not None:
+                data['topic_in'] = topic_in
+            return {'code': 200, 'data': data}
         return {'code': 200, 'data': {'state': 'idle'}}
+
+    def _topic_in(card_id):
+        """What the card reports having bound, or None to stay silent.
+
+        Silence is the default because most of this file's fakes predate the
+        question — and a tool that does not answer it must not be failed.
+        """
+        args = starts.get(card_id) or {}
+        sent = list(args.get('input_topics') or
+                    ([args['input_topic']] if args.get('input_topic') else []))
+        if card_id == GREEDY:      # binds everything it was handed, as agentcore does
+            return [{'topic': t, 'format': 'data/json'} for t in sent]
+        if card_id == PICKY:       # binds the first and ignores the rest
+            return [{'topic': t, 'format': 'data/json'} for t in sent[:1]]
+        return None
 
     def _topic_out(card_id, args):
         if card_id == ASR:
@@ -250,6 +274,59 @@ def test_an_error_key_alongside_a_live_state_is_only_a_message(driver):
         {'code': 200, 'data': {'state': 'running', 'error': 'last frame dropped'}})
     assert state == 'running'
     assert message == 'last frame dropped'
+
+
+# ── a card handed more inputs than it consumes ───────────────────────────────
+
+def _two_sources_into(card_id, tool):
+    return {
+        'cards': [_card(RM, 'remote_message', [{'topic': '/remote_control/message',
+                                                'format': 'data/json'}]),
+                  _card(MIC, 'mic', [{'topic': '/ubuntu/mic/audio',
+                                      'format': 'audio/pcm-16k'}]),
+                  _card(card_id, tool)],
+        'connections': [_conn(RM, card_id, '/remote_control/message'),
+                        _conn(MIC, card_id, '/ubuntu/mic/audio')],
+    }
+
+
+def test_a_card_that_binds_only_the_first_of_two_inputs_fails(driver):
+    """The second connection did nothing, and the card reported 已就绪.
+
+    No driver reads `input_topics`; perception's tts/ocr/face don't either.
+    Drawing two lines into such a card produced a project that came up green
+    with one of them inert.
+    """
+    assert _start(_two_sources_into(PICKY, 'tts')) is False
+    errors = _errors(driver.events)
+    assert len(errors) == 1
+    assert errors[0]['tool'] == 'tts'
+    # Names both halves: which input survived, and which one was ignored.
+    assert '/remote_control/message' in errors[0]['message']
+    assert '/ubuntu/mic/audio' in errors[0]['message']
+
+
+def test_a_card_that_binds_both_inputs_succeeds(driver):
+    """decision_core really does subscribe to all of them — no exemption needed."""
+    assert _start(_two_sources_into(GREEDY, 'decision_core')) is True
+    assert not _errors(driver.events)
+
+
+def test_a_card_that_reports_no_bound_input_is_not_failed(driver):
+    """Reticence is not evidence of dropping.
+
+    Most tools report nothing useful under `topic_in`. Failing them on that
+    would roll back projects that work.
+    """
+    assert _start(_two_sources_into(CORE, 'decision_core')) is True
+    assert not _errors(driver.events)
+
+
+def test_a_multi_input_card_is_also_given_the_singular_argument(driver):
+    """The plural-only argument reached every driver as no input at all."""
+    _start(_two_sources_into(GREEDY, 'decision_core'))
+    assert driver.starts[GREEDY]['input_topic'] == \
+        driver.starts[GREEDY]['input_topics'][0]
 
 
 # ── fallbacks, for a source that cannot answer ───────────────────────────────
