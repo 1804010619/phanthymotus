@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 plugins/vision_runtime.py — letterbox preprocessing and output decoding for the
-YOLO-family TensorRT engines used by vop (detection) and vdp (depth).
+YOLO-family TensorRT engines used by vop (detection) and visual_depth.
 
 Everything CUDA/TensorRT-related lives in `utils.tensorrt_runtime.TensorRTEngine`;
 this module is the model-specific layer on top, exactly as

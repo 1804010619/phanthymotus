@@ -1,6 +1,10 @@
 # Perception Stack
 
-Modular ASR/TTS perception plugins running as an MCP HTTP server. Connects to Agent Core via MCP tool calls and exchanges audio/text over ROS2 DDS topics.
+Perception plugins running as one MCP HTTP server: speech (`asr`, `tts`),
+vision (`vop` object detection, `visual_depth` monocular depth, `ocr`,
+`face_recognition`). Connects to Agent Core via MCP tool calls and exchanges
+audio, images and results over ROS2 DDS topics. On Jetson the vision models and
+the local TTS engines run on TensorRT.
 
 ## Audio Requirements for ASR
 
@@ -1996,7 +2000,7 @@ transcribed and TTS still speaks with the card running.
 
 ---
 
-## Vision: `vop` (detection) and `vdp` (depth)
+## Vision: `vop` (detection) and `visual_depth` (depth)
 
 Both run a **prebuilt TensorRT engine** fetched as a pinned bundle
 (`utils/model_downloader.py` → `ensure_vop_model` / `ensure_depth_model`), the
@@ -2087,15 +2091,24 @@ weights, so it cannot drift out of order or out of date — and falls back to th
 Legacy model names (`yolov8s-worldv2`, `yolov8s-world`, `yoloe-26s`) still
 resolve — a card saved before the switch must not come back as `state: error`.
 
-### vdp's depth is relative until it is calibrated
+### visual_depth is relative until it is calibrated
 
 The released weights predict on an unbounded log scale. Absolute metres need
 `model.calibrate()` against the actual camera. Until then every payload carries
 `"scale": "relative"` and `info` warns. Do not set `calibrated: true` to make
 the warning go away — downstream code will plan around invented units.
 
-`vdp` is **off by default**: it is a second resident engine, and on the 8 GB
-Orins memory, not GPU time, is what runs out.
+`visual_depth` is **on by default**, but its engine loads lazily on the first
+`start` — an enabled card that nothing has wired up costs nothing. The cost
+arrives with the first subscriber: it is a second resident engine, and on the
+8 GB Orins memory, not GPU time, is what runs out. Set `enabled: false` on a
+machine that does not consume depth.
+
+The tool was called `vdp` for one release. It still answers to `vdp` and
+`vdp_*` (`ALIASES` on the plugin, resolved by `PerceptionBundle._plugin_for`),
+and `main.py` still reads a `vdp:` section from a config.yaml already on a
+machine — but only `visual_depth` is advertised in `tools/list`, so the
+dashboard shows one card, not two.
 
 ### Building the engines
 
@@ -2157,8 +2170,8 @@ other bundles in that file state.
 | Input (mic) | `/{namespace}/mic/audio` or `/{namespace}/ext_mic/{id}/audio` | `audio/pcm-16k` |
 | Output (ASR result) | `{input_topic}/asr` | `data/json` |
 | Output (vop) | `{input_topic}/objects` | `data/json` |
-| Output (vdp depth map) | `{input_topic}/depth` | `image/depth-zlib` |
-| Output (vdp summary) | `{input_topic}/depth_summary` | `data/json` |
+| Output (visual_depth map) | `{input_topic}/depth` | `image/depth-zlib` |
+| Output (visual_depth summary) | `{input_topic}/depth_summary` | `data/json` |
 
 The depth map is **640x480 uint16 millimetres, zlib level 1**, published as a
 `CompressedImage` with `format="16UC1; compressedDepth zlib"`. The size is not
@@ -2166,7 +2179,7 @@ negotiable: agent-core's `DepthZlibRenderer`
 (`web/js/renderers/camera.js`) allocates a fixed 640x480 canvas and returns
 early when the decompressed buffer is shorter, so a map published at the
 model's own resolution renders as a blank panel and logs nothing anywhere.
-`plugins/vdp.py` resamples before publishing and `encode_depth` refuses any
+`plugins/visual_depth.py` resamples before publishing and `encode_depth` refuses any
 other shape.
 
 Depth summary JSON:

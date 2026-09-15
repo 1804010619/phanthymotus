@@ -961,7 +961,7 @@ def ensure_kokoro_model(model_dir: str, device: str = "gpu") -> str:
     return target
 
 
-# ── Vision engines (vop detection, vdp monocular depth) ─────────────────────
+# ── Vision engines (vop detection, visual_depth monocular depth) ────────────
 #
 # Both plugins run a prebuilt TensorRT engine, so these follow OCR's shape:
 # one bundle per JetPack family, selected by the TensorRT that is actually

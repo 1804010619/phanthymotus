@@ -140,11 +140,18 @@ plugins:
     # rather than silently ignore it. To change what vop can detect, edit
     # tools/export_vision_engines.py, rebuild, and republish the bundle.
 
-  vdp:
-    # Monocular depth. Off by default: it is a second engine resident alongside
-    # vop/OCR/ASR/TTS, and on the 8 GB Orins memory — not GPU time — is the
-    # binding constraint. Turn it on where something actually consumes depth.
-    enabled: false
+  # Was `vdp:` for one release; main.py still reads that spelling from a
+  # config.yaml already on a machine, and the tool answers to `vdp_*` too.
+  visual_depth:
+    # Monocular depth. On by default, so the card is there to wire up without
+    # editing a file on the robot first.
+    #
+    # It is a second resident engine next to vop/OCR/ASR/TTS, and on the 8 GB
+    # Orins memory — not GPU time — is the binding constraint. The engine is
+    # loaded lazily on the first `start`, so an enabled-but-unwired card costs
+    # nothing; the cost appears once something actually subscribes. On a tight
+    # machine that does not consume depth, set this to false.
+    enabled: true
     namespace: ""       # auto-detect from hostname if empty
     fps: 2
     # Uncalibrated output is RELATIVE, not metres, and is labelled as such in

@@ -60,7 +60,8 @@ from peer import store
 READ_ONLY_TYPES = frozenset({'sensor', 'resource'})
 
 # Layers, as sent in the registration payload's `category`.
-#   perception — ASR/TTS/OCR/VOP: computes on data, publishes to a topic
+#   perception — ASR/TTS/OCR/VOP/visual_depth/face: computes on data, publishes
+#                to a topic
 #   actucore   — the execution layer: navigation, VLA. Acts, whatever it declares.
 READ_ONLY_CATEGORIES = frozenset({'perception'})
 ACTING_CATEGORIES = frozenset({'actucore'})

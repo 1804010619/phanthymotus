@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-plugins/vdp.py — VideoDepthPerceptionPlugin: monocular depth from a plain RGB camera.
+plugins/visual_depth.py — VideoDepthPerceptionPlugin: monocular depth from a plain RGB camera.
 
 Subscribes to image/jpeg topics, runs a prebuilt YOLO26-depth TensorRT engine,
 and publishes two things per frame:
@@ -70,10 +70,10 @@ _PUB_QOS = QoSProfile(
 
 TOOLS = [
     {
-        "name": "vdp",
+        "name": "visual_depth",
         "type": "processor",
         "multiInstance": True,
-        "description": "Video Depth Perception — per-pixel depth from a single RGB camera",
+        "description": "视觉深度 — 用一个普通 RGB 摄像头估计每个像素的距离，输出深度图与左/中/右三区的最近障碍摘要。未标定时是相对尺度，不是米",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -163,12 +163,12 @@ def summarize_depth(depth_m: np.ndarray, scale: str, bands: int = 3) -> dict:
 
 # ── ROS2 Node (one per instance/topic) ───────────────────────────────────────
 
-class _VDPNode(Node):
+class _DepthNode(Node):
     """Per-topic depth inference node."""
 
     def __init__(self, input_topic: str, model, fps: float, depth_scale: float,
                  calibrated: bool, max_depth_m: float, node_suffix: str):
-        super().__init__(f"vdp_{node_suffix}")
+        super().__init__(f"visual_depth_{node_suffix}")
         self._input_topic = input_topic
         self._depth_topic = f"{input_topic}/depth"
         self._summary_topic = f"{input_topic}/depth_summary"
@@ -205,9 +205,9 @@ class _VDPNode(Node):
                 CompressedImage, self._input_topic, self._image_cb, _LOW_LAT_QOS
             )
             self._worker = threading.Thread(target=self._inference_worker, daemon=True,
-                                            name=f"vdp_worker_{self._input_topic}")
+                                            name=f"visual_depth_worker_{self._input_topic}")
             self._worker.start()
-            log.info(f"[vdp] started: {self._input_topic} → {self._depth_topic}, {self._summary_topic}")
+            log.info(f"[visual_depth] started: {self._input_topic} → {self._depth_topic}, {self._summary_topic}")
             return self._state("running")
 
     def stop(self) -> dict:
@@ -220,7 +220,7 @@ class _VDPNode(Node):
             if self._worker and self._worker.is_alive():
                 self._worker.join(timeout=3.0)
             self._worker = None
-            log.info(f"[vdp] stopped: {self._input_topic}")
+            log.info(f"[visual_depth] stopped: {self._input_topic}")
             return self._state("idle")
 
     def _state(self, state: str) -> dict:
@@ -273,7 +273,7 @@ class _VDPNode(Node):
                                          interpolation=cv2.INTER_NEAREST)
                 self._publish(depth_m)
             except Exception as e:
-                log.error(f"[vdp] inference error: {e}", exc_info=True)
+                log.error(f"[visual_depth] inference error: {e}", exc_info=True)
 
     def _publish(self, depth_m: np.ndarray):
         self._frame_count += 1
@@ -293,7 +293,14 @@ class _VDPNode(Node):
 # ── Plugin class ─────────────────────────────────────────────────────────────
 
 class VideoDepthPerceptionPlugin:
-    PREFIX = "vdp"
+    PREFIX = "visual_depth"
+    # `vdp` was the name this shipped under for one release. It said nothing to
+    # anyone reading a card on the dashboard or the image's card list on
+    # resource-center, so the tool is `visual_depth` now and the old spelling
+    # stays as an alias — a card saved under `vdp` keeps dispatching instead of
+    # coming back `state: error` after a restart. Same rule as the vop model
+    # rename; see perception/README.md § "Vision".
+    ALIASES = ("vdp",)
 
     def __init__(self, plugin_cfg: dict, namespace: str, executor):
         self._namespace = namespace
@@ -306,7 +313,7 @@ class VideoDepthPerceptionPlugin:
         self._model_loading = False
         self._model_load_error = None
         self._model_lock = threading.Lock()
-        self._nodes: dict[str, _VDPNode] = {}
+        self._nodes: dict[str, _DepthNode] = {}
         self._instance_configs: dict[str, dict] = {}
         # Guards _nodes / _instance_configs; never held across a node start,
         # stop, or a model load.
@@ -324,9 +331,9 @@ class VideoDepthPerceptionPlugin:
             model_dir = os.environ.get("DEPTH_MODEL_DIR", "/models/depth")
             paths = ensure_depth_model(model_dir)
             engine = next(p for name, p in paths.items() if name.endswith(".engine"))
-            log.info(f"[vdp] loading engine: {engine}")
+            log.info(f"[visual_depth] loading engine: {engine}")
             self._model = VisionEngineSession(engine)
-            log.info(f"[vdp] engine loaded, input={self._model.input_size}")
+            log.info(f"[visual_depth] engine loaded, input={self._model.input_size}")
 
     def _start_node(self, node_key: str, input_topic: str):
         """Register before starting, so a concurrent stop can always cancel it."""
@@ -334,7 +341,7 @@ class VideoDepthPerceptionPlugin:
             if node_key in self._nodes:
                 return
             icfg = self._instance_configs.get(node_key, {})
-            node = _VDPNode(
+            node = _DepthNode(
                 input_topic, self._model,
                 fps=int(icfg.get("fps", self._fps)),
                 depth_scale=float(icfg.get("depth_scale", self._depth_scale)),
@@ -345,7 +352,7 @@ class VideoDepthPerceptionPlugin:
             self._executor.add_node(node)
             self._nodes[node_key] = node
         node.start()
-        log.info(f"[vdp] node started (background): {input_topic}")
+        log.info(f"[visual_depth] node started (background): {input_topic}")
 
     def _retire_node(self, node_key: str) -> Optional[dict]:
         with self._nodes_lock:
@@ -357,7 +364,7 @@ class VideoDepthPerceptionPlugin:
         # remove-then-destroy: the node must leave the executor before its
         # handles are destroyed, and it must be destroyed rather than merely
         # removed or the publishers and the ROS node name leak.
-        dispose_node(self._executor, node, label=f"vdp/{node_key}")
+        dispose_node(self._executor, node, label=f"visual_depth/{node_key}")
         return result
 
     def get_tools(self) -> list:
@@ -456,9 +463,9 @@ class VideoDepthPerceptionPlugin:
                         except Exception as e:
                             self._model_loading = False
                             self._model_load_error = str(e)
-                            log.error(f"[vdp] engine load failed: {e}", exc_info=True)
+                            log.error(f"[visual_depth] engine load failed: {e}", exc_info=True)
 
-                    threading.Thread(target=_bg_start, daemon=True, name="vdp_model_load").start()
+                    threading.Thread(target=_bg_start, daemon=True, name="visual_depth_model_load").start()
                     return {"state": "loading", "input": input_topic,
                             "message": "Engine loading in background, will start automatically"}
                 self._start_node(node_key, input_topic)

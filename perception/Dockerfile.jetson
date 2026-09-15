@@ -131,7 +131,7 @@ RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} --ignore-installed PyYAML && \
     pip3 install --no-cache-dir -i ${PYPI_MIRROR} \
     websockets webrtcvad
 
-# ── Vision deps (vop detection, vdp depth, OCR, face) ────────────
+# ── Vision deps (vop detection, visual_depth, OCR, face) ─────────
 # Fix broken system cv2 __init__.py (mat_wrapper circular import on Jetson).
 # Only jp5.11's base is broken; on jp6.1 the import succeeds and this is a no-op.
 #

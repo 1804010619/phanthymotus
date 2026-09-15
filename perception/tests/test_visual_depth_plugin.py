@@ -1,5 +1,5 @@
 """
-tests/test_vdp_plugin.py — depth encoding, region summary, and lifecycle
+tests/test_visual_depth_plugin.py — depth encoding, region summary, and lifecycle
 (host-side, no GPU).
 
 The encoding tests are the load-bearing ones: agent-core's depth renderer
@@ -27,10 +27,10 @@ from vision_stubs import (  # noqa: F401
     _wait_until,
 )
 
-import plugins.vdp as vdp_plugin  # noqa: E402
+import plugins.visual_depth as depth_plugin  # noqa: E402
 from plugins.vision_runtime import LetterboxMeta  # noqa: E402
 
-W, H = vdp_plugin.DEPTH_WIDTH, vdp_plugin.DEPTH_HEIGHT
+W, H = depth_plugin.DEPTH_WIDTH, depth_plugin.DEPTH_HEIGHT
 
 
 class _FakeModel:
@@ -54,7 +54,7 @@ class _FakeModel:
 
 def _plugin(cfg=None, model=None):
     executor = _FakeExecutor()
-    plugin = vdp_plugin.VideoDepthPerceptionPlugin(cfg or {}, "testns", executor)
+    plugin = depth_plugin.VideoDepthPerceptionPlugin(cfg or {}, "testns", executor)
     if model is not None:
         plugin._model = model
     return plugin, executor
@@ -64,7 +64,7 @@ def _plugin(cfg=None, model=None):
 
 def test_encoded_depth_decompresses_to_exactly_640x480_uint16():
     depth = np.full((H, W), 1.234, dtype=np.float32)
-    raw = zlib.decompress(vdp_plugin.encode_depth(depth, max_depth_m=20.0))
+    raw = zlib.decompress(depth_plugin.encode_depth(depth, max_depth_m=20.0))
     values = np.frombuffer(raw, dtype="<u2")
     # Shorter than this and DepthZlibRenderer returns early, rendering nothing.
     assert values.size == W * H
@@ -74,13 +74,13 @@ def test_encoded_depth_decompresses_to_exactly_640x480_uint16():
 def test_wrong_shape_is_refused_rather_than_published():
     """Publishing a mis-sized map produces a blank panel and no log line."""
     with pytest.raises(ValueError, match="640x480"):
-        vdp_plugin.encode_depth(np.zeros((480, 512), dtype=np.float32), max_depth_m=20.0)
+        depth_plugin.encode_depth(np.zeros((480, 512), dtype=np.float32), max_depth_m=20.0)
 
 
 def test_out_of_range_becomes_invalid_not_wrapped():
     """A 70 m reading must not come out as an obstacle at arm's length."""
     depth = np.full((H, W), 70.0, dtype=np.float32)
-    values = np.frombuffer(zlib.decompress(vdp_plugin.encode_depth(depth, max_depth_m=20.0)), dtype="<u2")
+    values = np.frombuffer(zlib.decompress(depth_plugin.encode_depth(depth, max_depth_m=20.0)), dtype="<u2")
     assert set(values.tolist()) == {0}
 
 
@@ -90,15 +90,15 @@ def test_sub_millimetre_and_nonfinite_become_invalid():
     depth[0, 1] = np.inf
     depth[0, 2] = 0.0001          # rounds below 1 mm
     depth[0, 3] = 5.0
-    values = np.frombuffer(zlib.decompress(vdp_plugin.encode_depth(depth, max_depth_m=20.0)), dtype="<u2")
+    values = np.frombuffer(zlib.decompress(depth_plugin.encode_depth(depth, max_depth_m=20.0)), dtype="<u2")
     assert values[0] == 0 and values[1] == 0 and values[2] == 0
     assert values[3] == 5000
 
 
 def test_max_depth_ceiling_is_honoured():
     depth = np.full((H, W), 15.0, dtype=np.float32)
-    kept = np.frombuffer(zlib.decompress(vdp_plugin.encode_depth(depth, max_depth_m=20.0)), dtype="<u2")
-    dropped = np.frombuffer(zlib.decompress(vdp_plugin.encode_depth(depth, max_depth_m=10.0)), dtype="<u2")
+    kept = np.frombuffer(zlib.decompress(depth_plugin.encode_depth(depth, max_depth_m=20.0)), dtype="<u2")
+    dropped = np.frombuffer(zlib.decompress(depth_plugin.encode_depth(depth, max_depth_m=10.0)), dtype="<u2")
     assert kept[0] == 15000
     assert dropped[0] == 0
 
@@ -108,7 +108,7 @@ def test_max_depth_ceiling_is_honoured():
 def test_summary_reports_nearest_per_region():
     depth = np.full((H, W), 9.0, dtype=np.float32)
     depth[:, : W // 3] = 1.0            # something close on the left
-    summary = vdp_plugin.summarize_depth(depth, "metric")
+    summary = depth_plugin.summarize_depth(depth, "metric")
     assert summary["nearest_by_region"]["left"] == pytest.approx(1.0)
     assert summary["nearest_by_region"]["center"] == pytest.approx(9.0)
     assert summary["nearest_by_region"]["right"] == pytest.approx(9.0)
@@ -118,19 +118,19 @@ def test_summary_ignores_a_few_outlier_pixels():
     """The 5th percentile is the point: edge artefacts must not invent an obstacle."""
     depth = np.full((H, W), 5.0, dtype=np.float32)
     depth[0, :10] = 0.01               # a handful of edge artefacts
-    summary = vdp_plugin.summarize_depth(depth, "metric")
+    summary = depth_plugin.summarize_depth(depth, "metric")
     assert summary["nearest_by_region"]["left"] == pytest.approx(5.0)
 
 
 def test_summary_marks_uncalibrated_output_as_relative():
     """An agent reading relative numbers as metres is the failure to prevent."""
-    summary = vdp_plugin.summarize_depth(np.full((H, W), 2.0, dtype=np.float32), "relative")
+    summary = depth_plugin.summarize_depth(np.full((H, W), 2.0, dtype=np.float32), "relative")
     assert summary["scale"] == "relative"
     assert summary["unit"] == "relative"
 
 
 def test_summary_handles_an_all_invalid_map():
-    summary = vdp_plugin.summarize_depth(np.zeros((H, W), dtype=np.float32), "metric")
+    summary = depth_plugin.summarize_depth(np.zeros((H, W), dtype=np.float32), "metric")
     assert summary["nearest_by_region"] == {"left": None, "center": None, "right": None}
     assert summary["range"] is None
     assert summary["valid_fraction"] == 0.0
@@ -139,7 +139,7 @@ def test_summary_handles_an_all_invalid_map():
 def test_valid_fraction_reflects_partial_coverage():
     depth = np.zeros((H, W), dtype=np.float32)
     depth[: H // 2] = 3.0
-    assert vdp_plugin.summarize_depth(depth, "metric")["valid_fraction"] == pytest.approx(0.5)
+    assert depth_plugin.summarize_depth(depth, "metric")["valid_fraction"] == pytest.approx(0.5)
 
 
 # ── pipeline ─────────────────────────────────────────────────────────────────
@@ -150,7 +150,7 @@ def _feed(node, marker=b"640x480"):
 
 def test_both_topics_are_published_for_one_frame():
     plugin, executor = _plugin(model=_FakeModel())
-    plugin.dispatch("vdp", {"action": "start", "input_topic": "/cam/rgb"})
+    plugin.dispatch("visual_depth", {"action": "start", "input_topic": "/cam/rgb"})
     node = executor.nodes[0]
     _feed(node)
 
@@ -166,7 +166,7 @@ def test_both_topics_are_published_for_one_frame():
 def test_model_output_is_resampled_to_the_renderer_size():
     """The model runs at its own resolution; the renderer only accepts 640x480."""
     plugin, executor = _plugin(model=_FakeModel(depth=np.full((768, 768), 3.0, dtype=np.float32)))
-    plugin.dispatch("vdp", {"action": "start", "input_topic": "/cam/rgb"})
+    plugin.dispatch("visual_depth", {"action": "start", "input_topic": "/cam/rgb"})
     node = executor.nodes[0]
     _feed(node)
 
@@ -180,7 +180,7 @@ def test_model_output_is_resampled_to_the_renderer_size():
 def test_depth_scale_is_applied():
     plugin, executor = _plugin(cfg={"depth_scale": 2.0, "calibrated": True},
                                model=_FakeModel(depth=np.full((H, W), 1.0, dtype=np.float32)))
-    plugin.dispatch("vdp", {"action": "start", "input_topic": "/cam/rgb"})
+    plugin.dispatch("visual_depth", {"action": "start", "input_topic": "/cam/rgb"})
     node = executor.nodes[0]
     _feed(node)
 
@@ -194,31 +194,31 @@ def test_depth_scale_is_applied():
 
 def test_info_warns_while_uncalibrated():
     plugin, _ = _plugin()
-    info = plugin.dispatch("vdp", {"action": "info"})
+    info = plugin.dispatch("visual_depth", {"action": "info"})
     assert info["scale"] == "relative"
     assert "RELATIVE" in info["warning"]
 
 
 def test_info_drops_the_warning_once_calibrated():
     plugin, _ = _plugin(cfg={"calibrated": True})
-    info = plugin.dispatch("vdp", {"action": "info"})
+    info = plugin.dispatch("visual_depth", {"action": "info"})
     assert info["scale"] == "metric"
     assert "warning" not in info
 
 
 def test_info_advertises_both_output_formats():
     plugin, executor = _plugin(model=_FakeModel())
-    plugin.dispatch("vdp", {"action": "start", "input_topic": "/cam/rgb"})
-    info = plugin.dispatch("vdp", {"action": "info"})
+    plugin.dispatch("visual_depth", {"action": "start", "input_topic": "/cam/rgb"})
+    info = plugin.dispatch("visual_depth", {"action": "info"})
     formats = {t["format"] for t in info["topic_out"]}
     assert formats == {"image/depth-zlib", "data/json"}
 
 
 def test_start_then_stop_destroys_the_node():
     plugin, executor = _plugin(model=_FakeModel())
-    plugin.dispatch("vdp", {"action": "start", "input_topic": "/cam/rgb"})
+    plugin.dispatch("visual_depth", {"action": "start", "input_topic": "/cam/rgb"})
     node = executor.nodes[0]
-    plugin.dispatch("vdp", {"action": "stop", "instance_id": "/cam/rgb"})
+    plugin.dispatch("visual_depth", {"action": "stop", "instance_id": "/cam/rgb"})
     assert executor.nodes == []
     assert node.destroyed is True
 
@@ -229,7 +229,7 @@ def test_concurrent_starts_create_exactly_one_node():
 
     def _start():
         barrier.wait()
-        plugin.dispatch("vdp", {"action": "start", "input_topic": "/cam/rgb"})
+        plugin.dispatch("visual_depth", {"action": "start", "input_topic": "/cam/rgb"})
 
     threads = [threading.Thread(target=_start) for _ in range(8)]
     for thread in threads:
@@ -242,7 +242,7 @@ def test_concurrent_starts_create_exactly_one_node():
 
 def test_config_updates_global_defaults():
     plugin, _ = _plugin()
-    plugin.dispatch("vdp", {"action": "config", "fps": 7, "calibrated": True, "max_depth_m": 5.0})
+    plugin.dispatch("visual_depth", {"action": "config", "fps": 7, "calibrated": True, "max_depth_m": 5.0})
     assert plugin._fps == 7
     assert plugin._calibrated is True
     assert plugin._max_depth_m == 5.0
@@ -253,7 +253,7 @@ def test_a_frame_that_fails_to_decode_is_skipped_not_fatal():
     # at the default 2 fps the good frame lands inside the 500 ms window and is
     # dropped, which would make this pass or fail for the wrong reason.
     plugin, executor = _plugin(cfg={"fps": 1000}, model=_FakeModel())
-    plugin.dispatch("vdp", {"action": "start", "input_topic": "/cam/rgb"})
+    plugin.dispatch("visual_depth", {"action": "start", "input_topic": "/cam/rgb"})
     node = executor.nodes[0]
     _feed(node, b"not-a-frame")
     time.sleep(0.01)          # clear the 1 ms rate-limit window between frames

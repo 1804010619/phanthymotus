@@ -15,7 +15,10 @@ let _catalog  = { core: [], perception: [], actucore: [], driver: [] };
 
 // Fallback descriptions, used when resource-center didn't supply one
 const _CAT_DESC = {
-  perception: '语音感知套件 — ASR 语音识别 + TTS 语音合成 + VAD 静音检测 + 唤醒词检测',
+  // Keep in step with the `description` that deploy/build_perception.sh
+  // registers — this is only the fallback for an image registered before that
+  // field existed, and the two saying different things is worse than either.
+  perception: '感知套件 — 语音：ASR 语音识别 + TTS 语音合成 + VAD 静音检测 + 唤醒词检测；视觉：物体检测 + 单目深度 + OCR 文字识别 + 人脸识别',
   actucore:   '执行模型层 — VLA 策略 / 导航 / 抓取 / locomotion / 全身控制',
 };
 let _statuses = {};   // driver_id → { running, status, running_image, image, last_deploy }
