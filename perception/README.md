@@ -2155,21 +2155,44 @@ within-dataset and hurts cross-distribution generalisation. So `cal_a` stays a
 knob for a fit obtained elsewhere, and nothing fits it — here or upstream.
 
 That leaves one number, and the data for it is something a person standing next
-to the robot already has: a tape measure.
+to the robot already has: a tape measure and a wall.
+
+**The procedure.** Drive the robot up to a flat wall, square-on, so the wall
+fills the middle of the frame. Measure lens-to-wall with a tape. Call
+`calibrate` with that distance. Then back off and repeat at 1 m, 2 m, 3 m.
 
 ```
-calibrate  distance_m=2.0                  # target in the centre box, 2 m away
-calibrate  distance_m=6.0                  # again at a clearly different range
-calibrate  reset=true                      # back to the engine's own fit
+calibrate  distance_m=1.0                  # facing the wall, 1 m away
+calibrate  distance_m=2.0                  # back off, measure again
+calibrate  distance_m=3.0
+reset_calibration                          # back to the engine's own fit
 calibrate  distance_m=2.0 image_path=...   # or fit from a photo
 ```
 
+A flat plane is asked for because one number can only stand for a region if the
+region is genuinely all at one distance. Each call therefore also reports
+`flatness` — the interquartile spread of the region over its own median, which
+is scale-free, so a wall at 8 m scores the same as a wall at 1 m. Above 15% the
+reply carries a warning: that region is a corridor, a corner, or has something
+standing in front of the wall, and the reading should be thrown away with
+`reset_calibration`.
+
+Several distances are asked for because two parameters with `a` pinned can only
+express a **constant factor**. Readings spread over 1–3 m are what reveal
+whether that is what this camera has. If near is right and far is wrong, the
+error grows with distance, and no value of `cal_b` fixes it — the reply says so
+rather than leaving a good-looking `cal_b` sitting on a bad assumption.
+
 Each call samples the current frame (median over `region`, default the centre
-20% box), appends a `(predicted, measured)` pair, and **refits over every
-sample from scratch** — so a bad reading is undone by `reset`, not compounded.
-The node keeps the most recent **uncalibrated** depth map for exactly this
-reason: fitting against already-corrected depth converges on whatever the first
-guess was.
+20% box; use `full` when the wall fills the frame), appends a
+`(predicted, measured)` pair, and **refits over every sample from scratch** — so
+a bad reading is undone by `reset_calibration`, not compounded. The node keeps
+the most recent **uncalibrated** depth map for exactly this reason: fitting
+against already-corrected depth converges on whatever the first guess was.
+
+A sample whose own post-fit error exceeds 25% is named in `warnings` rather
+than quietly dragging the mean — most often a typo (2 for 20) or a reading
+taken facing something other than the wall.
 
 The result applies immediately, to running nodes too, **in memory only**. The
 reply says so and prints the `cal_a` / `cal_b` to paste into the card config —

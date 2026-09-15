@@ -493,17 +493,22 @@ def test_a_one_shot_result_is_echoed_onto_a_running_cards_topic(tmp_path):
 
     result = plugin.dispatch("vop", {"action": "recognize_by_photo",
                                      "image_path": _write_frame(tmp_path)})
-    assert result["published_to"] == vop_plugin.DEFAULT_OUTPUT_TOPIC
+    # Asserted on the bus, not on a field in the reply: where the echo went is
+    # plumbing, not an answer, so it is no longer reported back.
+    assert "published_to" not in result
     published = json.loads(node.publishers[0].messages[-1])
     assert published["objects"] == result["objects"]
+    assert node.publishers[0].topic == vop_plugin.DEFAULT_OUTPUT_TOPIC
 
 
 def test_a_one_shot_result_without_any_running_card_publishes_nothing(tmp_path):
-    plugin, _ = _photo_plugin(tmp_path, rows=[[1.0, 1.0, 2.0, 2.0, 0.9, 0]])
+    plugin, executor = _photo_plugin(tmp_path, rows=[[1.0, 1.0, 2.0, 2.0, 0.9, 0]])
     result = plugin.dispatch("vop", {"action": "recognize_by_photo",
                                      "image_path": _write_frame(tmp_path)})
     assert result["ok"] is True
-    assert "published_to" not in result
+    # Checked on the executor, not by the absence of a reply field — that
+    # field is gone now, so asserting on it would pass vacuously.
+    assert executor.nodes == []
 
 
 def test_the_loading_reply_names_the_right_output_topic():

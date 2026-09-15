@@ -102,6 +102,22 @@ _TARGET_BOX = 0.2
 
 CALIBRATION_REGIONS = ("center", "left", "right", "full")
 
+# A region whose interquartile spread exceeds this fraction of its own median
+# is not one surface at one distance, whatever the operator believes.
+_FLATNESS_LIMIT = 0.15
+
+# A sample whose own error after the fit exceeds this is arguing with the rest.
+# Most often a typo (2 for 20) or a reading taken facing something else.
+_OUTLIER_PCT = 25.0
+
+CALIBRATION_PROCEDURE = (
+    "把机器人开到一面平整的墙（或任何平面）正前方，让墙尽量正对、填满画面中央，"
+    "用卷尺量出镜头到墙的真实距离，调用 calibrate 填进 distance_m。"
+    "然后后退，换 1 米、2 米、3 米各做一次 —— 距离拉开才看得出误差是固定倍数还是随距离变化。"
+    "量错了用 reset_calibration 清空重来。"
+)
+
+
 
 TOOLS = [
     {
@@ -117,7 +133,7 @@ TOOLS = [
                     "enum": [
                         "start", "stop", "info", "config",
                         "recognize_by_photo", "recognize_by_url",
-                        "calibrate",
+                        "calibrate", "reset_calibration",
                     ],
                     "description": "Action to perform"
                 },
@@ -132,9 +148,9 @@ TOOLS = [
                 # path perception can open, with no shared mount.
                 "image_path": {"type": "string", "format": "file", "accept": "image/*", "uploadTo": "mcp", "description": "图片文件。从卡片上传，或填一个容器可读的路径（如 /uploads/scene.jpg）。常见格式都支持，过大的图会本地缩放"},
                 "url": {"type": "string", "description": "图片的 http(s) 地址，如 https://example.com/scene.jpg。下载后本地解码，格式限制同 image_path"},
-                "distance_m": {"type": "number", "description": "标定用：目标到镜头的真实距离（米），用卷尺量。目标要占满取样区域的一大半"},
-                "region": {"type": "string", "enum": list(CALIBRATION_REGIONS), "description": "标定用：在画面的哪一块取样。默认 center（画面正中 20% 的方框）"},
-                "reset": {"type": "boolean", "description": "标定用：清空所有标定样本，恢复成 engine 自带的标定"},
+                "distance_m": {"type": "number", "description": "标定用：镜头到那面墙/平面的真实距离（米），用卷尺量。墙要正对镜头、填满取样区域"},
+                "region": {"type": "string", "enum": list(CALIBRATION_REGIONS), "description": "标定用：在画面的哪一块取样。默认 center（画面正中 20% 的方框）；墙占满整个画面时可以用 full，取样像素更多"},
+                "reset": {"type": "boolean", "description": "标定用：等同于 reset_calibration，保留给已有调用方"},
             },
             "required": ["action"],
             "x-action-params": {
@@ -144,20 +160,23 @@ TOOLS = [
                 "config": {"params": [], "description": "更新 fps / 站点标定参数 cal_a、cal_b"},
                 "recognize_by_photo": {
                     "params": ["image_path"],
-                    "description": "看一张图片的远近 — 一次性估计，不需要摄像头也不需要先 start。用自然语言描述最近、最远、平均距离，以及左/中/右三个方向各自的远近",
+                    "description": "看一张图片的远近 — 一次性估计，不需要摄像头也不需要先 start。返回整体的最近/最远/平均距离（米），以及左/中/右三个方向各自的最近与平均",
                 },
                 "recognize_by_url": {
                     "params": ["url"],
                     "description": "看一张图片 URL 的远近 — 与 recognize_by_photo 相同，只是图片来自 http(s) 而非本地文件",
                 },
                 "calibrate": {
-                    "params": ["distance_m", "region", "image_path", "url", "reset"],
+                    "params": ["distance_m", "region", "image_path", "url"],
                     "description": (
-                        "用已知距离校准这台相机。把一个目标放在镜头前量出真实距离，"
-                        "填 distance_m 调用一次；多量几个距离（近的、远的）会一起拟合，更稳。"
-                        "结果立刻生效，但要写进卡片配置的 cal_a / cal_b 才能在重启后保留。"
-                        "reset=true 清空重来"
+                        "用已知距离校准这台相机的深度尺度。" + CALIBRATION_PROCEDURE +
+                        " 每次调用都会把新样本并进来重新拟合（不是覆盖），"
+                        "结果立刻生效；但只在内存里，要写进卡片配置的 cal_a / cal_b 才能在重启后保留。"
                     ),
+                },
+                "reset_calibration": {
+                    "params": [],
+                    "description": "清空所有标定样本，恢复成 engine 自带的标定。量错了、或者换了相机就用这个",
                 },
             },
         },
@@ -184,12 +203,12 @@ TOOLS = [
 ]
 
 
-_MODEL_DEFAULT_NOTE = (
-    "Metres from the model's general-purpose calibration, not a fit for this "
-    "camera. Good enough to compare and to reason about; run ultralytics' "
-    "model.calibrate() on a labelled split from this camera and set cal_a / "
-    "cal_b if you need the absolute numbers to be tight."
-)
+# There is deliberately no prose `note` on results any more. It said the same
+# paragraph on every single call — and it said the wrong thing, pointing at
+# ultralytics' model.calibrate(), which cannot run on a robot (see the
+# `calibrate` action). The one-token `calibration` field carries the same fact,
+# and the explanation belongs in the tool description and the README, which are
+# read once rather than re-sent with every answer.
 
 
 # ── Site calibration ─────────────────────────────────────────────────────────
@@ -245,17 +264,18 @@ def _calibration_message(samples: list) -> str:
     """What the operator should do next, given how much evidence there is.
 
     One sample fixes the average scale and nothing else; it is worth having and
-    worth not trusting too far. The advice is to add a second reading at a
-    clearly different distance, because that is what reveals whether the error
-    is a constant factor (which this can fix) or grows with range (which it
-    cannot — `a` is pinned at 1.0, following ultralytics).
+    worth not trusting too far. The advice is to add readings at clearly
+    different distances, because that is what reveals whether the error is a
+    constant factor (which this can fix) or grows with range (which it cannot —
+    `a` is pinned at 1.0, following ultralytics).
     """
     count = len(samples)
     if count == 1:
         return (
-            "已用 1 个样本标定。这只固定了整体比例 —— 建议再在一个明显不同的距离"
-            "（比如一近一远）量一次：两个样本才能看出误差是固定倍数（能修）还是"
-            "随距离变化（修不了，a 固定为 1.0）。"
+            "已用 1 个样本标定。这只固定了整体比例 —— 请把机器人挪到另一个距离"
+            "（比如这次 1 米、下次 2 米、3 米）再各量一次："
+            "两个以上、且距离拉开，才能看出误差是固定倍数（能修）还是随距离变化"
+            "（修不了，a 固定为 1.0）。"
         )
     distances = [s["measured_m"] for s in samples]
     spread = max(distances) / max(min(distances), 1e-6)
@@ -263,12 +283,13 @@ def _calibration_message(samples: list) -> str:
         return (
             f"已用 {count} 个样本标定，但它们的距离都差不多"
             f"（{min(distances):.2f}–{max(distances):.2f} 米）。"
-            "再取一个差距大些的距离，才知道这个比例在远处还成不成立。"
+            "把机器人再前后挪开一些（1 米 / 2 米 / 3 米），才知道这个比例在远处还成不成立。"
         )
     return (
         f"已用 {count} 个样本标定，覆盖 {min(distances):.2f}–{max(distances):.2f} 米。"
         "看一下 residuals 里各点的 error_pct：都小就说明这台相机的误差确实是一个"
-        "固定倍数，标定管用。"
+        "固定倍数，标定管用；如果近处准、远处偏，那是随距离变化的误差，"
+        "这个两参数标定修不了。"
     )
 
 
@@ -289,13 +310,19 @@ def _calibration_from_cfg(cfg: dict, default: tuple[float, float] = (1.0, 0.0)) 
     return cal_a, cal_b
 
 
-def sample_region_depth(depth_m: np.ndarray, region: str = "center") -> float:
-    """One representative distance for a named part of the frame.
+def sample_region(depth_m: np.ndarray, region: str = "center") -> dict:
+    """One representative distance for part of the frame, plus how flat it is.
 
-    Median, not mean: a calibration target rarely fills the box exactly, and
-    whatever is behind it at the edges would drag a mean off. The median holds
-    as long as the target covers more than half the box, which is the
-    instruction given to the operator.
+    Distance is the **median**, not the mean: the surface rarely fills the box
+    exactly, and whatever is behind it at the edges would drag a mean off. The
+    median holds as long as the surface covers more than half the box.
+
+    `flatness` is the interquartile range over that median — a scale-free
+    measure of how much the readings disagree. Facing a wall square-on it is
+    near zero; pointed at a corridor, a corner, or a person standing in front
+    of the wall it is not. That distinction is the whole reason the operator is
+    asked for a flat plane: one number can only stand for the region if the
+    region is genuinely all at one distance.
     """
     if region not in CALIBRATION_REGIONS:
         raise ValueError(f"region must be one of {CALIBRATION_REGIONS}, got {region!r}")
@@ -312,7 +339,18 @@ def sample_region_depth(depth_m: np.ndarray, region: str = "center") -> float:
     valid = patch[np.isfinite(patch) & (patch > 0)]
     if valid.size == 0:
         raise ValueError(f"no valid depth in the {region} region of this frame")
-    return float(np.median(valid))
+    median = float(np.median(valid))
+    q1, q3 = np.percentile(valid, [25, 75])
+    return {
+        "distance_m": median,
+        "flatness": round(float((q3 - q1) / max(median, 1e-6)), 3),
+        "pixels": int(valid.size),
+    }
+
+
+def sample_region_depth(depth_m: np.ndarray, region: str = "center") -> float:
+    """Just the distance from `sample_region`."""
+    return sample_region(depth_m, region)["distance_m"]
 
 
 # ── Depth encoding ───────────────────────────────────────────────────────────
@@ -402,82 +440,6 @@ def measure_depth(depth_m: np.ndarray, scale: str = "metric", bands: int = 3) ->
     stats["closest_region"] = min(known, key=known.get) if known else None
     stats["farthest_region"] = max(known, key=known.get) if known else None
     return stats
-
-
-# ── Natural-language description ─────────────────────────────────────────────
-
-_REGION_ZH = {"left": "左侧", "center": "正前方", "right": "右侧"}
-
-# How much closer one side has to be before the description calls it out.
-# Below this the three directions are, for the purpose of a spoken answer, the
-# same distance — and saying "最近的在左侧" about a 2% difference is noise that
-# an agent will act on.
-_REGION_CONTRAST = 0.15
-
-
-def _fmt(value: Optional[float], scale: str) -> str:
-    if value is None:
-        return "未知"
-    return f"{value:.2f} 米" if scale == "metric" else f"{value:.2f}"
-
-
-def describe_depth(stats: dict) -> str:
-    """Turn measure_depth's numbers into one paragraph a person can read.
-
-    The engine's output is metric, so this says metres. It used to refuse to,
-    on the belief that the numbers were a relative scale — see the module
-    docstring for why that was wrong. The `relative` branch is kept for a stats
-    dict that explicitly says so, which is now only reachable if someone builds
-    an engine without the calibration baked in.
-    """
-    scale = stats.get("scale", "metric")
-    metric = scale == "metric"
-    nearest, farthest = stats.get("nearest"), stats.get("farthest")
-
-    if nearest is None or farthest is None:
-        return "这张图没有估计出任何有效深度 —— 可能是纯色画面，或者图片解码后是空的。"
-
-    parts = []
-    if metric:
-        parts.append(
-            f"画面整体的距离范围是 {_fmt(nearest, scale)} 到 {_fmt(farthest, scale)}，"
-            f"平均约 {_fmt(stats.get('average'), scale)}。"
-        )
-    else:
-        parts.append(
-            f"这张深度图没有带标定，数值只能互相比较、不代表米。"
-            f"画面里最近处约 {_fmt(nearest, scale)}，最远处约 {_fmt(farthest, scale)}，"
-            f"平均 {_fmt(stats.get('average'), scale)}。"
-        )
-
-    regions = {k: v for k, v in (stats.get("nearest_by_region") or {}).items() if v is not None}
-    if regions:
-        listed = "；".join(
-            f"{_REGION_ZH.get(name, name)}最近 {_fmt(value, scale)}"
-            + (f"、平均 {_fmt((stats.get('average_by_region') or {}).get(name), scale)}"
-               if (stats.get("average_by_region") or {}).get(name) is not None else "")
-            for name, value in regions.items()
-        )
-        parts.append(f"分方向看：{listed}。")
-
-        closest, farthest_region = stats.get("closest_region"), stats.get("farthest_region")
-        spread = max(regions.values()) - min(regions.values())
-        reference = max(min(regions.values()), 1e-6)
-        if closest and farthest_region and closest != farthest_region and \
-                spread / reference >= _REGION_CONTRAST:
-            parts.append(
-                f"{_REGION_ZH.get(closest, closest)}明显比"
-                f"{_REGION_ZH.get(farthest_region, farthest_region)}近，"
-                f"要绕行就往{_REGION_ZH.get(farthest_region, farthest_region)}。"
-            )
-        else:
-            parts.append("三个方向的远近差不多，没有哪一侧特别挡路。")
-
-    coverage = stats.get("valid_fraction")
-    if coverage is not None and coverage < 0.9:
-        parts.append(f"注意：只有 {coverage * 100:.0f}% 的像素估计出了有效深度，其余是无读数区域。")
-
-    return "".join(parts)
 
 
 # ── ROS2 Node (one per instance/topic) ───────────────────────────────────────
@@ -719,7 +681,7 @@ class VideoDepthPerceptionPlugin:
         dispose_node(self._executor, node, label=f"visual_depth/{node_key}")
         return result
 
-    # ── one-shot depth description ───────────────────────────────────────────
+    # ── one-shot depth measurement ───────────────────────────────────────────
 
     # ── site calibration from known distances ────────────────────────────────
 
@@ -792,6 +754,7 @@ class VideoDepthPerceptionPlugin:
                 "生效了，但只在内存里。要长期保留，把 cal_a / cal_b 填进卡片配置"
                 "（config action 或卡片的配置弹窗）。"
             ),
+            "procedure": CALIBRATION_PROCEDURE,
         }
         if residuals:
             report["max_error_pct"] = max(r["error_pct"] for r in residuals)
@@ -817,7 +780,13 @@ class VideoDepthPerceptionPlugin:
         return self._model
 
     def _recognize_image(self, args: dict, url_action: str) -> dict:
-        """Estimate depth for one image and describe it in words."""
+        """Estimate depth for one image and return the measurements.
+
+        No prose summary. There was one, and it only restated `nearest` /
+        `farthest` / `average` / the per-region numbers that are already in the
+        reply — a model reading those can phrase them itself, and re-sending a
+        paragraph of Chinese on every call is context spent to say nothing new.
+        """
         cfg = dict(self._plugin_cfg)
         try:
             data, source = load_image_bytes(args, cfg, url_action=url_action)
@@ -851,7 +820,6 @@ class VideoDepthPerceptionPlugin:
         # the resample exists for the dashboard canvas, and the answer should
         # not be quantised by it.
         stats = measure_depth(depth_m, scale_label)
-        description = describe_depth(stats)
 
         height, width = frame.shape[:2]
         result = {
@@ -859,20 +827,17 @@ class VideoDepthPerceptionPlugin:
             "source": source,
             "image_size": [width, height],
             "latency_ms": int((time.time() - started) * 1000),
-            "description": description,
             **stats,
         }
         result["calibration"] = self._calibration_label()
-        if result["calibration"] == "model-default":
-            result["note"] = _MODEL_DEFAULT_NOTE
 
         # Echo onto the card's output topics when an instance is running, so a
         # topic-less card wired into the canvas actually shows data flowing —
         # which is the only reason it is startable without a camera. Purely
-        # additive: the answer goes back through MCP regardless.
-        published_to = self._publish_one_shot(args.get("instance_id", ""), depth_m, stats)
-        if published_to:
-            result["published_to"] = published_to
+        # additive, and deliberately not reported back: which topics this went
+        # out on is not something the caller asked about, and every field here
+        # is re-read by the model on every turn.
+        self._publish_one_shot(args.get("instance_id", ""), depth_m, stats)
         return result
 
     def _publish_one_shot(self, instance_id: str, depth_m: np.ndarray,
@@ -962,8 +927,6 @@ class VideoDepthPerceptionPlugin:
             }
             info["unit"] = "m"
             info["calibration"] = self._calibration_label()
-            if info["calibration"] == "model-default":
-                info["note"] = _MODEL_DEFAULT_NOTE
             return info
 
         elif action == "start":
@@ -1037,8 +1000,8 @@ class VideoDepthPerceptionPlugin:
                 self._max_depth_m = float(cfg["max_depth_m"])
             return {"status": "configured", "config": cfg}
 
-        elif action == "calibrate":
-            if args.get("reset"):
+        elif action in ("calibrate", "reset_calibration"):
+            if action == "reset_calibration" or args.get("reset"):
                 self._cal_samples = []
                 self._apply_calibration(*_calibration_from_cfg(self._plugin_cfg))
                 return self._calibration_report({"message": "标定已清空，恢复成 engine 自带的标定"})
@@ -1046,9 +1009,7 @@ class VideoDepthPerceptionPlugin:
             distance = args.get("distance_m")
             if distance in (None, ""):
                 return {"ok": False, "reason": "bad_input",
-                        "detail": "distance_m is required — measure the real distance "
-                                  "to the target with a tape and pass it in metres. "
-                                  "Use reset=true to clear an existing calibration."}
+                        "detail": "distance_m is required. " + CALIBRATION_PROCEDURE}
             distance = float(distance)
             if distance <= 0:
                 return {"ok": False, "reason": "bad_input",
@@ -1057,7 +1018,7 @@ class VideoDepthPerceptionPlugin:
             region = args.get("region") or "center"
             try:
                 raw, source = self._raw_depth_for_calibration(args, instance_id)
-                predicted = sample_region_depth(raw, region)
+                reading = sample_region(raw, region)
             except BadInput as error:
                 return error.as_result()
             except Exception as error:  # noqa: BLE001 — surfaced to the caller
@@ -1065,8 +1026,9 @@ class VideoDepthPerceptionPlugin:
 
             self._cal_samples.append({
                 "measured_m": distance,
-                "predicted_m": round(predicted, 3),
+                "predicted_m": round(reading["distance_m"], 3),
                 "region": region,
+                "flatness": reading["flatness"],
                 "source": source,
             })
             # Refit over every sample, not incrementally: `a` is pinned at 1.0
@@ -1077,10 +1039,36 @@ class VideoDepthPerceptionPlugin:
             self._apply_calibration(1.0, cal_b)
             log.info(f"[visual_depth] calibrated: {len(self._cal_samples)} sample(s) "
                      f"→ cal_a=1.0 cal_b={cal_b:.4f}")
-            return self._calibration_report({
+
+            extra = {
                 "sample": self._cal_samples[-1],
                 "message": _calibration_message(self._cal_samples),
-            })
+            }
+            warnings = []
+            if reading["flatness"] > _FLATNESS_LIMIT:
+                warnings.append(
+                    f"取样区域看起来不是一个平面：区域内深度的四分位跨度是中位数的 "
+                    f"{reading['flatness'] * 100:.0f}%（阈值 {_FLATNESS_LIMIT * 100:.0f}%）。"
+                    "一个距离代表不了这块画面 —— 请让机器人正对一面平整的墙，"
+                    "确认墙填满取样框、画面里没有别的东西，然后 reset_calibration 重来。"
+                )
+            extra["flatness"] = reading["flatness"]
+            report = self._calibration_report(extra)
+            # A sample that disagrees with the rest after the fit is usually a
+            # typo (2 for 20) or a reading taken facing something else. Name it
+            # rather than letting it quietly drag the mean.
+            outliers = [r for r in report["residuals"] if r["error_pct"] > _OUTLIER_PCT]
+            if outliers and len(self._cal_samples) > 1:
+                worst = max(outliers, key=lambda r: r["error_pct"])
+                warnings.append(
+                    f"有 {len(outliers)} 个样本和其余的对不上，最差的一个量的是 "
+                    f"{worst['measured_m']} 米、标定后是 {worst['corrected_m']} 米"
+                    f"（差 {worst['error_pct']}%）。要么那次量错了或对着别的东西，"
+                    "要么这台相机的误差随距离变化 —— 后者这个两参数标定修不了。"
+                )
+            if warnings:
+                report["warnings"] = warnings
+            return report
 
         elif action == "recognize_by_photo":
             return self._recognize_image(args, url_action="recognize_by_url")

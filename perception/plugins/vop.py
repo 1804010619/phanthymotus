@@ -629,7 +629,11 @@ class VideoObjectPerceptionPlugin:
         # only reason it is startable without a camera. Purely additive: the
         # answer goes back through MCP regardless, and a card that was never
         # started publishes nothing.
-        published_to = self._publish_one_shot(args.get("instance_id", ""), objects, started)
+        #
+        # Deliberately not reported back. Which topic the echo went out on is
+        # not something the caller asked about, and every field in this reply is
+        # re-read by the model on every turn. Same call as visual_depth's.
+        self._publish_one_shot(args.get("instance_id", ""), objects, started)
 
         result = {
             "ok": True,
@@ -642,8 +646,6 @@ class VideoObjectPerceptionPlugin:
             "latency_ms": int((time.time() - started) * 1000),
             "objects": objects,
         }
-        if published_to:
-            result["published_to"] = published_to
         return result
 
     def _publish_one_shot(self, instance_id: str, objects: list,

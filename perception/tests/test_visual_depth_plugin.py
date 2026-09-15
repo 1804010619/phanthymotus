@@ -13,7 +13,6 @@ Run: PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest perception/tests -q
 from __future__ import annotations
 
 import json
-import re
 import threading
 import time
 import zlib
@@ -201,8 +200,11 @@ def test_info_reports_metres_and_says_whose_calibration():
     assert info["scale"] == "metric"
     assert info["unit"] == "m"
     assert info["calibration"] == "model-default"
-    assert "calibrate()" in info["note"]
     assert "warning" not in info
+    # No prose. `calibration` carries the fact in one token; the explanation
+    # lives in the tool description, which is read once rather than re-sent
+    # with every answer.
+    assert "note" not in info
 
 
 def test_info_reports_a_site_calibration_once_one_is_set():
@@ -308,52 +310,6 @@ def test_measure_depth_ignores_invalid_pixels_in_the_average():
     assert stats["valid_fraction"] == pytest.approx(0.5)
 
 
-def test_description_of_a_metric_map_uses_metres():
-    text = depth_plugin.describe_depth(depth_plugin.measure_depth(_graded_depth(), "metric"))
-    assert "米" in text
-    assert "相对" not in text
-    assert "左侧" in text and "右侧" in text
-
-
-def test_description_of_an_uncalibrated_map_never_claims_metres():
-    """The whole point of the scale field: a relative number read as metres is
-    both wrong and actionable."""
-    text = depth_plugin.describe_depth(depth_plugin.measure_depth(_graded_depth(), "relative"))
-    # Not "no 米 anywhere" — the disclaimer sentence says the numbers are *not*
-    # metres, and that sentence is the point. What must never appear is a
-    # *number* given in metres.
-    assert not re.search(r"[0-9.]+\s*米", text)
-    assert "不代表米" in text
-
-
-def test_description_names_the_closer_side_and_where_to_go():
-    text = depth_plugin.describe_depth(
-        depth_plugin.measure_depth(_graded_depth(left=1.0, center=2.0, right=3.0), "metric"))
-    assert "左侧明显比正前方近" in text or "左侧明显比右侧近" in text
-    assert "绕行" in text
-
-
-def test_description_does_not_invent_a_closer_side_from_noise():
-    """A 1% spread is not a direction to steer by."""
-    text = depth_plugin.describe_depth(
-        depth_plugin.measure_depth(_graded_depth(2.00, 2.01, 2.02), "metric"))
-    assert "差不多" in text
-    assert "绕行" not in text
-
-
-def test_description_flags_poor_coverage():
-    depth = np.zeros((H, W), dtype=np.float32)
-    depth[: H // 4] = 2.0
-    text = depth_plugin.describe_depth(depth_plugin.measure_depth(depth, "metric"))
-    assert "25%" in text
-
-
-def test_description_of_an_empty_map_says_so_instead_of_crashing():
-    text = depth_plugin.describe_depth(
-        depth_plugin.measure_depth(np.zeros((H, W), dtype=np.float32), "metric"))
-    assert "没有估计出任何有效深度" in text
-
-
 # ── one-shot recognition ─────────────────────────────────────────────────────
 
 def _photo_plugin(tmp_path, depth=None, **cfg):
@@ -379,7 +335,6 @@ def test_recognize_by_photo_answers_without_any_instance(tmp_path):
     assert result["scale"] == "metric"
     assert result["image_size"] == [200, 100]
     assert result["closest_region"] == "left"
-    assert "米" in result["description"]
     assert "latency_ms" in result
     assert "published_to" not in result  # no instance to echo onto
 
@@ -389,8 +344,10 @@ def test_recognize_by_photo_answers_in_metres(tmp_path):
     result = plugin.dispatch("visual_depth", {
         "action": "recognize_by_photo", "image_path": _write_frame(tmp_path)})
     assert result["scale"] == "metric"
+    assert result["unit"] == "m"
     assert result["calibration"] == "model-default"
-    assert re.search(r"[0-9.]+\s*米", result["description"])
+    assert result["nearest"] == pytest.approx(1.0)
+    assert result["farthest"] == pytest.approx(3.0)
 
 
 def test_recognize_by_photo_refuses_a_path_outside_the_roots(tmp_path):
@@ -430,8 +387,10 @@ def test_one_shot_echoes_onto_a_running_instance(tmp_path):
 
     result = plugin.dispatch("visual_depth", {
         "action": "recognize_by_photo", "image_path": _write_frame(tmp_path)})
-    assert result["published_to"] == [depth_plugin.DEFAULT_DEPTH_TOPIC,
-                                      depth_plugin.DEFAULT_SUMMARY_TOPIC]
+    # Asserted on the bus, not on a field in the reply: where the echo went is
+    # not something the caller asked about, and the reply is re-read by the
+    # model on every turn.
+    assert "published_to" not in result
 
     depth_pub = next(p for p in node.publishers if p.topic == depth_plugin.DEFAULT_DEPTH_TOPIC)
     summary_pub = next(p for p in node.publishers if p.topic == depth_plugin.DEFAULT_SUMMARY_TOPIC)
@@ -656,3 +615,114 @@ def test_calibration_advice_escalates_with_the_evidence(tmp_path):
     three = plugin.dispatch("visual_depth", {
         "action": "calibrate", "distance_m": 8.0, "image_path": photo})
     assert "error_pct" in three["message"]
+
+
+# ── flat-plane procedure ─────────────────────────────────────────────────────
+
+def _plane(distance=2.0):
+    """What the camera sees facing a wall square-on: one distance everywhere."""
+    return np.full((H, W), distance, dtype=np.float32)
+
+
+def _corridor():
+    """Not a plane: depth ramps across the frame."""
+    return np.tile(np.linspace(1.0, 8.0, W, dtype=np.float32), (H, 1))
+
+
+def test_flatness_is_near_zero_for_a_plane_and_large_for_a_corridor():
+    assert depth_plugin.sample_region(_plane(), "full")["flatness"] == pytest.approx(0.0)
+    assert depth_plugin.sample_region(_corridor(), "full")["flatness"] > 0.5
+
+
+def test_flatness_is_scale_free():
+    """A wall at 8 m is as flat as a wall at 1 m — the check must not drift
+    with distance or it would only ever fire at range."""
+    near = depth_plugin.sample_region(_plane(1.0), "full")["flatness"]
+    far = depth_plugin.sample_region(_plane(8.0), "full")["flatness"]
+    assert near == pytest.approx(far)
+
+
+def test_calibrating_against_a_plane_raises_no_warning(tmp_path):
+    plugin, _ = _photo_plugin(tmp_path, depth=_plane(4.0))
+    result = plugin.dispatch("visual_depth", {
+        "action": "calibrate", "distance_m": 2.0, "image_path": _write_frame(tmp_path)})
+    assert result["flatness"] == pytest.approx(0.0)
+    assert "warnings" not in result
+
+
+def test_calibrating_against_something_that_is_not_a_plane_warns(tmp_path):
+    """One distance cannot stand for the region unless the region is at one
+    distance — which is the entire reason the operator is asked for a wall."""
+    plugin, _ = _photo_plugin(tmp_path, depth=_corridor())
+    result = plugin.dispatch("visual_depth", {
+        "action": "calibrate", "distance_m": 2.0, "region": "full",
+        "image_path": _write_frame(tmp_path)})
+    assert result["ok"] is True          # still fits; the operator decides
+    assert any("不是一个平面" in w for w in result["warnings"])
+    assert any("reset_calibration" in w for w in result["warnings"])
+
+
+def test_a_disagreeing_sample_is_named_not_silently_averaged(tmp_path):
+    """A typo (2 for 20) would otherwise just drag the mean."""
+    plugin, _ = _photo_plugin(tmp_path, depth=_plane(4.0))
+    photo = _write_frame(tmp_path)
+    plugin.dispatch("visual_depth", {
+        "action": "calibrate", "distance_m": 2.0, "image_path": photo})
+    result = plugin.dispatch("visual_depth", {
+        "action": "calibrate", "distance_m": 20.0, "image_path": photo})
+    assert result["samples"] == 2
+    assert any("对不上" in w for w in result["warnings"])
+
+
+def test_three_distances_over_a_real_spread_fit_cleanly(tmp_path):
+    """The 1 m / 2 m / 3 m procedure on a camera whose error IS a constant
+    factor: every residual should come out small."""
+    plugin, _ = _photo_plugin(tmp_path)
+    photo = _write_frame(tmp_path)
+    result = None
+    for truth, predicted in ((1.0, 2.0), (2.0, 4.0), (3.0, 6.0)):
+        plugin._model = _FakeModel(depth=_plane(predicted))
+        result = plugin.dispatch("visual_depth", {
+            "action": "calibrate", "distance_m": truth, "image_path": photo})
+    assert result["samples"] == 3
+    assert result["cal_b"] == pytest.approx(np.log(0.5), abs=1e-4)
+    assert result["max_error_pct"] < 1.0
+    assert "warnings" not in result
+    assert "error_pct" in result["message"]
+
+
+def test_reset_calibration_is_its_own_action(tmp_path):
+    plugin, _ = _photo_plugin(tmp_path, depth=_plane(4.0))
+    plugin.dispatch("visual_depth", {
+        "action": "calibrate", "distance_m": 2.0, "image_path": _write_frame(tmp_path)})
+    result = plugin.dispatch("visual_depth", {"action": "reset_calibration"})
+    assert result["samples"] == 0
+    assert (result["cal_a"], result["cal_b"]) == (1.0, 0.0)
+    assert result["calibration"] == "model-default"
+
+
+def test_the_procedure_is_in_every_calibration_reply(tmp_path):
+    """Whoever is holding the tape measure should not have to find the docs."""
+    plugin, _ = _photo_plugin(tmp_path, depth=_plane(4.0))
+    result = plugin.dispatch("visual_depth", {"action": "reset_calibration"})
+    assert "平整的墙" in result["procedure"]
+    missing = plugin.dispatch("visual_depth", {"action": "calibrate"})
+    assert missing["ok"] is False
+    assert "平整的墙" in missing["detail"]
+
+
+def test_a_one_shot_answer_carries_no_boilerplate(tmp_path):
+    """Every field here is re-read by the model on every turn, so the reply
+    holds answers only — no standing prose, no plumbing detail."""
+    plugin, _ = _photo_plugin(tmp_path)
+    result = plugin.dispatch("visual_depth", {
+        "action": "recognize_by_photo", "image_path": _write_frame(tmp_path)})
+    assert "note" not in result           # said the same paragraph every call
+    assert "published_to" not in result   # which topic it echoed to is plumbing
+    assert "warning" not in result
+    # No prose summary either: it only restated the numbers below it, which a
+    # model reading them can phrase itself.
+    assert "description" not in result
+    # What does survive: the measurements, and one token of provenance.
+    assert result["calibration"] == "model-default"
+    assert result["nearest"] and result["farthest"] and result["average"]
