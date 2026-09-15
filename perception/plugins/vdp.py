@@ -262,7 +262,7 @@ class _VDPNode(Node):
                 if frame is None:
                     continue
                 outputs, meta = self._model.infer(frame)
-                depth_m = decode_depth(outputs[0], meta) * self._depth_scale
+                depth_m = decode_depth(outputs, meta) * self._depth_scale
                 # Resampled here, not by the model: the renderer's canvas is
                 # fixed at 640x480 and a mismatch is dropped silently.
                 if depth_m.shape != (DEPTH_HEIGHT, DEPTH_WIDTH):

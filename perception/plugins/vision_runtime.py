@@ -110,28 +110,72 @@ def undo_letterbox(boxes: np.ndarray, meta: LetterboxMeta) -> np.ndarray:
 
 # ── detection decoding ───────────────────────────────────────────────────────
 
-def decode_detections(output: np.ndarray, meta: LetterboxMeta, conf: float) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+def _looks_like_detection_rows(rows: np.ndarray) -> bool:
+    """Do these rows actually carry [x1, y1, x2, y2, score, class, ...]?
+
+    Orientation is decided by checking the columns mean what they would have to
+    mean, not by matching a shape. An earlier version keyed off "an axis of
+    length 6" and rejected the real engine outright: yoloe-26s-seg emits
+    (1, 300, 38) — 4 box + score + class + 32 mask coefficients — so no axis is
+    6 at all. Shape alone also cannot tell (N, C) from (C, N) once both exceed
+    6, whereas scores confined to [0, 1] and integral class ids can.
+    """
+    if rows.ndim != 2 or rows.shape[1] < 6 or rows.shape[0] == 0:
+        return False
+    scores = rows[:, 4]
+    if not np.all((scores >= -1e-3) & (scores <= 1.0 + 1e-3)):
+        return False
+    classes = rows[:, 5]
+    return bool(np.all(classes >= -1e-3) and np.allclose(classes, np.round(classes), atol=1e-3))
+
+
+def _as_candidates(outputs) -> list:
+    """Normalize one array or a list of engine outputs into a candidate list."""
+    if isinstance(outputs, (list, tuple)):
+        return [np.asarray(o) for o in outputs]
+    return [np.asarray(outputs)]
+
+
+def _find_detection_rows(outputs) -> Optional[np.ndarray]:
+    """Pick the output that reads as detection rows, in either orientation.
+
+    Selected by content, never by index. The same yoloe-26s-seg export lists
+    its two tensors as ['output0', 'output1'] under TensorRT 10.3 (jp6.1) and
+    ['output1', 'output0'] under TensorRT 8.5 (jp5.11) — so `outputs[0]` is the
+    boxes on one JetPack line and the mask prototypes on the other. Indexing
+    would have worked on whichever line it was written against and failed on
+    the other.
+    """
+    for array in _as_candidates(outputs):
+        if array.ndim == 3 and array.shape[0] == 1:
+            array = array[0]
+        if array.ndim != 2:
+            continue
+        if _looks_like_detection_rows(array):
+            return array
+        if _looks_like_detection_rows(array.T):
+            return array.T
+    return None
+
+
+def decode_detections(outputs, meta: LetterboxMeta, conf: float) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Decode an NMS-free end-to-end head into (boxes_xyxy, scores, class_ids).
 
-    Accepts the two orientations an e2e head is serialized in — (1, N, 6) and
-    (1, 6, N) — and nothing else. A layout we do not recognise raises instead
-    of being interpreted, because every wrong interpretation still produces
-    plausible-looking numbers.
-    """
-    array = np.asarray(output)
-    if array.ndim == 3 and array.shape[0] == 1:
-        array = array[0]
-    if array.ndim != 2:
-        raise VisionDecodeError(f"unexpected detection output rank: {output.shape}")
+    Takes the engine's full output list and finds the right tensor itself.
+    Columns beyond the sixth (mask coefficients, for a -seg export) are ignored:
+    vop publishes boxes, and carrying prototypes through would cost a matrix
+    multiply per frame for something nothing consumes.
 
-    if array.shape[1] == 6:
-        rows = array
-    elif array.shape[0] == 6:
-        rows = array.T
-    else:
+    Outputs that satisfy no orientation raise rather than being interpreted,
+    because every wrong reading of these numbers still produces
+    plausible-looking boxes.
+    """
+    rows = _find_detection_rows(outputs)
+    if rows is None:
+        shapes = [tuple(a.shape) for a in _as_candidates(outputs)]
         raise VisionDecodeError(
-            f"detection output {output.shape} has no axis of 6 "
-            "(x1,y1,x2,y2,score,class) — was the engine exported with nms=False?"
+            f"no engine output {shapes} reads as [x1,y1,x2,y2,score,class,...] "
+            "in either orientation — was the engine exported with nms=False?"
         )
 
     scores = rows[:, 4].astype(np.float32)
@@ -150,17 +194,26 @@ def decode_detections(output: np.ndarray, meta: LetterboxMeta, conf: float) -> t
 
 # ── depth decoding ───────────────────────────────────────────────────────────
 
-def decode_depth(output: np.ndarray, meta: LetterboxMeta) -> np.ndarray:
+def decode_depth(outputs, meta: LetterboxMeta) -> np.ndarray:
     """Decode a dense depth output and crop the letterbox padding back off.
 
-    The padded border carries no real measurement — leaving it in would put a
+    Like decode_detections, this takes the engine's full output list and picks
+    by shape rather than by index — output ordering is not stable across
+    TensorRT versions.
+
+    The padded border carries no real measurement; leaving it in would put a
     band of invented depth down the sides of every frame from a camera whose
     aspect ratio is not the network's.
     """
-    array = np.asarray(output, dtype=np.float32)
-    array = np.squeeze(array)
-    if array.ndim != 2:
-        raise VisionDecodeError(f"unexpected depth output shape: {output.shape}")
+    array = None
+    for candidate in _as_candidates(outputs):
+        squeezed = np.squeeze(np.asarray(candidate, dtype=np.float32))
+        if squeezed.ndim == 2:
+            array = squeezed
+            break
+    if array is None:
+        shapes = [tuple(np.asarray(a).shape) for a in _as_candidates(outputs)]
+        raise VisionDecodeError(f"no engine output {shapes} is a 2-D depth map")
 
     inner_w = max(1, round(meta.orig_w * meta.scale))
     inner_h = max(1, round(meta.orig_h * meta.scale))

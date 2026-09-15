@@ -2005,26 +2005,41 @@ falls back to PyTorch if the bundle is missing — it fails loudly instead.
 
 ### Why TensorRT *directly*, and not through ultralytics
 
-Measured on an Orin NX 8GB, batch 1 at 640:
+End-to-end per frame, batch 1 at 640, **Orin 5 with its containers stopped** so
+nothing else was competing — same machine, same conditions, 144 classes:
 
 | Path | ms/frame |
 |------|----------|
-| `yolov8s-worldv2`, PyTorch eager — what this replaced | 35.6 |
-| `yoloe-26s-seg`, TensorRT engine **loaded by ultralytics** | 37.3 |
-| `yolo26n-depth`, PyTorch eager, jp6.1 | 39.3 |
-| `yolo26n-depth`, PyTorch eager, jp5.11 (torch 2.0, py3.8) | 68.0 |
-| `yolo26n-depth`, TensorRT fp16, **pure GPU time** (trtexec) | **4.9** |
+| `yolov8s-worldv2`, PyTorch eager — what this replaced | 31.9 |
+| `yoloe-26s-seg`, TensorRT through `vision_runtime` | **19.8** |
+| `yolo26n-depth`, TensorRT through `vision_runtime` | **12.5** |
 
-Two things follow, and the second one cost a design iteration:
+1.6x on detection, and a better model with it. The road there is worth
+recording, because two plausible beliefs turned out to be false:
 
-1. **Eager mode measures Python, not the network.** `n` and `s`, and 640 and
-   768, all landed within a few ms of each other, and a plain `yolo26n`
-   detector measured *slower* than a depth model carrying a dense head. Any
-   model comparison run in eager mode on this hardware is meaningless.
-2. **Swapping the backend under ultralytics changes nothing.** 35.6 → 37.3 ms
-   is not an improvement; ultralytics' own pre/post-processing costs ~30 ms
-   per frame whichever backend sits underneath it. The 8x only exists if that
-   path is bypassed.
+* **Swapping the backend under ultralytics changes nothing.** On one machine,
+  eager measured 35.6 ms and the same network as a TensorRT engine *loaded by
+  ultralytics* measured 37.3 ms. Its Python pre/post-processing costs ~30 ms
+  whichever backend sits underneath. The win only exists if that path is
+  bypassed — hence this module.
+* **It was never going to be 8x.** An early `trtexec --useCudaGraph
+  --noDataTransfers` run measured 4.9 ms and was read as the achievable floor.
+  It is not: that excludes both memory transfers and the Python around them,
+  and it was on jp6.1. Measured properly, GPU compute alone is 12.3 ms
+  (detection) and 8.2 ms (depth) on jp5.11's TensorRT 8.5, CUDA graphs buy ~11%
+  on top, and host↔device copies are genuinely cheap (4.9 MB H2D = 0.8 ms).
+  Most of what remains is the engine, not the wrapper.
+
+Two measurement traps this walked into, both worth avoiding next time:
+
+* **Eager mode measures Python, not the network.** `n` and `s`, 640 and 768,
+  all landed within a few ms, and a plain `yolo26n` detector measured *slower*
+  than a depth model with a dense head. Model comparisons run in eager mode on
+  this hardware are meaningless.
+* **A busy board depresses everything.** The same code measured 33.8 ms on
+  Orin 6 with agent-core and perception running, and 19.8 ms on a quiet Orin 5
+  — despite Orin 6 having the newer, faster TensorRT. Benchmark on an idle
+  machine or the numbers say more about the neighbours than the change.
 
 So `plugins/vision_runtime.py` drives `utils.tensorrt_runtime.TensorRTEngine`
 with its own letterbox and decode, exactly as `plugins/ocr_runtime.py` does.
@@ -2032,9 +2047,18 @@ ultralytics is a **build-time** dependency now — it exports the engine and
 nothing else.
 
 The decoders assume engines exported with `nms=False`, i.e. YOLO26's NMS-free
-end-to-end head whose output is already final boxes. `decode_detections`
-refuses a layout it does not recognise rather than interpreting it, because
-every wrong reading of those numbers still produces plausible-looking boxes.
+end-to-end head whose output is already final boxes. `yoloe-26s-seg` emits two
+tensors: `(1, 300, 38)` — 4 box + score + class + 32 mask coefficients, the
+last 32 ignored — and `(1, 32, 160, 160)` mask prototypes.
+
+**Both decoders pick their tensor by content, never by index.** TensorRT 10.3
+(jp6.1) lists that pair as `['output0', 'output1']` and TensorRT 8.5 (jp5.11)
+lists it as `['output1', 'output0']`, so `outputs[0]` is the boxes on one
+JetPack line and the mask prototypes on the other. Code written and tested
+against a single line looks completely correct and fails on the other one.
+Orientation is settled the same way — scores confined to [0, 1] beside
+integral class ids — and a layout that matches nothing raises, because every
+wrong reading of those numbers still produces plausible-looking boxes.
 
 ### vop's vocabulary is frozen at export time
 

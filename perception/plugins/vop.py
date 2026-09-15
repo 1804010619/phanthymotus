@@ -8,12 +8,14 @@ multi-instance (one instance per input topic).
 
 Two things changed together here, and the second is a consequence of the first:
 
-* **TensorRT, not PyTorch.** The previous version loaded a `.pt` and ran
-  ultralytics in eager mode. Measured on an Orin NX 8GB, eager costs ~39 ms per
-  frame against ~5 ms for the same network as a TensorRT fp16 engine — the gap
-  is kernel-launch overhead, not arithmetic, which is why it barely moved with
-  model size. The engine is built offline and shipped as a pinned bundle
-  (`utils.model_downloader.ensure_vop_model`), the same way OCR ships its own.
+* **TensorRT directly, not PyTorch and not ultralytics.** The previous version
+  loaded a `.pt` and ran ultralytics in eager mode, ~35.6 ms/frame on an Orin
+  NX 8GB. Loading a TensorRT engine *through ultralytics* measured 37.3 ms — no
+  better — because its Python pre/post-processing dominates whatever the
+  backend. So the engine is driven through
+  `utils.tensorrt_runtime.TensorRTEngine` with the letterbox and decode in
+  `plugins/vision_runtime.py`. Engines are built offline and shipped as pinned
+  bundles (`utils.model_downloader.ensure_vop_model`), as OCR ships its own.
 
 * **The vocabulary is frozen.** Ultralytics bakes the open-vocabulary class list
   into the weights at export time; on an exported model `set_classes()` raises.
@@ -23,9 +25,9 @@ Two things changed together here, and the second is a consequence of the first:
   nothing — a card that quietly stops honouring its configured classes is far
   worse than one that says why.
 
-The vocabulary travels with the engine as `vocab.json`; it is never hardcoded
-here, so what the plugin reports and what the engine can actually detect cannot
-drift apart.
+The vocabulary is read out of the engine's own metadata, with the bundled
+`vocab.json` as a fallback; it is never hardcoded here, so what the plugin
+reports and what the engine can actually detect cannot drift apart.
 """
 
 from __future__ import annotations
@@ -222,7 +224,7 @@ class _VOPNode(Node):
                     continue
                 outputs, meta = self._model.infer(frame)
                 boxes, scores, classes = decode_detections(
-                    outputs[0], meta, self._confidence
+                    outputs, meta, self._confidence
                 )
                 self._publish_objects(self._extract_objects(boxes, scores, classes, frame.shape))
             except Exception as e:
