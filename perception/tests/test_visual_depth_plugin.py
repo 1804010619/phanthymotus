@@ -201,8 +201,11 @@ def test_info_reports_metres_and_says_whose_calibration():
     assert info["scale"] == "metric"
     assert info["unit"] == "m"
     assert info["calibration"] == "model-default"
-    assert "calibrate()" in info["note"]
     assert "warning" not in info
+    # No prose. `calibration` carries the fact in one token; the explanation
+    # lives in the tool description, which is read once rather than re-sent
+    # with every answer.
+    assert "note" not in info
 
 
 def test_info_reports_a_site_calibration_once_one_is_set():
@@ -430,8 +433,10 @@ def test_one_shot_echoes_onto_a_running_instance(tmp_path):
 
     result = plugin.dispatch("visual_depth", {
         "action": "recognize_by_photo", "image_path": _write_frame(tmp_path)})
-    assert result["published_to"] == [depth_plugin.DEFAULT_DEPTH_TOPIC,
-                                      depth_plugin.DEFAULT_SUMMARY_TOPIC]
+    # Asserted on the bus, not on a field in the reply: where the echo went is
+    # not something the caller asked about, and the reply is re-read by the
+    # model on every turn.
+    assert "published_to" not in result
 
     depth_pub = next(p for p in node.publishers if p.topic == depth_plugin.DEFAULT_DEPTH_TOPIC)
     summary_pub = next(p for p in node.publishers if p.topic == depth_plugin.DEFAULT_SUMMARY_TOPIC)
@@ -750,3 +755,17 @@ def test_the_procedure_is_in_every_calibration_reply(tmp_path):
     missing = plugin.dispatch("visual_depth", {"action": "calibrate"})
     assert missing["ok"] is False
     assert "平整的墙" in missing["detail"]
+
+
+def test_a_one_shot_answer_carries_no_boilerplate(tmp_path):
+    """Every field here is re-read by the model on every turn, so the reply
+    holds answers only — no standing prose, no plumbing detail."""
+    plugin, _ = _photo_plugin(tmp_path)
+    result = plugin.dispatch("visual_depth", {
+        "action": "recognize_by_photo", "image_path": _write_frame(tmp_path)})
+    assert "note" not in result           # said the same paragraph every call
+    assert "published_to" not in result   # which topic it echoed to is plumbing
+    assert "warning" not in result
+    # What does survive: the answer, and one token of provenance.
+    assert result["calibration"] == "model-default"
+    assert result["description"]

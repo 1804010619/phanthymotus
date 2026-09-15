@@ -203,12 +203,12 @@ TOOLS = [
 ]
 
 
-_MODEL_DEFAULT_NOTE = (
-    "Metres from the model's general-purpose calibration, not a fit for this "
-    "camera. Good enough to compare and to reason about; run ultralytics' "
-    "model.calibrate() on a labelled split from this camera and set cal_a / "
-    "cal_b if you need the absolute numbers to be tight."
-)
+# There is deliberately no prose `note` on results any more. It said the same
+# paragraph on every single call — and it said the wrong thing, pointing at
+# ultralytics' model.calibrate(), which cannot run on a robot (see the
+# `calibrate` action). The one-token `calibration` field carries the same fact,
+# and the explanation belongs in the tool description and the README, which are
+# read once rather than re-sent with every answer.
 
 
 # ── Site calibration ─────────────────────────────────────────────────────────
@@ -902,16 +902,14 @@ class VideoDepthPerceptionPlugin:
             **stats,
         }
         result["calibration"] = self._calibration_label()
-        if result["calibration"] == "model-default":
-            result["note"] = _MODEL_DEFAULT_NOTE
 
         # Echo onto the card's output topics when an instance is running, so a
         # topic-less card wired into the canvas actually shows data flowing —
         # which is the only reason it is startable without a camera. Purely
-        # additive: the answer goes back through MCP regardless.
-        published_to = self._publish_one_shot(args.get("instance_id", ""), depth_m, stats)
-        if published_to:
-            result["published_to"] = published_to
+        # additive, and deliberately not reported back: which topics this went
+        # out on is not something the caller asked about, and every field here
+        # is re-read by the model on every turn.
+        self._publish_one_shot(args.get("instance_id", ""), depth_m, stats)
         return result
 
     def _publish_one_shot(self, instance_id: str, depth_m: np.ndarray,
@@ -1001,8 +999,6 @@ class VideoDepthPerceptionPlugin:
             }
             info["unit"] = "m"
             info["calibration"] = self._calibration_label()
-            if info["calibration"] == "model-default":
-                info["note"] = _MODEL_DEFAULT_NOTE
             return info
 
         elif action == "start":
