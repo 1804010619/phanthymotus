@@ -154,11 +154,17 @@ plugins:
     enabled: true
     namespace: ""       # auto-detect from hostname if empty
     fps: 2
-    # Uncalibrated output is RELATIVE, not metres, and is labelled as such in
-    # every published payload. Calibrate against the real camera before
-    # flipping `calibrated`, or downstream code will plan around made-up units.
-    depth_scale: 1.0
-    calibrated: false
+    # Output is METRES. ultralytics bakes its metric fit into the exported
+    # engine (Depth.forward applies cal_a/cal_b before the export branch), and
+    # the released yolo26n-depth weights ship with that fit done — verified on
+    # Orin5 against the reference .pt on the same photos.
+    #
+    # These two are a *site* refit on top of it, for when the generic fit is
+    # off for a particular camera: metres_out = metres_in**cal_a * exp(cal_b).
+    # Same parameterisation ultralytics' model.calibrate() produces, so a fit
+    # from there pastes in unchanged. 1.0 / 0.0 = trust the engine.
+    cal_a: 1.0
+    cal_b: 0.0
     max_depth_m: 20.0
 
   ocr:

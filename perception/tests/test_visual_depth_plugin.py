@@ -161,7 +161,7 @@ def test_both_topics_are_published_for_one_frame():
 
     values = np.frombuffer(zlib.decompress(depth_pub.messages[0]), dtype="<u2")
     assert values.size == W * H
-    assert json.loads(summary_pub.messages[0])["scale"] == "relative"
+    assert json.loads(summary_pub.messages[0])["scale"] == "metric"
 
 
 def test_model_output_is_resampled_to_the_renderer_size():
@@ -193,11 +193,23 @@ def test_depth_scale_is_applied():
 
 # ── lifecycle ────────────────────────────────────────────────────────────────
 
-def test_info_warns_while_uncalibrated():
+def test_info_reports_metres_and_says_whose_calibration():
+    """The engine bakes ultralytics' metric fit in, so the output IS metres —
+    what info has to convey is that the fit is generic, not this camera's."""
     plugin, _ = _plugin()
     info = plugin.dispatch("visual_depth", {"action": "info"})
-    assert info["scale"] == "relative"
-    assert "RELATIVE" in info["warning"]
+    assert info["scale"] == "metric"
+    assert info["unit"] == "m"
+    assert info["calibration"] == "model-default"
+    assert "calibrate()" in info["note"]
+    assert "warning" not in info
+
+
+def test_info_reports_a_site_calibration_once_one_is_set():
+    plugin, _ = _plugin(cfg={"cal_a": 0.97, "cal_b": 0.12})
+    info = plugin.dispatch("visual_depth", {"action": "info"})
+    assert info["calibration"] == "site"
+    assert "note" not in info
 
 
 def test_info_drops_the_warning_once_calibrated():
@@ -243,9 +255,9 @@ def test_concurrent_starts_create_exactly_one_node():
 
 def test_config_updates_global_defaults():
     plugin, _ = _plugin()
-    plugin.dispatch("visual_depth", {"action": "config", "fps": 7, "calibrated": True, "max_depth_m": 5.0})
+    plugin.dispatch("visual_depth", {"action": "config", "fps": 7, "cal_b": 0.25, "max_depth_m": 5.0})
     assert plugin._fps == 7
-    assert plugin._calibrated is True
+    assert plugin._cal_b == 0.25
     assert plugin._max_depth_m == 5.0
 
 
@@ -311,7 +323,7 @@ def test_description_of_an_uncalibrated_map_never_claims_metres():
     # metres, and that sentence is the point. What must never appear is a
     # *number* given in metres.
     assert not re.search(r"[0-9.]+\s*米", text)
-    assert "相对" in text
+    assert "不代表米" in text
 
 
 def test_description_names_the_closer_side_and_where_to_go():
@@ -358,7 +370,7 @@ def _write_frame(tmp_path, name="scene.jpg", marker=b"200x100"):
 
 def test_recognize_by_photo_answers_without_any_instance(tmp_path):
     """The point of the action: answer about a picture with no camera running."""
-    plugin, executor = _photo_plugin(tmp_path, **{"calibrated": True})
+    plugin, executor = _photo_plugin(tmp_path)
     result = plugin.dispatch("visual_depth", {
         "action": "recognize_by_photo", "image_path": _write_frame(tmp_path)})
 
@@ -372,13 +384,13 @@ def test_recognize_by_photo_answers_without_any_instance(tmp_path):
     assert "published_to" not in result  # no instance to echo onto
 
 
-def test_recognize_by_photo_warns_when_the_scale_is_relative(tmp_path):
+def test_recognize_by_photo_answers_in_metres(tmp_path):
     plugin, _ = _photo_plugin(tmp_path)
     result = plugin.dispatch("visual_depth", {
         "action": "recognize_by_photo", "image_path": _write_frame(tmp_path)})
-    assert result["scale"] == "relative"
-    assert "RELATIVE" in result["warning"]
-    assert not re.search(r"[0-9.]+\s*米", result["description"])
+    assert result["scale"] == "metric"
+    assert result["calibration"] == "model-default"
+    assert re.search(r"[0-9.]+\s*米", result["description"])
 
 
 def test_recognize_by_photo_refuses_a_path_outside_the_roots(tmp_path):
@@ -450,3 +462,54 @@ def test_info_reports_the_topics_of_a_topic_less_instance():
     assert [t["topic"] for t in info["topic_out"]] == [depth_plugin.DEFAULT_DEPTH_TOPIC,
                                                       depth_plugin.DEFAULT_SUMMARY_TOPIC]
     assert info["topic_in"] == []
+
+
+# ── site calibration ─────────────────────────────────────────────────────────
+
+def test_identity_calibration_returns_the_array_untouched():
+    depth = np.full((4, 4), 2.0, dtype=np.float32)
+    assert depth_plugin.apply_site_calibration(depth, 1.0, 0.0) is depth
+
+
+def test_site_calibration_is_log_affine_not_a_multiplier():
+    """`exp(a·log d + b)` == d**a * e**b — the shape ultralytics fits, so a
+    model.calibrate() result transfers here unchanged. The old linear
+    depth_scale was this only when a == 1."""
+    depth = np.array([[1.0, 4.0]], dtype=np.float32)
+    out = depth_plugin.apply_site_calibration(depth, 0.5, np.log(3.0))
+    assert out[0, 0] == pytest.approx(3.0)      # 1**0.5 * 3
+    assert out[0, 1] == pytest.approx(6.0)      # 4**0.5 * 3
+
+
+def test_site_calibration_keeps_invalid_pixels_invalid():
+    depth = np.array([[0.0, 2.0]], dtype=np.float32)
+    out = depth_plugin.apply_site_calibration(depth, 0.5, 0.0)
+    assert out[0, 0] == 0.0                     # 0 means "no reading", stays so
+    assert np.isfinite(out).all()
+
+
+def test_legacy_depth_scale_maps_onto_cal_b():
+    """A card configured with the old linear knob keeps its behaviour instead
+    of silently reverting to identity."""
+    cal_a, cal_b = depth_plugin._calibration_from_cfg({"depth_scale": 2.0})
+    assert cal_a == 1.0
+    assert cal_b == pytest.approx(np.log(2.0))
+    depth = np.array([[3.0]], dtype=np.float32)
+    assert depth_plugin.apply_site_calibration(depth, cal_a, cal_b)[0, 0] == pytest.approx(6.0)
+
+
+def test_an_explicit_cal_b_wins_over_legacy_depth_scale():
+    _, cal_b = depth_plugin._calibration_from_cfg({"depth_scale": 2.0, "cal_b": 0.0})
+    assert cal_b == 0.0
+
+
+def test_calibration_reaches_the_published_depth_map():
+    plugin, executor = _plugin(cfg={"cal_a": 1.0, "cal_b": float(np.log(2.0)), "fps": 1000},
+                               model=_FakeModel(depth=np.full((H, W), 1.5, dtype=np.float32)))
+    plugin.dispatch("visual_depth", {"action": "start", "input_topic": "/cam/rgb"})
+    node = executor.nodes[0]
+    _feed(node)
+    depth_pub = next(p for p in node.publishers if p.topic.endswith("/depth"))
+    assert _wait_until(lambda: bool(depth_pub.messages))
+    values = np.frombuffer(zlib.decompress(depth_pub.messages[0]), dtype="<u2")
+    assert values[0] == 3000          # 1.5 m * e^ln2 → 3.0 m → 3000 mm

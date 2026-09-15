@@ -2091,12 +2091,48 @@ weights, so it cannot drift out of order or out of date — and falls back to th
 Legacy model names (`yolov8s-worldv2`, `yolov8s-world`, `yoloe-26s`) still
 resolve — a card saved before the switch must not come back as `state: error`.
 
-### visual_depth is relative until it is calibrated
+### visual_depth outputs metres — this file used to say otherwise
 
-The released weights predict on an unbounded log scale. Absolute metres need
-`model.calibrate()` against the actual camera. Until then every payload carries
-`"scale": "relative"` and `info` warns. Do not set `calibrated: true` to make
-the warning go away — downstream code will plan around invented units.
+Every payload is in **metres**, with `"scale": "metric"` and `"unit": "m"`.
+
+This section previously claimed the opposite: that the numbers were a relative
+scale until someone ran `model.calibrate()`, and the plugin labelled every
+payload `"scale": "relative"` and attached a warning saying the distances were
+not metres. That was wrong. It is also the more dangerous direction of wrong —
+an agent told its distance readings are meaningless will not use them.
+
+The head does predict a relative log-depth field, but the metric transform is
+applied **inside `Depth.forward`**:
+
+```python
+depth = torch.exp(out.clamp(-4.0, 5.0))
+depth = depth.pow(self.cal_a) * self.cal_b.exp()   # ← before the export branch
+if self.export:
+    depth = F.interpolate(depth, scale_factor=4.0, ...)
+```
+
+Because it precedes `if self.export`, it is traced into the ONNX graph and
+therefore into the TensorRT engine. The released `yolo26n-depth.pt` ships with
+that fit already done (`cal_a=1.0`, `cal_b=-0.1938`).
+
+Measured on Orin5, our engine versus the reference `.pt` on the same photos:
+
+| image | our engine (fp16, 640) | reference `.pt` |
+|---|---|---|
+| landscape | 2.36 – 35.7 m | 2.63 – 48.1 m |
+| ultralytics `bus.jpg` | 1.29 – 16.3 m | 2.22 – 17.8 m |
+
+What `model.calibrate()` buys is a refit for **your** camera. Until that is
+done these are metres from a general-purpose fit — fine to compare and to
+reason about, not survey-grade, which is what the `calibration:
+"model-default"` field and its `note` say.
+
+`cal_a` / `cal_b` in the config apply a site refit on top of the engine's own:
+`metres_out = metres_in**cal_a * exp(cal_b)`. That is ultralytics' own
+parameterisation, so a `model.calibrate()` result pastes in unchanged. The old
+`depth_scale` was a plain **linear** multiplier, which is the same thing only
+when `a == 1` — it is still read, mapped onto `cal_b = log(depth_scale)`, so an
+existing card keeps its behaviour.
 
 `visual_depth` is **on by default**, but its engine loads lazily on the first
 `start` — an enabled card that nothing has wired up costs nothing. The cost

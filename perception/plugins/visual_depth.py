@@ -20,13 +20,27 @@ Two constraints worth knowing before changing anything here:
   published at the model's native resolution renders as a blank panel with
   nothing logged anywhere. Everything is resampled to 640x480 before publishing.
 
-* **The depth is relative until it is calibrated.** The released weights predict
-  on an unbounded log scale; absolute metric accuracy needs `model.calibrate()`
-  against a labelled split from the actual camera. Until that is done the
-  numbers are self-consistent but not metres, so every payload carries an
-  explicit `scale` field and the default is `"relative"`. An agent that reads a
-  relative number as metres and plans around it is exactly the failure this
-  guards against.
+* **The output is metres, straight out of the engine.** This file used to claim
+  the opposite — that the numbers were a relative scale until someone ran
+  `model.calibrate()` — and labelled every payload `"scale": "relative"`. That
+  was wrong, and it is the more dangerous direction of wrong: an agent told the
+  distances are meaningless will not use them.
+
+  The head predicts a relative log-depth field, but the metric transform is
+  applied *inside* `Depth.forward` (`depth.pow(cal_a) * cal_b.exp()`, ultralytics
+  `nn/modules/head.py`) **before** the export branch — so it is baked into the
+  exported ONNX and into our TensorRT engine. The released yolo26n-depth weights
+  ship with that fit already done (cal_a=1.0, cal_b=-0.1938).
+
+  Measured on Orin5 against the reference `.pt`, same photos: a landscape gives
+  2.4–35.7 m here vs 2.6–48.1 m there; ultralytics' bus.jpg gives 1.3–16.3 m vs
+  2.2–17.8 m. Metres, with the error you would expect from fp16 at 640.
+
+  What `model.calibrate()` buys is a refit for *your* camera. Until that is done
+  these are metres from a general-purpose fit — good enough to compare and to
+  reason about, not survey-grade. `cal_a` / `cal_b` in the config apply such a
+  refit on top of the engine's own, using ultralytics' own parameterisation so a
+  fit obtained there can be pasted here unchanged.
 """
 
 from __future__ import annotations
@@ -87,7 +101,7 @@ TOOLS = [
         "name": "visual_depth",
         "type": "processor",
         "multiInstance": True,
-        "description": "视觉深度 — 用一个普通 RGB 摄像头估计每个像素的距离，输出深度图与左/中/右三区的最近障碍摘要。未标定时是相对尺度，不是米",
+        "description": "视觉深度 — 用一个普通 RGB 摄像头估计每个像素的距离（单位：米），输出深度图与左/中/右三区的最近障碍摘要",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -115,8 +129,8 @@ TOOLS = [
             "x-action-params": {
                 "start":  {"params": ["input_topic"], "description": "启动。给 input_topic 则持续估计该摄像头话题的深度；不给则以按需模式启动，只服务单张图片"},
                 "stop":   {"params": [], "description": "停止深度估计"},
-                "info":   {"params": ["input_topic"], "description": "查看状态、输出话题与当前尺度（相对 / 米）"},
-                "config": {"params": [], "description": "更新 fps / 尺度标定参数"},
+                "info":   {"params": ["input_topic"], "description": "查看状态、输出话题与当前标定（engine 自带 / 站点重标定）"},
+                "config": {"params": [], "description": "更新 fps / 站点标定参数 cal_a、cal_b"},
                 "recognize_by_photo": {
                     "params": ["image_path"],
                     "description": "看一张图片的远近 — 一次性估计，不需要摄像头也不需要先 start。用自然语言描述最近、最远、平均距离，以及左/中/右三个方向各自的远近",
@@ -131,8 +145,13 @@ TOOLS = [
             "type": "object",
             "properties": {
                 "fps":          {"type": "integer", "description": "Max inference frames per second", "default": 2, "scope": "instance"},
-                "depth_scale":  {"type": "number",  "description": "Multiplier from model output to metres (1.0 = uncalibrated)", "default": 1.0, "scope": "instance"},
-                "calibrated":   {"type": "boolean", "description": "Mark output as metric. Only set this after calibrating against this camera", "default": False, "scope": "instance"},
+                # Log-affine site calibration, applied on top of the one baked
+                # into the engine: metres_out = metres_in**cal_a * exp(cal_b).
+                # Same two parameters ultralytics' model.calibrate() fits, so a
+                # result from there pastes in here unchanged. 1.0 / 0.0 is
+                # identity — i.e. trust the engine.
+                "cal_a": {"type": "number", "description": "站点标定指数 a（d^a）。默认 1.0 = 不额外修正，直接用 engine 自带的标定", "default": 1.0, "scope": "instance"},
+                "cal_b": {"type": "number", "description": "站点标定偏移 b（乘 e^b）。默认 0.0 = 不额外修正。与 ultralytics model.calibrate() 的 cal_b 同一参数", "default": 0.0, "scope": "instance"},
                 "max_depth_m":  {"type": "number",  "description": "Values above this are published as invalid (0)", "default": 20.0, "scope": "instance"},
             },
         },
@@ -143,6 +162,51 @@ TOOLS = [
         ],
     }
 ]
+
+
+_MODEL_DEFAULT_NOTE = (
+    "Metres from the model's general-purpose calibration, not a fit for this "
+    "camera. Good enough to compare and to reason about; run ultralytics' "
+    "model.calibrate() on a labelled split from this camera and set cal_a / "
+    "cal_b if you need the absolute numbers to be tight."
+)
+
+
+# ── Site calibration ─────────────────────────────────────────────────────────
+
+def apply_site_calibration(depth_m: np.ndarray, cal_a: float, cal_b: float) -> np.ndarray:
+    """metres**cal_a * exp(cal_b), on top of the engine's own calibration.
+
+    Log-affine, not a plain multiplier, because that is the shape ultralytics
+    fits (`exp(a·log d + b)`) — so a `model.calibrate()` result transfers here
+    unchanged. This used to be a linear `depth_scale`, which is the same thing
+    only when a == 1 and silently wrong otherwise.
+
+    Identity (1.0, 0.0) short-circuits: the common case should not pay for two
+    array passes per frame.
+    """
+    if cal_a == 1.0 and cal_b == 0.0:
+        return depth_m
+    with np.errstate(invalid="ignore", divide="ignore"):
+        out = np.power(np.maximum(depth_m, 0.0), cal_a) * float(np.exp(cal_b))
+    return np.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0)
+
+
+def _calibration_from_cfg(cfg: dict, default: tuple[float, float] = (1.0, 0.0)) -> tuple[float, float]:
+    """Read (cal_a, cal_b) from a config, honouring the legacy `depth_scale`.
+
+    `depth_scale` was a linear multiplier, which is exactly cal_b = log(scale)
+    at cal_a = 1 — so an existing card keeps the behaviour it was configured
+    for rather than silently reverting to identity.
+    """
+    cal_a = float(cfg.get("cal_a", default[0]))
+    cal_b = float(cfg.get("cal_b", default[1]))
+    legacy = cfg.get("depth_scale")
+    if legacy not in (None, "") and "cal_b" not in cfg:
+        legacy = float(legacy)
+        if legacy > 0:
+            cal_b = float(np.log(legacy))
+    return cal_a, cal_b
 
 
 # ── Depth encoding ───────────────────────────────────────────────────────────
@@ -167,7 +231,7 @@ def encode_depth(depth_m: np.ndarray, max_depth_m: float) -> bytes:
     return zlib.compress(mm.astype("<u2").tobytes(), 1)
 
 
-def summarize_depth(depth_m: np.ndarray, scale: str, bands: int = 3) -> dict:
+def summarize_depth(depth_m: np.ndarray, scale: str = "metric", bands: int = 3) -> dict:
     """Nearest valid reading per vertical band, plus the overall range.
 
     Uses the 5th percentile rather than the raw minimum: a monocular depth map
@@ -199,7 +263,7 @@ def summarize_depth(depth_m: np.ndarray, scale: str, bands: int = 3) -> dict:
     }
 
 
-def measure_depth(depth_m: np.ndarray, scale: str, bands: int = 3) -> dict:
+def measure_depth(depth_m: np.ndarray, scale: str = "metric", bands: int = 3) -> dict:
     """`summarize_depth` plus the averages a one-shot answer needs.
 
     The streamed summary stays deliberately small — it is published several
@@ -254,13 +318,13 @@ def _fmt(value: Optional[float], scale: str) -> str:
 def describe_depth(stats: dict) -> str:
     """Turn measure_depth's numbers into one paragraph a person can read.
 
-    Deliberately refuses to say "米" for an uncalibrated map. The model predicts
-    on an unbounded relative scale, and a sentence like "前方 0.7 米有障碍" is
-    both wrong and actionable, which is the worst combination — so relative
-    output is described comparatively ("左侧明显比右侧近") with the raw numbers
-    marked as relative.
+    The engine's output is metric, so this says metres. It used to refuse to,
+    on the belief that the numbers were a relative scale — see the module
+    docstring for why that was wrong. The `relative` branch is kept for a stats
+    dict that explicitly says so, which is now only reachable if someone builds
+    an engine without the calibration baked in.
     """
-    scale = stats.get("scale", "relative")
+    scale = stats.get("scale", "metric")
     metric = scale == "metric"
     nearest, farthest = stats.get("nearest"), stats.get("farthest")
 
@@ -275,7 +339,7 @@ def describe_depth(stats: dict) -> str:
         )
     else:
         parts.append(
-            f"这是未标定的相对深度，数值只能互相比较、不代表米。"
+            f"这张深度图没有带标定，数值只能互相比较、不代表米。"
             f"画面里最近处约 {_fmt(nearest, scale)}，最远处约 {_fmt(farthest, scale)}，"
             f"平均 {_fmt(stats.get('average'), scale)}。"
         )
@@ -315,8 +379,8 @@ def describe_depth(stats: dict) -> str:
 class _DepthNode(Node):
     """Per-topic depth inference node."""
 
-    def __init__(self, input_topic: Optional[str], model, fps: float, depth_scale: float,
-                 calibrated: bool, max_depth_m: float, node_suffix: str):
+    def __init__(self, input_topic: Optional[str], model, fps: float, cal_a: float,
+                 cal_b: float, max_depth_m: float, node_suffix: str):
         super().__init__(f"visual_depth_{node_suffix}" if node_suffix else "visual_depth")
         # Topic-less is a supported mode, as in plugins/vop.py and plugins/tts.py:
         # a card driven only by recognize_by_photo has no camera to subscribe
@@ -326,8 +390,9 @@ class _DepthNode(Node):
         self._model = model
         self._fps = fps
         self._frame_interval = 1.0 / max(fps, 0.1)
-        self._depth_scale = depth_scale
-        self._scale_label = "metric" if calibrated else "relative"
+        self._cal_a = cal_a
+        self._cal_b = cal_b
+        self._scale_label = "metric"
         self._max_depth_m = max_depth_m
 
         self._depth_pub = self.create_publisher(CompressedImage, self._depth_topic, _PUB_QOS)
@@ -425,7 +490,8 @@ class _DepthNode(Node):
                 if frame is None:
                     continue
                 outputs, meta = self._model.infer(frame)
-                depth_m = decode_depth(outputs, meta) * self._depth_scale
+                depth_m = apply_site_calibration(
+                    decode_depth(outputs, meta), self._cal_a, self._cal_b)
                 # Resampled here, not by the model: the renderer's canvas is
                 # fixed at 640x480 and a mismatch is dropped silently.
                 if depth_m.shape != (DEPTH_HEIGHT, DEPTH_WIDTH):
@@ -474,8 +540,7 @@ class VideoDepthPerceptionPlugin:
         # settings straight from it (see plugins/image_input.py).
         self._plugin_cfg = dict(plugin_cfg or {})
         self._fps = int(plugin_cfg.get("fps", 2))
-        self._depth_scale = float(plugin_cfg.get("depth_scale", 1.0))
-        self._calibrated = bool(plugin_cfg.get("calibrated", False))
+        self._cal_a, self._cal_b = _calibration_from_cfg(plugin_cfg)
         self._max_depth_m = float(plugin_cfg.get("max_depth_m", 20.0))
         self._model = None  # lazy load
         self._model_loading = False
@@ -512,8 +577,8 @@ class VideoDepthPerceptionPlugin:
             node = _DepthNode(
                 input_topic or None, self._model,
                 fps=int(icfg.get("fps", self._fps)),
-                depth_scale=float(icfg.get("depth_scale", self._depth_scale)),
-                calibrated=bool(icfg.get("calibrated", self._calibrated)),
+                **dict(zip(("cal_a", "cal_b"),
+                           _calibration_from_cfg(icfg, (self._cal_a, self._cal_b)))),
                 max_depth_m=float(icfg.get("max_depth_m", self._max_depth_m)),
                 node_suffix=node_key.replace("/", "_").replace("-", "_").lstrip("_"),
             )
@@ -537,6 +602,10 @@ class VideoDepthPerceptionPlugin:
         return result
 
     # ── one-shot depth description ───────────────────────────────────────────
+
+    def _calibration_label(self) -> str:
+        """Which fit produced these metres — the engine's, or a site refit."""
+        return "model-default" if (self._cal_a == 1.0 and self._cal_b == 0.0) else "site"
 
     def _require_engine(self):
         """Return a loaded engine, loading it on demand.
@@ -579,8 +648,8 @@ class VideoDepthPerceptionPlugin:
         from plugins.vision_runtime import decode_depth
 
         outputs, meta = model.infer(frame)
-        depth_m = decode_depth(outputs, meta) * self._depth_scale
-        scale_label = "metric" if self._calibrated else "relative"
+        depth_m = apply_site_calibration(decode_depth(outputs, meta), self._cal_a, self._cal_b)
+        scale_label = "metric"
 
         # Measured at the model's own resolution, not the renderer's 640x480:
         # the resample exists for the dashboard canvas, and the answer should
@@ -597,12 +666,9 @@ class VideoDepthPerceptionPlugin:
             "description": description,
             **stats,
         }
-        if scale_label != "metric":
-            result["warning"] = (
-                "Depth is uncalibrated and therefore RELATIVE, not metres. "
-                "Comparisons between regions are meaningful; absolute distances "
-                "are not."
-            )
+        result["calibration"] = self._calibration_label()
+        if result["calibration"] == "model-default":
+            result["note"] = _MODEL_DEFAULT_NOTE
 
         # Echo onto the card's output topics when an instance is running, so a
         # topic-less card wired into the canvas actually shows data flowing —
@@ -687,7 +753,7 @@ class VideoDepthPerceptionPlugin:
                 {"topic": summary_topic, "format": "data/json"},
             ] if (input_topic or nodes) else [])
 
-            scale = "metric" if self._calibrated else "relative"
+            scale = "metric"
             info = {
                 "name": "VideoDepthPerception", "manufacture": "Embodied",
                 "model": "yolo26n-depth",
@@ -698,13 +764,10 @@ class VideoDepthPerceptionPlugin:
                 "topic_out": topics_out,
                 "desc": "Monocular depth estimation (YOLO26-depth, TensorRT)",
             }
-            if scale != "metric":
-                info["warning"] = (
-                    "Depth is uncalibrated and therefore RELATIVE, not metres. "
-                    "Comparisons between regions are meaningful; absolute "
-                    "distances are not. Calibrate against this camera and set "
-                    "calibrated=true before using these values for navigation."
-                )
+            info["unit"] = "m"
+            info["calibration"] = self._calibration_label()
+            if info["calibration"] == "model-default":
+                info["note"] = _MODEL_DEFAULT_NOTE
             return info
 
         elif action == "start":
@@ -771,10 +834,9 @@ class VideoDepthPerceptionPlugin:
                 return {"status": "configured", "instance_id": instance_id, "config": cfg}
             if "fps" in cfg:
                 self._fps = int(cfg["fps"])
-            if "depth_scale" in cfg:
-                self._depth_scale = float(cfg["depth_scale"])
-            if "calibrated" in cfg:
-                self._calibrated = bool(cfg["calibrated"])
+            if any(k in cfg for k in ("cal_a", "cal_b", "depth_scale")):
+                self._cal_a, self._cal_b = _calibration_from_cfg(
+                    cfg, (self._cal_a, self._cal_b))
             if "max_depth_m" in cfg:
                 self._max_depth_m = float(cfg["max_depth_m"])
             return {"status": "configured", "config": cfg}
