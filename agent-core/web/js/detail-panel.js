@@ -21,10 +21,42 @@ const RENDERERS = [VideoRenderer, CameraRenderer, DepthRenderer, DepthZlibRender
 let _panel    = null;
 let _renderer = null;
 let _ws       = null;
+let _status   = null;   // overlay that says why nothing is on screen
+let _staleTimer = null;
+let _frames   = 0;
+
+// How long without a frame before the panel stops implying the stream is live.
+// A <canvas> keeps its last painted pixels forever, so a stalled stream is
+// indistinguishable from a running one unless something says so.
+const STALE_MS = 10000;
 
 export function initDetailPanel() {
   _panel = document.getElementById('detail-panel');
   document.getElementById('detail-close').addEventListener('click', _closePanel);
+}
+
+/**
+ * Show a line of text over the renderer, or hide it with `null`.
+ *
+ * Without this the panel has exactly one way to express every failure — a black
+ * rectangle. "Not registered", "registered but nothing has ever published",
+ * "publisher stopped an hour ago" and "the renderer threw" all looked the same,
+ * and the monitor tab showing the *same* topic as a picture (its canvas still
+ * holding a frame painted while the stream was alive) made it read as a
+ * rendering bug in this panel.
+ */
+function _setStatus(text, tone = 'dim') {
+  if (!_status) return;
+  _status.textContent = text || '';
+  _status.style.display = text ? 'block' : 'none';
+  _status.style.color = tone === 'warn' ? 'var(--orange, #d77757)' : 'var(--text-dim, #888)';
+}
+
+function _armStaleTimer() {
+  clearTimeout(_staleTimer);
+  _staleTimer = setTimeout(() => {
+    if (_frames > 0) _setStatus(`已暂停 — ${Math.round(STALE_MS / 1000)} 秒没有新数据，画面是最后一帧`, 'warn');
+  }, STALE_MS);
 }
 
 export function showTopicDetail(topicPath, format) {
@@ -44,12 +76,22 @@ export function showTopicDetail(topicPath, format) {
   _renderer = Object.assign(Object.create(Object.getPrototypeOf(Renderer)), Renderer);
   _renderer.mount(body, 'detail');
 
+  _frames = 0;
+  _status = document.createElement('div');
+  _status.className = 'detail-status';
+  _status.style.cssText = 'position:absolute;left:0;right:0;top:50%;transform:translateY(-50%);' +
+    'text-align:center;font-size:13px;padding:0 16px;pointer-events:none;z-index:2';
+  body.style.position = body.style.position || 'relative';
+  body.appendChild(_status);
+  _setStatus('正在连接…');
+
   // Connect WebSocket — /ws/bus/* is proxied through agent-core.
   // Skip it when the topic is unresolved: `/ws/bus` with nothing after it
   // matches no route (`/ws/bus/{topic:path}`), so the handshake fails and
   // uvicorn logs a 500 that looks like a server fault rather than "no topic".
   if (!topicPath || topicPath === '/') {
     console.debug('[detail-panel] no topic yet, not opening a bus WS');
+    _setStatus('这张卡片还没有解析出输出 topic — 先启动它', 'warn');
     return;
   }
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
@@ -57,27 +99,45 @@ export function showTopicDetail(topicPath, format) {
   const wsUrl = `${proto}://${wsHost}/ws/bus${topicPath}`;
   _ws = new WebSocket(wsUrl);
   _ws.binaryType = 'arraybuffer';
+  const _onFrame = (payload) => {
+    _frames++;
+    _setStatus(null);
+    _armStaleTimer();
+    _renderer?.onData?.(payload, hint);
+  };
   _ws.onmessage = (ev) => {
     if (ev.data instanceof ArrayBuffer) {
       // Binary frame — pass directly to renderer (audio PCM, sensor binary, etc.)
       if (ev.data.byteLength === 0) return;
-      _renderer?.onData?.(ev.data, hint);
+      _onFrame(ev.data);
     } else {
       // Text frame — JSON messages
       try {
         const parsed = JSON.parse(ev.data);
-        if (parsed.type === 'ping' || parsed.type === 'meta') return;
+        if (parsed.type === 'ping') return;
+        if (parsed.type === 'meta') {
+          // Connected, but a frame is what proves anything is publishing.
+          if (_frames === 0) _setStatus('已连接，等待数据…');
+          return;
+        }
         if (parsed.type === 'error') {
           console.warn('[detail-panel] WS error:', parsed.message);
+          _setStatus(parsed.message || '订阅失败', 'warn');
           return;
         }
       } catch {}
-      const buf = new TextEncoder().encode(ev.data).buffer;
-      _renderer?.onData?.(buf, hint);
+      _onFrame(new TextEncoder().encode(ev.data).buffer);
     }
   };
-  _ws.onclose = () => { console.debug('[detail-panel] WS closed:', topicPath); };
-  _ws.onerror = (e) => { console.warn('[detail-panel] WS error:', topicPath, e); };
+  _ws.onclose = () => {
+    console.debug('[detail-panel] WS closed:', topicPath);
+    clearTimeout(_staleTimer);
+    if (_frames === 0) _setStatus('连接已断开，这个 topic 没有发出任何数据', 'warn');
+  };
+  _ws.onerror = (e) => {
+    console.warn('[detail-panel] WS error:', topicPath, e);
+    if (_frames === 0) _setStatus('连接失败', 'warn');
+  };
 }
 
 export async function showNodeDetail(mcp) {
@@ -135,11 +195,21 @@ function _closePanel() {
 }
 
 function _cleanup() {
+  clearTimeout(_staleTimer);
+  _staleTimer = null;
+  _frames = 0;
+  if (_status) {
+    _status.remove();
+    _status = null;
+  }
   if (_renderer) {
     _renderer.unmount?.();
     _renderer = null;
   }
   if (_ws) {
+    // Drop the handlers first: onclose fires asynchronously and would otherwise
+    // write "连接已断开" over the panel the next topic has already mounted.
+    _ws.onmessage = _ws.onclose = _ws.onerror = null;
     _ws.close();
     _ws = null;
   }

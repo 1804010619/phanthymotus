@@ -46,6 +46,7 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPo
 from sensor_msgs.msg import CompressedImage
 from std_msgs.msg import String
 
+from plugins.image_input import BadInput, load_image_bytes
 from utils.ros_lifecycle import dispose_node
 
 log = logging.getLogger(__name__)
@@ -53,6 +54,19 @@ log = logging.getLogger(__name__)
 # Fixed by the dashboard renderer — see the module docstring.
 DEPTH_WIDTH = 640
 DEPTH_HEIGHT = 480
+
+# Where a topic-less instance publishes. There is no input topic to derive an
+# output from, so it is fixed — same idea as vop's DEFAULT_OUTPUT_TOPIC.
+DEFAULT_DEPTH_TOPIC = "/perception/visual_depth/depth"
+DEFAULT_SUMMARY_TOPIC = "/perception/visual_depth/depth_summary"
+_DEFAULT_INSTANCE = "_default"
+
+
+def output_topics_for(input_topic: Optional[str]) -> tuple[str, str]:
+    """The one place the two output topics are derived from the input."""
+    if input_topic:
+        return f"{input_topic}/depth", f"{input_topic}/depth_summary"
+    return DEFAULT_DEPTH_TOPIC, DEFAULT_SUMMARY_TOPIC
 
 _LOW_LAT_QOS = QoSProfile(
     reliability=ReliabilityPolicy.BEST_EFFORT,
@@ -79,15 +93,39 @@ TOOLS = [
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["start", "stop", "info", "config"],
+                    "enum": [
+                        "start", "stop", "info", "config",
+                        "recognize_by_photo", "recognize_by_url",
+                    ],
                     "description": "Action to perform"
                 },
                 "input_topic": {
                     "type": "string",
-                    "description": "ROS2 image topic to subscribe (e.g. /hostname/camera/rgb, required for action=start)"
+                    "description": "ROS2 image topic to subscribe (e.g. /hostname/camera/rgb). 可选：不填则卡片以按需模式启动，不订阅摄像头，只服务 recognize_by_photo / recognize_by_url"
+                },
+                # `format: file` makes the canvas render a file picker;
+                # `uploadTo: mcp` posts it to /api/mcp/<id>/file/upload, which
+                # streams the bytes to *this* service and returns the path they
+                # landed on here — so the value this field receives is already a
+                # path perception can open, with no shared mount.
+                "image_path": {"type": "string", "format": "file", "accept": "image/*", "uploadTo": "mcp", "description": "图片文件。从卡片上传，或填一个容器可读的路径（如 /uploads/scene.jpg）。常见格式都支持，过大的图会本地缩放"},
+                "url": {"type": "string", "description": "图片的 http(s) 地址，如 https://example.com/scene.jpg。下载后本地解码，格式限制同 image_path"},
+            },
+            "required": ["action"],
+            "x-action-params": {
+                "start":  {"params": ["input_topic"], "description": "启动。给 input_topic 则持续估计该摄像头话题的深度；不给则以按需模式启动，只服务单张图片"},
+                "stop":   {"params": [], "description": "停止深度估计"},
+                "info":   {"params": ["input_topic"], "description": "查看状态、输出话题与当前尺度（相对 / 米）"},
+                "config": {"params": [], "description": "更新 fps / 尺度标定参数"},
+                "recognize_by_photo": {
+                    "params": ["image_path"],
+                    "description": "看一张图片的远近 — 一次性估计，不需要摄像头也不需要先 start。用自然语言描述最近、最远、平均距离，以及左/中/右三个方向各自的远近",
+                },
+                "recognize_by_url": {
+                    "params": ["url"],
+                    "description": "看一张图片 URL 的远近 — 与 recognize_by_photo 相同，只是图片来自 http(s) 而非本地文件",
                 },
             },
-            "required": ["action"]
         },
         "configSchema": {
             "type": "object",
@@ -161,17 +199,130 @@ def summarize_depth(depth_m: np.ndarray, scale: str, bands: int = 3) -> dict:
     }
 
 
+def measure_depth(depth_m: np.ndarray, scale: str, bands: int = 3) -> dict:
+    """`summarize_depth` plus the averages a one-shot answer needs.
+
+    The streamed summary stays deliberately small — it is published several
+    times a second and an agent re-reads it constantly. A single photo is asked
+    about once, so it can afford the mean per region as well as the nearest,
+    which is what separates "one close object against a far wall" from
+    "everything in that direction is close".
+    """
+    stats = summarize_depth(depth_m, scale, bands)
+
+    valid = np.isfinite(depth_m) & (depth_m > 0)
+    width = depth_m.shape[1]
+    edges = [round(i * width / bands) for i in range(bands + 1)]
+    names = list(stats["nearest_by_region"].keys())
+
+    averages: dict = {}
+    for i, name in enumerate(names):
+        chunk = depth_m[:, edges[i]:edges[i + 1]]
+        chunk_valid = valid[:, edges[i]:edges[i + 1]]
+        averages[name] = (round(float(chunk[chunk_valid].mean()), 3)
+                          if chunk_valid.any() else None)
+
+    overall = depth_m[valid]
+    stats["average_by_region"] = averages
+    stats["nearest"] = stats["range"][0] if stats["range"] else None
+    stats["farthest"] = stats["range"][1] if stats["range"] else None
+    stats["average"] = round(float(overall.mean()), 3) if overall.size else None
+
+    known = {k: v for k, v in stats["nearest_by_region"].items() if v is not None}
+    stats["closest_region"] = min(known, key=known.get) if known else None
+    stats["farthest_region"] = max(known, key=known.get) if known else None
+    return stats
+
+
+# ── Natural-language description ─────────────────────────────────────────────
+
+_REGION_ZH = {"left": "左侧", "center": "正前方", "right": "右侧"}
+
+# How much closer one side has to be before the description calls it out.
+# Below this the three directions are, for the purpose of a spoken answer, the
+# same distance — and saying "最近的在左侧" about a 2% difference is noise that
+# an agent will act on.
+_REGION_CONTRAST = 0.15
+
+
+def _fmt(value: Optional[float], scale: str) -> str:
+    if value is None:
+        return "未知"
+    return f"{value:.2f} 米" if scale == "metric" else f"{value:.2f}"
+
+
+def describe_depth(stats: dict) -> str:
+    """Turn measure_depth's numbers into one paragraph a person can read.
+
+    Deliberately refuses to say "米" for an uncalibrated map. The model predicts
+    on an unbounded relative scale, and a sentence like "前方 0.7 米有障碍" is
+    both wrong and actionable, which is the worst combination — so relative
+    output is described comparatively ("左侧明显比右侧近") with the raw numbers
+    marked as relative.
+    """
+    scale = stats.get("scale", "relative")
+    metric = scale == "metric"
+    nearest, farthest = stats.get("nearest"), stats.get("farthest")
+
+    if nearest is None or farthest is None:
+        return "这张图没有估计出任何有效深度 —— 可能是纯色画面，或者图片解码后是空的。"
+
+    parts = []
+    if metric:
+        parts.append(
+            f"画面整体的距离范围是 {_fmt(nearest, scale)} 到 {_fmt(farthest, scale)}，"
+            f"平均约 {_fmt(stats.get('average'), scale)}。"
+        )
+    else:
+        parts.append(
+            f"这是未标定的相对深度，数值只能互相比较、不代表米。"
+            f"画面里最近处约 {_fmt(nearest, scale)}，最远处约 {_fmt(farthest, scale)}，"
+            f"平均 {_fmt(stats.get('average'), scale)}。"
+        )
+
+    regions = {k: v for k, v in (stats.get("nearest_by_region") or {}).items() if v is not None}
+    if regions:
+        listed = "；".join(
+            f"{_REGION_ZH.get(name, name)}最近 {_fmt(value, scale)}"
+            + (f"、平均 {_fmt((stats.get('average_by_region') or {}).get(name), scale)}"
+               if (stats.get("average_by_region") or {}).get(name) is not None else "")
+            for name, value in regions.items()
+        )
+        parts.append(f"分方向看：{listed}。")
+
+        closest, farthest_region = stats.get("closest_region"), stats.get("farthest_region")
+        spread = max(regions.values()) - min(regions.values())
+        reference = max(min(regions.values()), 1e-6)
+        if closest and farthest_region and closest != farthest_region and \
+                spread / reference >= _REGION_CONTRAST:
+            parts.append(
+                f"{_REGION_ZH.get(closest, closest)}明显比"
+                f"{_REGION_ZH.get(farthest_region, farthest_region)}近，"
+                f"要绕行就往{_REGION_ZH.get(farthest_region, farthest_region)}。"
+            )
+        else:
+            parts.append("三个方向的远近差不多，没有哪一侧特别挡路。")
+
+    coverage = stats.get("valid_fraction")
+    if coverage is not None and coverage < 0.9:
+        parts.append(f"注意：只有 {coverage * 100:.0f}% 的像素估计出了有效深度，其余是无读数区域。")
+
+    return "".join(parts)
+
+
 # ── ROS2 Node (one per instance/topic) ───────────────────────────────────────
 
 class _DepthNode(Node):
     """Per-topic depth inference node."""
 
-    def __init__(self, input_topic: str, model, fps: float, depth_scale: float,
+    def __init__(self, input_topic: Optional[str], model, fps: float, depth_scale: float,
                  calibrated: bool, max_depth_m: float, node_suffix: str):
-        super().__init__(f"visual_depth_{node_suffix}")
-        self._input_topic = input_topic
-        self._depth_topic = f"{input_topic}/depth"
-        self._summary_topic = f"{input_topic}/depth_summary"
+        super().__init__(f"visual_depth_{node_suffix}" if node_suffix else "visual_depth")
+        # Topic-less is a supported mode, as in plugins/vop.py and plugins/tts.py:
+        # a card driven only by recognize_by_photo has no camera to subscribe
+        # to, but still wants somewhere to publish so the canvas shows the flow.
+        self._input_topic = input_topic or ''
+        self._depth_topic, self._summary_topic = output_topics_for(input_topic)
         self._model = model
         self._fps = fps
         self._frame_interval = 1.0 / max(fps, 0.1)
@@ -187,6 +338,7 @@ class _DepthNode(Node):
         self._worker: Optional[threading.Thread] = None
         self._last_inference_time = 0.0
         self._frame_count = 0
+        self._running = False
         # See perception/README.md § "Plugin Concurrency" — every dispatch runs
         # on its own ThreadingHTTPServer thread and the canvas issues
         # config→start→stop→start within seconds.
@@ -198,16 +350,22 @@ class _DepthNode(Node):
 
     def start(self) -> dict:
         with self._lifecycle_lock:
-            if self._sub is not None:
+            if self._running:
                 return self._state("running")
             self._stop_event.clear()
-            self._sub = self.create_subscription(
-                CompressedImage, self._input_topic, self._image_cb, _LOW_LAT_QOS
-            )
-            self._worker = threading.Thread(target=self._inference_worker, daemon=True,
-                                            name=f"visual_depth_worker_{self._input_topic}")
-            self._worker.start()
-            log.info(f"[visual_depth] started: {self._input_topic} → {self._depth_topic}, {self._summary_topic}")
+            if self._input_topic and self._sub is None:
+                self._sub = self.create_subscription(
+                    CompressedImage, self._input_topic, self._image_cb, _LOW_LAT_QOS
+                )
+                self._worker = threading.Thread(target=self._inference_worker, daemon=True,
+                                                name=f"visual_depth_worker_{self._input_topic}")
+                self._worker.start()
+            # Without a topic there is nothing to subscribe to and no frames to
+            # consume, so no worker is spawned; the node exists to own the
+            # publishers that one-shot results go out on.
+            self._running = True
+            log.info(f"[visual_depth] started: {self._input_topic or '(no topic, on-demand)'} "
+                     f"→ {self._depth_topic}, {self._summary_topic}")
             return self._state("running")
 
     def stop(self) -> dict:
@@ -220,7 +378,8 @@ class _DepthNode(Node):
             if self._worker and self._worker.is_alive():
                 self._worker.join(timeout=3.0)
             self._worker = None
-            log.info(f"[visual_depth] stopped: {self._input_topic}")
+            self._running = False
+            log.info(f"[visual_depth] stopped: {self._input_topic or '(no topic, on-demand)'}")
             return self._state("idle")
 
     def _state(self, state: str) -> dict:
@@ -230,6 +389,7 @@ class _DepthNode(Node):
             "depth_topic": self._depth_topic,
             "summary_topic": self._summary_topic,
             "scale": self._scale_label,
+            "mode": "stream" if self._input_topic else "on_demand",
         }
 
     def _image_cb(self, msg: CompressedImage):
@@ -275,7 +435,12 @@ class _DepthNode(Node):
             except Exception as e:
                 log.error(f"[visual_depth] inference error: {e}", exc_info=True)
 
-    def _publish(self, depth_m: np.ndarray):
+    def _publish(self, depth_m: np.ndarray, summary: Optional[dict] = None):
+        """Publish one depth map and its summary.
+
+        `summary` is optional so a one-shot answer can reuse the richer stats it
+        already computed instead of measuring the same array twice.
+        """
         self._frame_count += 1
 
         depth_msg = CompressedImage()
@@ -283,7 +448,7 @@ class _DepthNode(Node):
         depth_msg.data = encode_depth(depth_m, self._max_depth_m)
         self._depth_pub.publish(depth_msg)
 
-        summary = summarize_depth(depth_m, self._scale_label)
+        summary = dict(summary) if summary is not None else summarize_depth(depth_m, self._scale_label)
         summary["timestamp"] = time.time()
         msg = String()
         msg.data = json.dumps(summary, ensure_ascii=False)
@@ -305,6 +470,9 @@ class VideoDepthPerceptionPlugin:
     def __init__(self, plugin_cfg: dict, namespace: str, executor):
         self._namespace = namespace
         self._executor = executor
+        # Kept whole: image_input reads max_image_bytes and the path-confinement
+        # settings straight from it (see plugins/image_input.py).
+        self._plugin_cfg = dict(plugin_cfg or {})
         self._fps = int(plugin_cfg.get("fps", 2))
         self._depth_scale = float(plugin_cfg.get("depth_scale", 1.0))
         self._calibrated = bool(plugin_cfg.get("calibrated", False))
@@ -335,14 +503,14 @@ class VideoDepthPerceptionPlugin:
             self._model = VisionEngineSession(engine)
             log.info(f"[visual_depth] engine loaded, input={self._model.input_size}")
 
-    def _start_node(self, node_key: str, input_topic: str):
+    def _start_node(self, node_key: str, input_topic: Optional[str]):
         """Register before starting, so a concurrent stop can always cancel it."""
         with self._nodes_lock:
             if node_key in self._nodes:
                 return
             icfg = self._instance_configs.get(node_key, {})
             node = _DepthNode(
-                input_topic, self._model,
+                input_topic or None, self._model,
                 fps=int(icfg.get("fps", self._fps)),
                 depth_scale=float(icfg.get("depth_scale", self._depth_scale)),
                 calibrated=bool(icfg.get("calibrated", self._calibrated)),
@@ -352,7 +520,8 @@ class VideoDepthPerceptionPlugin:
             self._executor.add_node(node)
             self._nodes[node_key] = node
         node.start()
-        log.info(f"[visual_depth] node started (background): {input_topic}")
+        log.info(f"[visual_depth] node started (background): "
+                 f"{input_topic or '(no topic, on-demand)'}")
 
     def _retire_node(self, node_key: str) -> Optional[dict]:
         with self._nodes_lock:
@@ -366,6 +535,106 @@ class VideoDepthPerceptionPlugin:
         # removed or the publishers and the ROS node name leak.
         dispose_node(self._executor, node, label=f"visual_depth/{node_key}")
         return result
+
+    # ── one-shot depth description ───────────────────────────────────────────
+
+    def _require_engine(self):
+        """Return a loaded engine, loading it on demand.
+
+        A photo question is useful without any instance running — someone asks
+        "how far away is this" before pointing a camera anywhere — so it
+        triggers the same single-flight load a `start` would and waits for it,
+        rather than reporting `loading` and making the caller poll. Each
+        tools/call already has its own thread (ThreadingHTTPServer), so blocking
+        here blocks nothing else. Same rule as plugins/vop.py.
+        """
+        self._ensure_model()
+        return self._model
+
+    def _recognize_image(self, args: dict, url_action: str) -> dict:
+        """Estimate depth for one image and describe it in words."""
+        cfg = dict(self._plugin_cfg)
+        try:
+            data, source = load_image_bytes(args, cfg, url_action=url_action)
+        except BadInput as error:
+            return error.as_result()
+
+        import cv2
+
+        started = time.time()
+        frame = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
+        if frame is None:
+            return BadInput(
+                "could not decode that file as an image — check it is a real "
+                "picture and not, say, HTML returned by a redirect", source,
+            ).as_result()
+
+        try:
+            model = self._require_engine()
+        except Exception as error:  # noqa: BLE001 — surfaced to the caller
+            log.error(f"[visual_depth] engine load failed during recognize: {error}",
+                      exc_info=True)
+            return {"ok": False, "reason": "engine_unavailable", "detail": str(error)}
+
+        from plugins.vision_runtime import decode_depth
+
+        outputs, meta = model.infer(frame)
+        depth_m = decode_depth(outputs, meta) * self._depth_scale
+        scale_label = "metric" if self._calibrated else "relative"
+
+        # Measured at the model's own resolution, not the renderer's 640x480:
+        # the resample exists for the dashboard canvas, and the answer should
+        # not be quantised by it.
+        stats = measure_depth(depth_m, scale_label)
+        description = describe_depth(stats)
+
+        height, width = frame.shape[:2]
+        result = {
+            "ok": True,
+            "source": source,
+            "image_size": [width, height],
+            "latency_ms": int((time.time() - started) * 1000),
+            "description": description,
+            **stats,
+        }
+        if scale_label != "metric":
+            result["warning"] = (
+                "Depth is uncalibrated and therefore RELATIVE, not metres. "
+                "Comparisons between regions are meaningful; absolute distances "
+                "are not."
+            )
+
+        # Echo onto the card's output topics when an instance is running, so a
+        # topic-less card wired into the canvas actually shows data flowing —
+        # which is the only reason it is startable without a camera. Purely
+        # additive: the answer goes back through MCP regardless.
+        published_to = self._publish_one_shot(args.get("instance_id", ""), depth_m, stats)
+        if published_to:
+            result["published_to"] = published_to
+        return result
+
+    def _publish_one_shot(self, instance_id: str, depth_m: np.ndarray,
+                          stats: dict) -> Optional[list]:
+        """Publish a one-shot result on the named instance, or the default one."""
+        with self._nodes_lock:
+            node = self._nodes.get(instance_id) if instance_id else None
+            if node is None:
+                node = self._nodes.get(_DEFAULT_INSTANCE)
+            if node is None and len(self._nodes) == 1:
+                node = next(iter(self._nodes.values()))
+        if node is None:
+            return None
+        try:
+            import cv2
+            published = depth_m
+            if published.shape != (DEPTH_HEIGHT, DEPTH_WIDTH):
+                published = cv2.resize(published, (DEPTH_WIDTH, DEPTH_HEIGHT),
+                                       interpolation=cv2.INTER_NEAREST)
+            node._publish(published, stats)
+            return [node._depth_topic, node._summary_topic]
+        except Exception as error:  # noqa: BLE001 — never fail the answer on this
+            log.warning(f"[visual_depth] could not echo one-shot result: {error}")
+            return None
 
     def get_tools(self) -> list:
         return TOOLS
@@ -409,10 +678,14 @@ class VideoDepthPerceptionPlugin:
                 input_topic = next(iter(nodes.values()))._input_topic
 
             topics_in = [{"topic": input_topic, "format": "image/jpeg"}] if input_topic else []
-            topics_out = [
-                {"topic": f"{input_topic}/depth", "format": "image/depth-zlib"},
-                {"topic": f"{input_topic}/depth_summary", "format": "data/json"},
-            ] if input_topic else []
+            depth_topic, summary_topic = output_topics_for(input_topic)
+            # `or nodes`: a topic-less instance has no input to derive from but
+            # does publish, on the fixed default topics. Reporting nothing there
+            # is what leaves a running on-demand card looking unwired.
+            topics_out = ([
+                {"topic": depth_topic, "format": "image/depth-zlib"},
+                {"topic": summary_topic, "format": "data/json"},
+            ] if (input_topic or nodes) else [])
 
             scale = "metric" if self._calibrated else "relative"
             info = {
@@ -440,9 +713,11 @@ class VideoDepthPerceptionPlugin:
                 topics_list = args.get("input_topics") or []
                 if topics_list:
                     input_topic = topics_list[0]
-            if not input_topic:
-                raise ValueError("input_topic is required")
-            node_key = instance_id or input_topic
+            # No topic is a supported mode, as in plugins/vop.py and
+            # plugins/tts.py: the card comes up on-demand, loads the engine and
+            # owns its publishers, and answers recognize_by_photo /
+            # recognize_by_url. It just has nothing to subscribe to.
+            node_key = instance_id or input_topic or _DEFAULT_INSTANCE
 
             with self._nodes_lock:
                 running = self._nodes.get(node_key)
@@ -503,5 +778,11 @@ class VideoDepthPerceptionPlugin:
             if "max_depth_m" in cfg:
                 self._max_depth_m = float(cfg["max_depth_m"])
             return {"status": "configured", "config": cfg}
+
+        elif action == "recognize_by_photo":
+            return self._recognize_image(args, url_action="recognize_by_url")
+
+        elif action == "recognize_by_url":
+            return self._recognize_image(args, url_action="recognize_by_url")
 
         return None

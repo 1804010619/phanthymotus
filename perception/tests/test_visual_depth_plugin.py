@@ -13,6 +13,7 @@ Run: PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest perception/tests -q
 from __future__ import annotations
 
 import json
+import re
 import threading
 import time
 import zlib
@@ -261,3 +262,191 @@ def test_a_frame_that_fails_to_decode_is_skipped_not_fatal():
 
     depth_pub = next(p for p in node.publishers if p.topic.endswith("/depth"))
     assert _wait_until(lambda: bool(depth_pub.messages))
+
+
+# ── measurements and the spoken description ──────────────────────────────────
+
+def _graded_depth(left=1.0, center=2.0, right=3.0):
+    """A depth map whose three vertical thirds have known, distinct values."""
+    depth = np.zeros((H, W), dtype=np.float32)
+    # Same edges summarize_depth uses; W is not divisible by 3, so a fixture
+    # that splits on W//3 disagrees with the code by one column and the test
+    # then fails on an off-by-one of its own making.
+    edges = [round(i * W / 3) for i in range(4)]
+    for i, value in enumerate((left, center, right)):
+        depth[:, edges[i]:edges[i + 1]] = value
+    return depth
+
+
+def test_measure_depth_adds_averages_and_the_closest_direction():
+    stats = depth_plugin.measure_depth(_graded_depth(), "metric")
+    assert stats["nearest"] == pytest.approx(1.0)
+    assert stats["farthest"] == pytest.approx(3.0)
+    assert stats["average"] == pytest.approx(2.0, abs=0.01)
+    assert stats["closest_region"] == "left"
+    assert stats["farthest_region"] == "right"
+    assert stats["average_by_region"]["center"] == pytest.approx(2.0)
+
+
+def test_measure_depth_ignores_invalid_pixels_in_the_average():
+    depth = np.full((H, W), 4.0, dtype=np.float32)
+    depth[: H // 2] = 0.0          # 0 means "no reading", not "at the lens"
+    stats = depth_plugin.measure_depth(depth, "metric")
+    assert stats["average"] == pytest.approx(4.0)
+    assert stats["valid_fraction"] == pytest.approx(0.5)
+
+
+def test_description_of_a_metric_map_uses_metres():
+    text = depth_plugin.describe_depth(depth_plugin.measure_depth(_graded_depth(), "metric"))
+    assert "米" in text
+    assert "相对" not in text
+    assert "左侧" in text and "右侧" in text
+
+
+def test_description_of_an_uncalibrated_map_never_claims_metres():
+    """The whole point of the scale field: a relative number read as metres is
+    both wrong and actionable."""
+    text = depth_plugin.describe_depth(depth_plugin.measure_depth(_graded_depth(), "relative"))
+    # Not "no 米 anywhere" — the disclaimer sentence says the numbers are *not*
+    # metres, and that sentence is the point. What must never appear is a
+    # *number* given in metres.
+    assert not re.search(r"[0-9.]+\s*米", text)
+    assert "相对" in text
+
+
+def test_description_names_the_closer_side_and_where_to_go():
+    text = depth_plugin.describe_depth(
+        depth_plugin.measure_depth(_graded_depth(left=1.0, center=2.0, right=3.0), "metric"))
+    assert "左侧明显比正前方近" in text or "左侧明显比右侧近" in text
+    assert "绕行" in text
+
+
+def test_description_does_not_invent_a_closer_side_from_noise():
+    """A 1% spread is not a direction to steer by."""
+    text = depth_plugin.describe_depth(
+        depth_plugin.measure_depth(_graded_depth(2.00, 2.01, 2.02), "metric"))
+    assert "差不多" in text
+    assert "绕行" not in text
+
+
+def test_description_flags_poor_coverage():
+    depth = np.zeros((H, W), dtype=np.float32)
+    depth[: H // 4] = 2.0
+    text = depth_plugin.describe_depth(depth_plugin.measure_depth(depth, "metric"))
+    assert "25%" in text
+
+
+def test_description_of_an_empty_map_says_so_instead_of_crashing():
+    text = depth_plugin.describe_depth(
+        depth_plugin.measure_depth(np.zeros((H, W), dtype=np.float32), "metric"))
+    assert "没有估计出任何有效深度" in text
+
+
+# ── one-shot recognition ─────────────────────────────────────────────────────
+
+def _photo_plugin(tmp_path, depth=None, **cfg):
+    base = {"image_roots": [str(tmp_path)], "max_image_bytes": 1 << 20}
+    base.update(cfg)
+    return _plugin(cfg=base, model=_FakeModel(depth=depth if depth is not None else _graded_depth()))
+
+
+def _write_frame(tmp_path, name="scene.jpg", marker=b"200x100"):
+    path = tmp_path / name
+    path.write_bytes(marker)
+    return str(path)
+
+
+def test_recognize_by_photo_answers_without_any_instance(tmp_path):
+    """The point of the action: answer about a picture with no camera running."""
+    plugin, executor = _photo_plugin(tmp_path, **{"calibrated": True})
+    result = plugin.dispatch("visual_depth", {
+        "action": "recognize_by_photo", "image_path": _write_frame(tmp_path)})
+
+    assert executor.nodes == []          # nothing was started
+    assert result["ok"] is True
+    assert result["scale"] == "metric"
+    assert result["image_size"] == [200, 100]
+    assert result["closest_region"] == "left"
+    assert "米" in result["description"]
+    assert "latency_ms" in result
+    assert "published_to" not in result  # no instance to echo onto
+
+
+def test_recognize_by_photo_warns_when_the_scale_is_relative(tmp_path):
+    plugin, _ = _photo_plugin(tmp_path)
+    result = plugin.dispatch("visual_depth", {
+        "action": "recognize_by_photo", "image_path": _write_frame(tmp_path)})
+    assert result["scale"] == "relative"
+    assert "RELATIVE" in result["warning"]
+    assert not re.search(r"[0-9.]+\s*米", result["description"])
+
+
+def test_recognize_by_photo_refuses_a_path_outside_the_roots(tmp_path):
+    plugin, _ = _photo_plugin(tmp_path)
+    result = plugin.dispatch("visual_depth", {
+        "action": "recognize_by_photo", "image_path": "/etc/passwd"})
+    assert result["ok"] is False
+    assert result["reason"] == "bad_input"
+    # Must name this plugin's own action, not some other card's.
+    assert "recognize_by_url" in result["detail"]
+
+
+def test_recognize_by_photo_on_an_undecodable_file(tmp_path):
+    plugin, _ = _photo_plugin(tmp_path)
+    path = _write_frame(tmp_path, "junk.jpg", b"this is not an image")
+    result = plugin.dispatch("visual_depth", {
+        "action": "recognize_by_photo", "image_path": path})
+    assert result["ok"] is False
+    assert "decode" in result["detail"]
+
+
+def test_recognize_by_url_shares_the_photo_path(tmp_path, monkeypatch):
+    import plugins.image_input as image_input
+    monkeypatch.setattr(image_input, "fetch_url", lambda url, max_bytes: b"200x100")
+    plugin, _ = _photo_plugin(tmp_path)
+    result = plugin.dispatch("visual_depth", {
+        "action": "recognize_by_url", "url": "https://example.com/scene.jpg"})
+    assert result["ok"] is True
+    assert result["source"] == "https://example.com/scene.jpg"
+
+
+def test_one_shot_echoes_onto_a_running_instance(tmp_path):
+    """A topic-less card wired into the canvas has to show data flowing."""
+    plugin, executor = _photo_plugin(tmp_path)
+    plugin.dispatch("visual_depth", {"action": "start"})
+    node = executor.nodes[0]
+
+    result = plugin.dispatch("visual_depth", {
+        "action": "recognize_by_photo", "image_path": _write_frame(tmp_path)})
+    assert result["published_to"] == [depth_plugin.DEFAULT_DEPTH_TOPIC,
+                                      depth_plugin.DEFAULT_SUMMARY_TOPIC]
+
+    depth_pub = next(p for p in node.publishers if p.topic == depth_plugin.DEFAULT_DEPTH_TOPIC)
+    summary_pub = next(p for p in node.publishers if p.topic == depth_plugin.DEFAULT_SUMMARY_TOPIC)
+    # Echoed onto the bus at the renderer's size, whatever the model's was.
+    assert np.frombuffer(zlib.decompress(depth_pub.messages[0]), dtype="<u2").size == W * H
+    assert json.loads(summary_pub.messages[0])["closest_region"] == "left"
+
+
+# ── topic-less (on-demand) mode ──────────────────────────────────────────────
+
+def test_start_without_a_topic_subscribes_to_nothing_but_still_publishes():
+    plugin, executor = _plugin(model=_FakeModel())
+    state = plugin.dispatch("visual_depth", {"action": "start"})
+    assert state["mode"] == "on_demand"
+    assert state["depth_topic"] == depth_plugin.DEFAULT_DEPTH_TOPIC
+
+    node = executor.nodes[0]
+    assert node.subscriptions == []      # no camera, so nothing to subscribe to
+    assert {p.topic for p in node.publishers} == {depth_plugin.DEFAULT_DEPTH_TOPIC,
+                                                 depth_plugin.DEFAULT_SUMMARY_TOPIC}
+
+
+def test_info_reports_the_topics_of_a_topic_less_instance():
+    """Without this the running on-demand card looks unwired on the canvas."""
+    plugin, _ = _plugin(model=_FakeModel())
+    plugin.dispatch("visual_depth", {"action": "start"})
+    info = plugin.dispatch("visual_depth", {"action": "info"})
+    assert [t["topic"] for t in info["topic_out"]] == [depth_plugin.DEFAULT_DEPTH_TOPIC,
+                                                      depth_plugin.DEFAULT_SUMMARY_TOPIC]
+    assert info["topic_in"] == []
