@@ -14,10 +14,27 @@
  *   node --test "agent-core/web/js/*.test.mjs"
  */
 
-/** The topic a card publishes on `portIdx`, or '' if not known yet. */
+/**
+ * The topic a card publishes on `portIdx`, or '' if not known yet.
+ *
+ * A port that exists but has no topic yet resolves to '' and never to another
+ * port's topic. The blanket `|| list[0]?.topic` fallback this replaces made a
+ * link out of port 1 silently carry port 0's data whenever port 1 had not
+ * resolved — a depth output feeding a panel that then showed the colour stream.
+ * Worse, the answer was non-empty, so `unresolved` below counted the card as
+ * done and nothing ever corrected it. Same doctrine as inputTopicOf: an
+ * unresolved source is waited for, not guessed at.
+ *
+ * The fallback survives for a genuinely out-of-range index on a *single*-output
+ * card, which is what a layout saved before the card's ports changed looks
+ * like. There "port 3" can only have meant the one port there is. On a
+ * multi-output card it could mean any of them, so '' is the honest answer and
+ * start-project's unresolved-input check reports the broken link.
+ */
 export function topicOfPort(card, portIdx) {
   const list = card?.topicOut || [];
-  return list[portIdx]?.topic || list[0]?.topic || '';
+  if (portIdx < list.length) return list[portIdx]?.topic || '';
+  return list.length === 1 ? (list[0]?.topic || '') : '';
 }
 
 /**
@@ -101,7 +118,15 @@ export async function resolveDerivedTopics(cards, connections, opts = {}) {
     }
   };
 
-  const unresolved = (c) => c.mcpId && c.toolName && !(c.topicOut || []).some(t => t.topic);
+  // A card counts as resolved only when *every* port has a topic. The old test
+  // was `!some(t => t.topic)` — any one resolved port marked the whole card
+  // done, so a two-output card whose second port came back empty kept that port
+  // empty for good, and every link out of it stayed dead.
+  const unresolved = (c) => {
+    if (!c.mcpId || !c.toolName) return false;
+    const list = c.topicOut || [];
+    return !list.length || list.some(t => !t.topic);
+  };
   // What each card has already been asked. The last-resort pass asks a different
   // question (a different input topic), but only where it *is* different —
   // otherwise an offline or can't-infer driver would be asked the same thing twice.

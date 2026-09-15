@@ -560,10 +560,23 @@ async def _do_start_project_impl():
             errors.append(tool_name)
 
     def _port_topic(out_list: list, port_idx: int) -> str:
-        """The topic a source publishes on `port_idx`, or its first one."""
-        if 0 <= port_idx < len(out_list) and out_list[port_idx].get('topic'):
-            return out_list[port_idx]['topic']
-        return (out_list[0].get('topic') or '') if out_list else ''
+        """The topic a source publishes on `port_idx`.
+
+        A port that exists but carries no topic resolves to '' rather than to
+        the first port's. Falling back across ports meant a link drawn from a
+        camera's depth output silently carried its colour stream whenever depth
+        had not resolved — wrong data on a live link, which is worse than a link
+        the operator can see is unresolved. Mirrors topicOfPort in
+        web/js/topic-derive.js; the two must agree or the canvas and the start
+        disagree about what a connection carries.
+
+        Out of range on a *single*-output source keeps the fallback: that is a
+        layout saved before the card's ports changed, where the index can only
+        have meant the one port there is.
+        """
+        if 0 <= port_idx < len(out_list):
+            return out_list[port_idx].get('topic') or ''
+        return (out_list[0].get('topic') or '') if len(out_list) == 1 else ''
 
     def _topic_of_connection(conn: dict) -> str:
         """The topic carried by one connection, best answer first.

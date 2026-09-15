@@ -138,10 +138,52 @@ test('it asks with the resolved input topic, not the stale one', async () => {
 test('inputTopicOf and topicOfPort read the port that the connection names', () => {
   const two = { id: 'c', topicOut: [{ topic: '/a' }, { topic: '/b' }] };
   assert.equal(topicOfPort(two, 1), '/b');
-  assert.equal(topicOfPort(two, 5), '/a', 'out of range falls back to the first port');
   assert.equal(topicOfPort({ }, 0), '');
   const conns = [{ fromCardId: 'c', fromPortIdx: '1', toCardId: 'd', toPortIdx: '0' }];
   assert.equal(inputTopicOf({ id: 'd' }, [two], conns), '/b');
+});
+
+test('an unresolved port does not borrow another port\'s topic', () => {
+  // A camera whose colour output resolved and whose depth output did not. The
+  // old `|| list[0]?.topic` handed /colour to the depth link: a live connection
+  // carrying the wrong stream, which the panel renders without complaint. And
+  // because the answer was non-empty, the card counted as resolved and nothing
+  // re-asked. '' is the honest answer — start-project then reports the link.
+  const cam = { id: 'cam', topicOut: [{ topic: '/colour' }, { format: 'image/depth-zlib' }] };
+  assert.equal(topicOfPort(cam, 1), '');
+  const conns = [{ fromCardId: 'cam', fromPortIdx: '1', toCardId: 'd', toPortIdx: '0' }];
+  assert.equal(inputTopicOf({ id: 'd' }, [cam], conns), '');
+});
+
+test('an out-of-range port still resolves on a single-output card', () => {
+  // A layout saved before the card's ports changed. With one port there is no
+  // ambiguity about what the index meant, so the old fallback is kept — but
+  // only here, where it cannot pick the wrong stream.
+  assert.equal(topicOfPort({ id: 'c', topicOut: [{ topic: '/a' }] }, 3), '/a');
+  const two = { id: 'c', topicOut: [{ topic: '/a' }, { topic: '/b' }] };
+  assert.equal(topicOfPort(two, 5), '', 'multi-output: which port did it mean?');
+});
+
+test('a card with one port still unresolved keeps being asked', async () => {
+  // `!some(t => t.topic)` treated any one resolved port as the whole card being
+  // done, so a second port that came back empty stayed empty for good.
+  const log = [];
+  // A *fed* card, so the inputless path cannot be what gets it asked — the
+  // half-resolved state has to be what does.
+  const src = { id: 'card-src', mcpId: 'mcp-1', toolName: 'camera',
+                topicOut: [{ topic: '/cam' }] };
+  const vop = { id: 'card-vop', mcpId: 'mcp-1', toolName: 'vop',
+                topicOut: [{ topic: '/cam/vop' }, { format: 'image/jpeg' }] };
+  const conns = [{ fromCardId: 'card-src', fromPortIdx: '0',
+                   toCardId: 'card-vop', toPortIdx: '0' }];
+  const fetchImpl = async (url, opts) => {
+    log.push(JSON.parse(opts.body).tool);
+    return { json: async () => ({ data: { topic_out: [
+      { topic: '/cam/vop' }, { topic: '/cam/vop/overlay', format: 'image/jpeg' }] } }) };
+  };
+  await resolveDerivedTopics([src, vop], conns, { fetchImpl });
+  assert.deepEqual(log, ['vop'], 'the half-resolved card was asked');
+  assert.equal(vop.topicOut[1].topic, '/cam/vop/overlay');
 });
 
 test('a source that is not on the canvas falls back to the persisted topic', async () => {
