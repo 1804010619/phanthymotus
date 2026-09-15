@@ -983,6 +983,12 @@ def ensure_kokoro_model(model_dir: str, device: str = "gpu") -> str:
 # exported model), so neither copy can be changed on a robot.
 VISION_MODEL_BASE = os.environ.get("VISION_MODEL_BASE_URL", f"{COS_BASE}/vision")
 
+# The jp61 bundle is built against TensorRT 10.4, which is what the jp6.1
+# *image* ships — not the 10.3 its Jetson hosts carry. An engine plan only
+# loads on the TensorRT that built it, so a bundle built on the host was
+# rejected by every jp6.1 robot. The version is in the path so the mismatch is
+# visible without deserializing anything.
+#
 # Every pin below was taken from the copy downloaded back out of COS, not from
 # the file that was uploaded — the point of the pin is to catch a bad transfer,
 # and hashing the source cannot. (Same note as THAI_TTS_ARCHIVE / KOKORO.)
@@ -996,11 +1002,11 @@ _VOP_VOCAB = {
 
 VOP_MODEL_BUNDLES = {
     "jp61": {
-        "base_url": f"{VISION_MODEL_BASE}/yoloe-26s-seg/tensorrt-jp61-trt10.3-orin-640",
+        "base_url": f"{VISION_MODEL_BASE}/yoloe-26s-seg/tensorrt-jp61-trt10.4-orin-640",
         "files": {
             "yoloe-26s-seg.engine": {
-                "size": 24520612,
-                "sha256": "33bcdf00b0cad906ab430e4b71d533a194e309a44034fe92c610ea0bce1a2a78",
+                "size": 24780908,
+                "sha256": "b8cb77a0685a399ef7d83dfc4d0777b54e66ea110d1085a005c4f153366e4099",
             },
             "vocab.json": _VOP_VOCAB,
         },
@@ -1019,11 +1025,11 @@ VOP_MODEL_BUNDLES = {
 
 DEPTH_MODEL_BUNDLES = {
     "jp61": {
-        "base_url": f"{VISION_MODEL_BASE}/yolo26n-depth/tensorrt-jp61-trt10.3-orin-640",
+        "base_url": f"{VISION_MODEL_BASE}/yolo26n-depth/tensorrt-jp61-trt10.4-orin-640",
         "files": {
             "yolo26n-depth.engine": {
-                "size": 14110654,
-                "sha256": "8e0ea2afdcf39c96a04cc9afe76e6953aec120f16c3db856d0af0266ec769765",
+                "size": 14020431,
+                "sha256": "d7fd1096fd2d29226b85693693a9ec11b65b0097ad0e783803b5fc7218d8f23b",
             },
         },
     },
