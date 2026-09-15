@@ -450,16 +450,77 @@ def test_the_new_actions_are_advertised_with_their_params():
     assert image_path["uploadTo"] == "mcp"
 
 
-def test_start_without_a_topic_points_at_the_actions_that_need_none():
-    """The instinct is to `start` first; the message has to redirect it.
+def test_start_without_a_topic_comes_up_on_demand():
+    """A card with no camera still starts, as tts's does.
 
-    A bare "input_topic is required" reads as a broken tool to an agent that
-    only wanted to look at one picture.
+    It loads the engine and owns a publisher; it just has nothing to subscribe
+    to. Before this it raised, so a photo-only card could never show `running`.
     """
-    plugin, _ = _plugin(model=_FakeModel())
-    with pytest.raises(ValueError) as excinfo:
-        plugin.dispatch("vop", {"action": "start"})
-    message = str(excinfo.value)
-    assert "recognize_by_photo" in message
-    assert "recognize_by_url" in message
-    assert "list_recognizable_objects" in message
+    plugin, executor = _plugin(model=_FakeModel())
+    result = plugin.dispatch("vop", {"action": "start"})
+
+    assert result["state"] == "running"
+    assert result["mode"] == "on_demand"
+    assert result["input"] == ""
+    assert result["output"] == vop_plugin.DEFAULT_OUTPUT_TOPIC
+    assert len(executor.nodes) == 1
+    # No topic means no subscription and no frame worker to feed.
+    assert executor.nodes[0].subscriptions == []
+
+
+def test_start_with_a_topic_still_subscribes():
+    plugin, executor = _plugin(model=_FakeModel())
+    result = plugin.dispatch("vop", {"action": "start", "input_topic": "/cam/rgb"})
+    assert result["mode"] == "stream"
+    assert result["output"] == "/cam/rgb/objects"
+    assert len(executor.nodes[0].subscriptions) == 1
+
+
+def test_the_topic_less_instance_is_keyed_apart_from_a_stream_one():
+    plugin, executor = _plugin(model=_FakeModel())
+    plugin.dispatch("vop", {"action": "start"})
+    plugin.dispatch("vop", {"action": "start", "input_topic": "/cam/rgb"})
+    assert len(executor.nodes) == 2
+    assert set(plugin._nodes) == {"_default", "/cam/rgb"}
+
+
+def test_a_one_shot_result_is_echoed_onto_a_running_cards_topic(tmp_path):
+    """The reason a topic-less card is startable: the canvas shows flow."""
+    plugin, executor = _photo_plugin(
+        tmp_path, rows=[[100.0, 0.0, 200.0, 50.0, 0.9, 0]])
+    plugin.dispatch("vop", {"action": "start"})
+    node = executor.nodes[0]
+
+    result = plugin.dispatch("vop", {"action": "recognize_by_photo",
+                                     "image_path": _write_frame(tmp_path)})
+    assert result["published_to"] == vop_plugin.DEFAULT_OUTPUT_TOPIC
+    published = json.loads(node.publishers[0].messages[-1])
+    assert published["objects"] == result["objects"]
+
+
+def test_a_one_shot_result_without_any_running_card_publishes_nothing(tmp_path):
+    plugin, _ = _photo_plugin(tmp_path, rows=[[1.0, 1.0, 2.0, 2.0, 0.9, 0]])
+    result = plugin.dispatch("vop", {"action": "recognize_by_photo",
+                                     "image_path": _write_frame(tmp_path)})
+    assert result["ok"] is True
+    assert "published_to" not in result
+
+
+def test_the_loading_reply_names_the_right_output_topic():
+    """It built "None/objects" — the topic was derived inline from a None."""
+    executor = _FakeExecutor()
+    plugin = vop_plugin.VideoObjectPerceptionPlugin({}, "testns", executor)
+    plugin._vocabulary = ["person"]
+    result = plugin.dispatch("vop", {"action": "start"})   # engine not loaded
+    assert result["state"] == "loading"
+    assert result["output"] == vop_plugin.DEFAULT_OUTPUT_TOPIC
+    assert result["input"] == ""
+
+
+@pytest.mark.parametrize("topic,expected", [
+    ("/cam/rgb", "/cam/rgb/objects"),
+    ("", "/perception/vop"),
+    (None, "/perception/vop"),
+])
+def test_output_topic_derivation_is_one_function(topic, expected):
+    assert vop_plugin.output_topic_for(topic) == expected

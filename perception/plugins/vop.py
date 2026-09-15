@@ -66,6 +66,13 @@ _PUB_QOS = QoSProfile(
     durability=DurabilityPolicy.VOLATILE,
 )
 
+# Where a topic-less card publishes. Fixed, because with no input topic
+# there is nothing to derive it from — same rule as tts's /perception/tts.
+DEFAULT_OUTPUT_TOPIC = "/perception/vop"
+
+# Instance key for the topic-less card, mirroring tts's `_default`.
+_DEFAULT_INSTANCE = "_default"
+
 DEFAULT_MODEL = "yoloe-26s-seg"
 
 # Names that already exist in deployed canvas cards and yaml. A card saved when
@@ -77,6 +84,17 @@ _MODEL_ALIASES = {
     "yolov8s-world": DEFAULT_MODEL,
     "yoloe-26s": DEFAULT_MODEL,
 }
+
+
+def output_topic_for(input_topic: Optional[str]) -> str:
+    """The one place the output topic is derived from the input.
+
+    Built in three places before — the node, info, and the loading
+    reply — and the loading reply forgot the topic-less case, so a
+    card starting without a camera reported publishing to
+    "None/objects".
+    """
+    return f"{input_topic}/objects" if input_topic else DEFAULT_OUTPUT_TOPIC
 
 
 def canonical_model_name(name: str) -> str:
@@ -111,7 +129,7 @@ TOOLS = [
                 },
                 "input_topic": {
                     "type": "string",
-                    "description": "ROS2 image topic to subscribe (e.g. /hostname/camera/rgb, required for action=start)"
+                    "description": "ROS2 image topic to subscribe (e.g. /hostname/camera/rgb). 可选：不填则卡片以按需模式启动，不订阅摄像头，只服务 recognize_by_photo / recognize_by_url"
                 },
                 # `format: file` makes the canvas render a file picker;
                 # `uploadTo: mcp` posts it to /api/mcp/<id>/file/upload, which
@@ -124,7 +142,7 @@ TOOLS = [
             },
             "required": ["action"],
             "x-action-params": {
-                "start":  {"params": ["input_topic"], "description": "Start detecting objects on an image topic"},
+                "start":  {"params": ["input_topic"], "description": "启动。给 input_topic 则持续检测该摄像头话题；不给则以按需模式启动，只服务单张图片的识别"},
                 "stop":   {"params": [], "description": "Stop detection"},
                 "info":   {"params": ["input_topic"], "description": "Report state, topics and the frozen class list"},
                 "config": {"params": [], "description": "Update confidence / fps"},
@@ -160,11 +178,15 @@ TOOLS = [
 class _VOPNode(Node):
     """Per-topic YOLO inference node."""
 
-    def __init__(self, input_topic: str, model, confidence: float, fps: float,
+    def __init__(self, input_topic: Optional[str], model, confidence: float, fps: float,
                  node_suffix: str, vocabulary: Optional[list] = None):
-        super().__init__(f"vop_{node_suffix}")
-        self._input_topic = input_topic
-        self._output_topic = f"{input_topic}/objects"
+        super().__init__(f"vop_{node_suffix}" if node_suffix else "vop")
+        # Topic-less is a supported mode, as in plugins/tts.py: a card driven
+        # only by recognize_by_photo has no camera to subscribe to, but still
+        # wants somewhere to publish so the canvas shows the flow. The fallback
+        # output is fixed because there is no input topic to derive it from.
+        self._input_topic = input_topic or ''
+        self._output_topic = output_topic_for(input_topic)
         self._model = model
         self._vocabulary = list(vocabulary or [])
         self._confidence = confidence
@@ -178,6 +200,7 @@ class _VOPNode(Node):
         self._worker: Optional[threading.Thread] = None
         self._last_inference_time = 0.0
         self._detect_count = 0
+        self._running = False
         # Serializes start/stop on this node. The plugin calls both from HTTP
         # handler threads, and the canvas routinely does config→start→stop→start
         # within seconds; without this two starts can both pass the running
@@ -193,19 +216,33 @@ class _VOPNode(Node):
         """
         self._stop_event.set()
 
+    def _status(self) -> dict:
+        return {
+            "state": "running" if self._running else "idle",
+            "input": self._input_topic,
+            "output": self._output_topic,
+            "mode": "stream" if self._input_topic else "on_demand",
+        }
+
     def start(self) -> dict:
         with self._lifecycle_lock:
-            if self._sub is not None:
-                return {"state": "running", "input": self._input_topic, "output": self._output_topic}
+            if self._running:
+                return self._status()
             self._stop_event.clear()
-            self._sub = self.create_subscription(
-                CompressedImage, self._input_topic, self._image_cb, _LOW_LAT_QOS
-            )
-            self._worker = threading.Thread(target=self._inference_worker, daemon=True,
-                                            name=f"vop_worker_{self._input_topic}")
-            self._worker.start()
-            log.info(f"[vop] started: {self._input_topic} → {self._output_topic}")
-            return {"state": "running", "input": self._input_topic, "output": self._output_topic}
+            if self._input_topic:
+                self._sub = self.create_subscription(
+                    CompressedImage, self._input_topic, self._image_cb, _LOW_LAT_QOS
+                )
+                self._worker = threading.Thread(target=self._inference_worker, daemon=True,
+                                                name=f"vop_worker_{self._input_topic}")
+                self._worker.start()
+            # Without a topic there is nothing to subscribe to and no frames to
+            # consume, so no worker is spawned; the node exists to own the
+            # publisher that one-shot results go out on.
+            self._running = True
+            log.info(f"[vop] started: {self._input_topic or '(no topic, on-demand)'} "
+                     f"→ {self._output_topic}")
+            return self._status()
 
     def stop(self) -> dict:
         # Flag first, lock second: a start() holding the lock will see the flag
@@ -218,8 +255,9 @@ class _VOPNode(Node):
             if self._worker and self._worker.is_alive():
                 self._worker.join(timeout=3.0)
             self._worker = None
-            log.info(f"[vop] stopped: {self._input_topic}")
-            return {"state": "idle", "input": self._input_topic}
+            self._running = False
+            log.info(f"[vop] stopped: {self._input_topic or '(no topic)'}")
+            return self._status()
 
     def _image_cb(self, msg: CompressedImage):
         now = time.monotonic()
@@ -288,6 +326,11 @@ class _VOPNode(Node):
                 "confidence": round(float(score), 2),
             })
         return objects
+
+    def publish_objects(self, objects: list):
+        """Publish a detection payload. Used by the stream worker and by
+        the one-shot photo actions, so both emit the same thing."""
+        self._publish_objects(objects)
 
     def _publish_objects(self, objects: list):
         self._detect_count += 1
@@ -557,7 +600,14 @@ class VideoObjectPerceptionPlugin:
                 "bbox": [round(float(v), 1) for v in (x1, y1, x2, y2)],
             })
 
-        return {
+        # Echo onto the card's output topic when one is running, so a topic-less
+        # card wired into the canvas actually shows data flowing — which is the
+        # only reason it is startable without a camera. Purely additive: the
+        # answer goes back through MCP regardless, and a card that was never
+        # started publishes nothing.
+        published_to = self._publish_one_shot(args.get("instance_id", ""), objects)
+
+        result = {
             "ok": True,
             "source": source,
             "image_size": [width, height],
@@ -565,6 +615,26 @@ class VideoObjectPerceptionPlugin:
             "count": len(objects),
             "objects": objects,
         }
+        if published_to:
+            result["published_to"] = published_to
+        return result
+
+    def _publish_one_shot(self, instance_id: str, objects: list) -> Optional[str]:
+        """Publish a one-shot result on the named instance, or the default one."""
+        with self._nodes_lock:
+            node = self._nodes.get(instance_id) if instance_id else None
+            if node is None:
+                node = self._nodes.get(_DEFAULT_INSTANCE)
+            if node is None and len(self._nodes) == 1:
+                node = next(iter(self._nodes.values()))
+        if node is None:
+            return None
+        try:
+            node.publish_objects(objects)
+            return node._output_topic
+        except Exception as error:  # noqa: BLE001 — never fail the answer on this
+            log.warning(f"[vop] could not echo one-shot result: {error}")
+            return None
 
     def _class_name_from_vocab(self, cls_id: int) -> str:
         if 0 <= cls_id < len(self._vocabulary):
@@ -586,7 +656,8 @@ class VideoObjectPerceptionPlugin:
             confidence = float(icfg.get("confidence", self._confidence))
             fps = int(icfg.get("fps", self._fps))
             suffix = node_key.replace("/", "_").replace("-", "_").lstrip("_")
-            node = _VOPNode(input_topic, self._model, confidence, fps,
+            input_for_node = input_topic or None
+            node = _VOPNode(input_for_node, self._model, confidence, fps,
                             node_suffix=suffix, vocabulary=self._vocabulary)
             self._executor.add_node(node)
             self._nodes[node_key] = node
@@ -676,7 +747,8 @@ class VideoObjectPerceptionPlugin:
             elif not input_topic and nodes:
                 input_topic = next(iter(nodes.values()))._input_topic
             topics_in = [{"topic": input_topic, "format": "image/jpeg"}] if input_topic else []
-            topics_out = [{"topic": f"{input_topic}/objects", "format": "data/json"}] if input_topic else []
+            topics_out = ([{"topic": output_topic_for(input_topic), "format": "data/json"}]
+                          if (input_topic or nodes) else [])
             state = "running" if instances else "idle"
             info = {
                 "name": "VideoObjectPerception", "manufacture": "Embodied", "model": self._model_name,
@@ -708,22 +780,11 @@ class VideoObjectPerceptionPlugin:
                 topics_list = args.get("input_topics") or []
                 if topics_list:
                     input_topic = topics_list[0]
-            if not input_topic:
-                # An agent that wants to look at one picture reaches for `start`
-                # first, which is a reasonable instinct and the wrong action. A
-                # bare "input_topic is required" reads as "this tool is broken";
-                # naming the three actions that need no camera turns the dead
-                # end into the answer.
-                raise ValueError(
-                    "input_topic is required for start — start subscribes to a "
-                    "camera topic and publishes detections continuously, so "
-                    "there is nothing to subscribe to without one. To examine a "
-                    "single image instead, no start and no camera are needed: "
-                    "use recognize_by_photo (a file), recognize_by_url (an "
-                    "http(s) address), or list_recognizable_objects to see what "
-                    "this engine can detect at all."
-                )
-            node_key = instance_id or input_topic
+            # No topic is a supported mode, as in plugins/tts.py: the card comes
+            # up on-demand, loads the engine and owns a publisher, and answers
+            # recognize_by_photo / recognize_by_url. It just has nothing to
+            # subscribe to, so it consumes no frames.
+            node_key = instance_id or input_topic or _DEFAULT_INSTANCE
             with self._nodes_lock:
                 running = self._nodes.get(node_key)
             if running is None:
@@ -745,7 +806,8 @@ class VideoObjectPerceptionPlugin:
                             self._model_load_error = str(e)
                             log.error(f"[vop] model load failed: {e}", exc_info=True)
                     threading.Thread(target=_bg_start, daemon=True, name="vop_model_load").start()
-                    return {"state": "loading", "input": input_topic, "output": f"{input_topic}/objects",
+                    return {"state": "loading", "input": input_topic or "",
+                            "output": output_topic_for(input_topic),
                             "message": "Model loading in background, will start automatically"}
                 self._start_node(node_key, input_topic)
                 with self._nodes_lock:

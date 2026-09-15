@@ -573,10 +573,18 @@ def test_the_new_ocr_actions_are_advertised(monkeypatch, tmp_path):
     assert schema["properties"]["image_path"]["uploadTo"] == "mcp"
 
 
-def test_start_without_a_topic_points_at_the_single_image_actions(ocr):
-    plugin, _, _ = ocr
-    with pytest.raises(ValueError) as excinfo:
-        plugin.dispatch("ocr", {"action": "start"})
-    message = str(excinfo.value)
-    assert "recognize_by_photo" in message
-    assert "recognize_by_url" in message
+def test_start_without_a_topic_comes_up_on_demand(ocr):
+    """A card with no camera still starts, as tts's does.
+
+    It loads the adapter and owns a publisher; it just has nothing to subscribe
+    to. Before this it raised, so a photo-only card could never show `running`.
+    """
+    plugin, executor, _ = ocr
+    plugin.dispatch("ocr", {"action": "start"})
+    assert _wait_until(lambda: len(executor.nodes) == 1
+                       and executor.nodes[0].state == "running")
+    node = executor.nodes[0]
+    assert node._input_topic == ""
+    assert node._output_topic == ocr_plugin.DEFAULT_OUTPUT_TOPIC
+    assert node.subscriptions == []          # nothing to subscribe to
+    assert set(plugin._nodes) == {"_default"}

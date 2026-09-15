@@ -37,6 +37,10 @@ from plugins.ocr_runtime import (
 log = logging.getLogger(__name__)
 
 DEFAULT_OCR_MODEL_DIR = "/models/ocr/ppocrv6-small-trt"
+
+# Where a topic-less card publishes, mirroring tts's /perception/tts.
+DEFAULT_OUTPUT_TOPIC = "/perception/ocr"
+_DEFAULT_INSTANCE = "_default"
 _ERROR_LOG_INTERVAL_SECONDS = 10.0
 
 _RESULT_QOS = QoSProfile(
@@ -65,7 +69,7 @@ TOOLS = [
                 },
                 "input_topic": {
                     "type": "string",
-                    "description": "ROS2 image topic to subscribe (e.g. /hostname/camera/rgb, required for action=start)"
+                    "description": "ROS2 image topic to subscribe (e.g. /hostname/camera/rgb). 可选：不填则卡片以按需模式启动，不订阅摄像头，只服务 recognize_by_photo / recognize_by_url"
                 },
                 # `format: file` renders a file picker on the card; `uploadTo:
                 # mcp` posts the bytes to /api/mcp/<id>/file/upload, which
@@ -76,7 +80,7 @@ TOOLS = [
             },
             "required": ["action"],
             "x-action-params": {
-                "start":  {"params": ["input_topic"], "description": "Start recognising text on an image topic"},
+                "start":  {"params": ["input_topic"], "description": "启动。给 input_topic 则持续识别该摄像头话题；不给则以按需模式启动，只服务单张图片的识别"},
                 "stop":   {"params": [], "description": "Stop recognition"},
                 "info":   {"params": ["input_topic"], "description": "Report state and topics"},
                 "config": {"params": [], "description": "Update configuration"},
@@ -113,7 +117,12 @@ TOOLS = [
 # ── OCR Adapters ──────────────────────────────────────────────────────────────
 
 def _ocr_output_topic(input_topic: str) -> str:
-    return f"{input_topic}/ocr"
+    """The one place the output topic is derived from the input.
+
+    Topic-less cards publish to a fixed topic; deriving it inline forgot that
+    case and reported "None/ocr".
+    """
+    return f"{input_topic}/ocr" if input_topic else DEFAULT_OUTPUT_TOPIC
 
 
 def _adapter_options(cfg: dict) -> dict:
@@ -164,7 +173,10 @@ class _OCRNode(Node):
         node_name = f"ocr_{node_suffix}" if node_suffix else "ocr"
         super().__init__(node_name)
 
-        self._input_topic = input_topic
+        # Topic-less is a supported mode, as in plugins/tts.py: a card driven
+        # only by recognize_by_photo has no camera to subscribe to but still
+        # needs somewhere to publish, and no input topic to derive it from.
+        self._input_topic = input_topic or ''
         self._output_topic = _ocr_output_topic(input_topic)
         self._adapter = adapter
         self._language = language
@@ -216,7 +228,7 @@ class _OCRNode(Node):
         frames: LatestFrame = LatestFrame()
         self._stop_event = stop_event
         self._frames = frames
-        if self._sub is None:
+        if self._input_topic and self._sub is None:
             self._sub = self.create_subscription(
                 CompressedImage, self._input_topic, self._image_cb, CAMERA_QOS
             )
@@ -624,7 +636,7 @@ class OCRPlugin:
                     node._input_topic if node is not None
                     else self._pending_starts.get(instance_id, input_topic)
                 )
-                out = f"{topic}/ocr" if topic else ""
+                out = _ocr_output_topic(topic) if topic else ""
                 state = self._instance_state_locked(instance_id)
                 result = {
                     **base,
@@ -646,7 +658,7 @@ class OCRPlugin:
                 node = self._nodes.get(key)
                 topic = node._input_topic if node else self._pending_starts[key]
                 topics_in.append({"topic": topic, "format": "image/jpeg", "desc": ""})
-                topics_out.append({"topic": f"{topic}/ocr", "format": "data/json", "desc": ""})
+                topics_out.append({"topic": _ocr_output_topic(topic), "format": "data/json", "desc": ""})
             states = {entry["state"] for entry in instances.values()}
             if "loading" in states or self._adapter_state == "loading":
                 state = "loading"
@@ -658,7 +670,7 @@ class OCRPlugin:
                 state = "idle"
             if not keys and input_topic:
                 topics_in = [{"topic": input_topic, "format": "image/jpeg", "desc": ""}]
-                topics_out = [{"topic": f"{input_topic}/ocr", "format": "data/json", "desc": ""}]
+                topics_out = [{"topic": _ocr_output_topic(input_topic), "format": "data/json", "desc": ""}]
             result = {
                 **base,
                 "state": state,
@@ -674,19 +686,10 @@ class OCRPlugin:
 
     def _do_start(self, instance_id: str, args: dict) -> dict:
         input_topic = args.get("input_topic")
-        if not input_topic:
-            # Same reasoning as plugins/vop.py: a caller who wants to read one
-            # image reaches for `start`, and a bare requirement message leaves
-            # them with no idea that the single-image actions exist.
-            raise ValueError(
-                "input_topic is required for start — start subscribes to a "
-                "camera topic and publishes results continuously, so there is "
-                "nothing to subscribe to without one. To read a single image "
-                "instead, no start and no camera are needed: use "
-                "recognize_by_photo (a file) or recognize_by_url (an http(s) "
-                "address)."
-            )
-        node_key = instance_id or input_topic
+        # No topic is a supported mode, as in plugins/tts.py: the card comes
+        # up on-demand and answers recognize_by_photo / recognize_by_url. It
+        # simply has nothing to subscribe to.
+        node_key = instance_id or input_topic or _DEFAULT_INSTANCE
 
         retired = None
         with self._state_lock:
@@ -715,7 +718,7 @@ class OCRPlugin:
                     self._spawn_loader_locked()
                 return {
                     "state": "loading",
-                    "input": input_topic,
+                    "input": input_topic or "",
                     "output": _ocr_output_topic(input_topic),
                 }
             adapter = self._adapter
@@ -759,9 +762,9 @@ class OCRPlugin:
             if current is not None:
                 return current.start()
             if claimed and not fresh:
-                return {"state": "loading", "input": input_topic,
+                return {"state": "loading", "input": input_topic or "",
                         "output": _ocr_output_topic(input_topic)}
-            return {"state": "idle", "input": input_topic,
+            return {"state": "idle", "input": input_topic or "",
                     "output": _ocr_output_topic(input_topic)}
         try:
             result = node.start()
@@ -777,7 +780,7 @@ class OCRPlugin:
             # A concurrent stop retired the node while start() ran; its
             # dispose handled teardown — stop the worker this start spawned.
             node.stop()
-            return {"state": "idle", "input": input_topic,
+            return {"state": "idle", "input": input_topic or "",
                     "output": _ocr_output_topic(input_topic)}
         return result
 
