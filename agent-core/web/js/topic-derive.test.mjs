@@ -12,7 +12,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { resolveDerivedTopics, inputTopicOf, topicOfPort } from './topic-derive.js';
+import { resolveDerivedTopics, inputTopicOf, inputTopicsOf, topicOfPort } from './topic-derive.js';
 
 // The layout that produced the report: mic → asr → tts, both derived cards saved
 // with no topic because nothing had asked the driver yet.
@@ -138,10 +138,102 @@ test('it asks with the resolved input topic, not the stale one', async () => {
 test('inputTopicOf and topicOfPort read the port that the connection names', () => {
   const two = { id: 'c', topicOut: [{ topic: '/a' }, { topic: '/b' }] };
   assert.equal(topicOfPort(two, 1), '/b');
-  assert.equal(topicOfPort(two, 5), '/a', 'out of range falls back to the first port');
   assert.equal(topicOfPort({ }, 0), '');
   const conns = [{ fromCardId: 'c', fromPortIdx: '1', toCardId: 'd', toPortIdx: '0' }];
   assert.equal(inputTopicOf({ id: 'd' }, [two], conns), '/b');
+});
+
+test('an unresolved port does not borrow another port\'s topic', () => {
+  // A camera whose colour output resolved and whose depth output did not. The
+  // old `|| list[0]?.topic` handed /colour to the depth link: a live connection
+  // carrying the wrong stream, which the panel renders without complaint. And
+  // because the answer was non-empty, the card counted as resolved and nothing
+  // re-asked. '' is the honest answer — start-project then reports the link.
+  const cam = { id: 'cam', topicOut: [{ topic: '/colour' }, { format: 'image/depth-zlib' }] };
+  assert.equal(topicOfPort(cam, 1), '');
+  const conns = [{ fromCardId: 'cam', fromPortIdx: '1', toCardId: 'd', toPortIdx: '0' }];
+  assert.equal(inputTopicOf({ id: 'd' }, [cam], conns), '');
+});
+
+test('an out-of-range port still resolves on a single-output card', () => {
+  // A layout saved before the card's ports changed. With one port there is no
+  // ambiguity about what the index meant, so the old fallback is kept — but
+  // only here, where it cannot pick the wrong stream.
+  assert.equal(topicOfPort({ id: 'c', topicOut: [{ topic: '/a' }] }, 3), '/a');
+  const two = { id: 'c', topicOut: [{ topic: '/a' }, { topic: '/b' }] };
+  assert.equal(topicOfPort(two, 5), '', 'multi-output: which port did it mean?');
+});
+
+test('a card with one port still unresolved keeps being asked', async () => {
+  // `!some(t => t.topic)` treated any one resolved port as the whole card being
+  // done, so a second port that came back empty stayed empty for good.
+  const log = [];
+  // A *fed* card, so the inputless path cannot be what gets it asked — the
+  // half-resolved state has to be what does.
+  const src = { id: 'card-src', mcpId: 'mcp-1', toolName: 'camera',
+                topicOut: [{ topic: '/cam' }] };
+  const vop = { id: 'card-vop', mcpId: 'mcp-1', toolName: 'vop',
+                topicOut: [{ topic: '/cam/vop' }, { format: 'image/jpeg' }] };
+  const conns = [{ fromCardId: 'card-src', fromPortIdx: '0',
+                   toCardId: 'card-vop', toPortIdx: '0' }];
+  const fetchImpl = async (url, opts) => {
+    log.push(JSON.parse(opts.body).tool);
+    return { json: async () => ({ data: { topic_out: [
+      { topic: '/cam/vop' }, { topic: '/cam/vop/overlay', format: 'image/jpeg' }] } }) };
+  };
+  await resolveDerivedTopics([src, vop], conns, { fetchImpl });
+  assert.deepEqual(log, ['vop'], 'the half-resolved card was asked');
+  assert.equal(vop.topicOut[1].topic, '/cam/vop/overlay');
+});
+
+test('a card fed by several links is asked about all of them', async () => {
+  // decision_core declares one `data/json` input and is normally fed by three.
+  // `connections.find(...)` asked about whichever link was first in the array,
+  // so the answer changed when the same links were redrawn in another order and
+  // disagreed with what api/config.py derives at start.
+  let sent = null;
+  const fetchImpl = async (url, opts) => {
+    sent = JSON.parse(opts.body).arguments;
+    return { json: async () => ({ data: { topic_out: [{ topic: '/decision_core' }] } }) };
+  };
+  const rm = { id: 'rm', topicOut: [{ topic: '/remote_control/message' }] };
+  const asr = { id: 'asr', topicOut: [{ topic: '/mic/asr' }] };
+  const core = { id: 'core', mcpId: 'agentcore', toolName: 'decision_core', topicOut: [] };
+  const conns = [
+    { fromCardId: 'rm', fromPortIdx: '0', toCardId: 'core', toPortIdx: '0' },
+    { fromCardId: 'asr', fromPortIdx: '0', toCardId: 'core', toPortIdx: '0' },
+  ];
+  await resolveDerivedTopics([rm, asr, core], conns, { fetchImpl });
+  assert.deepEqual(sent.input_topics, ['/remote_control/message', '/mic/asr']);
+  // The singular travels too — no driver reads the plural form.
+  assert.equal(sent.input_topic, '/remote_control/message');
+});
+
+test('a card waits until every one of its inputs has resolved', async () => {
+  // Deriving from half the set produces an answer that has to be thrown away,
+  // and on the start path it would bind a node to half a graph.
+  const unresolvedSrc = { id: 'src', topicOut: [] };
+  const rm = { id: 'rm', topicOut: [{ topic: '/remote_control/message' }] };
+  const core = { id: 'core', mcpId: 'agentcore', toolName: 'decision_core', topicOut: [] };
+  const conns = [
+    { fromCardId: 'rm', fromPortIdx: '0', toCardId: 'core', toPortIdx: '0' },
+    { fromCardId: 'src', fromPortIdx: '0', toCardId: 'core', toPortIdx: '0' },
+  ];
+  assert.deepEqual(inputTopicsOf(core, [rm, unresolvedSrc, core], conns), []);
+  // With allowStale the last-resort pass may still use a persisted fromTopic.
+  conns[1].fromTopic = '/saved/topic';
+  assert.deepEqual(inputTopicsOf(core, [rm, unresolvedSrc, core], conns, true),
+                   ['/remote_control/message', '/saved/topic']);
+});
+
+test('two links carrying the same topic are asked about once', () => {
+  const rm = { id: 'rm', topicOut: [{ topic: '/a' }] };
+  const core = { id: 'core', topicOut: [] };
+  const conns = [
+    { fromCardId: 'rm', fromPortIdx: '0', toCardId: 'core', toPortIdx: '0' },
+    { fromCardId: 'rm', fromPortIdx: '0', toCardId: 'core', toPortIdx: '0' },
+  ];
+  assert.deepEqual(inputTopicsOf(core, [rm, core], conns), ['/a']);
 });
 
 test('a source that is not on the canvas falls back to the persisted topic', async () => {

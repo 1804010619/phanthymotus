@@ -18,6 +18,10 @@ import { showToolDetail, isToolConfigured, isInstanceConfigured, openInstanceCon
 import { toggleMicStream, isMicActive } from './mic-stream.js';
 import { sessionId } from './session.js';
 import { getToken } from './auth.js';
+// Shared with the monitor dashboard so both sides shape the `info` call the
+// same way, and with api/config.py's _start_and_resolve so the canvas and the
+// start agree about what a card consumes.
+import { inputArgs, inputKey } from './topic-derive.js';
 
 let _canvasEl   = null;
 let _viewport   = null;
@@ -94,10 +98,81 @@ const _connEls = new Map();  // connId -> {hit, line, btn}
 let _draggingCardId = null;
 let _mcpsPendingRefresh = false;
 
-// Project run state
+// Project run state.
+//
+// `_projectRunning` starts false, which is a guess, not knowledge — the real
+// answer only arrives when /api/config/project-running resolves. The canvas
+// meanwhile renders and becomes clickable: measured on Orin 5, cards and their
+// × buttons are on screen at t=318ms and this is still false until t=470ms.
+// Every edit guard reads it, so for that window all of them were open on a
+// running project, and the operation went through in silence — a card delete
+// claimed the edit lock, stopped the plugin instance, and saved the layout.
+// The window has no upper bound: it is however long that request takes, and it
+// is longest exactly when the machine is busy starting the project.
+//
+// `_projectStateKnown` closes it by separating "stopped" from "not yet known"
+// and refusing edits for both.
 let _projectRunning = false;
+let _projectStateKnown = false;
 
 export function isProjectRunning() { return _projectRunning; }
+
+/** Why editing is refused right now, or '' when it is allowed. */
+function _editLockReason() {
+  if (!_projectStateKnown) return '正在确认运行状态，请稍候重试';
+  if (_projectRunning) return '请停止智能控制后修改';
+  return '';
+}
+
+/**
+ * Refuse an edit if the project is running — or if we cannot yet tell.
+ *
+ * Returns true when the caller must stop. Says so with a toast: these refusals
+ * used to go only to _logActivity, which appends a line to the activity strip
+ * at the bottom of the page, interleaved with the mcp_call/mcp_result traffic.
+ * Clicking × on a card therefore looked like nothing happened at all. Every
+ * other user-facing refusal in this file already uses a toast; these three
+ * (delete card, draw connection, delete connection) were the exceptions.
+ */
+function _refuseEdit() {
+  const reason = _editLockReason();
+  if (!reason) return false;
+  _showToast(reason);
+  _logActivity('warn', reason);
+  return true;
+}
+
+/** Same question without the toast, for paths that show their own rejection. */
+function _editsLocked() { return _editLockReason() !== ''; }
+
+/**
+ * Ask the backend for the run state, retrying until it answers.
+ *
+ * Editing is refused while the answer is unknown, so giving up would leave the
+ * canvas read-only until the next reload. Backs off to 5s and keeps trying;
+ * a WebSocket `project_state` event resolves it too, whichever lands first.
+ */
+function _syncProjectState(delay = 500) {
+  return fetch('/api/config/project-running')
+    .then(r => r.json())
+    .then(d => { _applyProjectState(d.running); return true; })
+    .catch(() => {
+      if (!_projectStateKnown) {
+        setTimeout(() => _syncProjectState(Math.min(delay * 2, 5000)), delay);
+      }
+      return false;
+    });
+}
+
+/** Record what the backend says about the run state, and unblock editing. */
+function _applyProjectState(running) {
+  _projectRunning = !!running;
+  _projectStateKnown = true;
+  _syncProjectBtn();
+  document.querySelectorAll('.canvas-exec-btn').forEach(btn => {
+    btn.classList.toggle('locked', !_projectRunning);
+  });
+}
 export function redrawCanvas() { _scheduleRedraw(); }
 export function ensureEdit() { return _ensureEdit(); }
 export function isEditor() { return _isEditor; }
@@ -115,7 +190,7 @@ export function reloadFromServer() { return _reloadLayout(); }
  * Returns true if added, false if rejected.
  */
 export async function addCardFromSidebar({ mcpId, toolName, driverName, hasConfig, multiInstance }) {
-  if (_projectRunning) return false;
+  if (_refuseEdit()) return false;
   if (!(await _ensureEdit())) return false;
   if (hasConfig && !isToolConfigured(mcpId, toolName)) return false;
   if (!multiInstance) {
@@ -208,29 +283,22 @@ export async function initCanvas(initialMcps) {
   // Show editor status bar
   _updateEditorUI();
 
-  // Restore project running state from backend
-  try {
-    const runRes = await fetch('/api/config/project-running');
-    const runData = await runRes.json();
-    if (runData.running) {
-      _projectRunning = true;
-      _syncProjectBtn();
-      document.querySelectorAll('.canvas-exec-btn').forEach(btn => btn.classList.remove('locked'));
-    }
-  } catch { /* ignore */ }
+  // Restore project running state from backend. Editing stays refused until
+  // this answers, so a failure must not leave the canvas locked for good —
+  // retry until it does. The old version swallowed the error and left
+  // `_projectRunning` at its false default, which read as "stopped" and opened
+  // every guard on a robot that was in fact running.
+  _syncProjectState();
 
   // Cross-tab sync: listen for project_state / editor-lock / layout events via WebSocket
   const { onMotusEvent } = await import('./motus-stream.js');
   onMotusEvent(null, (event) => {
     if (event.type === 'project_state') {
-      const running = event.payload?.running;
-      if (running !== _projectRunning) {
-        _projectRunning = running;
-        _syncProjectBtn();
-        document.querySelectorAll('.canvas-exec-btn').forEach(btn => {
-          btn.classList.toggle('locked', !_projectRunning);
-        });
-      }
+      const running = !!event.payload?.running;
+      // Applied even when it matches what we hold: this is also the first
+      // authoritative answer some page loads get, and it is what marks the
+      // state known.
+      if (running !== _projectRunning || !_projectStateKnown) _applyProjectState(running);
     } else if (event.type === 'canvas_editor') {
       _applyEditorState(event.payload?.editor || null, event.payload?.reason || '');
     } else if (event.type === 'canvas_layout') {
@@ -243,15 +311,7 @@ export async function initCanvas(initialMcps) {
   document.addEventListener('visibilitychange', () => {
     if (!document.hidden) {
       _checkEditStatus();
-      fetch('/api/config/project-running').then(r => r.json()).then(d => {
-        if (d.running !== _projectRunning) {
-          _projectRunning = d.running;
-          _syncProjectBtn();
-          document.querySelectorAll('.canvas-exec-btn').forEach(btn => {
-            btn.classList.toggle('locked', !_projectRunning);
-          });
-        }
-      }).catch(() => {});
+      _syncProjectState();
     }
   });
 
@@ -298,7 +358,7 @@ export function updateCanvasMcps(mcps) {
     // Only fetch once (not on every poll) — mark card to avoid repeated calls
     if (!card.topicOut?.some(t => t.topic) && liveTopicOut?.length && !toolObj?.multiInstance && !card._topicFetched) {
       card._topicFetched = true;
-      _fetchTopicsFromDriver(card, '');
+      _fetchTopicsFromDriver(card, []);
     }
 
     // Also trigger rebuild if instance-config button presence doesn't match live configSchema
@@ -529,8 +589,8 @@ function _setupDropZone() {
     e.preventDefault();
     _canvasEl.classList.remove('drag-over');
 
-    if (_projectRunning) {
-      _showDropReject(e, '请停止智能控制后修改');
+    if (_editsLocked()) {
+      _showDropReject(e, _editLockReason());
       return;
     }
 
@@ -649,7 +709,7 @@ function _addCard(data, save = true) {
   const _toolObj2 = (_mcp2?.tools || []).find(t => (typeof t === 'string' ? t : t.name) === toolName);
   const _isMultiInstanceSensor = _toolObj2?.multiInstance && _toolObj2?.type === 'sensor';
   if ((!_toolObj2?.multiInstance || _isMultiInstanceSensor) && (_toolObj2?.topic_out?.length || _toolObj2?.topic_in?.length)) {
-    _fetchTopicsFromDriver(cardData, '');
+    _fetchTopicsFromDriver(cardData, []);
   }
 
   _syncEmptyState();
@@ -658,10 +718,7 @@ function _addCard(data, save = true) {
 }
 
 async function _removeCard(id) {
-  if (_projectRunning) {
-    _logActivity('warn', '请停止智能控制后修改');
-    return;
-  }
+  if (_refuseEdit()) return;
   if (!(await _ensureEdit())) return;
   const idx = _cards.findIndex(c => c.id === id);
   if (idx === -1) return;
@@ -1355,10 +1412,18 @@ function _setupPortDrag() {
 
         const toCardData = _cards.find(c => c.id === toCard.dataset.cardId);
         if (toCardData && _projectRunning) {
-          // Use resolved topic from the destination's in-port
+          // Restart on the card's *whole* input set, not just the link that was
+          // just drawn. Perception rebuilds a node whose input_topic differs
+          // from the one it holds (plugins/tts.py), so naming only the new topic
+          // silently unbound whatever the card was already consuming — drawing a
+          // second line into a TTS card killed the first one.
+          const topics = _inputTopicsFor(toCardData);
           const resolvedInPort = toCard.querySelector(`.canvas-port.in[data-idx="${inPort.dataset.idx}"]`);
-          const resolvedTopic = resolvedInPort?.dataset.topic || _draggingConn.topic;
-          _triggerAction(toCardData.mcpId, toCardData.toolName, 'start', { input_topic: resolvedTopic, instance_id: toCardData.id });
+          const args = topics.length
+            ? inputArgs(topics)
+            : { input_topic: resolvedInPort?.dataset.topic || _draggingConn.topic };
+          _triggerAction(toCardData.mcpId, toCardData.toolName, 'start',
+                         { ...args, instance_id: toCardData.id });
         }
         // The destination's output topic is derived from this new input;
         // _resolveAllTopics above already scheduled that refetch, and doing it
@@ -1378,10 +1443,7 @@ function _setupPortDrag() {
     const outPort = e.target.closest('.canvas-port.out');
     const execPort = !outPort ? e.target.closest('.canvas-port.executor') : null;
     if (!outPort && !execPort) return;
-    if (_projectRunning) {
-      _logActivity('warn', '请停止智能控制后修改');
-      return;
-    }
+    if (_refuseEdit()) return;
     if (!(await _ensureEdit())) return;
     e.preventDefault();
     e.stopPropagation();
@@ -1623,7 +1685,7 @@ function _redrawConnections() {
     const d = `M${x1},${y1} C${x1+cx},${y1} ${x2-cx},${y2} ${x2},${y2}`;
 
     const { hit, line, btn } = _connectorEls(conn, () => {
-      if (_projectRunning) { _logActivity('warn', '请停止智能控制后修改'); return; }
+      if (_refuseEdit()) return;
       _ensureEdit().then(ok => { if (ok) _removeTopicConnection(conn.id); });
     });
     hit.setAttribute('d', d);
@@ -1865,9 +1927,7 @@ async function _startProject() {
   try {
     const res = await fetch('/api/config/start-project', { method: 'POST' });
     if (res.ok) {
-      _projectRunning = true;
-      _syncProjectBtn();
-      document.querySelectorAll('.canvas-exec-btn').forEach(btn => btn.classList.remove('locked'));
+      _applyProjectState(true);
       _logActivity('project', '智能控制已开启');
     } else {
       const data = await res.json().catch(() => ({}));
@@ -1891,9 +1951,7 @@ async function _startProject() {
 }
 
 function _stopProject() {
-  _projectRunning = false;
-  _syncProjectBtn();
-  document.querySelectorAll('.canvas-exec-btn').forEach(btn => btn.classList.add('locked'));
+  _applyProjectState(false);
   // Auto-stop mic stream
   for (const card of _cards) {
     if (card.toolName === 'remote_mic' && isMicActive()) {
@@ -2073,19 +2131,29 @@ function _parseMcpCallResult(json) {
 }
 
 /**
- * Ask the driver to infer topics for a card given an optional input topic.
+ * Ask the driver to infer topics for a card given the topics feeding it.
  * Used for multiInstance sensors (_addCard) and processors (after wiring).
  * Updates card.topicOut and DOM out-ports if driver returns non-empty topics.
+ *
+ * Takes the whole set, not one topic: a card can be fed by several connections
+ * (decision_core normally is), and asking about one of them produced an answer
+ * that depended on which link happened to be first in `_connections` — a
+ * different answer after the same links were redrawn in another order, and a
+ * different answer from the one api/config.py derives at start.
  */
-async function _fetchTopicsFromDriver(card, inputTopic) {
-  const want = inputTopic || '';
+async function _fetchTopicsFromDriver(card, inputTopics) {
+  const topics = Array.isArray(inputTopics) ? inputTopics
+                : (inputTopics ? [inputTopics] : []);
+  const want = inputKey(topics);
   if (card._topicFetchFor === want) return;   // identical request already in flight
   card._topicFetchFor = want;
   try {
     const resp = await fetch(`/api/mcp/${encodeURIComponent(card.mcpId)}/call`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ tool: card.toolName, arguments: { action: 'info', instance_id: card.id, input_topic: inputTopic } }),
+      body: JSON.stringify({ tool: card.toolName,
+                             arguments: { action: 'info', instance_id: card.id,
+                                          ...inputArgs(topics) } }),
     });
     const data = await resp.json();
     const parsed = _parseMcpCallResult(data);
@@ -2163,7 +2231,8 @@ async function _openTopicDetailFor(el, mcpId, cachedTopicOut) {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           tool: card.toolName,
-          arguments: { action: 'info', instance_id: card.id, input_topic: _inputTopicFor(card) },
+          arguments: { action: 'info', instance_id: card.id,
+                       ...inputArgs(_inputTopicsFor(card)) },
         }),
       });
       const parsed = _parseMcpCallResult(await resp.json());
@@ -2188,10 +2257,30 @@ async function _openTopicDetailFor(el, mcpId, cachedTopicOut) {
   showTopicDetail(candidate.topic, candidate.format || '');
 }
 
-function _inputTopicFor(card) {
-  const inConn = _connections.find(c => c.toCardId === card.id);
-  if (!inConn) return '';
-  const inPort = card.el.querySelector(`.canvas-port.in[data-idx="${inConn.toPortIdx}"]`);  return inPort?.dataset.topic || '';
+/**
+ * Every topic feeding `card`, in the order the connections were drawn.
+ *
+ * Read from each *source's* out-port, not from this card's in-port. An in-port
+ * dataset holds one string, and several connections routinely land on one port
+ * — decision_core declares a single `data/json` input and is normally fed by
+ * three — so _resolveAllTopics' last writer won and the rest were invisible
+ * here. This used to take `_connections.find(...)`, one arbitrary link, which
+ * made a card's derived topic depend on the order the links were drawn in and
+ * disagree with what api/config.py resolves at start.
+ *
+ * [] if any source is unresolved: same "wait, don't guess" rule as elsewhere,
+ * since deriving from half the inputs yields an answer that must be redone.
+ */
+function _inputTopicsFor(card) {
+  const topics = [];
+  for (const conn of _connections.filter(c => c.toCardId === card.id)) {
+    const src = _cards.find(c => c.id === conn.fromCardId);
+    const outPort = src?.el?.querySelector(`.canvas-port.out[data-idx="${conn.fromPortIdx}"]`);
+    const topic = outPort?.dataset.topic || '';
+    if (!topic) return [];
+    if (!topics.includes(topic)) topics.push(topic);
+  }
+  return topics;
 }
 
 /**
@@ -2211,7 +2300,8 @@ function _inputTopicFor(card) {
  */
 function _revalidateDerivedTopics() {
   for (const card of _cards) {
-    const want = _inputTopicFor(card);
+    const want = _inputTopicsFor(card);
+    const wantKey = inputKey(want);
     const known = card.topicOutFrom;
     const hasReal = card.topicOut?.some(t => t.topic);
     // Nothing verified this card's topics in this page's lifetime. The saved
@@ -2243,7 +2333,7 @@ function _revalidateDerivedTopics() {
       _fetchTopicsFromDriver(card, want);
       continue;
     }
-    if (known !== want) _fetchTopicsFromDriver(card, want);
+    if (known !== wantKey) _fetchTopicsFromDriver(card, want);
   }
 }
 
@@ -2475,7 +2565,7 @@ function _makeDraggable(el, cardData) {
     if (e.target.closest('.canvas-card-close')) return;
     if (e.target.closest('.canvas-card-info-btn')) return;
     if (e.target.closest('.canvas-card-instance-cfg-btn')) return;
-    if (_projectRunning) return;
+    if (_editsLocked()) return;
     if (!(await _ensureEdit())) return;
     e.preventDefault();
     e.stopPropagation();
