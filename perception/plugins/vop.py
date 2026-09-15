@@ -353,11 +353,19 @@ class VideoObjectPerceptionPlugin:
             from plugins.vision_runtime import VisionEngineSession
 
             engine_path, vocab = self._resolve_engine()
-            self._vocabulary = vocab
-            log.info(f"[vop] loading engine: {engine_path} ({len(vocab)} classes)")
+            log.info(f"[vop] loading engine: {engine_path}")
             self._model = VisionEngineSession(engine_path)
+            # The engine's own metadata wins over the bundled vocab.json: it was
+            # written by the export that baked the classes into the weights, so
+            # it cannot be stale or out of order. vocab.json only covers an
+            # engine built without names.
+            self._vocabulary = self._model.class_names() or vocab
+            if not self._vocabulary:
+                log.warning("[vop] engine carries no class names and no vocab.json "
+                            "was readable — detections will be labelled by index")
             log.info(f"[vop] engine loaded: {self._model_name} "
-                     f"input={self._model.input_size}")
+                     f"input={self._model.input_size}, "
+                     f"{len(self._vocabulary)} classes")
 
     def _resolve_engine(self) -> tuple[str, list[str]]:
         """Return (engine path, frozen vocabulary) for the configured model.

@@ -2003,21 +2003,38 @@ Both run a **prebuilt TensorRT engine** fetched as a pinned bundle
 same distribution shape OCR uses. Neither loads a `.pt` at runtime, and neither
 falls back to PyTorch if the bundle is missing — it fails loudly instead.
 
-### Why TensorRT, measured
+### Why TensorRT *directly*, and not through ultralytics
 
-On an Orin NX 8GB, `yolo26n-depth` at 640:
+Measured on an Orin NX 8GB, batch 1 at 640:
 
 | Path | ms/frame |
 |------|----------|
-| PyTorch eager fp16, jp6.1 (torch 2.5) | 39.3 |
-| PyTorch eager fp16, jp5.11 (torch 2.0, py3.8) | 68.0 |
-| TensorRT fp16, pure GPU time (trtexec) | **4.9** |
+| `yolov8s-worldv2`, PyTorch eager — what this replaced | 35.6 |
+| `yoloe-26s-seg`, TensorRT engine **loaded by ultralytics** | 37.3 |
+| `yolo26n-depth`, PyTorch eager, jp6.1 | 39.3 |
+| `yolo26n-depth`, PyTorch eager, jp5.11 (torch 2.0, py3.8) | 68.0 |
+| `yolo26n-depth`, TensorRT fp16, **pure GPU time** (trtexec) | **4.9** |
 
-The gap is kernel-launch overhead, not arithmetic — which is why in eager mode
-`n` and `s`, and 640 and 768, all landed within a few ms of each other, and a
-plain `yolo26n` detector measured *slower* than the depth model. Any model
-comparison run in eager mode on this hardware is measuring Python, not the
-network.
+Two things follow, and the second one cost a design iteration:
+
+1. **Eager mode measures Python, not the network.** `n` and `s`, and 640 and
+   768, all landed within a few ms of each other, and a plain `yolo26n`
+   detector measured *slower* than a depth model carrying a dense head. Any
+   model comparison run in eager mode on this hardware is meaningless.
+2. **Swapping the backend under ultralytics changes nothing.** 35.6 → 37.3 ms
+   is not an improvement; ultralytics' own pre/post-processing costs ~30 ms
+   per frame whichever backend sits underneath it. The 8x only exists if that
+   path is bypassed.
+
+So `plugins/vision_runtime.py` drives `utils.tensorrt_runtime.TensorRTEngine`
+with its own letterbox and decode, exactly as `plugins/ocr_runtime.py` does.
+ultralytics is a **build-time** dependency now — it exports the engine and
+nothing else.
+
+The decoders assume engines exported with `nms=False`, i.e. YOLO26's NMS-free
+end-to-end head whose output is already final boxes. `decode_detections`
+refuses a layout it does not recognise rather than interpreting it, because
+every wrong reading of those numbers still produces plausible-looking boxes.
 
 ### vop's vocabulary is frozen at export time
 
@@ -2036,8 +2053,12 @@ config states is much worse than one that refuses.
 
 To change what vop detects: edit `ROBOT_EXTRA` in
 `tools/export_vision_engines.py`, rebuild on a host of each JetPack line,
-republish, re-pin. The vocabulary ships beside the engine as `vocab.json` so
-the plugin never restates it.
+republish, re-pin.
+
+The plugin never restates the vocabulary. It reads it from the **engine's own
+metadata** — written by the same export that baked the classes into the
+weights, so it cannot drift out of order or out of date — and falls back to the
+`vocab.json` shipped in the bundle only for an engine built without names.
 
 Legacy model names (`yolov8s-worldv2`, `yolov8s-world`, `yoloe-26s`) still
 resolve — a card saved before the switch must not come back as `state: error`.
@@ -2062,9 +2083,13 @@ python3 tools/export_vision_engines.py --out /tmp/engines --workspace 2
 
 Two traps, both observed:
 
-* **It must be ultralytics' exporter, not trtexec.** The plugins load engines
-  through `YOLO("....engine")`, which requires the metadata ultralytics embeds.
-  A trtexec-built engine deserializes fine and is then rejected on load.
+* **The ONNX must come from ultralytics, with the classes already set.**
+  `set_classes()` runs on the build host and bakes the vocabulary into the
+  weights; exporting without it produces an engine whose classes are numeric
+  and whose names metadata is useless. The engine *build* itself could be done
+  by trtexec — `utils.tensorrt_runtime.read_engine_file` strips the ultralytics
+  JSON header when present and accepts a plain engine otherwise — but the tool
+  uses ultralytics end to end so the class names travel inside the engine.
 * **Cap the builder workspace.** Jetson memory is shared between CPU and GPU;
   an unbounded workspace got the jp5.11 build OOM-killed mid-`[GpuLayer]` with
   no Python traceback — just `Killed`. `--workspace 2` is the default here for

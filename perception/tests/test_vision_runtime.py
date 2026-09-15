@@ -19,6 +19,7 @@ from plugins.vision_runtime import (  # noqa: E402
     PAD_VALUE,
     LetterboxMeta,
     VisionDecodeError,
+    VisionEngineSession,
     decode_depth,
     decode_detections,
     letterbox,
@@ -178,3 +179,36 @@ def test_depth_with_an_unreadable_shape_raises():
     meta = LetterboxMeta(1.0, 0, 0, 640, 640)
     with pytest.raises(VisionDecodeError):
         decode_depth(np.zeros((3, 4, 5), dtype=np.float32), meta)
+
+
+# ── class names out of engine metadata ───────────────────────────────────────
+
+class _MetaOnlySession(VisionEngineSession):
+    """Exercises class_names() without a real engine behind it."""
+
+    def __init__(self, metadata):
+        self._meta = metadata
+
+    @property
+    def metadata(self):
+        return self._meta
+
+
+def test_class_names_come_back_in_index_order():
+    """JSON turns ultralytics' int keys into strings; order must survive."""
+    session = _MetaOnlySession({"names": {"2": "forklift", "0": "person", "10": "door"}})
+    assert session.class_names() == ["person", "forklift", "door"]
+
+
+def test_class_names_accept_a_plain_list():
+    assert _MetaOnlySession({"names": ["a", "b"]}).class_names() == ["a", "b"]
+
+
+@pytest.mark.parametrize("metadata", [
+    {},
+    {"names": None},
+    {"names": {"a": "person"}},      # non-integer keys: order is unknowable
+])
+def test_unusable_names_metadata_yields_nothing(metadata):
+    """Empty lets the caller fall back to vocab.json rather than guess an order."""
+    assert _MetaOnlySession(metadata).class_names() == []

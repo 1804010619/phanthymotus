@@ -203,6 +203,30 @@ class VisionEngineSession:
     def output_names(self) -> list:
         return list(self._engine.output_names)
 
+    @property
+    def metadata(self) -> dict:
+        """The JSON header ultralytics' exporter prefixes to the engine."""
+        return dict(getattr(self._engine, "metadata", None) or {})
+
+    def class_names(self) -> list:
+        """Class names as recorded *inside the engine*, or [] if absent.
+
+        This is the authoritative vocabulary: it was written by the same export
+        that baked the classes into the weights, so unlike a file shipped
+        alongside it, it cannot drift out of order or out of date.
+        """
+        names = self.metadata.get("names")
+        if isinstance(names, dict):
+            # ultralytics writes {0: "person", 1: "door", ...}, and a JSON round
+            # trip turns those keys into strings.
+            try:
+                return [names[key] for key in sorted(names, key=lambda k: int(k))]
+            except (ValueError, TypeError):
+                return []
+        if isinstance(names, (list, tuple)):
+            return list(names)
+        return []
+
     def infer(self, frame: np.ndarray) -> tuple[list, LetterboxMeta]:
         canvas, meta = letterbox(frame, self._in_w, self._in_h)
         blob = to_blob(canvas, self._engine.input_dtype)
