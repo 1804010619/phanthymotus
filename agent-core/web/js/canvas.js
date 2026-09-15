@@ -158,6 +158,7 @@ export async function initCanvas(initialMcps) {
   _setupDropZone();
   _setupControlButtons();
   _setupPortDrag();
+  _setupPortTooltip();
   _syncGeometryObservers();
 
   // Load persisted layout
@@ -729,17 +730,15 @@ function _buildCardEl({ id, mcpId, toolName, driverName, x, y, topicIn: savedTop
   // Build port HTML
   const inPortsHtml = topicIn.map((t, i) => {
     const fmt = t.format || '';
-    const fmtShort = fmt.split('/').pop() || '?';
     const colorCls = _fmtColorClass(fmt);
-    return `<div class="canvas-port in ${colorCls}" data-dir="in" data-format="${_esc(fmt)}" data-topic="${_esc(t.topic || '')}" data-idx="${i}" title="${_esc(fmt)}"><span class="canvas-port-label">${_esc(fmtShort)}</span></div>`;
+    return `<div class="canvas-port in ${colorCls}" data-dir="in" data-format="${_esc(fmt)}" data-topic="${_esc(t.topic || '')}" data-idx="${i}"></div>`;
   }).join('');
 
   const outPortsHtml = topicOut.map((t, i) => {
     const fmt = t.format || '';
-    const fmtShort = fmt.split('/').pop() || '?';
     const colorCls = _fmtColorClass(fmt);
     const staticAttr = t.topic ? `data-static-topic="${_esc(t.topic)}"` : '';
-    return `<div class="canvas-port out ${colorCls}" data-dir="out" data-format="${_esc(fmt)}" data-topic="${_esc(t.topic || '')}" ${staticAttr} data-idx="${i}" title="${_esc(fmt)}"><span class="canvas-port-label">${_esc(fmtShort)}</span></div>`;
+    return `<div class="canvas-port out ${colorCls}" data-dir="out" data-format="${_esc(fmt)}" data-topic="${_esc(t.topic || '')}" ${staticAttr} data-idx="${i}"></div>`;
   }).join('');
 
   if (effectiveType === 'controller') {
@@ -757,7 +756,7 @@ function _buildCardEl({ id, mcpId, toolName, driverName, x, y, topicIn: savedTop
       </div>
       <div class="canvas-port-col left">${inPortsHtml}</div>
       <div class="canvas-port-col right">${outPortsHtml}</div>
-      <div class="canvas-port-col bottom"><div class="canvas-port executor" data-dir="executor" data-format="executor" title="连接执行器"><span class="canvas-port-label">执行器</span></div></div>
+      <div class="canvas-port-col bottom"><div class="canvas-port executor" data-dir="executor" data-format="executor" data-tip="连接执行器"></div></div>
     `;
 
     el.querySelector('.canvas-card-close').addEventListener('click', (e) => {
@@ -996,7 +995,7 @@ function _buildCardEl({ id, mcpId, toolName, driverName, x, y, topicIn: savedTop
 
     // Controller gets an additional bottom executor port
     const executorPortHtml = effectiveType === 'controller'
-      ? `<div class="canvas-port-col bottom"><div class="canvas-port executor" data-dir="executor" data-format="executor" title="连接执行器"><span class="canvas-port-label">执行器</span></div></div>`
+      ? `<div class="canvas-port-col bottom"><div class="canvas-port executor" data-dir="executor" data-format="executor" data-tip="连接执行器"></div></div>`
       : '';
 
     // Determine if there are any usable fields/actions left
@@ -1165,6 +1164,67 @@ function _fmtColorClass(fmt) {
   if (fmt.startsWith('data/json') || fmt.startsWith('text')) return 'fmt-json';
   if (fmt.startsWith('image') || fmt.startsWith('video')) return 'fmt-visual';
   return 'fmt-default';
+}
+
+// ── Port hover tooltip ────────────────────────────────────────────────────────
+// Replaces the native `title`, whose ~1s delay made it useless for telling apart
+// several same-format ports on one card. Text is read from the DOM at hover time
+// rather than baked in at render: most topics are resolved later (by
+// _resolveAllTopics, by connection propagation, or by an async `info` call), so a
+// stored copy would go stale.
+
+let _portTip = null;
+
+function _ensurePortTip() {
+  if (_portTip) return _portTip;
+  _portTip = document.createElement('div');
+  _portTip.className = 'canvas-port-tip';
+  _portTip.innerHTML = '<span class="canvas-port-tip-fmt"></span><span class="canvas-port-tip-topic"></span>';
+  document.body.appendChild(_portTip);
+  return _portTip;
+}
+
+function _hidePortTip() {
+  if (_portTip) _portTip.classList.remove('visible');
+}
+
+function _showPortTip(port) {
+  const tip = _ensurePortTip();
+  const fmt = port.dataset.tip || port.dataset.format || '?';
+  // An out-port with no topic yet is unresolved, not topic-less — say so rather
+  // than showing the format alone, which is what made the ports ambiguous.
+  const topic = port.dataset.tip ? '' : (port.dataset.topic || (port.dataset.dir === 'out' ? '(未解析)' : ''));
+
+  tip.querySelector('.canvas-port-tip-fmt').textContent = fmt;
+  const topicEl = tip.querySelector('.canvas-port-tip-topic');
+  topicEl.textContent = topic;
+  topicEl.style.display = topic ? '' : 'none';
+  tip.classList.toggle('unresolved', topic === '(未解析)');
+  tip.classList.add('visible');
+
+  // Ports live inside the zoom/pan viewport, so anchor off the on-screen rect and
+  // position fixed — the tooltip then stays a constant size at any zoom level.
+  const r = port.getBoundingClientRect();
+  const tw = tip.offsetWidth;
+  const th = tip.offsetHeight;
+  const below = r.top < th + 12;
+  let left = r.left + r.width / 2 - tw / 2;
+  left = Math.max(8, Math.min(left, window.innerWidth - tw - 8));
+  tip.style.left = `${Math.round(left)}px`;
+  tip.style.top = `${Math.round(below ? r.bottom + 8 : r.top - th - 8)}px`;
+  tip.classList.toggle('below', below);
+}
+
+function _setupPortTooltip() {
+  // mouseover fires for every element, so the non-port case doubles as mouseout.
+  document.addEventListener('mouseover', (e) => {
+    const port = e.target.closest?.('.canvas-port');
+    if (port && !_draggingConn) _showPortTip(port);
+    else _hidePortTip();
+  });
+  // Dragging a connection or panning/zooming moves the port out from under it.
+  document.addEventListener('pointerdown', _hidePortTip);
+  document.addEventListener('wheel', _hidePortTip, { passive: true });
 }
 
 // ── Config overlay helpers ─────────────────────────────────────────────────

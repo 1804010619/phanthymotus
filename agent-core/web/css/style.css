@@ -1262,31 +1262,34 @@ html, body {
   box-shadow: 0 0 0 3px rgba(5,150,105,.18), 0 2px 8px rgba(0,0,0,.15);
 }
 .canvas-port.executor:hover::after { background: #047857; }
-.canvas-port.executor .canvas-port-label {
-  top: auto;
-  bottom: calc(100% + 7px);
-  left: 50%;
-  right: auto;
-  transform: translateX(-50%);
-}
 
-/* Port label — appears inside card on hover, anchored to inner edge */
-.canvas-port-label {
-  position: absolute;
-  top: 50%;
-  transform: translateY(-50%);
-  font-size: 9px;
+/* Port tooltip — format + topic, shown instantly on hover. Positioned in JS
+   (_showPortTip) as a fixed-position child of <body>, so it is not scaled by the
+   canvas zoom transform and is never clipped by a card. */
+.canvas-port-tip {
+  position: fixed;
+  z-index: 400;
+  display: none;
+  flex-direction: column;
+  gap: 2px;
+  max-width: 340px;
+  padding: 5px 9px;
+  border-radius: 5px;
+  background: rgba(24,28,36,.94);
+  box-shadow: 0 2px 10px rgba(0,0,0,.28);
   font-family: var(--font-mono);
-  color: var(--text-dim);
-  white-space: nowrap;
-  pointer-events: none;
-  opacity: 0;
-  transition: opacity 0.15s;
+  font-size: 11px;
+  line-height: 1.4;
   letter-spacing: 0.02em;
+  pointer-events: none;
 }
-.canvas-port-col.left  .canvas-port-label { left:  calc(100% + 7px); }
-.canvas-port-col.right .canvas-port-label { right: calc(100% + 7px); }
-.canvas-port:hover .canvas-port-label { opacity: 1; }
+.canvas-port-tip.visible { display: flex; }
+.canvas-port-tip-fmt { color: #fff; }
+.canvas-port-tip-topic {
+  color: #9aa4b8;
+  overflow-wrap: anywhere;
+}
+.canvas-port-tip.unresolved .canvas-port-tip-topic { font-style: italic; }
 
 /* ── Canvas connectors SVG ─────────────────────────────────────────────── */
 .canvas-connectors-svg {
