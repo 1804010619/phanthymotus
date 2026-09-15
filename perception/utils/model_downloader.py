@@ -982,19 +982,36 @@ def ensure_kokoro_model(model_dir: str, device: str = "gpu") -> str:
 # is what that exact engine was built with.
 VISION_MODEL_BASE = os.environ.get("VISION_MODEL_BASE_URL", f"{COS_BASE}/vision")
 
+# Every pin below was taken from the copy downloaded back out of COS, not from
+# the file that was uploaded — the point of the pin is to catch a bad transfer,
+# and hashing the source cannot. (Same note as THAI_TTS_ARCHIVE / KOKORO.)
+#
+# vocab.json is byte-identical across both families; the two bundles carry
+# their own copy anyway so a family is one self-contained download.
+_VOP_VOCAB = {
+    "size": 1969,
+    "sha256": "5aaa0f34df07fff0037318c4100f40bf55b62beb439b89f60b6641924f17fd3b",
+}
+
 VOP_MODEL_BUNDLES = {
     "jp61": {
         "base_url": f"{VISION_MODEL_BASE}/yoloe-26s-seg/tensorrt-jp61-trt10.3-orin-640",
         "files": {
-            "yoloe-26s-seg.engine": {"size": 0, "sha256": ""},
-            "vocab.json": {"size": 0, "sha256": ""},
+            "yoloe-26s-seg.engine": {
+                "size": 24520612,
+                "sha256": "33bcdf00b0cad906ab430e4b71d533a194e309a44034fe92c610ea0bce1a2a78",
+            },
+            "vocab.json": _VOP_VOCAB,
         },
     },
     "jp511": {
         "base_url": f"{VISION_MODEL_BASE}/yoloe-26s-seg/tensorrt-jp511-trt8.5-orin-640",
         "files": {
-            "yoloe-26s-seg.engine": {"size": 0, "sha256": ""},
-            "vocab.json": {"size": 0, "sha256": ""},
+            "yoloe-26s-seg.engine": {
+                "size": 23742701,
+                "sha256": "49df478a308de3a1f996d4784d2b00245486c04a40e0b7b6005b7226674da4fe",
+            },
+            "vocab.json": _VOP_VOCAB,
         },
     },
 }
@@ -1003,13 +1020,19 @@ DEPTH_MODEL_BUNDLES = {
     "jp61": {
         "base_url": f"{VISION_MODEL_BASE}/yolo26n-depth/tensorrt-jp61-trt10.3-orin-640",
         "files": {
-            "yolo26n-depth.engine": {"size": 0, "sha256": ""},
+            "yolo26n-depth.engine": {
+                "size": 14110654,
+                "sha256": "8e0ea2afdcf39c96a04cc9afe76e6953aec120f16c3db856d0af0266ec769765",
+            },
         },
     },
     "jp511": {
         "base_url": f"{VISION_MODEL_BASE}/yolo26n-depth/tensorrt-jp511-trt8.5-orin-640",
         "files": {
-            "yolo26n-depth.engine": {"size": 0, "sha256": ""},
+            "yolo26n-depth.engine": {
+                "size": 13059848,
+                "sha256": "2f9da78b4eb689a30860996c7b962770fd09d4d86a4578f1010844c3ef6d68c5",
+            },
         },
     },
 }
