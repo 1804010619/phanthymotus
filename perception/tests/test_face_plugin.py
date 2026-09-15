@@ -1124,6 +1124,7 @@ def test_recognize_by_photo_identifies_a_registered_person(plugin, tmp_path):
     assert face["name"] == "小王"
     assert face["profile"] == {"gender": "male"}
     assert face["score"] > 0.9
+    assert face["bbox"] == pytest.approx([0.4, 0.4, 0.2, 0.2])
 
 
 def test_recognize_is_read_only(plugin, tmp_path):

@@ -423,9 +423,23 @@ def _subject_weight(face: DetectedFace, shape: tuple[int, int]) -> float:
     return face.area * (1.0 - 0.4 * offness)
 
 
+def _bbox_normalized(face: DetectedFace, shape: tuple[int, int]) -> list[float]:
+    """Return [x, y, width, height] as fractions of image dimensions."""
+    height, width = shape[:2]
+    if width <= 0 or height <= 0:
+        return [0.0, 0.0, 0.0, 0.0]
+    x1, y1, x2, y2 = face.bbox
+    return [
+        round(max(0.0, min(1.0, x1 / width)), 6),
+        round(max(0.0, min(1.0, y1 / height)), 6),
+        round(max(0.0, min(1.0, (x2 - x1) / width)), 6),
+        round(max(0.0, min(1.0, (y2 - y1) / height)), 6),
+    ]
+
+
 def _candidate_summary(face: DetectedFace, shape: tuple[int, int]) -> dict:
     return {
-        "bbox": face.bbox_xywh(),
+        "bbox": _bbox_normalized(face, shape),
         "det_score": round(face.det_score, 4),
         "min_side_px": int(face.min_side),
         "blur": round(face.blur, 2),
@@ -1020,7 +1034,7 @@ class _FaceNode(Node):
                     and face.blur >= gates["blur_min"]
                 )
                 entry = {
-                    "bbox": face.bbox_xywh(),
+                    "bbox": _bbox_normalized(face, shape),
                     "det_score": round(face.det_score, 4),
                     "blur": round(face.blur, 2),
                     "min_side_px": int(face.min_side),
@@ -1979,7 +1993,7 @@ class FaceRecognitionPlugin:
         for face in faces:
             engine.analyzer.prepare(image, face)
             entry = {
-                "bbox": face.bbox_xywh(),
+                "bbox": _bbox_normalized(face, image.shape[:2]),
                 "det_score": round(face.det_score, 4),
                 "blur": round(face.blur, 2),
                 "min_side_px": int(face.min_side),
