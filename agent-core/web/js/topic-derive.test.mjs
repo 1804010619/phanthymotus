@@ -12,7 +12,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { resolveDerivedTopics, inputTopicOf, topicOfPort } from './topic-derive.js';
+import { resolveDerivedTopics, inputTopicOf, inputTopicsOf, topicOfPort } from './topic-derive.js';
 
 // The layout that produced the report: mic → asr → tts, both derived cards saved
 // with no topic because nothing had asked the driver yet.
@@ -184,6 +184,56 @@ test('a card with one port still unresolved keeps being asked', async () => {
   await resolveDerivedTopics([src, vop], conns, { fetchImpl });
   assert.deepEqual(log, ['vop'], 'the half-resolved card was asked');
   assert.equal(vop.topicOut[1].topic, '/cam/vop/overlay');
+});
+
+test('a card fed by several links is asked about all of them', async () => {
+  // decision_core declares one `data/json` input and is normally fed by three.
+  // `connections.find(...)` asked about whichever link was first in the array,
+  // so the answer changed when the same links were redrawn in another order and
+  // disagreed with what api/config.py derives at start.
+  let sent = null;
+  const fetchImpl = async (url, opts) => {
+    sent = JSON.parse(opts.body).arguments;
+    return { json: async () => ({ data: { topic_out: [{ topic: '/decision_core' }] } }) };
+  };
+  const rm = { id: 'rm', topicOut: [{ topic: '/remote_control/message' }] };
+  const asr = { id: 'asr', topicOut: [{ topic: '/mic/asr' }] };
+  const core = { id: 'core', mcpId: 'agentcore', toolName: 'decision_core', topicOut: [] };
+  const conns = [
+    { fromCardId: 'rm', fromPortIdx: '0', toCardId: 'core', toPortIdx: '0' },
+    { fromCardId: 'asr', fromPortIdx: '0', toCardId: 'core', toPortIdx: '0' },
+  ];
+  await resolveDerivedTopics([rm, asr, core], conns, { fetchImpl });
+  assert.deepEqual(sent.input_topics, ['/remote_control/message', '/mic/asr']);
+  // The singular travels too — no driver reads the plural form.
+  assert.equal(sent.input_topic, '/remote_control/message');
+});
+
+test('a card waits until every one of its inputs has resolved', async () => {
+  // Deriving from half the set produces an answer that has to be thrown away,
+  // and on the start path it would bind a node to half a graph.
+  const unresolvedSrc = { id: 'src', topicOut: [] };
+  const rm = { id: 'rm', topicOut: [{ topic: '/remote_control/message' }] };
+  const core = { id: 'core', mcpId: 'agentcore', toolName: 'decision_core', topicOut: [] };
+  const conns = [
+    { fromCardId: 'rm', fromPortIdx: '0', toCardId: 'core', toPortIdx: '0' },
+    { fromCardId: 'src', fromPortIdx: '0', toCardId: 'core', toPortIdx: '0' },
+  ];
+  assert.deepEqual(inputTopicsOf(core, [rm, unresolvedSrc, core], conns), []);
+  // With allowStale the last-resort pass may still use a persisted fromTopic.
+  conns[1].fromTopic = '/saved/topic';
+  assert.deepEqual(inputTopicsOf(core, [rm, unresolvedSrc, core], conns, true),
+                   ['/remote_control/message', '/saved/topic']);
+});
+
+test('two links carrying the same topic are asked about once', () => {
+  const rm = { id: 'rm', topicOut: [{ topic: '/a' }] };
+  const core = { id: 'core', topicOut: [] };
+  const conns = [
+    { fromCardId: 'rm', fromPortIdx: '0', toCardId: 'core', toPortIdx: '0' },
+    { fromCardId: 'rm', fromPortIdx: '0', toCardId: 'core', toPortIdx: '0' },
+  ];
+  assert.deepEqual(inputTopicsOf(core, [rm, core], conns), ['/a']);
 });
 
 test('a source that is not on the canvas falls back to the persisted topic', async () => {

@@ -18,6 +18,10 @@ import { showToolDetail, isToolConfigured, isInstanceConfigured, openInstanceCon
 import { toggleMicStream, isMicActive } from './mic-stream.js';
 import { sessionId } from './session.js';
 import { getToken } from './auth.js';
+// Shared with the monitor dashboard so both sides shape the `info` call the
+// same way, and with api/config.py's _start_and_resolve so the canvas and the
+// start agree about what a card consumes.
+import { inputArgs, inputKey } from './topic-derive.js';
 
 let _canvasEl   = null;
 let _viewport   = null;
@@ -298,7 +302,7 @@ export function updateCanvasMcps(mcps) {
     // Only fetch once (not on every poll) — mark card to avoid repeated calls
     if (!card.topicOut?.some(t => t.topic) && liveTopicOut?.length && !toolObj?.multiInstance && !card._topicFetched) {
       card._topicFetched = true;
-      _fetchTopicsFromDriver(card, '');
+      _fetchTopicsFromDriver(card, []);
     }
 
     // Also trigger rebuild if instance-config button presence doesn't match live configSchema
@@ -649,7 +653,7 @@ function _addCard(data, save = true) {
   const _toolObj2 = (_mcp2?.tools || []).find(t => (typeof t === 'string' ? t : t.name) === toolName);
   const _isMultiInstanceSensor = _toolObj2?.multiInstance && _toolObj2?.type === 'sensor';
   if ((!_toolObj2?.multiInstance || _isMultiInstanceSensor) && (_toolObj2?.topic_out?.length || _toolObj2?.topic_in?.length)) {
-    _fetchTopicsFromDriver(cardData, '');
+    _fetchTopicsFromDriver(cardData, []);
   }
 
   _syncEmptyState();
@@ -1355,10 +1359,18 @@ function _setupPortDrag() {
 
         const toCardData = _cards.find(c => c.id === toCard.dataset.cardId);
         if (toCardData && _projectRunning) {
-          // Use resolved topic from the destination's in-port
+          // Restart on the card's *whole* input set, not just the link that was
+          // just drawn. Perception rebuilds a node whose input_topic differs
+          // from the one it holds (plugins/tts.py), so naming only the new topic
+          // silently unbound whatever the card was already consuming — drawing a
+          // second line into a TTS card killed the first one.
+          const topics = _inputTopicsFor(toCardData);
           const resolvedInPort = toCard.querySelector(`.canvas-port.in[data-idx="${inPort.dataset.idx}"]`);
-          const resolvedTopic = resolvedInPort?.dataset.topic || _draggingConn.topic;
-          _triggerAction(toCardData.mcpId, toCardData.toolName, 'start', { input_topic: resolvedTopic, instance_id: toCardData.id });
+          const args = topics.length
+            ? inputArgs(topics)
+            : { input_topic: resolvedInPort?.dataset.topic || _draggingConn.topic };
+          _triggerAction(toCardData.mcpId, toCardData.toolName, 'start',
+                         { ...args, instance_id: toCardData.id });
         }
         // The destination's output topic is derived from this new input;
         // _resolveAllTopics above already scheduled that refetch, and doing it
@@ -2073,19 +2085,29 @@ function _parseMcpCallResult(json) {
 }
 
 /**
- * Ask the driver to infer topics for a card given an optional input topic.
+ * Ask the driver to infer topics for a card given the topics feeding it.
  * Used for multiInstance sensors (_addCard) and processors (after wiring).
  * Updates card.topicOut and DOM out-ports if driver returns non-empty topics.
+ *
+ * Takes the whole set, not one topic: a card can be fed by several connections
+ * (decision_core normally is), and asking about one of them produced an answer
+ * that depended on which link happened to be first in `_connections` — a
+ * different answer after the same links were redrawn in another order, and a
+ * different answer from the one api/config.py derives at start.
  */
-async function _fetchTopicsFromDriver(card, inputTopic) {
-  const want = inputTopic || '';
+async function _fetchTopicsFromDriver(card, inputTopics) {
+  const topics = Array.isArray(inputTopics) ? inputTopics
+                : (inputTopics ? [inputTopics] : []);
+  const want = inputKey(topics);
   if (card._topicFetchFor === want) return;   // identical request already in flight
   card._topicFetchFor = want;
   try {
     const resp = await fetch(`/api/mcp/${encodeURIComponent(card.mcpId)}/call`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ tool: card.toolName, arguments: { action: 'info', instance_id: card.id, input_topic: inputTopic } }),
+      body: JSON.stringify({ tool: card.toolName,
+                             arguments: { action: 'info', instance_id: card.id,
+                                          ...inputArgs(topics) } }),
     });
     const data = await resp.json();
     const parsed = _parseMcpCallResult(data);
@@ -2163,7 +2185,8 @@ async function _openTopicDetailFor(el, mcpId, cachedTopicOut) {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           tool: card.toolName,
-          arguments: { action: 'info', instance_id: card.id, input_topic: _inputTopicFor(card) },
+          arguments: { action: 'info', instance_id: card.id,
+                       ...inputArgs(_inputTopicsFor(card)) },
         }),
       });
       const parsed = _parseMcpCallResult(await resp.json());
@@ -2188,10 +2211,30 @@ async function _openTopicDetailFor(el, mcpId, cachedTopicOut) {
   showTopicDetail(candidate.topic, candidate.format || '');
 }
 
-function _inputTopicFor(card) {
-  const inConn = _connections.find(c => c.toCardId === card.id);
-  if (!inConn) return '';
-  const inPort = card.el.querySelector(`.canvas-port.in[data-idx="${inConn.toPortIdx}"]`);  return inPort?.dataset.topic || '';
+/**
+ * Every topic feeding `card`, in the order the connections were drawn.
+ *
+ * Read from each *source's* out-port, not from this card's in-port. An in-port
+ * dataset holds one string, and several connections routinely land on one port
+ * — decision_core declares a single `data/json` input and is normally fed by
+ * three — so _resolveAllTopics' last writer won and the rest were invisible
+ * here. This used to take `_connections.find(...)`, one arbitrary link, which
+ * made a card's derived topic depend on the order the links were drawn in and
+ * disagree with what api/config.py resolves at start.
+ *
+ * [] if any source is unresolved: same "wait, don't guess" rule as elsewhere,
+ * since deriving from half the inputs yields an answer that must be redone.
+ */
+function _inputTopicsFor(card) {
+  const topics = [];
+  for (const conn of _connections.filter(c => c.toCardId === card.id)) {
+    const src = _cards.find(c => c.id === conn.fromCardId);
+    const outPort = src?.el?.querySelector(`.canvas-port.out[data-idx="${conn.fromPortIdx}"]`);
+    const topic = outPort?.dataset.topic || '';
+    if (!topic) return [];
+    if (!topics.includes(topic)) topics.push(topic);
+  }
+  return topics;
 }
 
 /**
@@ -2211,7 +2254,8 @@ function _inputTopicFor(card) {
  */
 function _revalidateDerivedTopics() {
   for (const card of _cards) {
-    const want = _inputTopicFor(card);
+    const want = _inputTopicsFor(card);
+    const wantKey = inputKey(want);
     const known = card.topicOutFrom;
     const hasReal = card.topicOut?.some(t => t.topic);
     // Nothing verified this card's topics in this page's lifetime. The saved
@@ -2243,7 +2287,7 @@ function _revalidateDerivedTopics() {
       _fetchTopicsFromDriver(card, want);
       continue;
     }
-    if (known !== want) _fetchTopicsFromDriver(card, want);
+    if (known !== wantKey) _fetchTopicsFromDriver(card, want);
   }
 }
 
