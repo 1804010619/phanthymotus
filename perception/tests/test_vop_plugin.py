@@ -524,3 +524,41 @@ def test_the_loading_reply_names_the_right_output_topic():
 ])
 def test_output_topic_derivation_is_one_function(topic, expected):
     assert vop_plugin.output_topic_for(topic) == expected
+
+
+def test_retire_leaves_the_executor_before_destroying_anything():
+    """Order matters: destroying a handle the executor still holds kills spin.
+
+    rclpy raises `InvalidHandle: cannot use Destroyable because destruction was
+    requested` from the executor's own thread, which took down every
+    subscription in the process — ASR, OCR and vop — while the MCP server kept
+    answering, so the service looked healthy and simply stopped perceiving.
+    """
+    order = []
+
+    class _RecordingExecutor(_FakeExecutor):
+        def remove_node(self, node):
+            order.append("remove_node")
+            super().remove_node(node)
+
+    executor = _RecordingExecutor()
+    plugin = vop_plugin.VideoObjectPerceptionPlugin({}, "testns", executor)
+    plugin._vocabulary = ["person", "door", "forklift"]
+    plugin._model = _FakeModel()
+    plugin.dispatch("vop", {"action": "start", "input_topic": "/cam/rgb"})
+
+    node = executor.nodes[0]
+    original_destroy = node.destroy_node
+    def _tracking_destroy():
+        order.append("destroy_node")
+        original_destroy()
+    node.destroy_node = _tracking_destroy
+    node.destroy_subscription = lambda sub: order.append("destroy_subscription")
+
+    plugin.dispatch("vop", {"action": "stop", "instance_id": "/cam/rgb"})
+
+    assert "destroy_subscription" not in order, (
+        "stop() must not destroy the subscription — destroy_node does it after "
+        "the node has left the executor"
+    )
+    assert order == ["remove_node", "destroy_node"]

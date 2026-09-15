@@ -48,6 +48,8 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPo
 from sensor_msgs.msg import CompressedImage
 from std_msgs.msg import String
 
+from utils.ros_lifecycle import dispose_node
+
 from plugins.image_input import BadInput, load_image_bytes
 
 log = logging.getLogger(__name__)
@@ -229,7 +231,7 @@ class _VOPNode(Node):
             if self._running:
                 return self._status()
             self._stop_event.clear()
-            if self._input_topic:
+            if self._input_topic and self._sub is None:
                 self._sub = self.create_subscription(
                     CompressedImage, self._input_topic, self._image_cb, _LOW_LAT_QOS
                 )
@@ -245,13 +247,20 @@ class _VOPNode(Node):
             return self._status()
 
     def stop(self) -> dict:
+        """Stop this node's worker. Does NOT touch the subscription.
+
+        Destroying a subscription while the node is still registered with the
+        executor races the executor's own wait list and kills the spin thread
+        with `InvalidHandle: cannot use Destroyable because destruction was
+        requested` — which takes every subscription in the process with it,
+        silently, because nothing catches it. The subscription is torn down by
+        destroy_node() in utils.ros_lifecycle.dispose_node, after the node has
+        been removed from the executor. Same order plugins/ocr.py uses.
+        """
         # Flag first, lock second: a start() holding the lock will see the flag
         # as soon as it releases, instead of this call queueing behind it.
         self._stop_event.set()
         with self._lifecycle_lock:
-            if self._sub is not None:
-                self.destroy_subscription(self._sub)
-                self._sub = None
             if self._worker and self._worker.is_alive():
                 self._worker.join(timeout=3.0)
             self._worker = None
@@ -672,11 +681,12 @@ class VideoObjectPerceptionPlugin:
             return None
         node.request_stop()
         result = node.stop()
-        self._executor.remove_node(node)
-        # destroy_node(), not just remove_node(): otherwise the publisher and
-        # the ROS node name leak, and the next start on the same topic trips
-        # rclpy's "Publisher already registered for provided node name".
-        node.destroy_node()
+        # remove-then-destroy, via the shared helper: the node has to leave the
+        # executor before any of its handles are destroyed, or the spin thread
+        # dies on InvalidHandle. It must also be destroyed and not merely
+        # removed, or the publisher and the ROS node name leak and the next
+        # start on the same topic trips "Publisher already registered".
+        dispose_node(self._executor, node, label=f"vop/{node_key}")
         return result
 
     def get_tools(self) -> list:

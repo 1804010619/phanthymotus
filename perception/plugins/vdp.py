@@ -46,6 +46,8 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPo
 from sensor_msgs.msg import CompressedImage
 from std_msgs.msg import String
 
+from utils.ros_lifecycle import dispose_node
+
 log = logging.getLogger(__name__)
 
 # Fixed by the dashboard renderer — see the module docstring.
@@ -209,11 +211,12 @@ class _VDPNode(Node):
             return self._state("running")
 
     def stop(self) -> dict:
+        # Worker only — the subscription is destroyed by destroy_node() after
+        # the node leaves the executor. Destroying it here races the executor's
+        # wait list and kills the spin thread with InvalidHandle, taking every
+        # other subscription in the process down with it. See plugins/vop.py.
         self._stop_event.set()
         with self._lifecycle_lock:
-            if self._sub is not None:
-                self.destroy_subscription(self._sub)
-                self._sub = None
             if self._worker and self._worker.is_alive():
                 self._worker.join(timeout=3.0)
             self._worker = None
@@ -351,10 +354,10 @@ class VideoDepthPerceptionPlugin:
             return None
         node.request_stop()
         result = node.stop()
-        self._executor.remove_node(node)
-        # destroy_node() as well, or the publishers and the ROS node name leak
-        # and the next start on this topic trips "Publisher already registered".
-        node.destroy_node()
+        # remove-then-destroy: the node must leave the executor before its
+        # handles are destroyed, and it must be destroyed rather than merely
+        # removed or the publishers and the ROS node name leak.
+        dispose_node(self._executor, node, label=f"vdp/{node_key}")
         return result
 
     def get_tools(self) -> list:
