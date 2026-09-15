@@ -389,14 +389,7 @@ function _connectWs(topicPath, format, renderer) {
   function create() {
     const ws = new WebSocket(wsUrl);
     ws.binaryType = 'arraybuffer';
-    ws.onmessage = (ev) => {
-      // First frame retires the placeholder. Three of six cards on a live rig
-      // were blank white rectangles with nothing to say whether the stream was
-      // idle, unbound or broken.
-      const c = _cards.get(topicPath);
-      if (c && !c.gotData) { c.gotData = true; c.el.classList.add('has-data'); }
-      _handleWsMessage(ev, renderer, format);
-    };
+    ws.onmessage = _wsHandler(topicPath, () => _cards.get(topicPath)?.renderer || renderer, format);
     ws.onerror = () => {};
     ws.onclose = () => {
       // Auto-reconnect after 5s if card still exists
@@ -416,18 +409,43 @@ function _connectWs(topicPath, format, renderer) {
   return create();
 }
 
+/**
+ * Deliver one frame to a renderer. Returns whether it was real data.
+ *
+ * The distinction matters to the empty-state placeholder: the bus also carries
+ * keepalive pings and metadata, and a card fed nothing but those would have
+ * retired its placeholder and gone back to being the blank rectangle the
+ * placeholder exists to explain.
+ */
 function _handleWsMessage(ev, renderer, format) {
   if (ev.data instanceof ArrayBuffer) {
-    if (ev.data.byteLength === 0) return;
+    if (ev.data.byteLength === 0) return false;
     renderer.onData?.(ev.data, format);
-  } else {
-    try {
-      const parsed = JSON.parse(ev.data);
-      if (parsed.type === 'ping' || parsed.type === 'meta' || parsed.type === 'error') return;
-    } catch {}
-    const buf = new TextEncoder().encode(ev.data).buffer;
-    renderer.onData?.(buf, format);
+    return true;
   }
+  try {
+    const parsed = JSON.parse(ev.data);
+    if (parsed.type === 'ping' || parsed.type === 'meta' || parsed.type === 'error') return false;
+  } catch { /* not JSON — treat as payload */ }
+  renderer.onData?.(new TextEncoder().encode(ev.data).buffer, format);
+  return true;
+}
+
+/**
+ * The socket's message handler, shared by the initial connection and by a
+ * re-wire after a mode switch — which used to install a plain _handleWsMessage
+ * and so stopped tracking whether the card had ever received anything.
+ * `getRenderer` is resolved per frame because a mode switch replaces it.
+ */
+function _wsHandler(topicPath, getRenderer, format) {
+  return (ev) => {
+    if (!_handleWsMessage(ev, getRenderer(), format)) return;
+    const card = _cards.get(topicPath);
+    if (card && !card.gotData) {
+      card.gotData = true;
+      card.el.classList.add('has-data');
+    }
+  };
 }
 
 function _refreshRenderer(topicPath) {
@@ -442,7 +460,7 @@ function _refreshRenderer(topicPath) {
   // Re-wire WS. Optional: _connectWs returns null for a card whose topic is
   // not resolved yet, and a mode switch on such a card must not throw.
   if (card.ws) {
-    card.ws.onmessage = (ev) => _handleWsMessage(ev, card.renderer, card.format);
+    card.ws.onmessage = _wsHandler(topicPath, () => _cards.get(topicPath)?.renderer, card.format);
   }
 }
 

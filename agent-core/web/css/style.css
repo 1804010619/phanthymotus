@@ -3988,6 +3988,13 @@ html, body {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  /* Truncation stays left-to-right. `direction: rtl` is the usual trick for
+     clipping a path's head instead of its tail, and it does move the ellipsis —
+     but a path begins with `/`, a bidi-neutral character, which at the start of
+     an RTL paragraph gets reordered to the far end: `/decision_core` rendered as
+     `decision_core/`. Shortening the string in JS instead (_displayPath keeps
+     the last two segments) gets the same disambiguation with no reordering, and
+     the title attribute still carries the full path. */
 }
 .monitor-card-format {
   font-size: 9px;
@@ -4054,6 +4061,11 @@ html, body {
   padding: 0 16px;
   text-align: center;
   pointer-events: none;
+  /* Opaque, not a translucent overlay: the image and video renderers paint a
+     black canvas before their first frame, and dim grey text on that was barely
+     legible. Nothing is being hidden — this is only up while the card has no
+     data, and `.has-data` removes it on the first real frame. */
+  background: var(--bg-card);
 }
 .monitor-card.has-data .monitor-card-empty { display: none; }
 .monitor-card-empty-title {
