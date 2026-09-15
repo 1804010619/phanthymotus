@@ -301,16 +301,63 @@ class VideoObjectPerceptionPlugin:
                 "TensorRT engine with a frozen vocabulary; see info action",
                 self._rejected_classes,
             )
+        # The engine is loaded lazily on the first start, but the card has to be
+        # able to say what this build can detect before anyone starts it —
+        # otherwise a freshly deployed robot shows a vop card with no classes
+        # and no way to find out what it would find. Fetching just vocab.json
+        # (~2 KB, pinned) in the background gives an honest answer within
+        # seconds without blocking dispatch or touching the GPU.
+        threading.Thread(target=self._prefetch_vocabulary, daemon=True,
+                         name="vop_vocab_prefetch").start()
+
+    def _prefetch_vocabulary(self):
+        """Populate _vocabulary from vocab.json alone, without loading the engine.
+
+        Never fatal: a robot with no route to COS keeps a working vop (the
+        engine download at start has its own error path) and simply reports an
+        unknown vocabulary until then.
+        """
+        try:
+            from utils.model_downloader import (
+                VOP_MODEL_BUNDLES, ensure_verified_bundle, require_models_subpath,
+                select_bundle_family,
+            )
+
+            model_dir = require_models_subpath(
+                os.environ.get("VOP_MODEL_DIR", "/models/vop")
+            )
+            key = select_bundle_family(VOP_MODEL_BUNDLES)
+            entry = VOP_MODEL_BUNDLES[key]
+            vocab_only = {n: m for n, m in entry["files"].items() if n == "vocab.json"}
+            if not vocab_only:
+                return
+            paths = ensure_verified_bundle(
+                f"vop/{key}/vocab", model_dir, entry["base_url"], vocab_only
+            )
+            vocab = self._read_vocab(paths.get("vocab.json"))
+            if vocab and not self._vocabulary:
+                self._vocabulary = vocab
+                log.info(f"[vop] vocabulary available before load: {len(vocab)} classes")
+        except Exception as exc:
+            log.warning(f"[vop] could not prefetch vocabulary ({exc}); "
+                        "info will report it as unknown until the engine loads")
 
     def _frozen_vocab_error(self, requested) -> str:
         """The one explanation both rejection paths give."""
-        head = ", ".join(self._vocabulary[:12])
-        more = f" (+{len(self._vocabulary) - 12} more)" if len(self._vocabulary) > 12 else ""
+        if self._vocabulary:
+            head = ", ".join(self._vocabulary[:12])
+            more = f" (+{len(self._vocabulary) - 12} more)" if len(self._vocabulary) > 12 else ""
+            covers = f"The engine detects {len(self._vocabulary)} classes: {head}{more}. "
+        else:
+            # Never say "0 classes" — it reads as "this detects nothing", which
+            # is wrong and alarming. The list simply is not known yet.
+            covers = ("The engine's class list is not loaded yet, so it cannot be "
+                      "listed here; start the card, or check the vop card's info. ")
         return (
             f"This build runs a prebuilt TensorRT engine whose open-vocabulary "
             f"class list was frozen when the engine was exported, so classes "
             f"cannot be changed at runtime. Requested: {list(requested)}. "
-            f"The engine detects {len(self._vocabulary)} classes: {head}{more}. "
+            f"{covers}"
             f"To detect something outside that list, rebuild the engine with "
             f"tools/export_vision_engines.py and republish the bundle."
         )
@@ -499,8 +546,13 @@ class VideoObjectPerceptionPlugin:
                 "name": "VideoObjectPerception", "manufacture": "Embodied", "model": self._model_name,
                 "state": state,
                 "vocabulary_frozen": True,
-                "total_classes": len(self._vocabulary),
+                # `None` rather than 0 while the list is still unknown: a card
+                # that says "0 classes" reads as "detects nothing", which is
+                # both wrong and the first thing an operator would report as a
+                # bug. The list is fetched in the background at startup.
+                "total_classes": len(self._vocabulary) if self._vocabulary else None,
                 "classes": self._vocabulary,
+                "classes_loaded": bool(self._vocabulary),
                 "instances": instances,
                 "topic_in": topics_in,
                 "topic_out": topics_out,

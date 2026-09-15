@@ -116,7 +116,30 @@ def test_info_reports_the_engine_vocabulary():
     info = plugin.dispatch("vop", {"action": "info"})
     assert info["total_classes"] == 3
     assert info["classes"] == ["person", "door", "forklift"]
+    assert info["classes_loaded"] is True
     assert "warning" not in info          # nothing was rejected in this one
+
+
+def test_info_before_the_vocabulary_is_known_does_not_claim_zero():
+    """A freshly deployed robot must not show a vop card reading "0 classes".
+
+    The engine loads lazily on first start, so until then the list is unknown —
+    which is not the same as empty, and an operator reads 0 as "detects
+    nothing" and files a bug.
+    """
+    plugin, _ = _plugin()
+    plugin._vocabulary = []
+    info = plugin.dispatch("vop", {"action": "info"})
+    assert info["total_classes"] is None
+    assert info["classes_loaded"] is False
+
+
+def test_rejection_message_does_not_say_zero_classes():
+    plugin, _ = _plugin()
+    plugin._vocabulary = []
+    message = plugin._frozen_vocab_error(["forklift"])
+    assert "0 classes" not in message
+    assert "not loaded yet" in message
 
 
 # ── vocab.json reading ───────────────────────────────────────────────────────
