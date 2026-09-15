@@ -295,6 +295,7 @@ class _VOPNode(Node):
                 jpeg_bytes = self._frame_queue.get(timeout=1.0)
             except queue.Empty:
                 continue
+            started = time.time()
             try:
                 frame = cv2.imdecode(
                     np.frombuffer(jpeg_bytes, np.uint8), cv2.IMREAD_COLOR
@@ -305,7 +306,8 @@ class _VOPNode(Node):
                 boxes, scores, classes = decode_detections(
                     outputs, meta, self._confidence
                 )
-                self._publish_objects(self._extract_objects(boxes, scores, classes, frame.shape))
+                objects = self._extract_objects(boxes, scores, classes, frame.shape)
+                self._publish_objects(objects, started)
             except Exception as e:
                 log.error(f"[vop] inference error: {e}", exc_info=True)
 
@@ -336,18 +338,30 @@ class _VOPNode(Node):
             })
         return objects
 
-    def publish_objects(self, objects: list):
+    def publish_objects(self, objects: list, started: Optional[float] = None):
         """Publish a detection payload. Used by the stream worker and by
         the one-shot photo actions, so both emit the same thing."""
-        self._publish_objects(objects)
+        self._publish_objects(objects, started)
 
-    def _publish_objects(self, objects: list):
+    def _publish_objects(self, objects: list, started: Optional[float] = None):
         self._detect_count += 1
-        msg = String()
-        msg.data = json.dumps({
+        # `count` and `latency_ms` follow plugins/face.py: a consumer should not
+        # have to len() the list to know whether anything was seen, and latency
+        # is the number an operator actually watches. `timestamp` keeps its name
+        # rather than becoming face's `ts` — renaming it would break every
+        # existing reader of {topic}/objects for no gain.
+        payload = {
             "timestamp": time.time(),
+            "count": len(objects),
             "objects": objects,
-        }, ensure_ascii=False)
+        }
+        if started is not None:
+            # Measured from the start of processing this frame, not from its
+            # arrival: queue wait is a function of the fps cap, not of how long
+            # detection takes, and mixing them makes the number unreadable.
+            payload["latency_ms"] = int((time.time() - started) * 1000)
+        msg = String()
+        msg.data = json.dumps(payload, ensure_ascii=False)
         self._pub.publish(msg)
 
 
@@ -570,6 +584,7 @@ class VideoObjectPerceptionPlugin:
 
         import cv2
 
+        started = time.time()
         frame = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
         if frame is None:
             return BadInput(
@@ -614,7 +629,7 @@ class VideoObjectPerceptionPlugin:
         # only reason it is startable without a camera. Purely additive: the
         # answer goes back through MCP regardless, and a card that was never
         # started publishes nothing.
-        published_to = self._publish_one_shot(args.get("instance_id", ""), objects)
+        published_to = self._publish_one_shot(args.get("instance_id", ""), objects, started)
 
         result = {
             "ok": True,
@@ -622,13 +637,17 @@ class VideoObjectPerceptionPlugin:
             "image_size": [width, height],
             "confidence_threshold": confidence,
             "count": len(objects),
+            # Same field the stream publishes, so the MCP reply and
+            # {topic}/objects cannot disagree about how long this took.
+            "latency_ms": int((time.time() - started) * 1000),
             "objects": objects,
         }
         if published_to:
             result["published_to"] = published_to
         return result
 
-    def _publish_one_shot(self, instance_id: str, objects: list) -> Optional[str]:
+    def _publish_one_shot(self, instance_id: str, objects: list,
+                          started: Optional[float] = None) -> Optional[str]:
         """Publish a one-shot result on the named instance, or the default one."""
         with self._nodes_lock:
             node = self._nodes.get(instance_id) if instance_id else None
@@ -639,7 +658,7 @@ class VideoObjectPerceptionPlugin:
         if node is None:
             return None
         try:
-            node.publish_objects(objects)
+            node.publish_objects(objects, started)
             return node._output_topic
         except Exception as error:  # noqa: BLE001 — never fail the answer on this
             log.warning(f"[vop] could not echo one-shot result: {error}")

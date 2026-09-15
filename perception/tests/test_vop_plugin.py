@@ -562,3 +562,57 @@ def test_retire_leaves_the_executor_before_destroying_anything():
         "the node has left the executor"
     )
     assert order == ["remove_node", "destroy_node"]
+
+
+# ── payload fields ───────────────────────────────────────────────────────────
+
+def test_published_payload_carries_count_and_latency():
+    """Mirrors plugins/face.py: a consumer should not have to len() the list,
+    and latency is the number an operator actually watches."""
+    plugin, executor = _plugin(
+        model=_FakeModel(rows=[[100.0, 0.0, 200.0, 50.0, 0.9, 1]]))
+    plugin.dispatch("vop", {"action": "start", "input_topic": "/cam/rgb"})
+    node = executor.nodes[0]
+    node._image_cb(_FakeCompressedImage(b"200x100"))
+
+    pub = node.publishers[0]
+    assert _wait_until(lambda: bool(pub.messages))
+    payload = json.loads(pub.messages[0])
+    assert payload["count"] == 1
+    assert payload["count"] == len(payload["objects"])
+    assert isinstance(payload["latency_ms"], int)
+    assert payload["latency_ms"] >= 0
+    # `timestamp` keeps its name — face calls it `ts`, but renaming vop's would
+    # break every existing reader of {topic}/objects.
+    assert "timestamp" in payload
+
+
+def test_an_empty_detection_still_reports_count_zero():
+    plugin, executor = _plugin(model=_FakeModel(rows=[]))
+    plugin.dispatch("vop", {"action": "start", "input_topic": "/cam/rgb"})
+    node = executor.nodes[0]
+    node._image_cb(_FakeCompressedImage(b"200x100"))
+
+    pub = node.publishers[0]
+    assert _wait_until(lambda: bool(pub.messages))
+    payload = json.loads(pub.messages[0])
+    assert payload["count"] == 0
+    assert payload["objects"] == []
+    assert "latency_ms" in payload
+
+
+def test_the_one_shot_reply_reports_the_same_two_numbers(tmp_path):
+    """The MCP reply and {topic}/objects must not disagree about a frame."""
+    plugin, executor = _photo_plugin(
+        tmp_path, rows=[[100.0, 0.0, 200.0, 50.0, 0.9, 0]])
+    plugin.dispatch("vop", {"action": "start"})
+    node = executor.nodes[0]
+
+    result = plugin.dispatch("vop", {"action": "recognize_by_photo",
+                                     "image_path": _write_frame(tmp_path)})
+    assert result["count"] == 1
+    assert isinstance(result["latency_ms"], int)
+
+    published = json.loads(node.publishers[0].messages[-1])
+    assert published["count"] == result["count"]
+    assert "latency_ms" in published
