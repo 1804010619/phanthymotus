@@ -1653,6 +1653,13 @@ html, body {
   cursor: text;
 }
 .canvas-result-pre.error { color: var(--red); }
+/* The box is focusable so Ctrl/Cmd+A can be scoped to it; without a visible
+   focus ring, which key went where would be guesswork. */
+.canvas-result-pre:focus,
+.canvas-result-pre:focus-visible {
+  outline: 2px solid var(--accent, #c8714b);
+  outline-offset: 1px;
+}
 
 /* ── Flow Area (keep for backward compat if referenced) ───────────────── */
 .flow-area {
