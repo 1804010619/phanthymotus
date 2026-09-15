@@ -675,7 +675,17 @@ class OCRPlugin:
     def _do_start(self, instance_id: str, args: dict) -> dict:
         input_topic = args.get("input_topic")
         if not input_topic:
-            raise ValueError("input_topic is required for start action")
+            # Same reasoning as plugins/vop.py: a caller who wants to read one
+            # image reaches for `start`, and a bare requirement message leaves
+            # them with no idea that the single-image actions exist.
+            raise ValueError(
+                "input_topic is required for start — start subscribes to a "
+                "camera topic and publishes results continuously, so there is "
+                "nothing to subscribe to without one. To read a single image "
+                "instead, no start and no camera are needed: use "
+                "recognize_by_photo (a file) or recognize_by_url (an http(s) "
+                "address)."
+            )
         node_key = instance_id or input_topic
 
         retired = None

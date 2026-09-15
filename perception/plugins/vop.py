@@ -709,7 +709,20 @@ class VideoObjectPerceptionPlugin:
                 if topics_list:
                     input_topic = topics_list[0]
             if not input_topic:
-                raise ValueError("input_topic is required")
+                # An agent that wants to look at one picture reaches for `start`
+                # first, which is a reasonable instinct and the wrong action. A
+                # bare "input_topic is required" reads as "this tool is broken";
+                # naming the three actions that need no camera turns the dead
+                # end into the answer.
+                raise ValueError(
+                    "input_topic is required for start — start subscribes to a "
+                    "camera topic and publishes detections continuously, so "
+                    "there is nothing to subscribe to without one. To examine a "
+                    "single image instead, no start and no camera are needed: "
+                    "use recognize_by_photo (a file), recognize_by_url (an "
+                    "http(s) address), or list_recognizable_objects to see what "
+                    "this engine can detect at all."
+                )
             node_key = instance_id or input_topic
             with self._nodes_lock:
                 running = self._nodes.get(node_key)

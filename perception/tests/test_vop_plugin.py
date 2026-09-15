@@ -448,3 +448,18 @@ def test_the_new_actions_are_advertised_with_their_params():
     image_path = schema["properties"]["image_path"]
     assert image_path["format"] == "file"
     assert image_path["uploadTo"] == "mcp"
+
+
+def test_start_without_a_topic_points_at_the_actions_that_need_none():
+    """The instinct is to `start` first; the message has to redirect it.
+
+    A bare "input_topic is required" reads as a broken tool to an agent that
+    only wanted to look at one picture.
+    """
+    plugin, _ = _plugin(model=_FakeModel())
+    with pytest.raises(ValueError) as excinfo:
+        plugin.dispatch("vop", {"action": "start"})
+    message = str(excinfo.value)
+    assert "recognize_by_photo" in message
+    assert "recognize_by_url" in message
+    assert "list_recognizable_objects" in message

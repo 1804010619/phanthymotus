@@ -571,3 +571,12 @@ def test_the_new_ocr_actions_are_advertised(monkeypatch, tmp_path):
         schema["properties"]["action"]["enum"])
     assert schema["x-action-params"]["recognize_by_photo"]["params"] == ["image_path"]
     assert schema["properties"]["image_path"]["uploadTo"] == "mcp"
+
+
+def test_start_without_a_topic_points_at_the_single_image_actions(ocr):
+    plugin, _, _ = ocr
+    with pytest.raises(ValueError) as excinfo:
+        plugin.dispatch("ocr", {"action": "start"})
+    message = str(excinfo.value)
+    assert "recognize_by_photo" in message
+    assert "recognize_by_url" in message
