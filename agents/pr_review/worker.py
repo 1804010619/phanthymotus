@@ -252,25 +252,27 @@ async def _run_once(
         job.build_results = results
         await store.save_job(job)
 
-        # Posted before the tests run, not after: a build failure is the thing
-        # the author most needs to see immediately, and tests can take minutes.
-        # _report edits one comment in place, so the update below replaces this
-        # body rather than adding a second comment.
+        # The build result is posted before the tests run and is never rewritten
+        # afterwards. Somebody is reading this comment to pull an image and
+        # deploy it; replacing its body minutes later would move the refs and
+        # the deploy instructions out from under them. It says tests are coming
+        # instead, so a reader knows to expect a second comment.
+        planned = _planned_test_components(job, results, config)
         await _report(
             job, github_client,
-            comments.format_build_result(job.pr_head_sha, results),
+            comments.format_build_result(
+                job.pr_head_sha, results, tests_pending=planned
+            ),
         )
 
         # Tests run before the build-failure return, so a job where core built
         # and perception did not still gets core's suite. plan_suites only
         # picks components whose own build succeeded.
         test_results = await _run_tests(job, results, worktree, config, store)
-        if test_results:
-            await _report(
+        if any(t.status not in (None, "skipped") for t in test_results):
+            await _post(
                 job, github_client,
-                comments.format_build_result(
-                    job.pr_head_sha, results, tests=test_results
-                ),
+                comments.format_test_result(job.pr_head_sha, test_results),
             )
 
         if any(not r.success for r in results):
@@ -484,6 +486,24 @@ def _build_plan(
     return plan
 
 
+def _planned_test_components(
+    job: ReviewJob, build_results: list[BuildResult], config: Config
+) -> list[str]:
+    """Which suites the build comment should announce as coming next.
+
+    Computed before the run so the announcement names what will actually
+    happen — a component with no image is not promised and then silently
+    dropped.
+    """
+    if not config.tests_enabled or job.skip_tests:
+        return []
+    return [
+        component
+        for component, _ref, skip_reason in plan_suites(build_results, config)
+        if not skip_reason
+    ]
+
+
 async def _run_tests(
     job: ReviewJob,
     build_results: list[BuildResult],
@@ -653,6 +673,21 @@ def _parse_forced_targets(
             targets.append(BuildTarget.DRIVER)
             driver_paths.append(t)
     return list(dict.fromkeys(targets)), driver_paths
+
+
+async def _post(job: ReviewJob, github_client: GitHubClient, body: str):
+    """Post a *new* comment, leaving the progress comment alone.
+
+    Used for test results. They deliberately do not go through `_report`: that
+    rewrites the progress comment, and the build result living there is what
+    somebody is reading while they pull an image and deploy it. Replacing that
+    body under them — minutes later, when the suites finish — moves the image
+    refs and the deploy instructions they were using.
+    """
+    try:
+        await github_client.post_comment(job.repo_full_name, job.pr_number, body)
+    except Exception as e:
+        logger.warning(f"Job {job.id}: failed to post test results: {e}")
 
 
 async def _report(job: ReviewJob, github_client: GitHubClient, body: str):

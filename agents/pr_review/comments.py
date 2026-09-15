@@ -90,20 +90,24 @@ def format_building(
 | Status | Building... |
 
 Builds usually take 5–20 minutes, and longer when something compiles from source.
-This comment will be updated when done.
+This comment will be updated when done, and the test suites run after that — as
+their own comment, so the build result stays put once you have it.
 """
 
 
 def format_build_result(
     head_sha: str,
     results: list[BuildResult],
-    tests: list[TestResult] | None = None,
+    tests_pending: list[str] | None = None,
 ) -> str:
     """Final build state — success or failure, with logs for failures.
 
-    The test results ride in this comment rather than a new one because the
-    progress comment is edited in place (worker._report): a second comment
-    would break the "one comment per job" property the whole flow is built on.
+    `tests_pending` names the suites that will run next, so the reader knows a
+    second comment is coming. The results themselves go in that separate
+    comment (`format_test_result`) rather than being folded back in here: this
+    body is what somebody is reading while they pull an image and deploy it,
+    and rewriting it minutes later would move the refs and the deploy
+    instructions out from under them.
     """
     rows = []
     for r in results:
@@ -184,7 +188,13 @@ Commit: `{head_sha[:7]}`
             f"dashboard.\n"
         )
 
-    body += _format_tests(tests or [])
+    if tests_pending:
+        listed = ", ".join(f"`{n}`" for n in tests_pending)
+        body += (
+            f"\n### Tests\n\nRunning {listed} inside the image(s) above — the "
+            f"results will arrive as a **separate comment**, so nothing here "
+            f"changes. They do not block the review.\n"
+        )
 
     # Logs last, and sharing whatever the rest of the comment left over: the
     # author reads the log to fix the build, so it gets the space, but the table
@@ -192,30 +202,15 @@ Commit: `{head_sha[:7]}`
     # equally keeps the total inside the limit by construction, rather than
     # relying on the client's truncation backstop.
     failed = [r for r in results if not r.success and r.log_tail]
-    # Test logs compete for the same budget, and lose: when a build is broken,
-    # its log is the one that has to be readable. If the share falls below the
-    # useful floor, the test logs are the ones dropped.
-    failed_suites = [
-        t for t in (tests or [])
-        if t.status in ("failed", "error") and t.log_tail
-    ]
-    if failed or failed_suites:
-        entries = (
-            [(r.label(), r.log_tail, "build") for r in failed]
-            + [(t.label(), t.log_tail, "run") for t in failed_suites]
-        )
-        share = (COMMENT_BUDGET - len(body)) // len(entries)
-        if share < MIN_USEFUL_LOG_CHARS and failed:
-            # Drop the test logs and try again with builds alone.
-            entries = [(r.label(), r.log_tail, "build") for r in failed]
-            share = (COMMENT_BUDGET - len(body)) // len(entries)
+    if failed:
+        share = (COMMENT_BUDGET - len(body)) // len(failed)
         if share >= MIN_USEFUL_LOG_CHARS:
-            for name, tail, kind in entries:
-                body += _log_details(name, tail, share, kind)
+            for r in failed:
+                body += _log_details(r.label(), r.log_tail, share)
         else:
-            names = ", ".join(f"`{name}`" for name, _, _ in entries)
+            names = ", ".join(f"`{r.label()}`" for r in failed)
             body += (
-                f"\n> {len(entries)} builds failed — too many to include their "
+                f"\n> {len(failed)} builds failed — too many to include their "
                 f"logs here without cutting each to a few unreadable lines. "
                 f"Open the dashboard for the full log of each: {names}.\n"
             )
@@ -228,13 +223,20 @@ Commit: `{head_sha[:7]}`
     return body
 
 
-def _format_tests(tests: list[TestResult]) -> str:
-    """The `### Tests` section of the build comment.
+def format_test_result(head_sha: str, tests: list[TestResult]) -> str:
+    """Test results, as their own comment.
 
-    Omitted entirely when nothing actually ran: a PR that built no images has
-    nothing to say about tests, and a table of "not run" rows on every
-    `skip-build` job is noise that trains people to ignore the section. The
-    skipped rows are still persisted and shown on the dashboard.
+    Separate from the build comment on purpose. That one is what somebody is
+    reading while they pull an image and deploy it, and the suites finish
+    minutes after it is posted — rewriting it then would move the image refs
+    and the deploy commands out from under them. It is also simpler: the logs
+    here get the whole comment budget instead of competing with a failed
+    build's.
+
+    Returns "" when nothing actually ran: a PR that built no images has nothing
+    to say about tests, and a table of "not run" rows on every `skip-build` job
+    is noise that trains people to ignore it. Those rows are still persisted
+    and shown on the dashboard.
     """
     ran = [t for t in tests if t.status not in (None, "skipped")]
     if not ran:
@@ -257,20 +259,33 @@ def _format_tests(tests: list[TestResult]) -> str:
             f"| {t.component} | {verdict} | {t.passed} | {t.failed} | {took} |"
         )
 
-    body = (
-        "\n### Tests\n\n"
-        "| Suite | Result | Passed | Failed | Took |\n"
-        "|-------|--------|--------|--------|------|\n"
-        + "\n".join(rows)
-        + "\n"
+    images = sorted({t.image_tag for t in ran if t.image_tag})
+    ran_in = (
+        "\n".join(f"- `{ref}`" for ref in images)
+        if images else "- (image reference unavailable)"
     )
 
-    # Said explicitly, because a red X sitting above a review that got posted
-    # anyway reads as a bug in the agent rather than a deliberate policy.
+    body = f"""{BOT_MARKER}
+## PR Review Agent — Test Results
+
+Commit: `{head_sha[:7]}`
+
+| Suite | Result | Passed | Failed | Took |
+|-------|--------|--------|--------|------|
+{chr(10).join(rows)}
+
+Run inside the image(s) built from this commit, so these are this PR's code on
+the Python it actually ships:
+
+{ran_in}
+"""
+
+    # Said explicitly, because a red X next to a review that got posted anyway
+    # reads as a bug in the agent rather than a deliberate policy.
     if any(t.status == "failed" for t in tests):
         body += (
-            "\n> Test failures do not block the review — the review below was "
-            "generated with these failures as context.\n"
+            "\n> Test failures do not block the review — the review is posted "
+            "either way, and was generated with these failures as context.\n"
         )
 
     # An `error` is ours, not the PR's, and saying so stops the author hunting
@@ -297,6 +312,25 @@ def _format_tests(tests: list[TestResult]) -> str:
             body += "\n"
         body += "</details>\n"
 
+    # Logs get the whole budget here — no failed build to share it with, which
+    # is the other reason this is its own comment.
+    bad = [t for t in tests if t.status in ("failed", "error") and t.log_tail]
+    if bad:
+        share = (COMMENT_BUDGET - len(body)) // len(bad)
+        if share >= MIN_USEFUL_LOG_CHARS:
+            for t in bad:
+                body += _log_details(t.label(), t.log_tail, share, "run")
+        else:
+            names = ", ".join(f"`{t.label()}`" for t in bad)
+            body += (
+                f"\n> Logs omitted — too long to include here. Open the "
+                f"dashboard for the full output of: {names}.\n"
+            )
+
+    body += (
+        "\n---\n<sub>Tests run automatically after each build. "
+        "`/request_bot_review skip-tests` to skip them.</sub>\n"
+    )
     return body
 
 
@@ -500,7 +534,7 @@ def _format_test_summary(tests: list[TestResult]) -> str:
             body += (
                 f"- {t.component} — {t.passed} passed, "
                 f"**{t.failed + t.errors} failed** "
-                f"(logs are in the build comment above)\n"
+                f"(details in the test results comment above)\n"
             )
         elif t.status == "passed":
             body += f"- {t.component} — {t.passed} passed\n"
