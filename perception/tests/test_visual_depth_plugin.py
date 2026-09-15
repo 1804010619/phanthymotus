@@ -656,3 +656,97 @@ def test_calibration_advice_escalates_with_the_evidence(tmp_path):
     three = plugin.dispatch("visual_depth", {
         "action": "calibrate", "distance_m": 8.0, "image_path": photo})
     assert "error_pct" in three["message"]
+
+
+# ── flat-plane procedure ─────────────────────────────────────────────────────
+
+def _plane(distance=2.0):
+    """What the camera sees facing a wall square-on: one distance everywhere."""
+    return np.full((H, W), distance, dtype=np.float32)
+
+
+def _corridor():
+    """Not a plane: depth ramps across the frame."""
+    return np.tile(np.linspace(1.0, 8.0, W, dtype=np.float32), (H, 1))
+
+
+def test_flatness_is_near_zero_for_a_plane_and_large_for_a_corridor():
+    assert depth_plugin.sample_region(_plane(), "full")["flatness"] == pytest.approx(0.0)
+    assert depth_plugin.sample_region(_corridor(), "full")["flatness"] > 0.5
+
+
+def test_flatness_is_scale_free():
+    """A wall at 8 m is as flat as a wall at 1 m — the check must not drift
+    with distance or it would only ever fire at range."""
+    near = depth_plugin.sample_region(_plane(1.0), "full")["flatness"]
+    far = depth_plugin.sample_region(_plane(8.0), "full")["flatness"]
+    assert near == pytest.approx(far)
+
+
+def test_calibrating_against_a_plane_raises_no_warning(tmp_path):
+    plugin, _ = _photo_plugin(tmp_path, depth=_plane(4.0))
+    result = plugin.dispatch("visual_depth", {
+        "action": "calibrate", "distance_m": 2.0, "image_path": _write_frame(tmp_path)})
+    assert result["flatness"] == pytest.approx(0.0)
+    assert "warnings" not in result
+
+
+def test_calibrating_against_something_that_is_not_a_plane_warns(tmp_path):
+    """One distance cannot stand for the region unless the region is at one
+    distance — which is the entire reason the operator is asked for a wall."""
+    plugin, _ = _photo_plugin(tmp_path, depth=_corridor())
+    result = plugin.dispatch("visual_depth", {
+        "action": "calibrate", "distance_m": 2.0, "region": "full",
+        "image_path": _write_frame(tmp_path)})
+    assert result["ok"] is True          # still fits; the operator decides
+    assert any("不是一个平面" in w for w in result["warnings"])
+    assert any("reset_calibration" in w for w in result["warnings"])
+
+
+def test_a_disagreeing_sample_is_named_not_silently_averaged(tmp_path):
+    """A typo (2 for 20) would otherwise just drag the mean."""
+    plugin, _ = _photo_plugin(tmp_path, depth=_plane(4.0))
+    photo = _write_frame(tmp_path)
+    plugin.dispatch("visual_depth", {
+        "action": "calibrate", "distance_m": 2.0, "image_path": photo})
+    result = plugin.dispatch("visual_depth", {
+        "action": "calibrate", "distance_m": 20.0, "image_path": photo})
+    assert result["samples"] == 2
+    assert any("对不上" in w for w in result["warnings"])
+
+
+def test_three_distances_over_a_real_spread_fit_cleanly(tmp_path):
+    """The 1 m / 2 m / 3 m procedure on a camera whose error IS a constant
+    factor: every residual should come out small."""
+    plugin, _ = _photo_plugin(tmp_path)
+    photo = _write_frame(tmp_path)
+    result = None
+    for truth, predicted in ((1.0, 2.0), (2.0, 4.0), (3.0, 6.0)):
+        plugin._model = _FakeModel(depth=_plane(predicted))
+        result = plugin.dispatch("visual_depth", {
+            "action": "calibrate", "distance_m": truth, "image_path": photo})
+    assert result["samples"] == 3
+    assert result["cal_b"] == pytest.approx(np.log(0.5), abs=1e-4)
+    assert result["max_error_pct"] < 1.0
+    assert "warnings" not in result
+    assert "error_pct" in result["message"]
+
+
+def test_reset_calibration_is_its_own_action(tmp_path):
+    plugin, _ = _photo_plugin(tmp_path, depth=_plane(4.0))
+    plugin.dispatch("visual_depth", {
+        "action": "calibrate", "distance_m": 2.0, "image_path": _write_frame(tmp_path)})
+    result = plugin.dispatch("visual_depth", {"action": "reset_calibration"})
+    assert result["samples"] == 0
+    assert (result["cal_a"], result["cal_b"]) == (1.0, 0.0)
+    assert result["calibration"] == "model-default"
+
+
+def test_the_procedure_is_in_every_calibration_reply(tmp_path):
+    """Whoever is holding the tape measure should not have to find the docs."""
+    plugin, _ = _photo_plugin(tmp_path, depth=_plane(4.0))
+    result = plugin.dispatch("visual_depth", {"action": "reset_calibration"})
+    assert "平整的墙" in result["procedure"]
+    missing = plugin.dispatch("visual_depth", {"action": "calibrate"})
+    assert missing["ok"] is False
+    assert "平整的墙" in missing["detail"]
