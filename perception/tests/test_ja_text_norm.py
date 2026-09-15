@@ -304,7 +304,12 @@ def test_the_reported_sentence_leaves_no_kanji():
         "こんにちは！今日は2026年10月1日です。私はシャオ・ファンと申します。"
         "何かお手伝いしましょうか？")
     assert not ja.has_kanji(out), f"kanji survived: {out}"
-    assert "ジュウガツ" in out and "ツイタチ" in out
+    # Romaji, not katakana: `normalize` is the whole pipeline and its last stage
+    # is `to_romaji` (see the note above it — feeding katakana to espeak-`ja`
+    # spells the letters out instead of reading them). The katakana assertions
+    # elsewhere in this file are on `normalize_dates`/`read_number`, which are
+    # the intermediate stages and do return kana.
+    assert "juugatsu" in out and "tsuitachi" in out, out
 
 
 @janome_only
