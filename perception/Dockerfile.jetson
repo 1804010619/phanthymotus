@@ -170,10 +170,16 @@ RUN . /etc/jetpack.env; \
 # tools/export_vision_engines.py, and never runs on a robot. Nothing under
 # plugins/ or utils/ imports ultralytics or torch any more.
 #
-# pillow stays — plugins/face_runtime.py and plugins/ocr_runtime.py both use
-# it. So do tqdm and psutil, which other packages here import even though our
-# own code does not; dropping those saves almost nothing and risks a
-# transitive break.
+# pillow stays: face_runtime and ocr_runtime import it directly, and rapidocr
+# needs it further down (`pip3 show pillow` → Required-by: rapidocr,
+# torchvision).
+#
+# psutil is gone with ultralytics — it was required by nothing else
+# (Required-by listed ultralytics alone). tqdm was NOT only ultralytics'
+# (Required-by: nltk, rapidocr) and is installed with rapidocr's other
+# dependencies below. Both facts come from `pip3 show` on the last good image;
+# an earlier version of this comment asserted the opposite for both from
+# memory, and the build caught it at `import rapidocr`.
 RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} "pillow>=7.1.2" && \
     pip3 uninstall -y opencv-python opencv-python-headless 2>/dev/null; true
 
@@ -320,17 +326,30 @@ RUN printf '%s\n' \
 # libvips42 (apt, above) is the runtime library pyvips dlopens for JPEG decode
 # + downscale; rapidocr is used --no-deps for its pure-Python DB/CTC post-
 # processing only (its bundled ONNX models are deleted, onnxruntime is not
-# installed). Every package is version-pinned; six and Pillow are NOT listed
-# because both bases already ship them (jp511: 1.14.0/10.4.0 via the VOP
-# layer, jp61: 1.16.0/9.0.1) and re-listing them unpinned would make the
-# resolution nondeterministic. numpy is pinned to the version each JetPack's
-# torch/cv2 stack already ships so nothing in the base image is upgraded.
+# installed).
+#
+# Because rapidocr is installed --no-deps, THIS LIST IS ITS DEPENDENCY SET.
+# rapidocr 3.9.1 declares: pyclipper, opencv_python, numpy, six, Shapely,
+# PyYAML, Pillow, tqdm, omegaconf, requests, colorlog. What is deliberately
+# absent and why:
+#   opencv_python — the base ships cv2; the pip build is uninstalled on purpose
+#   six, requests — apt-provided in both bases (1.14.0 / 2.22.0 on jp511)
+#   PyYAML        — installed with --ignore-installed further up
+#   Pillow        — installed in the vision-deps layer above, which face and
+#                   ocr_runtime also import directly
+# Everything else is listed here and version-pinned. tqdm used to arrive as a
+# side effect of the ultralytics install that layer once carried; when
+# ultralytics was removed it went with it and the image built fine right up to
+# `import rapidocr`. It is listed explicitly now, and nltk needs it too.
+#
+# numpy is pinned to the version each JetPack's torch/cv2 stack already ships
+# so nothing in the base image is upgraded.
 # Measured layer growth: apt (ffmpeg+libvips42) 17.2 MB + this step 24.5 MB
 # ≈ 42 MB on a ~14.6 GB image (<0.3%).
 RUN . /etc/jetpack.env; \
     pip3 install --no-cache-dir -i ${PYPI_MIRROR} \
       "numpy==${NUMPY_VERSION}" pyclipper==1.3.0.post3 Shapely==2.0.5 \
-      omegaconf==2.3.0 colorlog==6.12.0 && \
+      omegaconf==2.3.0 colorlog==6.12.0 tqdm==4.70.0 && \
     pip3 install --no-cache-dir --no-deps -i ${PYPI_MIRROR} rapidocr==3.9.1 && \
     pip3 install --no-cache-dir -i ${PYPI_MIRROR} "pyvips==3.1.0" && \
     RAPIDOCR_MODELS="$(python3 -c 'from pathlib import Path; import rapidocr; print(Path(rapidocr.__file__).resolve().parent / "models")')" && \
