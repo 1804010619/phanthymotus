@@ -496,7 +496,30 @@ class VideoObjectPerceptionPlugin:
         return result
 
     def get_tools(self) -> list:
-        return TOOLS
+        """TOOLS, with the frozen vocabulary folded into the description.
+
+        The dashboard renders a tool's `description` but ignores the rest of an
+        info payload — `canvas.js` keeps `topic_out` and drops everything else.
+        So `info`'s `classes` list, however complete, is invisible to an
+        operator, and removing the `classes` config field took away the last
+        place the UI showed anything about what vop can detect. The description
+        is the one channel that reaches the card, so the summary goes there.
+
+        Built per call rather than baked into TOOLS because the vocabulary
+        arrives from the background prefetch after import; the registration
+        heartbeat re-reads tools, so the card picks it up shortly after start.
+        """
+        if not self._vocabulary:
+            return TOOLS
+        sample = ", ".join(self._vocabulary[:8])
+        tools = [dict(t) for t in TOOLS]
+        tools[0]["description"] = (
+            f"Video Object Perception — detects a FIXED set of "
+            f"{len(self._vocabulary)} classes ({sample}, ...). The class list is "
+            f"frozen into the TensorRT engine and cannot be changed at runtime; "
+            f"call info for the full list."
+        )
+        return tools
 
     def dispatch(self, name: str, args: dict) -> dict | None:
         action = args.get("action", name)

@@ -287,3 +287,34 @@ def test_low_confidence_detections_are_dropped():
     pub = node.publishers[0]
     assert _wait_until(lambda: bool(pub.messages))
     assert json.loads(pub.messages[0])["objects"] == []
+
+
+# ── discoverability ──────────────────────────────────────────────────────────
+
+def test_description_names_the_vocabulary_once_it_is_known():
+    """The dashboard renders `description` and drops the rest of info.
+
+    canvas.js keeps only `topic_out` from an info payload, so the `classes`
+    list never reaches the card. Removing the `classes` config field took away
+    the last thing the UI showed about what vop detects — the description is
+    the one channel left.
+    """
+    plugin, _ = _plugin()          # vocabulary: person, door, forklift
+    description = plugin.get_tools()[0]["description"]
+    assert "3 classes" in description
+    assert "person" in description
+    assert "cannot be changed at runtime" in description
+
+
+def test_description_falls_back_before_the_vocabulary_arrives():
+    plugin, _ = _plugin()
+    plugin._vocabulary = []
+    assert plugin.get_tools() is vop_plugin.TOOLS
+
+
+def test_get_tools_does_not_mutate_the_module_level_TOOLS():
+    """A per-call rewrite must not leave the shared dict edited."""
+    original = vop_plugin.TOOLS[0]["description"]
+    plugin, _ = _plugin()
+    plugin.get_tools()
+    assert vop_plugin.TOOLS[0]["description"] == original
