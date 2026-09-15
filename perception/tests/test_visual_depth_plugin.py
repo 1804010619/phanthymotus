@@ -13,7 +13,6 @@ Run: PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest perception/tests -q
 from __future__ import annotations
 
 import json
-import re
 import threading
 import time
 import zlib
@@ -311,52 +310,6 @@ def test_measure_depth_ignores_invalid_pixels_in_the_average():
     assert stats["valid_fraction"] == pytest.approx(0.5)
 
 
-def test_description_of_a_metric_map_uses_metres():
-    text = depth_plugin.describe_depth(depth_plugin.measure_depth(_graded_depth(), "metric"))
-    assert "米" in text
-    assert "相对" not in text
-    assert "左侧" in text and "右侧" in text
-
-
-def test_description_of_an_uncalibrated_map_never_claims_metres():
-    """The whole point of the scale field: a relative number read as metres is
-    both wrong and actionable."""
-    text = depth_plugin.describe_depth(depth_plugin.measure_depth(_graded_depth(), "relative"))
-    # Not "no 米 anywhere" — the disclaimer sentence says the numbers are *not*
-    # metres, and that sentence is the point. What must never appear is a
-    # *number* given in metres.
-    assert not re.search(r"[0-9.]+\s*米", text)
-    assert "不代表米" in text
-
-
-def test_description_names_the_closer_side_and_where_to_go():
-    text = depth_plugin.describe_depth(
-        depth_plugin.measure_depth(_graded_depth(left=1.0, center=2.0, right=3.0), "metric"))
-    assert "左侧明显比正前方近" in text or "左侧明显比右侧近" in text
-    assert "绕行" in text
-
-
-def test_description_does_not_invent_a_closer_side_from_noise():
-    """A 1% spread is not a direction to steer by."""
-    text = depth_plugin.describe_depth(
-        depth_plugin.measure_depth(_graded_depth(2.00, 2.01, 2.02), "metric"))
-    assert "差不多" in text
-    assert "绕行" not in text
-
-
-def test_description_flags_poor_coverage():
-    depth = np.zeros((H, W), dtype=np.float32)
-    depth[: H // 4] = 2.0
-    text = depth_plugin.describe_depth(depth_plugin.measure_depth(depth, "metric"))
-    assert "25%" in text
-
-
-def test_description_of_an_empty_map_says_so_instead_of_crashing():
-    text = depth_plugin.describe_depth(
-        depth_plugin.measure_depth(np.zeros((H, W), dtype=np.float32), "metric"))
-    assert "没有估计出任何有效深度" in text
-
-
 # ── one-shot recognition ─────────────────────────────────────────────────────
 
 def _photo_plugin(tmp_path, depth=None, **cfg):
@@ -382,7 +335,6 @@ def test_recognize_by_photo_answers_without_any_instance(tmp_path):
     assert result["scale"] == "metric"
     assert result["image_size"] == [200, 100]
     assert result["closest_region"] == "left"
-    assert "米" in result["description"]
     assert "latency_ms" in result
     assert "published_to" not in result  # no instance to echo onto
 
@@ -392,8 +344,10 @@ def test_recognize_by_photo_answers_in_metres(tmp_path):
     result = plugin.dispatch("visual_depth", {
         "action": "recognize_by_photo", "image_path": _write_frame(tmp_path)})
     assert result["scale"] == "metric"
+    assert result["unit"] == "m"
     assert result["calibration"] == "model-default"
-    assert re.search(r"[0-9.]+\s*米", result["description"])
+    assert result["nearest"] == pytest.approx(1.0)
+    assert result["farthest"] == pytest.approx(3.0)
 
 
 def test_recognize_by_photo_refuses_a_path_outside_the_roots(tmp_path):
@@ -766,6 +720,9 @@ def test_a_one_shot_answer_carries_no_boilerplate(tmp_path):
     assert "note" not in result           # said the same paragraph every call
     assert "published_to" not in result   # which topic it echoed to is plumbing
     assert "warning" not in result
-    # What does survive: the answer, and one token of provenance.
+    # No prose summary either: it only restated the numbers below it, which a
+    # model reading them can phrase itself.
+    assert "description" not in result
+    # What does survive: the measurements, and one token of provenance.
     assert result["calibration"] == "model-default"
-    assert result["description"]
+    assert result["nearest"] and result["farthest"] and result["average"]

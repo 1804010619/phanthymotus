@@ -160,7 +160,7 @@ TOOLS = [
                 "config": {"params": [], "description": "更新 fps / 站点标定参数 cal_a、cal_b"},
                 "recognize_by_photo": {
                     "params": ["image_path"],
-                    "description": "看一张图片的远近 — 一次性估计，不需要摄像头也不需要先 start。用自然语言描述最近、最远、平均距离，以及左/中/右三个方向各自的远近",
+                    "description": "看一张图片的远近 — 一次性估计，不需要摄像头也不需要先 start。返回整体的最近/最远/平均距离（米），以及左/中/右三个方向各自的最近与平均",
                 },
                 "recognize_by_url": {
                     "params": ["url"],
@@ -442,82 +442,6 @@ def measure_depth(depth_m: np.ndarray, scale: str = "metric", bands: int = 3) ->
     return stats
 
 
-# ── Natural-language description ─────────────────────────────────────────────
-
-_REGION_ZH = {"left": "左侧", "center": "正前方", "right": "右侧"}
-
-# How much closer one side has to be before the description calls it out.
-# Below this the three directions are, for the purpose of a spoken answer, the
-# same distance — and saying "最近的在左侧" about a 2% difference is noise that
-# an agent will act on.
-_REGION_CONTRAST = 0.15
-
-
-def _fmt(value: Optional[float], scale: str) -> str:
-    if value is None:
-        return "未知"
-    return f"{value:.2f} 米" if scale == "metric" else f"{value:.2f}"
-
-
-def describe_depth(stats: dict) -> str:
-    """Turn measure_depth's numbers into one paragraph a person can read.
-
-    The engine's output is metric, so this says metres. It used to refuse to,
-    on the belief that the numbers were a relative scale — see the module
-    docstring for why that was wrong. The `relative` branch is kept for a stats
-    dict that explicitly says so, which is now only reachable if someone builds
-    an engine without the calibration baked in.
-    """
-    scale = stats.get("scale", "metric")
-    metric = scale == "metric"
-    nearest, farthest = stats.get("nearest"), stats.get("farthest")
-
-    if nearest is None or farthest is None:
-        return "这张图没有估计出任何有效深度 —— 可能是纯色画面，或者图片解码后是空的。"
-
-    parts = []
-    if metric:
-        parts.append(
-            f"画面整体的距离范围是 {_fmt(nearest, scale)} 到 {_fmt(farthest, scale)}，"
-            f"平均约 {_fmt(stats.get('average'), scale)}。"
-        )
-    else:
-        parts.append(
-            f"这张深度图没有带标定，数值只能互相比较、不代表米。"
-            f"画面里最近处约 {_fmt(nearest, scale)}，最远处约 {_fmt(farthest, scale)}，"
-            f"平均 {_fmt(stats.get('average'), scale)}。"
-        )
-
-    regions = {k: v for k, v in (stats.get("nearest_by_region") or {}).items() if v is not None}
-    if regions:
-        listed = "；".join(
-            f"{_REGION_ZH.get(name, name)}最近 {_fmt(value, scale)}"
-            + (f"、平均 {_fmt((stats.get('average_by_region') or {}).get(name), scale)}"
-               if (stats.get("average_by_region") or {}).get(name) is not None else "")
-            for name, value in regions.items()
-        )
-        parts.append(f"分方向看：{listed}。")
-
-        closest, farthest_region = stats.get("closest_region"), stats.get("farthest_region")
-        spread = max(regions.values()) - min(regions.values())
-        reference = max(min(regions.values()), 1e-6)
-        if closest and farthest_region and closest != farthest_region and \
-                spread / reference >= _REGION_CONTRAST:
-            parts.append(
-                f"{_REGION_ZH.get(closest, closest)}明显比"
-                f"{_REGION_ZH.get(farthest_region, farthest_region)}近，"
-                f"要绕行就往{_REGION_ZH.get(farthest_region, farthest_region)}。"
-            )
-        else:
-            parts.append("三个方向的远近差不多，没有哪一侧特别挡路。")
-
-    coverage = stats.get("valid_fraction")
-    if coverage is not None and coverage < 0.9:
-        parts.append(f"注意：只有 {coverage * 100:.0f}% 的像素估计出了有效深度，其余是无读数区域。")
-
-    return "".join(parts)
-
-
 # ── ROS2 Node (one per instance/topic) ───────────────────────────────────────
 
 class _DepthNode(Node):
@@ -757,7 +681,7 @@ class VideoDepthPerceptionPlugin:
         dispose_node(self._executor, node, label=f"visual_depth/{node_key}")
         return result
 
-    # ── one-shot depth description ───────────────────────────────────────────
+    # ── one-shot depth measurement ───────────────────────────────────────────
 
     # ── site calibration from known distances ────────────────────────────────
 
@@ -856,7 +780,13 @@ class VideoDepthPerceptionPlugin:
         return self._model
 
     def _recognize_image(self, args: dict, url_action: str) -> dict:
-        """Estimate depth for one image and describe it in words."""
+        """Estimate depth for one image and return the measurements.
+
+        No prose summary. There was one, and it only restated `nearest` /
+        `farthest` / `average` / the per-region numbers that are already in the
+        reply — a model reading those can phrase them itself, and re-sending a
+        paragraph of Chinese on every call is context spent to say nothing new.
+        """
         cfg = dict(self._plugin_cfg)
         try:
             data, source = load_image_bytes(args, cfg, url_action=url_action)
@@ -890,7 +820,6 @@ class VideoDepthPerceptionPlugin:
         # the resample exists for the dashboard canvas, and the answer should
         # not be quantised by it.
         stats = measure_depth(depth_m, scale_label)
-        description = describe_depth(stats)
 
         height, width = frame.shape[:2]
         result = {
@@ -898,7 +827,6 @@ class VideoDepthPerceptionPlugin:
             "source": source,
             "image_size": [width, height],
             "latency_ms": int((time.time() - started) * 1000),
-            "description": description,
             **stats,
         }
         result["calibration"] = self._calibration_label()
