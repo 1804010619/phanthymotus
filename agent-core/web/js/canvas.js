@@ -98,10 +98,81 @@ const _connEls = new Map();  // connId -> {hit, line, btn}
 let _draggingCardId = null;
 let _mcpsPendingRefresh = false;
 
-// Project run state
+// Project run state.
+//
+// `_projectRunning` starts false, which is a guess, not knowledge — the real
+// answer only arrives when /api/config/project-running resolves. The canvas
+// meanwhile renders and becomes clickable: measured on Orin 5, cards and their
+// × buttons are on screen at t=318ms and this is still false until t=470ms.
+// Every edit guard reads it, so for that window all of them were open on a
+// running project, and the operation went through in silence — a card delete
+// claimed the edit lock, stopped the plugin instance, and saved the layout.
+// The window has no upper bound: it is however long that request takes, and it
+// is longest exactly when the machine is busy starting the project.
+//
+// `_projectStateKnown` closes it by separating "stopped" from "not yet known"
+// and refusing edits for both.
 let _projectRunning = false;
+let _projectStateKnown = false;
 
 export function isProjectRunning() { return _projectRunning; }
+
+/** Why editing is refused right now, or '' when it is allowed. */
+function _editLockReason() {
+  if (!_projectStateKnown) return '正在确认运行状态，请稍候重试';
+  if (_projectRunning) return '请停止智能控制后修改';
+  return '';
+}
+
+/**
+ * Refuse an edit if the project is running — or if we cannot yet tell.
+ *
+ * Returns true when the caller must stop. Says so with a toast: these refusals
+ * used to go only to _logActivity, which appends a line to the activity strip
+ * at the bottom of the page, interleaved with the mcp_call/mcp_result traffic.
+ * Clicking × on a card therefore looked like nothing happened at all. Every
+ * other user-facing refusal in this file already uses a toast; these three
+ * (delete card, draw connection, delete connection) were the exceptions.
+ */
+function _refuseEdit() {
+  const reason = _editLockReason();
+  if (!reason) return false;
+  _showToast(reason);
+  _logActivity('warn', reason);
+  return true;
+}
+
+/** Same question without the toast, for paths that show their own rejection. */
+function _editsLocked() { return _editLockReason() !== ''; }
+
+/**
+ * Ask the backend for the run state, retrying until it answers.
+ *
+ * Editing is refused while the answer is unknown, so giving up would leave the
+ * canvas read-only until the next reload. Backs off to 5s and keeps trying;
+ * a WebSocket `project_state` event resolves it too, whichever lands first.
+ */
+function _syncProjectState(delay = 500) {
+  return fetch('/api/config/project-running')
+    .then(r => r.json())
+    .then(d => { _applyProjectState(d.running); return true; })
+    .catch(() => {
+      if (!_projectStateKnown) {
+        setTimeout(() => _syncProjectState(Math.min(delay * 2, 5000)), delay);
+      }
+      return false;
+    });
+}
+
+/** Record what the backend says about the run state, and unblock editing. */
+function _applyProjectState(running) {
+  _projectRunning = !!running;
+  _projectStateKnown = true;
+  _syncProjectBtn();
+  document.querySelectorAll('.canvas-exec-btn').forEach(btn => {
+    btn.classList.toggle('locked', !_projectRunning);
+  });
+}
 export function redrawCanvas() { _scheduleRedraw(); }
 export function ensureEdit() { return _ensureEdit(); }
 export function isEditor() { return _isEditor; }
@@ -119,7 +190,7 @@ export function reloadFromServer() { return _reloadLayout(); }
  * Returns true if added, false if rejected.
  */
 export async function addCardFromSidebar({ mcpId, toolName, driverName, hasConfig, multiInstance }) {
-  if (_projectRunning) return false;
+  if (_refuseEdit()) return false;
   if (!(await _ensureEdit())) return false;
   if (hasConfig && !isToolConfigured(mcpId, toolName)) return false;
   if (!multiInstance) {
@@ -212,29 +283,22 @@ export async function initCanvas(initialMcps) {
   // Show editor status bar
   _updateEditorUI();
 
-  // Restore project running state from backend
-  try {
-    const runRes = await fetch('/api/config/project-running');
-    const runData = await runRes.json();
-    if (runData.running) {
-      _projectRunning = true;
-      _syncProjectBtn();
-      document.querySelectorAll('.canvas-exec-btn').forEach(btn => btn.classList.remove('locked'));
-    }
-  } catch { /* ignore */ }
+  // Restore project running state from backend. Editing stays refused until
+  // this answers, so a failure must not leave the canvas locked for good —
+  // retry until it does. The old version swallowed the error and left
+  // `_projectRunning` at its false default, which read as "stopped" and opened
+  // every guard on a robot that was in fact running.
+  _syncProjectState();
 
   // Cross-tab sync: listen for project_state / editor-lock / layout events via WebSocket
   const { onMotusEvent } = await import('./motus-stream.js');
   onMotusEvent(null, (event) => {
     if (event.type === 'project_state') {
-      const running = event.payload?.running;
-      if (running !== _projectRunning) {
-        _projectRunning = running;
-        _syncProjectBtn();
-        document.querySelectorAll('.canvas-exec-btn').forEach(btn => {
-          btn.classList.toggle('locked', !_projectRunning);
-        });
-      }
+      const running = !!event.payload?.running;
+      // Applied even when it matches what we hold: this is also the first
+      // authoritative answer some page loads get, and it is what marks the
+      // state known.
+      if (running !== _projectRunning || !_projectStateKnown) _applyProjectState(running);
     } else if (event.type === 'canvas_editor') {
       _applyEditorState(event.payload?.editor || null, event.payload?.reason || '');
     } else if (event.type === 'canvas_layout') {
@@ -247,15 +311,7 @@ export async function initCanvas(initialMcps) {
   document.addEventListener('visibilitychange', () => {
     if (!document.hidden) {
       _checkEditStatus();
-      fetch('/api/config/project-running').then(r => r.json()).then(d => {
-        if (d.running !== _projectRunning) {
-          _projectRunning = d.running;
-          _syncProjectBtn();
-          document.querySelectorAll('.canvas-exec-btn').forEach(btn => {
-            btn.classList.toggle('locked', !_projectRunning);
-          });
-        }
-      }).catch(() => {});
+      _syncProjectState();
     }
   });
 
@@ -533,8 +589,8 @@ function _setupDropZone() {
     e.preventDefault();
     _canvasEl.classList.remove('drag-over');
 
-    if (_projectRunning) {
-      _showDropReject(e, '请停止智能控制后修改');
+    if (_editsLocked()) {
+      _showDropReject(e, _editLockReason());
       return;
     }
 
@@ -662,10 +718,7 @@ function _addCard(data, save = true) {
 }
 
 async function _removeCard(id) {
-  if (_projectRunning) {
-    _logActivity('warn', '请停止智能控制后修改');
-    return;
-  }
+  if (_refuseEdit()) return;
   if (!(await _ensureEdit())) return;
   const idx = _cards.findIndex(c => c.id === id);
   if (idx === -1) return;
@@ -1390,10 +1443,7 @@ function _setupPortDrag() {
     const outPort = e.target.closest('.canvas-port.out');
     const execPort = !outPort ? e.target.closest('.canvas-port.executor') : null;
     if (!outPort && !execPort) return;
-    if (_projectRunning) {
-      _logActivity('warn', '请停止智能控制后修改');
-      return;
-    }
+    if (_refuseEdit()) return;
     if (!(await _ensureEdit())) return;
     e.preventDefault();
     e.stopPropagation();
@@ -1635,7 +1685,7 @@ function _redrawConnections() {
     const d = `M${x1},${y1} C${x1+cx},${y1} ${x2-cx},${y2} ${x2},${y2}`;
 
     const { hit, line, btn } = _connectorEls(conn, () => {
-      if (_projectRunning) { _logActivity('warn', '请停止智能控制后修改'); return; }
+      if (_refuseEdit()) return;
       _ensureEdit().then(ok => { if (ok) _removeTopicConnection(conn.id); });
     });
     hit.setAttribute('d', d);
@@ -1877,9 +1927,7 @@ async function _startProject() {
   try {
     const res = await fetch('/api/config/start-project', { method: 'POST' });
     if (res.ok) {
-      _projectRunning = true;
-      _syncProjectBtn();
-      document.querySelectorAll('.canvas-exec-btn').forEach(btn => btn.classList.remove('locked'));
+      _applyProjectState(true);
       _logActivity('project', '智能控制已开启');
     } else {
       const data = await res.json().catch(() => ({}));
@@ -1903,9 +1951,7 @@ async function _startProject() {
 }
 
 function _stopProject() {
-  _projectRunning = false;
-  _syncProjectBtn();
-  document.querySelectorAll('.canvas-exec-btn').forEach(btn => btn.classList.add('locked'));
+  _applyProjectState(false);
   // Auto-stop mic stream
   for (const card of _cards) {
     if (card.toolName === 'remote_mic' && isMicActive()) {
@@ -2519,7 +2565,7 @@ function _makeDraggable(el, cardData) {
     if (e.target.closest('.canvas-card-close')) return;
     if (e.target.closest('.canvas-card-info-btn')) return;
     if (e.target.closest('.canvas-card-instance-cfg-btn')) return;
-    if (_projectRunning) return;
+    if (_editsLocked()) return;
     if (!(await _ensureEdit())) return;
     e.preventDefault();
     e.stopPropagation();
