@@ -1,10 +1,28 @@
 #!/usr/bin/env python3
 """tools/export_vision_engines.py — build the vop / vdp TensorRT engines.
 
-Run this ON a host of the target JetPack line — TensorRT engines are not
-portable across TensorRT majors, so jp5.11 (TRT 8.5) and jp6.1 (TRT 10.x) each
-need their own build. The two Orin reference rigs named in CLAUDE.md are the
-intended hosts.
+Run this INSIDE a container built from the target perception image — not on the
+Jetson host, and not in any other container.
+
+An engine plan only loads on the exact TensorRT that built it, and the image
+ships its own TensorRT independently of the host's. On Orin 6 the host carries
+TensorRT 10.3 while the jp6.1 perception image carries 10.4, so an engine built
+on that host deserializes nowhere: every jp6.1 robot rejects it with
+"engine plan file is not compatible with this version of TensorRT, expecting
+library version 10.4.0.26". An earlier version of this note said "on a host of
+the target JetPack line", which is how that happened.
+
+    docker run --rm --runtime nvidia --network host \
+      -v "$PWD/out:/work/exp" -w /work/exp -e YOLO_CONFIG_DIR=/work/exp \
+      --entrypoint bash <perception-image> -lc \
+      'source /etc/dla-fallback.env; python3 export_vision_engines.py --out /work/exp/engines'
+
+`source /etc/dla-fallback.env` is required: on vendor BSPs missing
+libnvdla_compiler.so, importing tensorrt fails outright without it, and the
+image's own CMD sources it for exactly this reason.
+
+The image must still carry ultralytics, which the runtime image no longer does
+— use a pre-removal tag, or pip install it into the throwaway container.
 
 The engines MUST come from ultralytics' own exporter rather than trtexec: the
 plugins load them back through `YOLO("....engine")`, and that loader requires

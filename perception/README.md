@@ -2100,12 +2100,23 @@ Orins memory, not GPU time, is what runs out.
 ### Building the engines
 
 ```bash
-# ON a host of the target JetPack line — engines are not portable across
-# TensorRT majors (jp5.11 = TRT 8.5, jp6.1 = TRT 10.x).
-python3 tools/export_vision_engines.py --out /tmp/engines --workspace 2
+# INSIDE a container from the target perception image — not on the Jetson host.
+docker run --rm --runtime nvidia --network host \
+  -v "$PWD/out:/work/exp" -w /work/exp -e YOLO_CONFIG_DIR=/work/exp \
+  --entrypoint bash <perception-image> -lc \
+  'source /etc/dla-fallback.env; python3 export_vision_engines.py --out /work/exp/engines'
 ```
 
-Two traps, both observed:
+Three traps, all observed:
+
+* **The image's TensorRT is what counts, not the host's.** An engine plan only
+  loads on the exact TensorRT that built it. Orin 6's *host* carries TensorRT
+  10.3 while the jp6.1 perception *image* carries 10.4, so engines built on
+  that host were rejected by every jp6.1 robot with "engine plan file is not
+  compatible … expecting library version 10.4.0.26". Build in a throwaway
+  container from the target image. `source /etc/dla-fallback.env` first, or
+  `import tensorrt` fails outright on vendor BSPs missing
+  libnvdla_compiler.so — which is why the image's CMD sources it.
 
 * **The ONNX must come from ultralytics, with the classes already set.**
   `set_classes()` runs on the build host and bakes the vocabulary into the
