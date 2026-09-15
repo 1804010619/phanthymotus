@@ -967,19 +967,20 @@ def ensure_kokoro_model(model_dir: str, device: str = "gpu") -> str:
 # one bundle per JetPack family, selected by the TensorRT that is actually
 # importable. Engines are not portable across TensorRT majors.
 #
-# Unlike OCR's, these engines are produced by `ultralytics.YOLO.export(
-# format="engine")` rather than trtexec, because the plugins load them back
-# through `YOLO("...engine")` and that loader requires the metadata the
-# ultralytics exporter embeds. An engine built by trtexec deserializes fine but
-# is rejected on load, so tools/export_vision_engines.py is the only supported
-# way to produce these files.
+# They are produced by tools/export_vision_engines.py, which drives
+# ultralytics' exporter on a host of the matching JetPack line. What has to come
+# from ultralytics is the *ONNX*, with set_classes() already applied, or the
+# open-vocabulary class list is not baked into the weights at all. The engine
+# build itself could be done by trtexec — read_engine_file() strips the
+# ultralytics JSON header when present and accepts a plain engine otherwise —
+# but going through ultralytics end to end keeps the class names inside the
+# engine, which is where the plugin reads them from.
 #
-# vop's bundle carries `vocab.json` next to the engine. The open-vocabulary
-# class list is frozen into the weights at export time (ultralytics: once
-# exported, `set_classes()` fails), so the plugin has no way to read back what
-# it is actually able to detect — it has to be told. Shipping the list with the
-# engine keeps the two from drifting: whatever the plugin reports, and rejects,
-# is what that exact engine was built with.
+# vop's bundle also carries `vocab.json` beside the engine. That is the
+# fallback, not the source of truth: an engine exported without names would
+# otherwise leave vop labelling detections by index. The class list is frozen
+# into the weights at export time (ultralytics raises on set_classes() for an
+# exported model), so neither copy can be changed on a robot.
 VISION_MODEL_BASE = os.environ.get("VISION_MODEL_BASE_URL", f"{COS_BASE}/vision")
 
 # Every pin below was taken from the copy downloaded back out of COS, not from

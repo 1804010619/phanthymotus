@@ -131,7 +131,7 @@ RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} --ignore-installed PyYAML && \
     pip3 install --no-cache-dir -i ${PYPI_MIRROR} \
     websockets webrtcvad
 
-# ── VOP deps (YOLOv8-World object detection) ─────────────────────
+# ── Vision deps (vop detection, vdp depth, OCR, face) ────────────
 # Fix broken system cv2 __init__.py (mat_wrapper circular import on Jetson).
 # Only jp5.11's base is broken; on jp6.1 the import succeeds and this is a no-op.
 #
@@ -155,21 +155,27 @@ RUN . /etc/jetpack.env; \
         'sys.modules["cv2"] = _mod' \
         > "${CV2_DIR}/__init__.py"; \
     }
-# Install ultralytics WITHOUT replacing Jetson's CUDA torch + torchvision
-RUN pip3 install --no-cache-dir --no-deps -i ${PYPI_MIRROR} ultralytics && \
-    pip3 install --no-cache-dir -i ${PYPI_MIRROR} \
-    matplotlib pandas tqdm "pillow>=7.1.2" psutil py-cpuinfo \
-    "ultralytics-thop>=0.2.7" "seaborn>=0.11.0" && \
+# No ultralytics and no CLIP here, on purpose.
+#
+# vop used to load a `.pt` and run ultralytics in eager mode, and to call
+# set_classes() at runtime — which needs a CLIP text encoder. So this image
+# carried ultralytics, ultralytics/CLIP, a 338 MB ViT-B-32 checkpoint, and the
+# stack ultralytics wants around it (matplotlib, pandas, seaborn, thop,
+# py-cpuinfo, ...), none of which any robot ever executed for its own sake.
+#
+# Both vision plugins now run prebuilt TensorRT engines through
+# utils.tensorrt_runtime, with their own letterbox and decode in
+# plugins/vision_runtime.py. ultralytics is a *build-host* dependency: it
+# exports the engine and bakes the vocabulary in, inside
+# tools/export_vision_engines.py, and never runs on a robot. Nothing under
+# plugins/ or utils/ imports ultralytics or torch any more.
+#
+# pillow stays — plugins/face_runtime.py and plugins/ocr_runtime.py both use
+# it. So do tqdm and psutil, which other packages here import even though our
+# own code does not; dropping those saves almost nothing and risks a
+# transitive break.
+RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} "pillow>=7.1.2" && \
     pip3 uninstall -y opencv-python opencv-python-headless 2>/dev/null; true
-# No CLIP here on purpose. vop used to call set_classes() at runtime, which
-# needs a text encoder, so this image carried ultralytics/CLIP plus a 338 MB
-# ViT-B-32 checkpoint. vop now runs a prebuilt TensorRT engine whose vocabulary
-# is frozen at export time — the text encoder runs on the build host, inside
-# tools/export_vision_engines.py, and never on a robot. Removing both was worth
-# one full rebuild of the layers below.
-
-# Set YOLO_CONFIG_DIR so WEIGHTS_DIR resolves to /work/weights
-ENV YOLO_CONFIG_DIR=/work
 
 # ── sherpa-onnx (on-device ASR/TTS/KWS) ──────────────────────────
 # PyPI ships CPU-only sherpa-onnx, so each JetPack line installs a CUDA-enabled
