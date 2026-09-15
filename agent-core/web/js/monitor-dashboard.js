@@ -535,7 +535,10 @@ function _beginPointer(e, topicPath, kind) {
     pointerId: e.pointerId,
   };
   card.el.classList.add(kind === 'move' ? 'dragging' : 'resizing');
-  try { e.target.setPointerCapture?.(e.pointerId); } catch {}
+  // Deliberately no setPointerCapture. The listeners below are on `document`, so
+  // they already see every move; capture only adds a way to lose them, since it
+  // retargets events to the captured node and browsers drop the capture when
+  // that node is re-laid-out — which is exactly what dragging a card does.
   _showGridOverlay();
   document.addEventListener('pointermove', _onPointerMove);
   document.addEventListener('pointerup', _onPointerEnd);
@@ -573,14 +576,25 @@ function _onPointerMove(e) {
   }
 
   const blocking = _blockers(_drag.topicPath, card.col, card.row, card.colSpan, card.rowSpan);
-  // One same-sized neighbour can simply trade places; anything else would have
-  // to push cards around and is refused instead.
-  _drag.swapWith = (_drag.kind === 'move' && blocking.length === 1 &&
-                    blocking[0].colSpan === card.colSpan && blocking[0].rowSpan === card.rowSpan)
-    ? blocking[0] : null;
-  _drag.valid = blocking.length === 0 || !!_drag.swapWith;
+  // A drop always lands. Whatever was in the way is moved aside on release, so
+  // there is no arrangement the pointer can reach that the grid will refuse.
+  //
+  // The previous rule only accepted a drop onto a *single* neighbour of exactly
+  // matching span, which is close to unreachable in a real layout: cards get
+  // resized to suit their content, so a drag usually straddles two of them or
+  // lands on one of a different size, and the card silently snapped back. A drag
+  // that mostly undoes itself reads as "cards cannot be moved".
+  if (_drag.kind === 'move') {
+    _drag.displacing = blocking;
+    _drag.valid = true;
+  } else {
+    // Growing a card over its neighbours would cascade, so a resize still has to
+    // fit in the space available.
+    _drag.displacing = [];
+    _drag.valid = blocking.length === 0;
+  }
   card.el.classList.toggle('drag-invalid', !_drag.valid);
-  card.el.classList.toggle('drag-swap', !!_drag.swapWith);
+  card.el.classList.toggle('drag-swap', _drag.valid && blocking.length > 0);
 
   _autoScroll(e);
 }
@@ -611,21 +625,16 @@ function _autoScroll(e) {
 function _onPointerEnd() {
   if (!_drag) return;
   clearTimeout(_edgeTimer);
-  const { card, topicPath, kind, moved, valid, swapWith } = _drag;
+  const { card, topicPath, kind, moved, valid, displacing } = _drag;
 
-  if (!moved) {
+  if (!moved || !valid) {
     // A click that never became a drag must change nothing. The resize path used
     // to treat an untouched `valid` flag as success and rebuild the renderer, so
     // a stray click on the corner handle silently cleared the card's log history
     // and restarted its stream.
     _restore(card);
-  } else if (!valid) {
-    _restore(card);
-  } else if (swapWith) {
-    const other = _cards.get(swapWith.topicPath);
-    other.col = _drag.origCol;
-    other.row = _drag.origRow;
-    _applyPlacement(other.el, other.col, other.row, other.colSpan, other.rowSpan);
+  } else if (displacing?.length) {
+    _displace(topicPath, card, displacing);
   }
 
   card.el.classList.remove('dragging', 'resizing', 'drag-invalid', 'drag-swap');
@@ -639,6 +648,37 @@ function _onPointerEnd() {
 
   if (changed) _saveLayout();
   if (resized) _refreshRenderer(topicPath);
+}
+
+/**
+ * Re-home the cards a drop landed on.
+ *
+ * Each goes to the first slot free once the dragged card is in place. For two
+ * equal-sized cards that is exactly the spot the dragged card vacated, so a
+ * straight swap falls out of the same rule without being a special case — and a
+ * drop onto a card of a different size, or straddling two of them, resolves
+ * instead of being refused.
+ */
+function _displace(topicPath, card, blocked) {
+  const moving = new Set(blocked.map(b => b.topicPath));
+  const occupied = [{ col: card.col, row: card.row, colSpan: card.colSpan, rowSpan: card.rowSpan }];
+  for (const [t, o] of _cards) {
+    if (t === topicPath || moving.has(t)) continue;
+    occupied.push({ col: o.col, row: o.row, colSpan: o.colSpan, rowSpan: o.rowSpan });
+  }
+  // Largest first: a wide card left until last would be pushed past a gap that
+  // the narrow ones have meanwhile filled.
+  const order = [...blocked].sort((a, b) =>
+    (b.colSpan * b.rowSpan) - (a.colSpan * a.rowSpan));
+  for (const b of order) {
+    const other = _cards.get(b.topicPath);
+    if (!other) continue;
+    const slot = _findFreeSlot(occupied, other.colSpan, other.rowSpan);
+    other.col = slot.col;
+    other.row = slot.row;
+    occupied.push({ col: other.col, row: other.row, colSpan: other.colSpan, rowSpan: other.rowSpan });
+    _applyPlacement(other.el, other.col, other.row, other.colSpan, other.rowSpan);
+  }
 }
 
 function _restore(card) {
