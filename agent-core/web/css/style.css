@@ -862,6 +862,14 @@ html, body {
   position: absolute;
   top: 0;
   left: 0;
+  /* Every child is absolutely positioned, so without an explicit size this
+     element's own border box collapses to 0x0 — and the connector SVG, which
+     is sized off it, collapsed with it. Giving it the canvas area's box means
+     the SVG has a real viewport to paint into. Cards are unaffected (they are
+     positioned, not laid out), and world coordinates are unchanged because
+     the origin stays at top-left. */
+  width: 100%;
+  height: 100%;
   transform-origin: 0 0;
   /* transform set by JS */
 }
@@ -1268,14 +1276,12 @@ html, body {
   inset: 0;
   width: 100%;
   height: 100%;
-  /* Chrome skips overflow painting when the SVG viewport collapses to 0x0. */
-  min-width: 1px;
-  min-height: 1px;
   pointer-events: none;
+  /* Cards may sit at negative world coordinates, so connectors are drawn
+     outside the SVG viewport on purpose. */
   overflow: visible;
   z-index: 5;
 }
-.canvas-connectors-svg line { pointer-events: stroke; }
 
 /* Connector lines */
 .connector-line {

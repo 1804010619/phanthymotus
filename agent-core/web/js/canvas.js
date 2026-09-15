@@ -78,15 +78,27 @@ function _showToast(msg) {
 }
 
 // Connection state
-let _connections = [];  // [{id, fromCardId, fromPort, toCardId, toPort, format}]
+let _connections = [];  // [{id, fromCardId, fromPortIdx, toCardId, toPortIdx, format, fromTopic}]
 let _execConnections = []; // [{id, fromCardId, toCardId, toToolName, toMcpId}]
 let _draggingConn = null; // {fromCardId, fromPortEl, format, topic, tempPath, type?}
+
+// Live connector DOM, keyed by connection id. Connectors are updated in place
+// rather than torn down and rebuilt on every redraw: a redraw runs on every
+// pointermove of a card drag, and recreating the paths there dropped the
+// :hover that was keeping the × button open and re-bound every listener 60x a
+// second.
+const _connEls = new Map();  // connId -> {hit, line, btn}
+
+// Card being dragged right now (null when idle). The MCP poll must not swap
+// card elements out from under an active pointer capture — see updateCanvasMcps.
+let _draggingCardId = null;
+let _mcpsPendingRefresh = false;
 
 // Project run state
 let _projectRunning = false;
 
 export function isProjectRunning() { return _projectRunning; }
-export function redrawCanvas() { _redrawConnections(); }
+export function redrawCanvas() { _scheduleRedraw(); }
 export function ensureEdit() { return _ensureEdit(); }
 export function isEditor() { return _isEditor; }
 
@@ -146,6 +158,7 @@ export async function initCanvas(initialMcps) {
   _setupDropZone();
   _setupControlButtons();
   _setupPortDrag();
+  _syncGeometryObservers();
 
   // Load persisted layout
   try {
@@ -165,7 +178,7 @@ export async function initCanvas(initialMcps) {
       c => cardIds.has(c.fromCardId) && cardIds.has(c.toCardId)
     );
     _resolveAllTopics();
-    _redrawConnections();
+    _scheduleRedraw();
 
     // Cards whose topic_out is derived resolve inside _resolveAllTopics now
     // (_revalidateDerivedTopics). The bespoke recovery that used to live here
@@ -246,6 +259,13 @@ export async function initCanvas(initialMcps) {
 
 export function updateCanvasMcps(mcps) {
   _allMcps = mcps || [];
+  // This runs on a 10s poll and can replace card elements wholesale. Doing that
+  // mid-drag detaches the element that holds the pointer capture: the drag
+  // handler keeps writing style.left/top to the orphan and keeps advancing
+  // cardData.x/y (which is what gets saved), while the card on screen snaps
+  // back to where the rebuild put it. Saved position and rendered position then
+  // disagree permanently, which reads as "the connections drifted".
+  if (_draggingCardId) { _mcpsPendingRefresh = true; return; }
   let topicsChanged = false;
   for (const card of _cards) {
     const mcp = _allMcps.find(m => m.id === card.mcpId);
@@ -297,8 +317,9 @@ export function updateCanvasMcps(mcps) {
       card.el = newEl;
       _makeDraggable(newEl, card);
     }
+    _syncGeometryObservers();
     _resolveAllTopics();
-    _redrawConnections();
+    _scheduleRedraw();
     _debouncedSave();
   }
 }
@@ -453,10 +474,6 @@ function _setupZoomPan() {
 }
 
 function _setupControlButtons() {
-  const rect = _canvasEl?.getBoundingClientRect() ?? { left: 0, top: 0, width: 800, height: 600 };
-  const cx = (rect.width  || 800) / 2;
-  const cy = (rect.height || 600) / 2;
-
   document.getElementById('canvas-zoom-in')?.addEventListener('click', () => {
     const r = _canvasEl.getBoundingClientRect();
     _zoomAt(r.left + r.width / 2, r.top + r.height / 2, ZOOM_STEP);
@@ -622,6 +639,7 @@ function _addCard(data, save = true) {
   const cardData = { id, mcpId, toolName, driverName, x, y, el, topicIn: topicInData, topicOut: topicOutData };
   _cards.push(cardData);
   _makeDraggable(el, cardData);
+  _syncGeometryObservers();
 
   // Call info(instance_id) to get driver-inferred topics for static tools.
   // For multiInstance processors, topics depend on the connected input_topic — skip here.
@@ -666,7 +684,8 @@ async function _removeCard(id) {
   // Clean up executor connections
   _execConnections = _execConnections.filter(c => c.fromCardId !== id && c.toCardId !== id);
   _resolveAllTopics();
-  _redrawConnections();
+  _syncGeometryObservers();
+  _scheduleRedraw();
   _syncEmptyState();
   // Cancel any pending debounced save, then save immediately with updated state
   clearTimeout(_saveTimer);
@@ -1031,12 +1050,10 @@ function _buildCardEl({ id, mcpId, toolName, driverName, x, y, topicIn: savedTop
             field.style.display = paramKeys.includes(key) ? '' : 'none';
           });
           // Showing/hiding fields changes the card's height, which moves every
-          // port on it. _redrawConnections reads live getBoundingClientRect,
-          // so it is correct whenever it runs — it just was not running here,
-          // leaving connection lines anchored to where the ports used to be.
-          // Most visible on a tool whose actions differ a lot in parameter
-          // count (face_recognition: 4 params for list_persons, 0 for stop).
-          _redrawConnections();
+          // port on it. The card ResizeObserver (_syncGeometryObservers) now
+          // covers this, but ask explicitly too so the behaviour does not
+          // depend on ResizeObserver being available.
+          _scheduleRedraw();
         };
         actionSelect.addEventListener('change', async () => {
           if (!(await _ensureEdit())) {
@@ -1240,7 +1257,7 @@ function _setupPortDrag() {
             toToolName: toCardData?.toolName || '',
             toMcpId: toCardData?.mcpId || '',
           });
-          _redrawConnections();
+          _scheduleRedraw();
           _logActivity('executor', `绑定执行器: ${toCardData?.toolName || toCardId}`);
           _saveLayout();
         }
@@ -1271,7 +1288,7 @@ function _setupPortDrag() {
         });
 
         _resolveAllTopics();
-        _redrawConnections();
+        _scheduleRedraw();
         _saveLayout();
 
         const toCardData = _cards.find(c => c.id === toCard.dataset.cardId);
@@ -1354,159 +1371,248 @@ function _setupPortDrag() {
   });
 }
 
+/**
+ * True when the canvas subtree is actually laid out.
+ *
+ * Both monitor mode (`#app.monitor-active .canvas-area`) and the mobile
+ * settings/account panels (`#app.settings-active .canvas-area`) hide the canvas
+ * with `display:none`. getBoundingClientRect() inside a display:none subtree
+ * returns all zeros, so a redraw that lands there writes every path as a
+ * zero-length segment at the world origin — and because the redraw is purely
+ * event-driven, nothing recomputes it when the canvas comes back. That is one
+ * of the ways connectors "disappear". The 10s MCP poll and async topic fetches
+ * make it easy to hit.
+ */
+function _canvasVisible() {
+  return !!_viewport && _viewport.offsetParent !== null;
+}
+
+// ── Redraw scheduling ─────────────────────────────────────────────────────────
+
+let _redrawRaf = null;
+
+/**
+ * Coalesce redraws to one per frame. Card drag, the resize observer and the
+ * MCP poll can all ask for a redraw within the same frame; each redraw measures
+ * every port, so doing it once is both cheaper and visually identical.
+ */
+function _scheduleRedraw() {
+  if (_redrawRaf !== null) return;
+  _redrawRaf = requestAnimationFrame(() => {
+    _redrawRaf = null;
+    _redrawConnections();
+  });
+}
+
+/**
+ * Watches everything whose geometry the connector endpoints depend on.
+ *
+ * Ports are vertically centred in a full-height column (`.canvas-port-col`,
+ * `justify-content:center`), so *any* change in a card's height moves every
+ * port on it. Card height changes in a lot of places that have no reason to
+ * know about connectors — appending an execution result, a longer driver name
+ * wrapping onto a second line, a web font swapping in, a config field being
+ * revealed. Each of those used to leave the lines anchored where the ports
+ * used to be; observing the cards fixes the whole class at once instead of
+ * chasing each call site.
+ *
+ * `_canvasEl` is observed too: it covers window resizes, and its box going
+ * 0 -> non-zero is the signal that the canvas became visible again, which is
+ * what flushes the redraw deferred by _canvasVisible().
+ */
+let _geomObs = null;
+
+function _syncGeometryObservers() {
+  if (typeof ResizeObserver === 'undefined') return;
+  if (!_geomObs) _geomObs = new ResizeObserver(() => _scheduleRedraw());
+  // Cheap to rebuild wholesale (a handful of cards) and avoids leaking
+  // observations of card elements that have been replaced or removed.
+  _geomObs.disconnect();
+  if (_canvasEl) _geomObs.observe(_canvasEl);
+  for (const card of _cards) if (card.el) _geomObs.observe(card.el);
+}
+
+// ── Connector drawing ─────────────────────────────────────────────────────────
+
+/**
+ * Resolve a saved connection endpoint to a live port element.
+ *
+ * `data-idx` is just the position of the topic in the card's topicIn/topicOut
+ * array, and updateCanvasMcps rebuilds a card whenever the driver reports a
+ * different topic list — which renumbers the ports. A connection saved against
+ * the old numbering then resolves to nothing. Falling back to a unique
+ * format match recovers the common case; anything else is reported rather than
+ * silently skipped, because the connection stays in _connections and is still
+ * persisted, so it can reappear later and looks like a flickering line.
+ */
+function _findPort(cardEl, dir, idx, format) {
+  const ports = Array.from(cardEl.querySelectorAll(`.canvas-port.${dir}`));
+  const byIdx = ports.find(p => p.dataset.idx === String(idx));
+  if (byIdx) return byIdx;
+  if (format) {
+    const byFmt = ports.filter(p => p.dataset.format === format);
+    if (byFmt.length === 1) return byFmt[0];
+  }
+  return null;
+}
+
+// Connection ids already reported as undrawable. Kept out of the connection
+// objects themselves because _saveLayout serializes those verbatim.
+const _unresolvedWarned = new Set();
+
+function _warnUnresolved(conn, reason) {
+  if (_unresolvedWarned.has(conn.id)) return;  // redraw runs per frame during a drag
+  _unresolvedWarned.add(conn.id);
+  _logActivity('warn', `连线无法绘制（${reason}），请重新连接: ${conn.id}`);
+}
+
+const _ARROW_BY_FMT = {
+  'fmt-audio':  'conn-arrow-audio',
+  'fmt-json':   'conn-arrow-json',
+  'fmt-visual': 'conn-arrow-visual',
+};
+
+/**
+ * Get the DOM for a connection, creating it (and binding its listeners) once.
+ * `onDelete` is invoked by both the × button and the right-click handler.
+ */
+function _connectorEls(conn, onDelete) {
+  let entry = _connEls.get(conn.id);
+  if (entry) return entry;
+
+  const hit = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+  hit.classList.add('connector-hit');
+
+  const line = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+  line.classList.add('connector-line');
+
+  const btn = document.createElement('button');
+  btn.className = 'conn-delete-btn';
+  btn.textContent = '×';
+  btn.dataset.connId = conn.id;
+
+  const showBtn = () => btn.classList.add('visible');
+  const hideBtn = () => { if (!btn.matches(':hover')) btn.classList.remove('visible'); };
+  hit.addEventListener('mouseenter', showBtn);
+  hit.addEventListener('mouseleave', hideBtn);
+  line.addEventListener('mouseenter', showBtn);
+  line.addEventListener('mouseleave', hideBtn);
+  btn.addEventListener('mouseleave', () => btn.classList.remove('visible'));
+  btn.addEventListener('click', (e) => { e.stopPropagation(); onDelete(); });
+  line.addEventListener('contextmenu', (e) => { e.preventDefault(); onDelete(); });
+
+  _connSvg.appendChild(hit);
+  _connSvg.appendChild(line);
+  _viewport.appendChild(btn);
+
+  entry = { hit, line, btn };
+  _connEls.set(conn.id, entry);
+  return entry;
+}
+
+function _dropConnector(id) {
+  const entry = _connEls.get(id);
+  if (!entry) return;
+  entry.hit.remove();
+  entry.line.remove();
+  entry.btn.remove();
+  _connEls.delete(id);
+}
+
+function _removeTopicConnection(connId) {
+  const conn = _connections.find(c => c.id === connId);
+  if (!conn) return;
+  _connections = _connections.filter(c => c.id !== connId);
+  _resolveAllTopics();
+  _autoStopOnDisconnect(conn.toCardId, conn.toPortIdx, conn.fromTopic);
+  _scheduleRedraw();
+  _saveLayout();
+}
+
 function _redrawConnections() {
-  if (!_connSvg) return;
-  _connSvg.querySelectorAll('.connector-line, .connector-hit').forEach(l => l.remove());
-  _viewport.querySelectorAll('.conn-delete-btn').forEach(b => b.remove());
-  // Force synchronous layout flush so compositor layer is invalidated immediately
-  void _connSvg.getBoundingClientRect();
+  if (!_connSvg || !_viewport) return;
+  // Deferred rather than drawn wrong — see _canvasVisible. The observer on
+  // _canvasEl re-schedules this once the canvas has a box again.
+  if (!_canvasVisible()) return;
+
+  const alive = new Set();
+  const vpRect = _viewport.getBoundingClientRect();
+  const toWorldX = v => (v - vpRect.left) / _zoom;
+  const toWorldY = v => (v - vpRect.top) / _zoom;
 
   for (const conn of _connections) {
     const fromCard = _cards.find(c => c.id === conn.fromCardId);
     const toCard = _cards.find(c => c.id === conn.toCardId);
     if (!fromCard || !toCard) continue;
 
-    const fromPort = fromCard.el.querySelector(`.canvas-port.out[data-idx="${conn.fromPortIdx}"]`);
-    const toPort = toCard.el.querySelector(`.canvas-port.in[data-idx="${conn.toPortIdx}"]`);
-    if (!fromPort || !toPort) continue;
+    const fromPort = _findPort(fromCard.el, 'out', conn.fromPortIdx, conn.format);
+    const toPort = _findPort(toCard.el, 'in', conn.toPortIdx, conn.format);
+    if (!fromPort || !toPort) { _warnUnresolved(conn, '端口已变更'); continue; }
+    _unresolvedWarned.delete(conn.id);
 
-    const vpRect = _viewport.getBoundingClientRect();
     const fromRect = fromPort.getBoundingClientRect();
     const toRect = toPort.getBoundingClientRect();
 
-    const x1 = (fromRect.left + fromRect.width / 2 - vpRect.left) / _zoom;
-    const y1 = (fromRect.top + fromRect.height / 2 - vpRect.top) / _zoom;
-    const x2 = (toRect.left + toRect.width / 2 - vpRect.left) / _zoom;
-    const y2 = (toRect.top + toRect.height / 2 - vpRect.top) / _zoom;
+    const x1 = toWorldX(fromRect.left + fromRect.width / 2);
+    const y1 = toWorldY(fromRect.top + fromRect.height / 2);
+    const x2 = toWorldX(toRect.left + toRect.width / 2);
+    const y2 = toWorldY(toRect.top + toRect.height / 2);
     const cx = Math.max(Math.abs(x2 - x1) * 0.5, 60);
+    const d = `M${x1},${y1} C${x1+cx},${y1} ${x2-cx},${y2} ${x2},${y2}`;
 
-    // Invisible wide hit-area path (easier to hover/click)
-    const hitLine = document.createElementNS('http://www.w3.org/2000/svg', 'path');
-    hitLine.classList.add('connector-hit');
-    hitLine.setAttribute('d', `M${x1},${y1} C${x1+cx},${y1} ${x2-cx},${y2} ${x2},${y2}`);
-
-    const line = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+    const { hit, line, btn } = _connectorEls(conn, () => {
+      if (_projectRunning) { _logActivity('warn', '请停止智能控制后修改'); return; }
+      _ensureEdit().then(ok => { if (ok) _removeTopicConnection(conn.id); });
+    });
+    hit.setAttribute('d', d);
+    line.setAttribute('d', d);
     const fmtCls = _fmtColorClass(conn.format);
-    line.classList.add('connector-line', fmtCls);
-    line.setAttribute('d', `M${x1},${y1} C${x1+cx},${y1} ${x2-cx},${y2} ${x2},${y2}`);
-    const arrowId = fmtCls === 'fmt-audio' ? 'conn-arrow-audio'
-                  : fmtCls === 'fmt-json'  ? 'conn-arrow-json'
-                  : fmtCls === 'fmt-visual' ? 'conn-arrow-visual'
-                  : 'conn-arrow';
-    line.setAttribute('marker-end', `url(#${arrowId})`);
-
-    // Delete button at midpoint
-    const mx = (x1 + x2) / 2;
-    const my = (y1 + y2) / 2;
-    const delBtn = document.createElement('button');
-    delBtn.className = 'conn-delete-btn';
-    delBtn.textContent = '×';
-    delBtn.style.left = mx + 'px';
-    delBtn.style.top  = my + 'px';
-    delBtn.dataset.connId = conn.id;
-    _viewport.appendChild(delBtn);
-
-    const showBtn = () => delBtn.classList.add('visible');
-    const hideBtn = () => { if (!delBtn.matches(':hover')) delBtn.classList.remove('visible'); };
-
-    hitLine.addEventListener('mouseenter', showBtn);
-    hitLine.addEventListener('mouseleave', hideBtn);
-    line.addEventListener('mouseenter', showBtn);
-    line.addEventListener('mouseleave', hideBtn);
-    delBtn.addEventListener('mouseleave', () => delBtn.classList.remove('visible'));
-    delBtn.addEventListener('click', async (e) => {
-      e.stopPropagation();
-      if (_projectRunning) {
-        _logActivity('warn', '请停止智能控制后修改');
-        return;
-      }
-      if (!(await _ensureEdit())) return;
-      _connections = _connections.filter(c => c.id !== conn.id);
-      _resolveAllTopics();
-      _autoStopOnDisconnect(conn.toCardId, conn.toPortIdx, conn.fromTopic);
-      _redrawConnections();
-      _saveLayout();
-    });
-
-    line.addEventListener('contextmenu', (e) => {
-      e.preventDefault();
-      if (_projectRunning) {
-        _logActivity('warn', '请停止智能控制后修改');
-        return;
-      }
-      _connections = _connections.filter(c => c.id !== conn.id);
-      _resolveAllTopics();
-      _autoStopOnDisconnect(conn.toCardId, conn.toPortIdx, conn.fromTopic);
-      _redrawConnections();
-      _saveLayout();
-    });
-
-    _connSvg.appendChild(hitLine);
-    _connSvg.appendChild(line);
+    line.setAttribute('class', `connector-line ${fmtCls}`);
+    line.setAttribute('marker-end', `url(#${_ARROW_BY_FMT[fmtCls] || 'conn-arrow'})`);
+    btn.style.left = (x1 + x2) / 2 + 'px';
+    btn.style.top  = (y1 + y2) / 2 + 'px';
+    alive.add(conn.id);
   }
 
-  // ── Draw executor connections (vertical, dashed emerald) ──
+  // ── Executor connections (vertical, dashed emerald) ──
   for (const conn of _execConnections) {
     const fromCard = _cards.find(c => c.id === conn.fromCardId);
     const toCard = _cards.find(c => c.id === conn.toCardId);
     if (!fromCard || !toCard) continue;
 
     const execPort = fromCard.el.querySelector('.canvas-port.executor');
-    if (!execPort) continue;
+    if (!execPort) { _warnUnresolved(conn, '执行器端口已消失'); continue; }
+    _unresolvedWarned.delete(conn.id);
 
-    const vpRect = _viewport.getBoundingClientRect();
     const fromRect = execPort.getBoundingClientRect();
     // Target: top center of the destination card
     const toCardRect = toCard.el.getBoundingClientRect();
 
-    const x1 = (fromRect.left + fromRect.width / 2 - vpRect.left) / _zoom;
-    const y1 = (fromRect.top + fromRect.height / 2 - vpRect.top) / _zoom;
-    const x2 = (toCardRect.left + toCardRect.width / 2 - vpRect.left) / _zoom;
-    const y2 = (toCardRect.top - vpRect.top) / _zoom;
+    const x1 = toWorldX(fromRect.left + fromRect.width / 2);
+    const y1 = toWorldY(fromRect.top + fromRect.height / 2);
+    const x2 = toWorldX(toCardRect.left + toCardRect.width / 2);
+    const y2 = toWorldY(toCardRect.top);
     const cy = Math.max(Math.abs(y2 - y1) * 0.5, 60);
+    const d = `M${x1},${y1} C${x1},${y1+cy} ${x2},${y2-cy} ${x2},${y2}`;
 
-    const pathD = `M${x1},${y1} C${x1},${y1+cy} ${x2},${y2-cy} ${x2},${y2}`;
-
-    const hitLine = document.createElementNS('http://www.w3.org/2000/svg', 'path');
-    hitLine.classList.add('connector-hit');
-    hitLine.setAttribute('d', pathD);
-
-    const line = document.createElementNS('http://www.w3.org/2000/svg', 'path');
-    line.classList.add('connector-line', 'executor-conn');
-    line.setAttribute('d', pathD);
-    line.setAttribute('marker-end', 'url(#exec-arrow)');
-
-    const mx = (x1 + x2) / 2;
-    const my = (y1 + y2) / 2;
-    const delBtn = document.createElement('button');
-    delBtn.className = 'conn-delete-btn';
-    delBtn.textContent = '×';
-    delBtn.style.left = mx + 'px';
-    delBtn.style.top  = my + 'px';
-    delBtn.dataset.connId = conn.id;
-    _viewport.appendChild(delBtn);
-
-    const showBtn = () => delBtn.classList.add('visible');
-    const hideBtn = () => { if (!delBtn.matches(':hover')) delBtn.classList.remove('visible'); };
-
-    hitLine.addEventListener('mouseenter', showBtn);
-    hitLine.addEventListener('mouseleave', hideBtn);
-    line.addEventListener('mouseenter', showBtn);
-    line.addEventListener('mouseleave', hideBtn);
-    delBtn.addEventListener('mouseleave', () => delBtn.classList.remove('visible'));
-
-    const removeExec = async () => {
+    const { hit, line, btn } = _connectorEls(conn, async () => {
       if (!(await _ensureEdit())) return;
       _execConnections = _execConnections.filter(c => c.id !== conn.id);
       _logActivity('executor', `解绑执行器: ${conn.toToolName || conn.toCardId}`);
-      _redrawConnections();
+      _scheduleRedraw();
       _saveLayout();
-    };
-    delBtn.addEventListener('click', (e) => { e.stopPropagation(); removeExec(); });
-    line.addEventListener('contextmenu', (e) => { e.preventDefault(); removeExec(); });
+    });
+    hit.setAttribute('d', d);
+    line.setAttribute('d', d);
+    line.setAttribute('class', 'connector-line executor-conn');
+    line.setAttribute('marker-end', 'url(#exec-arrow)');
+    btn.style.left = (x1 + x2) / 2 + 'px';
+    btn.style.top  = (y1 + y2) / 2 + 'px';
+    alive.add(conn.id);
+  }
 
-    _connSvg.appendChild(hitLine);
-    _connSvg.appendChild(line);
+  for (const id of Array.from(_connEls.keys())) {
+    if (!alive.has(id)) _dropConnector(id);
   }
 }
 
@@ -1934,7 +2040,7 @@ async function _fetchTopicsFromDriver(card, inputTopic) {
       // one has to be re-walked — otherwise a chain (mic → asr → tts) only ever
       // resolves its first hop.
       _resolveAllTopics();
-      _redrawConnections();
+      _scheduleRedraw();
       _debouncedSave();
     } else if (card.topicOut?.some(t => t.topic)) {
       // The driver cannot infer an output for this input, so whatever we are
@@ -1942,7 +2048,7 @@ async function _fetchTopicsFromDriver(card, inputTopic) {
       // what stops a deleted connection's topic from outliving the connection.
       card.topicOut = [];
       _resolveAllTopics();
-      _redrawConnections();
+      _scheduleRedraw();
       _debouncedSave();
     }
   } catch (e) {
@@ -2249,6 +2355,7 @@ function _makeDraggable(el, cardData) {
     e.stopPropagation();
 
     isDragging   = true;
+    _draggingCardId = cardData.id;
     startClientX = e.clientX;
     startClientY = e.clientY;
     startWorldX  = cardData.x;
@@ -2270,15 +2377,28 @@ function _makeDraggable(el, cardData) {
 
     el.style.left = cardData.x + 'px';
     el.style.top  = cardData.y + 'px';
-    _redrawConnections();
+    _scheduleRedraw();
   });
 
-  header.addEventListener('pointerup', () => {
+  const endDrag = (save) => {
     if (!isDragging) return;
     isDragging = false;
+    _draggingCardId = null;
     el.classList.remove('dragging');
-    _debouncedSave();
-  });
+    if (save) _debouncedSave();
+    // Card rebuilds were held off for the duration of the drag; catch up now.
+    if (_mcpsPendingRefresh) {
+      _mcpsPendingRefresh = false;
+      updateCanvasMcps(_allMcps);
+    }
+  };
+
+  header.addEventListener('pointerup', () => endDrag(true));
+  // Without this a lost capture (alt-tab, touch interruption, the element being
+  // replaced) would leave _draggingCardId set forever, which silently freezes
+  // every card rebuild from then on.
+  header.addEventListener('pointercancel', () => endDrag(true));
+  header.addEventListener('lostpointercapture', () => endDrag(true));
 }
 
 // ── Layout persistence ────────────────────────────────────────────────────────
@@ -2498,7 +2618,7 @@ async function _reloadLayout() {
     _connections = (layoutJson.data?.connections || []).filter(c => cardIds.has(c.fromCardId) && cardIds.has(c.toCardId));
     _execConnections = (layoutJson.data?.execConnections || []).filter(c => cardIds.has(c.fromCardId) && cardIds.has(c.toCardId));
     _resolveAllTopics();
-    _redrawConnections();
+    _scheduleRedraw();
     _syncEmptyState();
     // Update editor info
     _currentEditor = layoutJson.editor || null;
