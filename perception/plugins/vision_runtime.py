@@ -120,8 +120,13 @@ def _looks_like_detection_rows(rows: np.ndarray) -> bool:
     6 at all. Shape alone also cannot tell (N, C) from (C, N) once both exceed
     6, whereas scores confined to [0, 1] and integral class ids can.
     """
-    if rows.ndim != 2 or rows.shape[1] < 6 or rows.shape[0] == 0:
+    if rows.ndim != 2 or rows.shape[1] < 6:
         return False
+    if rows.shape[0] == 0:
+        # No detections is a valid answer, not an unreadable layout. The width
+        # still settles the orientation: an empty (0, 6+) is the rows form,
+        # while its transpose is (6+, 0) and fails the width check above.
+        return True
     scores = rows[:, 4]
     if not np.all((scores >= -1e-3) & (scores <= 1.0 + 1e-3)):
         return False

@@ -48,6 +48,8 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPo
 from sensor_msgs.msg import CompressedImage
 from std_msgs.msg import String
 
+from plugins.image_input import BadInput, load_image_bytes
+
 log = logging.getLogger(__name__)
 
 _LOW_LAT_QOS = QoSProfile(
@@ -100,15 +102,45 @@ TOOLS = [
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["start", "stop", "info", "config"],
+                    "enum": [
+                        "start", "stop", "info", "config",
+                        "recognize_by_photo", "recognize_by_url",
+                        "list_recognizable_objects",
+                    ],
                     "description": "Action to perform"
                 },
                 "input_topic": {
                     "type": "string",
                     "description": "ROS2 image topic to subscribe (e.g. /hostname/camera/rgb, required for action=start)"
                 },
+                # `format: file` makes the canvas render a file picker;
+                # `uploadTo: mcp` posts it to /api/mcp/<id>/file/upload, which
+                # streams the bytes to *this* service and returns the path they
+                # landed on here — so the value this field receives is already a
+                # path perception can open, with no shared mount.
+                "image_path": {"type": "string", "format": "file", "accept": "image/*", "uploadTo": "mcp", "description": "图片文件。从卡片上传，或填一个容器可读的路径（如 /uploads/scene.jpg）。常见格式都支持，过大的图会本地缩放"},
+                "url": {"type": "string", "description": "图片的 http(s) 地址，如 https://example.com/scene.jpg。下载后本地解码，格式限制同 image_path"},
+                "confidence": {"type": "number", "description": "本次识别的置信度阈值（0-1）。不填则用卡片配置的值"},
             },
-            "required": ["action"]
+            "required": ["action"],
+            "x-action-params": {
+                "start":  {"params": ["input_topic"], "description": "Start detecting objects on an image topic"},
+                "stop":   {"params": [], "description": "Stop detection"},
+                "info":   {"params": ["input_topic"], "description": "Report state, topics and the frozen class list"},
+                "config": {"params": [], "description": "Update confidence / fps"},
+                "recognize_by_photo": {
+                    "params": ["image_path", "confidence"],
+                    "description": "认出一张图片里的物体 — 一次性识别，不需要摄像头也不需要先 start。返回每个物体的名称、画面中的相对位置与置信度",
+                },
+                "recognize_by_url": {
+                    "params": ["url", "confidence"],
+                    "description": "认出图片 URL 里的物体 — 与 recognize_by_photo 相同，只是图片来自 http(s) 而非本地文件",
+                },
+                "list_recognizable_objects": {
+                    "params": [],
+                    "description": "列出这个引擎能认出的全部物体类别。类别在导出 engine 时固定，运行时不可更改 — 先查这个，就知道某样东西问不问得出来",
+                },
+            },
         },
         "configSchema": {
             "type": "object",
@@ -275,6 +307,9 @@ class VideoObjectPerceptionPlugin:
     def __init__(self, plugin_cfg: dict, namespace: str, executor):
         self._namespace = namespace
         self._executor = executor
+        # Kept whole for the image-source helpers, which read image_roots and
+        # max_image_bytes straight from it (see plugins/image_input.py).
+        self._plugin_cfg = dict(plugin_cfg or {})
         self._confidence = float(plugin_cfg.get("confidence", 0.3))
         self._fps = int(plugin_cfg.get("fps", 5))
         self._model_name = canonical_model_name(plugin_cfg.get("model", DEFAULT_MODEL))
@@ -458,6 +493,84 @@ class VideoObjectPerceptionPlugin:
         names = data.get("classes") if isinstance(data, dict) else data
         return [str(n) for n in names] if isinstance(names, list) else []
 
+    # ── one-shot recognition ─────────────────────────────────────────────
+
+    def _require_engine(self):
+        """Return a loaded engine, loading it on demand.
+
+        A photo question is useful without any instance running — an operator
+        asks "what is in this picture" before pointing a camera anywhere — so
+        it triggers the same single-flight load a `start` would and waits for
+        it, rather than reporting `loading` and making the caller poll. Each
+        tools/call already has its own thread (ThreadingHTTPServer), so
+        blocking here blocks nothing else. Same rule as plugins/face.py.
+        """
+        self._ensure_model()
+        return self._model
+
+    def _recognize_image(self, args: dict, url_action: str) -> dict:
+        """Decode one image and run the detector over it once."""
+        cfg = dict(self._plugin_cfg)
+        try:
+            data, source = load_image_bytes(args, cfg, url_action=url_action)
+        except BadInput as error:
+            return error.as_result()
+
+        import cv2
+
+        frame = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
+        if frame is None:
+            return BadInput(
+                "could not decode that file as an image — check it is a real "
+                "picture and not, say, HTML returned by a redirect", source,
+            ).as_result()
+
+        try:
+            model = self._require_engine()
+        except Exception as error:  # noqa: BLE001 — surfaced to the caller
+            log.error(f"[vop] engine load failed during recognize: {error}", exc_info=True)
+            return {"ok": False, "reason": "engine_unavailable", "detail": str(error)}
+
+        confidence = args.get("confidence")
+        confidence = float(confidence) if confidence not in (None, "") else self._confidence
+
+        from plugins.vision_runtime import decode_detections
+
+        outputs, meta = model.infer(frame)
+        boxes, scores, classes = decode_detections(outputs, meta, confidence)
+
+        # Same shape the stream publishes, so a consumer written against
+        # {topic}/objects needs no second parser — plus the pixel box, which a
+        # caller who cannot see the frame has no other way to recover.
+        height, width = frame.shape[:2]
+        half_w, half_h = width / 2.0, height / 2.0
+        objects = []
+        for (x1, y1, x2, y2), score, cls_id in zip(boxes, scores, classes):
+            cx, cy = (x1 + x2) / 2.0, (y1 + y2) / 2.0
+            objects.append({
+                "name": self._class_name_from_vocab(int(cls_id)),
+                "position": [
+                    round(float((cx - half_w) / half_w), 3),
+                    round(float((cy - half_h) / half_h), 3),
+                ],
+                "confidence": round(float(score), 2),
+                "bbox": [round(float(v), 1) for v in (x1, y1, x2, y2)],
+            })
+
+        return {
+            "ok": True,
+            "source": source,
+            "image_size": [width, height],
+            "confidence_threshold": confidence,
+            "count": len(objects),
+            "objects": objects,
+        }
+
+    def _class_name_from_vocab(self, cls_id: int) -> str:
+        if 0 <= cls_id < len(self._vocabulary):
+            return self._vocabulary[cls_id]
+        return str(cls_id)
+
     def _start_node(self, node_key: str, input_topic: str):
         """Create and start a VOPNode for the given topic.
 
@@ -637,6 +750,36 @@ class VideoObjectPerceptionPlugin:
                 keys = list(self._nodes.keys())
             results = [key for key in keys if self._retire_node(key) is not None]
             return {"state": "idle", "stopped_instances": results} if results else {"state": "idle"}
+
+        elif action == "recognize_by_photo":
+            return self._recognize_image(args, url_action="recognize_by_url")
+
+        elif action == "recognize_by_url":
+            return self._recognize_image(args, url_action="recognize_by_url")
+
+        elif action == "list_recognizable_objects":
+            # Answers "can I ask about X" without loading the engine: the
+            # vocabulary is prefetched at startup from vocab.json alone.
+            if not self._vocabulary:
+                return {
+                    "ok": False,
+                    "reason": "vocabulary_unavailable",
+                    "detail": "the class list has not been fetched yet — it is "
+                              "loaded in the background at startup, and comes "
+                              "with the engine bundle. Retry shortly, or start "
+                              "the card to force the download.",
+                }
+            return {
+                "ok": True,
+                "model": self._model_name,
+                "frozen": True,
+                "count": len(self._vocabulary),
+                "objects": list(self._vocabulary),
+                "note": "This list is baked into the TensorRT engine at export "
+                        "time and cannot be changed at runtime. Anything not "
+                        "listed here will never be detected, however it is "
+                        "phrased.",
+            }
 
         elif action == "set_classes":
             # Kept reachable although it is no longer advertised in the tool

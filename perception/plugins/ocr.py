@@ -23,6 +23,7 @@ from utils.log_sampling import SampledLogGate, escape_log_text
 from utils.qos import CAMERA_QOS
 from utils.ros_lifecycle import dispose_node
 
+from plugins.image_input import BadInput, load_image_bytes
 from plugins.ocr_runtime import (
     DEFAULT_DET_BOX_THRESH,
     DEFAULT_DET_THRESH,
@@ -50,21 +51,44 @@ TOOLS = [
         "name": "ocr",
         "type": "processor",
         "multiInstance": True,
-        "description": "OCR — recognize text in camera feed via image topic subscription",
+        "description": "OCR — recognize text in a camera feed, or in a single photo or image URL",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["start", "stop", "info", "config"],
+                    "enum": [
+                        "start", "stop", "info", "config",
+                        "recognize_by_photo", "recognize_by_url",
+                    ],
                     "description": "Action to perform"
                 },
                 "input_topic": {
                     "type": "string",
                     "description": "ROS2 image topic to subscribe (e.g. /hostname/camera/rgb, required for action=start)"
                 },
+                # `format: file` renders a file picker on the card; `uploadTo:
+                # mcp` posts the bytes to /api/mcp/<id>/file/upload, which
+                # streams them to *this* service and returns the path they
+                # landed on here — no shared mount needed.
+                "image_path": {"type": "string", "format": "file", "accept": "image/*", "uploadTo": "mcp", "description": "图片文件。从卡片上传，或填一个容器可读的路径（如 /uploads/doc.jpg）"},
+                "url": {"type": "string", "description": "图片的 http(s) 地址，如 https://example.com/doc.jpg。下载后本地解码，格式限制同 image_path"},
             },
-            "required": ["action"]
+            "required": ["action"],
+            "x-action-params": {
+                "start":  {"params": ["input_topic"], "description": "Start recognising text on an image topic"},
+                "stop":   {"params": [], "description": "Stop recognition"},
+                "info":   {"params": ["input_topic"], "description": "Report state and topics"},
+                "config": {"params": [], "description": "Update configuration"},
+                "recognize_by_photo": {
+                    "params": ["image_path"],
+                    "description": "识别一张图片里的文字 — 一次性识别，不需要摄像头也不需要先 start。返回与实时流同样的结果结构",
+                },
+                "recognize_by_url": {
+                    "params": ["url"],
+                    "description": "识别图片 URL 里的文字 — 与 recognize_by_photo 相同，只是图片来自 http(s) 而非本地文件",
+                },
+            },
         },
         # Deliberately minimal: only what an operator meaningfully decides.
         # Expert knobs (model_dir, device_id, DB thresholds, crop refinement,
@@ -523,7 +547,62 @@ class OCRPlugin:
             return self._do_stop(instance_id)
         if action == "config":
             return self._do_config(instance_id, args)
+        if action in ("recognize_by_photo", "recognize_by_url"):
+            return self._do_recognize_image(args)
         return None
+
+    # ── one-shot recognition ──────────────────────────────────────────────
+
+    def _require_adapter(self, timeout: float = 600.0):
+        """Return a ready adapter, triggering the single-flight load if needed.
+
+        Reading one photo is useful without any instance running, so this waits
+        for the load rather than reporting `loading` and making the caller
+        poll. It reuses the one background loader instead of building a second
+        adapter — the OCR bundle is three TensorRT engines, and a duplicate set
+        would be both slow and a second claim on GPU memory.
+
+        Each tools/call has its own thread (ThreadingHTTPServer), so waiting
+        here holds up nothing else.
+        """
+        deadline = time.monotonic() + timeout
+        while True:
+            with self._state_lock:
+                if self._adapter_state == "ready" and self._adapter is not None:
+                    return self._adapter, None
+                if self._adapter_state == "error":
+                    return None, {
+                        "ok": False, "reason": "adapter_unavailable",
+                        "detail": f"OCR model failed to load: {self._load_error}",
+                    }
+                if self._adapter_state == "idle":
+                    self._spawn_loader_locked()
+            if time.monotonic() >= deadline:
+                return None, {
+                    "ok": False, "reason": "adapter_timeout",
+                    "detail": f"OCR model was still loading after {timeout:.0f}s "
+                              "(first load downloads and verifies the engine bundle)",
+                }
+            time.sleep(0.2)
+
+    def _do_recognize_image(self, args: dict) -> dict:
+        cfg = dict(self._plugin_cfg)
+        try:
+            data, source = load_image_bytes(args, cfg, url_action="recognize_by_url")
+        except BadInput as error:
+            return error.as_result()
+
+        adapter, failure = self._require_adapter()
+        if adapter is None:
+            return {**failure, "source": source}
+
+        # The same call the worker thread makes, so a one-shot answer and a
+        # streamed one cannot drift into different shapes.
+        payload = recognize_to_payload(adapter, data, self._language, time.time())
+        if "error" in payload:
+            return {"ok": False, "reason": "recognize_failed",
+                    "detail": payload["error"], "source": source}
+        return {"ok": True, "source": source, **payload}
 
     _DESC = "OCR service — extracts text from images"
 

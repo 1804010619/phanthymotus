@@ -318,3 +318,133 @@ def test_get_tools_does_not_mutate_the_module_level_TOOLS():
     plugin, _ = _plugin()
     plugin.get_tools()
     assert vop_plugin.TOOLS[0]["description"] == original
+
+
+# ── one-shot recognition ─────────────────────────────────────────────────────
+
+def _photo_plugin(tmp_path, rows=(), **cfg):
+    """A plugin whose image roots are tmp_path and whose engine is already up."""
+    base = {"image_roots": [str(tmp_path)], "max_image_bytes": 1 << 20}
+    base.update(cfg)
+    plugin, executor = _plugin(cfg=base, model=_FakeModel(rows=rows))
+    return plugin, executor
+
+
+def _write_frame(tmp_path, name="scene.jpg", marker=b"200x100"):
+    path = tmp_path / name
+    path.write_bytes(marker)
+    return str(path)
+
+
+def test_recognize_by_photo_reports_objects_without_any_instance(tmp_path):
+    """The point of the action: answer about a picture with no camera running."""
+    plugin, executor = _photo_plugin(
+        tmp_path, rows=[[100.0, 0.0, 200.0, 50.0, 0.9, 1]])
+    result = plugin.dispatch("vop", {
+        "action": "recognize_by_photo", "image_path": _write_frame(tmp_path)})
+
+    assert executor.nodes == []          # nothing was started
+    assert result["ok"] is True
+    assert result["count"] == 1
+    obj = result["objects"][0]
+    assert obj["name"] == "door"         # vocab index 1
+    assert obj["position"] == [0.5, -0.5]
+    assert obj["confidence"] == 0.9
+    # The caller cannot see the frame, so the pixel box is the only way back
+    # to where in the image this was.
+    assert obj["bbox"] == [100.0, 0.0, 200.0, 50.0]
+    assert result["image_size"] == [200, 100]
+
+
+def test_recognize_by_photo_honours_a_per_call_confidence(tmp_path):
+    plugin, _ = _photo_plugin(tmp_path, rows=[[10.0, 10.0, 20.0, 20.0, 0.4, 0]])
+    photo = _write_frame(tmp_path)
+
+    loose = plugin.dispatch("vop", {"action": "recognize_by_photo",
+                                    "image_path": photo, "confidence": 0.2})
+    strict = plugin.dispatch("vop", {"action": "recognize_by_photo",
+                                     "image_path": photo, "confidence": 0.8})
+    assert loose["count"] == 1
+    assert strict["count"] == 0
+    assert strict["confidence_threshold"] == 0.8
+
+
+def test_recognize_by_photo_falls_back_to_the_card_confidence(tmp_path):
+    plugin, _ = _photo_plugin(tmp_path, rows=[], confidence=0.55)
+    result = plugin.dispatch("vop", {"action": "recognize_by_photo",
+                                     "image_path": _write_frame(tmp_path)})
+    assert result["confidence_threshold"] == 0.55
+
+
+def test_recognize_by_photo_refuses_a_path_outside_the_roots(tmp_path):
+    plugin, _ = _photo_plugin(tmp_path)
+    result = plugin.dispatch("vop", {"action": "recognize_by_photo",
+                                     "image_path": "/etc/passwd"})
+    assert result["ok"] is False
+    assert result["reason"] == "bad_input"
+    # Must name vop's own action, not "the _by_url action".
+    assert "recognize_by_url" in result["detail"]
+
+
+def test_recognize_by_photo_on_an_undecodable_file(tmp_path):
+    plugin, _ = _photo_plugin(tmp_path)
+    path = _write_frame(tmp_path, "junk.jpg", b"this is not an image")
+    result = plugin.dispatch("vop", {"action": "recognize_by_photo",
+                                     "image_path": path})
+    assert result["ok"] is False
+    assert "decode" in result["detail"]
+
+
+def test_recognize_by_url_shares_the_photo_path(tmp_path, monkeypatch):
+    import plugins.image_input as image_input
+    monkeypatch.setattr(image_input, "fetch_url", lambda url, max_bytes: b"200x100")
+    plugin, _ = _photo_plugin(tmp_path, rows=[[100.0, 0.0, 200.0, 50.0, 0.9, 0]])
+    result = plugin.dispatch("vop", {"action": "recognize_by_url",
+                                     "url": "https://example.com/a.jpg"})
+    assert result["ok"] is True
+    assert result["source"] == "https://example.com/a.jpg"
+    assert result["objects"][0]["name"] == "person"
+
+
+# ── list_recognizable_objects ────────────────────────────────────────────────
+
+def test_list_recognizable_objects_returns_the_frozen_vocabulary():
+    plugin, _ = _plugin()
+    result = plugin.dispatch("vop", {"action": "list_recognizable_objects"})
+    assert result["ok"] is True
+    assert result["count"] == 3
+    assert result["objects"] == ["person", "door", "forklift"]
+    assert result["frozen"] is True
+    # The note is the actionable half: an agent that reads "not listed here
+    # will never be detected" stops rephrasing and reports the limit.
+    assert "cannot be changed at runtime" in result["note"]
+
+
+def test_list_recognizable_objects_needs_no_engine():
+    """It answers from the prefetched vocab.json, not from a loaded engine."""
+    plugin, executor = _plugin()      # no model installed
+    assert plugin._model is None
+    assert plugin.dispatch("vop", {"action": "list_recognizable_objects"})["ok"] is True
+    assert executor.nodes == []
+
+
+def test_list_recognizable_objects_says_so_when_it_does_not_know_yet():
+    plugin, _ = _plugin()
+    plugin._vocabulary = []
+    result = plugin.dispatch("vop", {"action": "list_recognizable_objects"})
+    assert result["ok"] is False
+    assert result["reason"] == "vocabulary_unavailable"
+
+
+def test_the_new_actions_are_advertised_with_their_params():
+    schema = vop_plugin.TOOLS[0]["inputSchema"]
+    actions = set(schema["properties"]["action"]["enum"])
+    assert {"recognize_by_photo", "recognize_by_url",
+            "list_recognizable_objects"} <= actions
+    params = schema["x-action-params"]
+    assert params["recognize_by_photo"]["params"] == ["image_path", "confidence"]
+    assert params["recognize_by_url"]["params"] == ["url", "confidence"]
+    # The card renders a file picker only for format=file + uploadTo=mcp.
+    image_path = schema["properties"]["image_path"]
+    assert image_path["format"] == "file"
+    assert image_path["uploadTo"] == "mcp"

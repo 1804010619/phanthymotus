@@ -284,3 +284,17 @@ def test_class_names_accept_a_plain_list():
 def test_unusable_names_metadata_yields_nothing(metadata):
     """Empty lets the caller fall back to vocab.json rather than guess an order."""
     assert _MetaOnlySession(metadata).class_names() == []
+
+
+def test_an_empty_detection_output_decodes_to_no_boxes():
+    """Finding nothing is an answer, not an unreadable layout.
+
+    The e2e head emits a fixed 300 rows so hardware never produces this, but a
+    zero-row output is well-formed and used to raise — which surfaced as a
+    photo with no objects in it failing instead of returning an empty list.
+    """
+    meta = LetterboxMeta(1.0, 0, 0, 640, 640)
+    boxes, scores, classes = decode_detections(
+        np.zeros((1, 0, 6), dtype=np.float32), meta, conf=0.25)
+    assert boxes.shape == (0, 4)
+    assert scores.size == 0 and classes.size == 0
