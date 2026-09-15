@@ -1777,7 +1777,11 @@ html, body {
   padding: 7px 16px;
   border-bottom: 1px solid var(--border);
   flex-shrink: 0;
+  /* When the bar is shut this strip is the only way back, so it has to look
+     like the control it is rather than like a caption. */
+  cursor: pointer;
 }
+.activity-strip.collapsed .activity-strip-header:hover { background: var(--bg-hover); }
 .activity-title {
   font-size: 10px;
   font-weight: 700;
@@ -3885,7 +3889,27 @@ html, body {
   overflow: hidden;
   position: relative;
   transition: border-color 0.2s, box-shadow 0.2s;
+  cursor: grab;
+  /* The card chrome is a drag handle, so it must not be selectable text.
+     Suppression used to rest entirely on a preventDefault() inside the drag
+     handler, which has two early returns before it and covers nothing outside
+     the header — so an attempt to grab the card anywhere else selected the
+     title instead of moving it. The body opts back in below: log output is
+     worth copying. `touch-action: none` lets a touch drag rearrange the card
+     instead of scrolling the grid away underneath it. */
+  user-select: none;
+  -webkit-user-select: none;
+  touch-action: none;
 }
+.monitor-card:active { cursor: grabbing; }
+.monitor-card-body {
+  user-select: text;
+  -webkit-user-select: text;
+  cursor: auto;
+}
+/* Interactive bits keep a pointer and their own gestures. */
+.monitor-card-modes,
+.monitor-card-mode-btn { cursor: pointer; touch-action: auto; }
 .monitor-card:hover {
   border-color: var(--accent);
   box-shadow: 0 2px 12px var(--accent-dim);
@@ -3913,6 +3937,13 @@ html, body {
   z-index: 10;
   border-color: var(--accent);
 }
+/* Landing on a same-sized neighbour trades places rather than being refused,
+   so it needs to read as a valid outcome and not as the red rejection. */
+.monitor-card.drag-swap {
+  border-color: var(--accent) !important;
+  box-shadow: 0 0 12px var(--accent-dim) !important;
+}
+.monitor-card.drag-swap::after { content: none !important; }
 
 .monitor-card-header {
   display: flex;
@@ -4010,6 +4041,31 @@ html, body {
   color: var(--text);
 }
 
+/* Shown until the first frame arrives on this topic. Sits over the body rather
+   than inside it so no renderer has to know about it. */
+.monitor-card-empty {
+  position: absolute;
+  inset: 49px 0 0 0;          /* below the header */
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  padding: 0 16px;
+  text-align: center;
+  pointer-events: none;
+}
+.monitor-card.has-data .monitor-card-empty { display: none; }
+.monitor-card-empty-title {
+  font-size: 12px;
+  color: var(--text-muted, var(--text-dim));
+}
+.monitor-card-empty-hint {
+  font-size: 10px;
+  color: var(--text-dim);
+  opacity: 0.75;
+}
+
 /* Resize handle */
 .monitor-card-resize {
   position: absolute;
@@ -4033,16 +4089,19 @@ html, body {
 .monitor-card:hover .monitor-card-resize { opacity: 1; }
 
 /* Grid overlay (visual guides during drag/resize) */
+/* Rows and height are set inline from the same measurement the drag snaps to —
+   see _showGridOverlay. `inset: 0` would pin the guides to the visible box while
+   the cards they describe live in the scrolled content, so only `top` is fixed. */
 .monitor-grid-overlay {
   position: absolute;
-  inset: 0;
+  top: 0;
+  left: 0;
+  right: 0;
   display: grid;
   gap: 12px;
   padding: 0;
   pointer-events: none;
   z-index: 1;
-  grid-template-columns: inherit;
-  grid-auto-rows: 20%;
 }
 .monitor-grid-cell {
   border: 1px dashed var(--border);

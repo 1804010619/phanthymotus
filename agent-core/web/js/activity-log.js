@@ -4,6 +4,7 @@
  */
 
 import { onMotusEvent } from './motus-stream.js';
+import { toggleLog } from './mobile.js';
 
 export function initActivityLog() {
   onMotusEvent(null, _append);
@@ -12,18 +13,21 @@ export function initActivityLog() {
 
 function _initCollapse() {
   const strip = document.getElementById('activity-strip');
-  const btn = document.getElementById('activity-collapse-btn');
-  if (!strip || !btn) return;
+  const toggle = document.getElementById('activity-toggle');
+  if (!strip || !toggle) return;
 
-  // restore persisted state
-  if (localStorage.getItem('activity-collapsed') === '1') {
+  // Restore the bar's persisted state, but only where a bar is what gets shown.
+  // Below 768px the log is a drawer and `collapsed` has no styling behind it, so
+  // carrying the flag in only left the class on the element misrepresenting a
+  // state the user could not see or change.
+  if (localStorage.getItem('activity-collapsed') === '1' &&
+      !window.matchMedia('(max-width: 768px)').matches) {
     strip.classList.add('collapsed');
   }
 
-  document.getElementById('activity-toggle').addEventListener('click', () => {
-    strip.classList.toggle('collapsed');
-    localStorage.setItem('activity-collapsed', strip.classList.contains('collapsed') ? '1' : '0');
-  });
+  // Delegated to the shared toggle so the header, the floating button and the
+  // monitor-header button all mean the same thing — see mobile.js toggleLog.
+  toggle.addEventListener('click', () => toggleLog());
 }
 
 function _append(event) {
