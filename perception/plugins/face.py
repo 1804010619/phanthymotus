@@ -1064,7 +1064,7 @@ class _FaceNode(Node):
                 if not usable:
                     # Reported, but neither matched nor enrolled. Matching a
                     # blurred 30 px face is a coin flip, and auto-enrolling it
-                    # would spend an unknown-N slot on a smear that never
+                    # would spend a person slot on a smear that never
                     # matches anything again. "There is a face here and I
                     # cannot identify it" is the honest answer.
                     entry.update({
@@ -1757,7 +1757,7 @@ class FaceRecognitionPlugin:
             return {**failure, "source": source}
         # No person_id input: which identity a photo belongs to is decided by
         # matching, not by the caller. A face that matches an existing person
-        # becomes another sample of them; one that matches an unknown-N promotes
+        # becomes another sample of them; one that matches an anonymous entry promotes
         # that entry in place. Naming an identity after the fact is
         # `update_person`, and grouping several photos under one person is the
         # batch manifest's `person` key.
@@ -1998,7 +1998,7 @@ class FaceRecognitionPlugin:
         """Every face in one image, matched against the database.
 
         **Read-only.** Unlike the continuous stream, this neither auto-enrols a
-        stranger as `unknown-N` nor records a sighting: "who is this" is a
+        stranger as an anonymous `p-N` nor records a sighting: "who is this" is a
         question, and answering it should not mutate the roster or the visit
         log. It also does not apply `subject_dominance` — that gate exists
         because *enrolment* must resolve to exactly one person, whereas a query

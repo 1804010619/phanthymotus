@@ -426,14 +426,16 @@ def _run_one_frame(plugin, frame: bytes, topic: str = "/cam/rgb"):
 def test_unknown_face_gets_a_stable_id_across_frames(plugin):
     node, payloads = _run_one_frame(plugin, _FakeFrame.one(7))
     first = payloads[0]["faces"][0]
-    assert first["person_id"] == "unknown-1"
+    # Unnamed people get the same `p-N` ids as named ones; `known` is what
+    # distinguishes them, not the id format.
+    assert first["person_id"] == "p-1"
     assert first["known"] is False
     assert first["quality"] == "ok"
 
     node._image_cb(_FakeCompressedImage(_FakeFrame.one(7)))
     assert _wait_until(lambda: len(node.publishers[0].messages) >= 2, timeout=5.0)
     second = json.loads(node.publishers[0].messages[-1])["faces"][0]
-    assert second["person_id"] == "unknown-1"      # same person, same id
+    assert second["person_id"] == "p-1"      # same person, same id
     assert second["score"] > 0.9
 
 
@@ -449,7 +451,7 @@ def test_a_registered_person_is_reported_with_their_name(plugin):
 
 
 def test_a_low_quality_face_is_reported_but_not_enrolled(plugin):
-    """It must not burn an unknown-N slot on a face it cannot match again."""
+    """It must not burn an unknown-person slot on a face it cannot match again."""
     _node, payloads = _run_one_frame(plugin, _FakeFrame.one(9, size=30, blur=4.0))
     face = payloads[0]["faces"][0]
     assert face["person_id"] is None
@@ -472,7 +474,7 @@ def test_several_people_in_one_frame_are_all_reported(plugin):
     payload = payloads[0]
     assert payload["count"] == 2
     ids = {face["person_id"] for face in payload["faces"]}
-    assert ids == {"unknown-1", "unknown-2"}      # ambiguity only blocks enrolment
+    assert ids == {"p-1", "p-2"}      # ambiguity only blocks enrolment
 
 
 # ── register_by_photo ───────────────────────────────────────────────────────
@@ -595,7 +597,7 @@ def test_registering_a_tracked_stranger_promotes_their_unknown_id(plugin, tmp_pa
     """The id already on the activity stream must survive being named."""
     _node, payloads = _run_one_frame(plugin, _FakeFrame.one(21))
     unknown_id = payloads[0]["faces"][0]["person_id"]
-    assert unknown_id == "unknown-1"
+    assert unknown_id == "p-1"
 
     path = _write_photo(tmp_path, "b.jpg", _FakeFrame.one(21))
     result = plugin.dispatch("face_recognition", {
