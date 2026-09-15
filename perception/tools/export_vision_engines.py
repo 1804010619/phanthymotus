@@ -24,6 +24,25 @@ image's own CMD sources it for exactly this reason.
 The image must still carry ultralytics, which the runtime image no longer does
 — use a pre-removal tag, or pip install it into the throwaway container.
 
+Install the export-only dependencies yourself, pinning numpy to whatever the
+image ships:
+
+    pip3 install -i <reachable-mirror> onnx onnxslim "numpy==$(python3 -c 'import numpy;print(numpy.__version__)')"
+
+Three reasons, each of which cost a failed build:
+
+* **onnx is not in the image** and ultralytics' AutoUpdate cannot install it
+  here — the Orins reach github.com but not pypi.org, so the automatic
+  `pip install` fails and the export dies on `No module named 'onnx'`. Naming
+  a reachable mirror is the fix; `mirrors.tencent.com` works from the office.
+* **Pin numpy or onnx will raise it**, and the base's cv2 and torch are built
+  against the version the image ships. Unpinned, the next import fails with
+  `numpy.core.multiarray failed to import`.
+* **Never run this in a live container.** AutoUpdate, when it does have a
+  route, silently installs onnx and drags protobuf from 3.6.1 to 5.x — a
+  shared dependency of onnxruntime and sherpa. A running perception container
+  was polluted that way once, and `docker restart` does not undo it.
+
 The engines MUST come from ultralytics' own exporter rather than trtexec: the
 plugins load them back through `YOLO("....engine")`, and that loader requires
 the metadata the ultralytics exporter embeds. A trtexec-built engine

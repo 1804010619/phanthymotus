@@ -2100,11 +2100,17 @@ Orins memory, not GPU time, is what runs out.
 ### Building the engines
 
 ```bash
-# INSIDE a container from the target perception image — not on the Jetson host.
+# INSIDE a container from the target perception image — not on the Jetson host,
+# and never in a live one. Pin numpy to what the image ships, and name a
+# reachable mirror: the Orins reach github.com but not pypi.org.
 docker run --rm --runtime nvidia --network host \
   -v "$PWD/out:/work/exp" -w /work/exp -e YOLO_CONFIG_DIR=/work/exp \
-  --entrypoint bash <perception-image> -lc \
-  'source /etc/dla-fallback.env; python3 export_vision_engines.py --out /work/exp/engines'
+  --entrypoint bash <perception-image-with-ultralytics> -lc '
+    source /etc/dla-fallback.env
+    pip3 install -i https://mirrors.tencent.com/pypi/simple/ onnx onnxslim \
+      "numpy==$(python3 -c "import numpy;print(numpy.__version__)")"
+    python3 /work/exp/export_vision_engines.py --out /work/exp/engines --workspace 2
+  '
 ```
 
 Three traps, all observed:
@@ -2128,7 +2134,15 @@ Three traps, all observed:
 * **Cap the builder workspace.** Jetson memory is shared between CPU and GPU;
   an unbounded workspace got the jp5.11 build OOM-killed mid-`[GpuLayer]` with
   no Python traceback — just `Killed`. `--workspace 2` is the default here for
-  that reason.
+  that reason. Stopping the host's own containers first helps too, and also
+  makes any timing measured afterwards mean something.
+* **Pin numpy when installing the export dependencies.** onnx raises it
+  otherwise, and the base's cv2 and torch are built against the version the
+  image ships — the next import dies with `numpy.core.multiarray failed to
+  import`. And do not let ultralytics' AutoUpdate install onnx for you: given a
+  route it also drags protobuf from 3.6.1 to 5.x, which onnxruntime and sherpa
+  share. That is how a live perception container got polluted once; `docker
+  restart` does not undo it.
 
 Then upload to COS and pin size + SHA256 in `utils/model_downloader.py` — of
 the copy **downloaded back from COS**, not the local file, for the reason the
