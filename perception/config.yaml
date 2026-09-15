@@ -140,18 +140,31 @@ plugins:
     # rather than silently ignore it. To change what vop can detect, edit
     # tools/export_vision_engines.py, rebuild, and republish the bundle.
 
-  vdp:
-    # Monocular depth. Off by default: it is a second engine resident alongside
-    # vop/OCR/ASR/TTS, and on the 8 GB Orins memory — not GPU time — is the
-    # binding constraint. Turn it on where something actually consumes depth.
-    enabled: false
+  # Was `vdp:` for one release; main.py still reads that spelling from a
+  # config.yaml already on a machine, and the tool answers to `vdp_*` too.
+  visual_depth:
+    # Monocular depth. On by default, so the card is there to wire up without
+    # editing a file on the robot first.
+    #
+    # It is a second resident engine next to vop/OCR/ASR/TTS, and on the 8 GB
+    # Orins memory — not GPU time — is the binding constraint. The engine is
+    # loaded lazily on the first `start`, so an enabled-but-unwired card costs
+    # nothing; the cost appears once something actually subscribes. On a tight
+    # machine that does not consume depth, set this to false.
+    enabled: true
     namespace: ""       # auto-detect from hostname if empty
     fps: 2
-    # Uncalibrated output is RELATIVE, not metres, and is labelled as such in
-    # every published payload. Calibrate against the real camera before
-    # flipping `calibrated`, or downstream code will plan around made-up units.
-    depth_scale: 1.0
-    calibrated: false
+    # Output is METRES. ultralytics bakes its metric fit into the exported
+    # engine (Depth.forward applies cal_a/cal_b before the export branch), and
+    # the released yolo26n-depth weights ship with that fit done — verified on
+    # Orin5 against the reference .pt on the same photos.
+    #
+    # These two are a *site* refit on top of it, for when the generic fit is
+    # off for a particular camera: metres_out = metres_in**cal_a * exp(cal_b).
+    # Same parameterisation ultralytics' model.calibrate() produces, so a fit
+    # from there pastes in unchanged. 1.0 / 0.0 = trust the engine.
+    cal_a: 1.0
+    cal_b: 0.0
     max_depth_m: 20.0
 
   ocr:

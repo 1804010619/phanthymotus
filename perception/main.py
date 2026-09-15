@@ -2,8 +2,17 @@
 """
 perception/main.py — Perception Stack bundle 统一入口。
 
-读取 config.yaml，按插件配置加载 ASRPlugin / TTSPlugin（以及未来的 VLM、SLAM 等），
-聚合成一个 MCP HTTP server 对外暴露。
+读取 config.yaml，按插件配置加载各感知插件，聚合成一个 MCP HTTP server 对外暴露：
+
+  asr              语音识别（VAD + 唤醒词 + 多后端 ASR）
+  tts              语音合成（VITS2 / Matcha / Kokoro，本地 TensorRT 或 ONNX）
+  vop              物体检测（YOLOE-26 + TensorRT）
+  visual_depth     单目深度（YOLO26-depth + TensorRT）
+  ocr              文字识别（RapidOCR + TensorRT）
+  face_recognition 人脸识别与建库（InsightFace buffalo_sc）
+
+每个插件自带一个 `enabled` 开关，加载失败的插件不会拖垮其余插件 —— 它的卡片
+不出现在 dashboard 上，这一点是看得见的。
 
 MCP 工具命名规则：{plugin_prefix}_{tool_name}
   例：asr_info, asr_start, asr_stop, tts_info, tts_start, tts_speak
@@ -127,19 +136,22 @@ class PerceptionBundle:
             self._plugins.append(plugin)
             log.info("VideoObjectPerceptionPlugin loaded (namespace=%s)", namespace)
 
-        if plugins_cfg.get("vdp", {}).get("enabled", False):
+        # `vdp:` is the pre-rename spelling of this section; a config.yaml a
+        # machine already has on disk still uses it.
+        depth_cfg = plugins_cfg.get("visual_depth") or plugins_cfg.get("vdp") or {}
+        if depth_cfg.get("enabled", False):
             import re, socket
-            namespace = plugins_cfg["vdp"].get("namespace", "").strip()
+            namespace = depth_cfg.get("namespace", "").strip()
             if not namespace:
                 namespace = re.sub(r"[^a-zA-Z0-9_]", "_", socket.gethostname())
-            from plugins.vdp import VideoDepthPerceptionPlugin
+            from plugins.visual_depth import VideoDepthPerceptionPlugin
             # Guarded like TTSPlugin and FaceRecognitionPlugin: this one needs a
             # TensorRT engine bundle for the running JetPack line, and a machine
             # that cannot fetch it must still get ASR/TTS/VOP/OCR. The card
             # simply does not appear, which is visible in the dashboard.
             try:
                 self._plugins.append(
-                    VideoDepthPerceptionPlugin(plugins_cfg["vdp"], namespace, executor)
+                    VideoDepthPerceptionPlugin(depth_cfg, namespace, executor)
                 )
                 log.info("VideoDepthPerceptionPlugin loaded (namespace=%s)", namespace)
             except Exception:
@@ -167,17 +179,27 @@ class PerceptionBundle:
                           exc_info=True)
 
     def _plugin_for(self, full_name: str):
-        """Resolve a tool name to (plugin, action) by longest matching PREFIX.
+        """Resolve a tool name to (plugin, action) by longest matching prefix.
 
         Matching the *longest* prefix, not the first underscore-separated
-        segment: a PREFIX may itself contain an underscore (`face_recognition`),
+        segment: a prefix may itself contain an underscore (`face_recognition`),
         and splitting on the first `_` would look for a plugin called `face`,
         find none, and report the tool as unknown.
+
+        A plugin may also declare `ALIASES` — prefixes it answers to but does
+        not advertise. That is what keeps a card saved under an old tool name
+        working after a rename: `get_all_tools` publishes only PREFIX, so the
+        dashboard shows the new name, while an existing canvas card still
+        dispatches instead of going `state: error` on the next restart.
         """
-        for plugin in sorted(self._plugins, key=lambda p: -len(p.PREFIX)):
-            prefix = plugin.PREFIX
+        candidates = [(plugin.PREFIX, 0, plugin) for plugin in self._plugins]
+        candidates += [(alias, 1, plugin) for plugin in self._plugins
+                       for alias in getattr(plugin, "ALIASES", ())]
+        # Longest prefix first, and a real prefix ahead of an alias of the same
+        # length: whoever actually owns a name outranks whoever used to.
+        for prefix, _is_alias, plugin in sorted(candidates, key=lambda c: (-len(c[0]), c[1])):
             if full_name == prefix:
-                return plugin, prefix
+                return plugin, plugin.PREFIX
             if full_name.startswith(prefix + "_"):
                 return plugin, full_name[len(prefix) + 1:]
         return None, ""
@@ -586,7 +608,7 @@ def main():
 
         raised from `_take_subscription` when a node's handle is destroyed
         while the executor still holds it in its wait list. That is a bug in
-        whoever tore the node down (fixed in vop/vdp: leave the executor
+        whoever tore the node down (fixed in vop/visual_depth: leave the executor
         before destroying anything), but one plugin's teardown must not be
         able to silence the whole stack.
 

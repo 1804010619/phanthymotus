@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""tools/export_vision_engines.py — build the vop / vdp TensorRT engines.
+"""tools/export_vision_engines.py — build the vop / visual_depth TensorRT engines.
 
 Run this INSIDE a container built from the target perception image — not on the
 Jetson host, and not in any other container.
@@ -53,7 +53,7 @@ deserializes fine and is then rejected on load.
 
 Outputs, per model:
     yoloe-26s-seg.engine + vocab.json     (vop)
-    yolo26n-depth.engine                  (vdp)
+    yolo26n-depth.engine                  (visual_depth)
 
 Then upload to COS and record size + SHA256 of the *uploaded* copy (re-download
 it and hash that) in utils/model_downloader.py. See that file's bundle tables.
