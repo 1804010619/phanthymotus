@@ -959,3 +959,128 @@ def ensure_kokoro_model(model_dir: str, device: str = "gpu") -> str:
         entry,
     )
     return target
+
+
+# ── Vision engines (vop detection, vdp monocular depth) ─────────────────────
+#
+# Both plugins run a prebuilt TensorRT engine, so these follow OCR's shape:
+# one bundle per JetPack family, selected by the TensorRT that is actually
+# importable. Engines are not portable across TensorRT majors.
+#
+# They are produced by tools/export_vision_engines.py, which drives
+# ultralytics' exporter on a host of the matching JetPack line. What has to come
+# from ultralytics is the *ONNX*, with set_classes() already applied, or the
+# open-vocabulary class list is not baked into the weights at all. The engine
+# build itself could be done by trtexec — read_engine_file() strips the
+# ultralytics JSON header when present and accepts a plain engine otherwise —
+# but going through ultralytics end to end keeps the class names inside the
+# engine, which is where the plugin reads them from.
+#
+# vop's bundle also carries `vocab.json` beside the engine. That is the
+# fallback, not the source of truth: an engine exported without names would
+# otherwise leave vop labelling detections by index. The class list is frozen
+# into the weights at export time (ultralytics raises on set_classes() for an
+# exported model), so neither copy can be changed on a robot.
+VISION_MODEL_BASE = os.environ.get("VISION_MODEL_BASE_URL", f"{COS_BASE}/vision")
+
+# The jp61 bundle is built against TensorRT 10.4, which is what the jp6.1
+# *image* ships — not the 10.3 its Jetson hosts carry. An engine plan only
+# loads on the TensorRT that built it, so a bundle built on the host was
+# rejected by every jp6.1 robot. The version is in the path so the mismatch is
+# visible without deserializing anything.
+#
+# Every pin below was taken from the copy downloaded back out of COS, not from
+# the file that was uploaded — the point of the pin is to catch a bad transfer,
+# and hashing the source cannot. (Same note as THAI_TTS_ARCHIVE / KOKORO.)
+#
+# vocab.json is byte-identical across both families; the two bundles carry
+# their own copy anyway so a family is one self-contained download.
+_VOP_VOCAB = {
+    "size": 1969,
+    "sha256": "5aaa0f34df07fff0037318c4100f40bf55b62beb439b89f60b6641924f17fd3b",
+}
+
+VOP_MODEL_BUNDLES = {
+    "jp61": {
+        "base_url": f"{VISION_MODEL_BASE}/yoloe-26s-seg/tensorrt-jp61-trt10.4-orin-640",
+        "files": {
+            "yoloe-26s-seg.engine": {
+                "size": 24780908,
+                "sha256": "b8cb77a0685a399ef7d83dfc4d0777b54e66ea110d1085a005c4f153366e4099",
+            },
+            "vocab.json": _VOP_VOCAB,
+        },
+    },
+    "jp511": {
+        "base_url": f"{VISION_MODEL_BASE}/yoloe-26s-seg/tensorrt-jp511-trt8.5-orin-640",
+        "files": {
+            "yoloe-26s-seg.engine": {
+                "size": 23742701,
+                "sha256": "49df478a308de3a1f996d4784d2b00245486c04a40e0b7b6005b7226674da4fe",
+            },
+            "vocab.json": _VOP_VOCAB,
+        },
+    },
+}
+
+DEPTH_MODEL_BUNDLES = {
+    "jp61": {
+        "base_url": f"{VISION_MODEL_BASE}/yolo26n-depth/tensorrt-jp61-trt10.4-orin-640",
+        "files": {
+            "yolo26n-depth.engine": {
+                "size": 14020431,
+                "sha256": "d7fd1096fd2d29226b85693693a9ec11b65b0097ad0e783803b5fc7218d8f23b",
+            },
+        },
+    },
+    "jp511": {
+        "base_url": f"{VISION_MODEL_BASE}/yolo26n-depth/tensorrt-jp511-trt8.5-orin-640",
+        "files": {
+            "yolo26n-depth.engine": {
+                "size": 13059848,
+                "sha256": "2f9da78b4eb689a30860996c7b962770fd09d4d86a4578f1010844c3ef6d68c5",
+            },
+        },
+    },
+}
+
+
+def _ensure_vision_bundle(
+    kind: str, bundles: dict, model_dir: str, family: str | None = None
+) -> dict[str, str]:
+    """Shared body of ensure_vop_model / ensure_depth_model.
+
+    Refuses an unpinned entry rather than downloading it, for the reason
+    ensure_kokoro_model states: every other model here is size+SHA256 verified,
+    and a placeholder would be the one hole in that. A bundle whose pins are
+    still zero has not been published yet.
+    """
+    model_dir = require_models_subpath(model_dir)
+    key = select_bundle_family(bundles, family)
+    entry = bundles[key]
+    unpinned = [
+        name for name, meta in entry["files"].items()
+        if not meta.get("sha256") or not meta.get("size")
+    ]
+    if unpinned:
+        raise RuntimeError(
+            f"{kind.upper()}_MODEL_BUNDLES[{key!r}] has no pinned size/sha256 for "
+            f"{sorted(unpinned)} — build the engine with "
+            "tools/export_vision_engines.py on a host of that JetPack line, "
+            "publish it to COS, and record the size and SHA256 of the *uploaded* "
+            "copy here"
+        )
+    log.info(f"[model_downloader] {kind}: using {key} bundle")
+    return ensure_verified_bundle(
+        f"{kind}/{key}", model_dir, entry["base_url"], entry["files"]
+    )
+
+
+def ensure_vop_model(model_dir: str, family: str | None = None) -> dict[str, str]:
+    """Ensure the vop detection engine + its frozen vocabulary are present."""
+    return _ensure_vision_bundle("vop", VOP_MODEL_BUNDLES, model_dir, family)
+
+
+def ensure_depth_model(model_dir: str, family: str | None = None) -> dict[str, str]:
+    """Ensure the monocular depth engine matching the runtime TensorRT is present."""
+    return _ensure_vision_bundle("depth", DEPTH_MODEL_BUNDLES, model_dir, family)

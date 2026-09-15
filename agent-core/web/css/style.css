@@ -642,6 +642,24 @@ html, body {
 .tool-config-label:first-child {
   margin-top: 0;
 }
+/* Tool-level description above the fields. Kept visually quieter than a label
+   so it reads as context rather than as another setting, and allowed to wrap —
+   a tool that has to state a fixed capability (vop's frozen class list) needs
+   more than one line. */
+.tool-config-desc {
+  margin: 0 0 4px;
+  padding: 8px 10px;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--text-secondary);
+  background: var(--bg-subtle, rgba(127, 127, 127, 0.08));
+  border-radius: 6px;
+}
+/* The description occupies :first-child, so the first real label would lose
+   its zero top-margin and sit too close to it. */
+.tool-config-desc + .tool-config-label {
+  margin-top: 14px;
+}
 .tool-config-input {
   width: 100%;
   padding: 10px 12px;
@@ -1635,6 +1653,13 @@ html, body {
   cursor: text;
 }
 .canvas-result-pre.error { color: var(--red); }
+/* The box is focusable so Ctrl/Cmd+A can be scoped to it; without a visible
+   focus ring, which key went where would be guesswork. */
+.canvas-result-pre:focus,
+.canvas-result-pre:focus-visible {
+  outline: 2px solid var(--accent, #c8714b);
+  outline-offset: 1px;
+}
 
 /* ── Flow Area (keep for backward compat if referenced) ───────────────── */
 .flow-area {

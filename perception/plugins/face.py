@@ -55,6 +55,18 @@ from utils.log_sampling import SampledLogGate, escape_log_text
 from utils.qos import CAMERA_QOS
 from utils.ros_lifecycle import dispose_node
 
+from plugins import image_input as _img
+# Shared with vop and ocr, which grew the same *_by_photo / *_by_url
+# actions. The local names are kept so the rest of this file is unchanged;
+# the rules they enforce are security properties, so there is one copy.
+from plugins.image_input import (
+    BadInput as _BadInput,
+    check_under_roots as _check_under_roots,
+    fetch_url as _fetch_url,
+    image_roots as _image_roots,
+    load_image_bytes as _load_image_bytes_shared,
+    read_local as _read_local,
+)
 from plugins.face_db import (
     DEFAULT_DB_DIR,
     DEFAULT_VISIT_CHECKPOINT_S,
@@ -98,11 +110,11 @@ DEFAULT_MAX_BATCH = 200
 # downscaled locally (see FaceAnalyzer.decode_image) rather than rejected, so
 # this only has to be larger than any real photo. 64 MB covers a 60 MP
 # uncompressed-ish PNG; the pixel cap is what actually protects memory.
-DEFAULT_MAX_IMAGE_BYTES = 64 * 1024 * 1024
+DEFAULT_MAX_IMAGE_BYTES = _img.DEFAULT_MAX_IMAGE_BYTES
 # /models/uploads is where the file-intake endpoint writes (see
 # utils/file_intake.py and the `file_intake` block in config.yaml); /models is
 # already listed, which covers it.
-DEFAULT_IMAGE_ROOTS = ("/models", "/tmp", "/work")
+DEFAULT_IMAGE_ROOTS = _img.DEFAULT_IMAGE_ROOTS
 
 
 def detect_interval(cfg: dict) -> float:
@@ -279,28 +291,13 @@ REASON_NO_FACE = "no_face"
 REASON_LOW_QUALITY = "low_quality"
 REASON_AMBIGUOUS = "ambiguous_subject"
 REASON_NO_FRAMES = "no_frames"
-REASON_BAD_INPUT = "bad_input"
+REASON_BAD_INPUT = _img.REASON_BAD_INPUT
 
 # Which reason to report when frames in a window disagree. Ordered by what the
 # operator has to change: move people out of shot, then get closer / hold
 # still, then point the camera at somebody at all. Reporting "no clear face"
 # for a window that mostly contained a crowd sends them to fix the wrong thing.
 _REASON_PRECEDENCE = (REASON_AMBIGUOUS, REASON_LOW_QUALITY, REASON_NO_FACE)
-
-
-class _BadInput(Exception):
-    """An image or package could not be loaded. Carries the caller-facing detail."""
-
-    def __init__(self, detail: str, source: str = ""):
-        super().__init__(detail)
-        self.detail = detail
-        self.source = source
-
-    def as_result(self) -> dict:
-        result = {"ok": False, "reason": REASON_BAD_INPUT, "detail": self.detail}
-        if self.source:
-            result["source"] = self.source
-        return result
 
 
 def _face_output_topic(input_topic: str) -> str:
@@ -559,112 +556,14 @@ def _worst_reason(failures: list[dict]) -> dict:
     }
 
 
-# ── image sources ─────────────────────────────────────────────────────────────
-
 def _load_image_bytes(args: dict, cfg: dict) -> tuple[bytes, str]:
-    """Read image bytes from `url` or `image_path`.
+    """The shared loader, naming this plugin's own action in any rejection.
 
-    **Deliberately no base64 input.** It was there, and an LLM failed on it
-    twice in production: a 43 800-character string is not something a model can
-    carry through its own context reliably, and what arrived was truncated, so
-    the decoder correctly refused it. Both remaining channels move a *reference*
-    instead of the bytes.
-
-    The byte ceiling here is a transfer/memory guard, not a policy limit: an
-    image that is merely *large* is downscaled and converted locally by
-    `FaceAnalyzer.decode_image`, because "your photo is 24 MB" or "we only take
-    JPEG" is a limitation of ours rather than a property of their photo.
-
-    `url` is its own action (`register_by_url`) rather than a parameter
-    smuggled into the photo path, so the capability is visible on the card. Note
-    it does let a caller make this container issue an outbound request —
-    acceptable for a deliberate, named action, which is why it is not folded
-    into the generic input.
+    The generic module cannot know whether the caller should be pointed at
+    register_by_url or recognize_by_url; telling them 'the _by_url action'
+    leaves them to go and find which one that is.
     """
-    max_bytes = int(cfg.get("max_image_bytes", DEFAULT_MAX_IMAGE_BYTES))
-
-    if args.get("image_b64"):
-        # Say what to do instead, rather than silently ignoring the argument:
-        # the model that reaches for base64 has the file in hand already.
-        raise _BadInput(
-            "image_b64 is no longer accepted — a long base64 string does not "
-            "survive being carried through an LLM's context. Upload the file "
-            "through POST /api/mcp/<mcp_id>/file/upload and pass the path it "
-            "returns as image_path, or use register_by_url.",
-            "image_b64",
-        )
-
-    url = args.get("url") or args.get("image_url")
-    if url:
-        return _fetch_url(str(url), max_bytes), str(url)
-
-    path = args.get("image_path")
-    if path:
-        return _read_local(str(path), cfg, max_bytes), str(path)
-
-    raise _BadInput("one of image_path or url is required")
-
-
-def _image_roots(cfg: dict) -> tuple[str, ...]:
-    roots = cfg.get("image_roots") or DEFAULT_IMAGE_ROOTS
-    return tuple(os.path.realpath(str(root)) for root in roots)
-
-
-def _check_under_roots(path: str, cfg: dict) -> str:
-    """Confine caller-supplied paths to the configured roots.
-
-    The MCP server has no authentication and runs as root in the container, so
-    an unrestricted path would let any LAN caller probe the filesystem by
-    asking whether a file decodes as an image. Symlinks are resolved first —
-    a link inside a root pointing outside it would otherwise pass.
-    """
-    resolved = os.path.realpath(path)
-    roots = _image_roots(cfg)
-    if any(resolved == root or resolved.startswith(root + os.sep) for root in roots):
-        return resolved
-    # A caller that names a plausible-but-invisible path is almost always
-    # another container's filesystem — agent-core's /work and /tmp are its own,
-    # which is exactly how the first LLM attempt failed. Say where to put it.
-    raise _BadInput(
-        f"path must be under one of {', '.join(roots)}: got {path!r}. "
-        "If you are writing the file from another container (e.g. agent-core), "
-        "If you are calling from another container, upload the file through "
-        "POST /api/mcp/<mcp_id>/file/upload — the reply carries a path this "
-        "container can open — or use register_by_url.",
-        path,
-    )
-
-
-def _read_local(path: str, cfg: dict, max_bytes: int) -> bytes:
-    resolved = _check_under_roots(path, cfg)
-    try:
-        if os.path.isdir(resolved):
-            raise _BadInput(f"{path!r} is a directory, not an image", path)
-        size = os.path.getsize(resolved)
-        if size > max_bytes:
-            raise _BadInput(
-                    f"file is {size} bytes, over the {max_bytes} byte transfer cap "
-                "(raise max_image_bytes if this is a real photo)", path
-            )
-        with open(resolved, "rb") as handle:
-            return handle.read()
-    except OSError as error:
-        raise _BadInput(f"cannot read {path!r}: {error}", path) from error
-
-
-def _fetch_url(url: str, max_bytes: int) -> bytes:
-    if not url.lower().startswith(("http://", "https://")):
-        raise _BadInput(f"only http(s) URLs are supported: {url!r}", url)
-    try:
-        with urllib.request.urlopen(url, timeout=20) as response:
-            data = response.read(max_bytes + 1)
-    except (urllib.error.URLError, OSError, ValueError) as error:
-        raise _BadInput(f"cannot fetch {url!r}: {error}", url) from error
-    if len(data) > max_bytes:
-        raise _BadInput(f"download exceeds the {max_bytes} byte limit", url)
-    if not data:
-        raise _BadInput(f"{url!r} returned no data", url)
-    return data
+    return _load_image_bytes_shared(args, cfg, url_action="register_by_url")
 
 
 # ── package extraction ────────────────────────────────────────────────────────

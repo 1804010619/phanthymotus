@@ -1996,12 +1996,192 @@ transcribed and TTS still speaks with the card running.
 
 ---
 
+## Vision: `vop` (detection) and `vdp` (depth)
+
+Both run a **prebuilt TensorRT engine** fetched as a pinned bundle
+(`utils/model_downloader.py` → `ensure_vop_model` / `ensure_depth_model`), the
+same distribution shape OCR uses. Neither loads a `.pt` at runtime, and neither
+falls back to PyTorch if the bundle is missing — it fails loudly instead.
+
+### Why TensorRT *directly*, and not through ultralytics
+
+End-to-end per frame, batch 1 at 640, **Orin 5 with its containers stopped** so
+nothing else was competing — same machine, same conditions, 144 classes:
+
+| Path | ms/frame |
+|------|----------|
+| `yolov8s-worldv2`, PyTorch eager — what this replaced | 31.9 |
+| `yoloe-26s-seg`, TensorRT through `vision_runtime` | **19.8** |
+| `yolo26n-depth`, TensorRT through `vision_runtime` | **12.5** |
+
+1.6x on detection, and a better model with it. The road there is worth
+recording, because two plausible beliefs turned out to be false:
+
+* **Swapping the backend under ultralytics changes nothing.** On one machine,
+  eager measured 35.6 ms and the same network as a TensorRT engine *loaded by
+  ultralytics* measured 37.3 ms. Its Python pre/post-processing costs ~30 ms
+  whichever backend sits underneath. The win only exists if that path is
+  bypassed — hence this module.
+* **It was never going to be 8x.** An early `trtexec --useCudaGraph
+  --noDataTransfers` run measured 4.9 ms and was read as the achievable floor.
+  It is not: that excludes both memory transfers and the Python around them,
+  and it was on jp6.1. Measured properly, GPU compute alone is 12.3 ms
+  (detection) and 8.2 ms (depth) on jp5.11's TensorRT 8.5, CUDA graphs buy ~11%
+  on top, and host↔device copies are genuinely cheap (4.9 MB H2D = 0.8 ms).
+  Most of what remains is the engine, not the wrapper.
+
+Two measurement traps this walked into, both worth avoiding next time:
+
+* **Eager mode measures Python, not the network.** `n` and `s`, 640 and 768,
+  all landed within a few ms, and a plain `yolo26n` detector measured *slower*
+  than a depth model with a dense head. Model comparisons run in eager mode on
+  this hardware are meaningless.
+* **A busy board depresses everything.** The same code measured 33.8 ms on
+  Orin 6 with agent-core and perception running, and 19.8 ms on a quiet Orin 5
+  — despite Orin 6 having the newer, faster TensorRT. Benchmark on an idle
+  machine or the numbers say more about the neighbours than the change.
+
+So `plugins/vision_runtime.py` drives `utils.tensorrt_runtime.TensorRTEngine`
+with its own letterbox and decode, exactly as `plugins/ocr_runtime.py` does.
+ultralytics is a **build-time** dependency now — it exports the engine and
+nothing else.
+
+The decoders assume engines exported with `nms=False`, i.e. YOLO26's NMS-free
+end-to-end head whose output is already final boxes. `yoloe-26s-seg` emits two
+tensors: `(1, 300, 38)` — 4 box + score + class + 32 mask coefficients, the
+last 32 ignored — and `(1, 32, 160, 160)` mask prototypes.
+
+**Both decoders pick their tensor by content, never by index.** TensorRT 10.3
+(jp6.1) lists that pair as `['output0', 'output1']` and TensorRT 8.5 (jp5.11)
+lists it as `['output1', 'output0']`, so `outputs[0]` is the boxes on one
+JetPack line and the mask prototypes on the other. Code written and tested
+against a single line looks completely correct and fails on the other one.
+Orientation is settled the same way — scores confined to [0, 1] beside
+integral class ids — and a layout that matches nothing raises, because every
+wrong reading of those numbers still produces plausible-looking boxes.
+
+### vop's vocabulary is frozen at export time
+
+`YOLOE-26` is open-vocabulary, but ultralytics bakes the class list into the
+weights when it exports; on an exported model `set_classes()` raises. So:
+
+* the `set_classes` action is **gone from the tool schema** and `dispatch`
+  answers it with an error naming the baked vocabulary;
+* a `classes:` key in yaml or on a canvas card makes `config` **fail** rather
+  than apply the rest and drop `classes` on the floor;
+* `info` reports `vocabulary_frozen`, the full class list, and — if something
+  asked for classes this build cannot honour — `ignored_config_classes`.
+
+This is deliberate. A card that silently detects a different set than its
+config states is much worse than one that refuses.
+
+To change what vop detects: edit `ROBOT_EXTRA` in
+`tools/export_vision_engines.py`, rebuild on a host of each JetPack line,
+republish, re-pin.
+
+The plugin never restates the vocabulary. It reads it from the **engine's own
+metadata** — written by the same export that baked the classes into the
+weights, so it cannot drift out of order or out of date — and falls back to the
+`vocab.json` shipped in the bundle only for an engine built without names.
+
+Legacy model names (`yolov8s-worldv2`, `yolov8s-world`, `yoloe-26s`) still
+resolve — a card saved before the switch must not come back as `state: error`.
+
+### vdp's depth is relative until it is calibrated
+
+The released weights predict on an unbounded log scale. Absolute metres need
+`model.calibrate()` against the actual camera. Until then every payload carries
+`"scale": "relative"` and `info` warns. Do not set `calibrated: true` to make
+the warning go away — downstream code will plan around invented units.
+
+`vdp` is **off by default**: it is a second resident engine, and on the 8 GB
+Orins memory, not GPU time, is what runs out.
+
+### Building the engines
+
+```bash
+# INSIDE a container from the target perception image — not on the Jetson host,
+# and never in a live one. Pin numpy to what the image ships, and name a
+# reachable mirror: the Orins reach github.com but not pypi.org.
+docker run --rm --runtime nvidia --network host \
+  -v "$PWD/out:/work/exp" -w /work/exp -e YOLO_CONFIG_DIR=/work/exp \
+  --entrypoint bash <perception-image-with-ultralytics> -lc '
+    source /etc/dla-fallback.env
+    pip3 install -i https://mirrors.tencent.com/pypi/simple/ onnx onnxslim \
+      "numpy==$(python3 -c "import numpy;print(numpy.__version__)")"
+    python3 /work/exp/export_vision_engines.py --out /work/exp/engines --workspace 2
+  '
+```
+
+Three traps, all observed:
+
+* **The image's TensorRT is what counts, not the host's.** An engine plan only
+  loads on the exact TensorRT that built it. Orin 6's *host* carries TensorRT
+  10.3 while the jp6.1 perception *image* carries 10.4, so engines built on
+  that host were rejected by every jp6.1 robot with "engine plan file is not
+  compatible … expecting library version 10.4.0.26". Build in a throwaway
+  container from the target image. `source /etc/dla-fallback.env` first, or
+  `import tensorrt` fails outright on vendor BSPs missing
+  libnvdla_compiler.so — which is why the image's CMD sources it.
+
+* **The ONNX must come from ultralytics, with the classes already set.**
+  `set_classes()` runs on the build host and bakes the vocabulary into the
+  weights; exporting without it produces an engine whose classes are numeric
+  and whose names metadata is useless. The engine *build* itself could be done
+  by trtexec — `utils.tensorrt_runtime.read_engine_file` strips the ultralytics
+  JSON header when present and accepts a plain engine otherwise — but the tool
+  uses ultralytics end to end so the class names travel inside the engine.
+* **Cap the builder workspace.** Jetson memory is shared between CPU and GPU;
+  an unbounded workspace got the jp5.11 build OOM-killed mid-`[GpuLayer]` with
+  no Python traceback — just `Killed`. `--workspace 2` is the default here for
+  that reason. Stopping the host's own containers first helps too, and also
+  makes any timing measured afterwards mean something.
+* **Pin numpy when installing the export dependencies.** onnx raises it
+  otherwise, and the base's cv2 and torch are built against the version the
+  image ships — the next import dies with `numpy.core.multiarray failed to
+  import`. And do not let ultralytics' AutoUpdate install onnx for you: given a
+  route it also drags protobuf from 3.6.1 to 5.x, which onnxruntime and sherpa
+  share. That is how a live perception container got polluted once; `docker
+  restart` does not undo it.
+
+Then upload to COS and pin size + SHA256 in `utils/model_downloader.py` — of
+the copy **downloaded back from COS**, not the local file, for the reason the
+other bundles in that file state.
+
+---
+
 ## Topic Naming
 
 | Direction | Topic pattern | Format |
 |-----------|--------------|--------|
 | Input (mic) | `/{namespace}/mic/audio` or `/{namespace}/ext_mic/{id}/audio` | `audio/pcm-16k` |
 | Output (ASR result) | `{input_topic}/asr` | `data/json` |
+| Output (vop) | `{input_topic}/objects` | `data/json` |
+| Output (vdp depth map) | `{input_topic}/depth` | `image/depth-zlib` |
+| Output (vdp summary) | `{input_topic}/depth_summary` | `data/json` |
+
+The depth map is **640x480 uint16 millimetres, zlib level 1**, published as a
+`CompressedImage` with `format="16UC1; compressedDepth zlib"`. The size is not
+negotiable: agent-core's `DepthZlibRenderer`
+(`web/js/renderers/camera.js`) allocates a fixed 640x480 canvas and returns
+early when the decompressed buffer is shorter, so a map published at the
+model's own resolution renders as a blank panel and logs nothing anywhere.
+`plugins/vdp.py` resamples before publishing and `encode_depth` refuses any
+other shape.
+
+Depth summary JSON:
+```json
+{
+  "scale": "relative",
+  "unit": "relative",
+  "nearest_by_region": {"left": 1.42, "center": 3.10, "right": null},
+  "range": [0.51, 18.3],
+  "valid_fraction": 0.98,
+  "timestamp": 1234567890.123
+}
+```
+`scale` is `"relative"` unless the camera has been calibrated; `null` for a
+region means it had no valid pixels.
 
 ASR result JSON:
 ```json

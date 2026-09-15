@@ -26,6 +26,7 @@ import logging
 import os
 import signal
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from socketserver import ThreadingMixIn
 
@@ -125,6 +126,25 @@ class PerceptionBundle:
             plugin = VideoObjectPerceptionPlugin(plugins_cfg["vop"], namespace, executor)
             self._plugins.append(plugin)
             log.info("VideoObjectPerceptionPlugin loaded (namespace=%s)", namespace)
+
+        if plugins_cfg.get("vdp", {}).get("enabled", False):
+            import re, socket
+            namespace = plugins_cfg["vdp"].get("namespace", "").strip()
+            if not namespace:
+                namespace = re.sub(r"[^a-zA-Z0-9_]", "_", socket.gethostname())
+            from plugins.vdp import VideoDepthPerceptionPlugin
+            # Guarded like TTSPlugin and FaceRecognitionPlugin: this one needs a
+            # TensorRT engine bundle for the running JetPack line, and a machine
+            # that cannot fetch it must still get ASR/TTS/VOP/OCR. The card
+            # simply does not appear, which is visible in the dashboard.
+            try:
+                self._plugins.append(
+                    VideoDepthPerceptionPlugin(plugins_cfg["vdp"], namespace, executor)
+                )
+                log.info("VideoDepthPerceptionPlugin loaded (namespace=%s)", namespace)
+            except Exception:
+                log.error("VideoDepthPerceptionPlugin failed to load; continuing without depth",
+                          exc_info=True)
 
         if plugins_cfg.get("ocr", {}).get("enabled", False):
             from plugins.ocr import OCRPlugin
@@ -553,7 +573,36 @@ def main():
     _bundle  = PerceptionBundle(cfg, executor)
 
     def _spin():
-        executor.spin()
+        """Spin the executor, surviving a single entity's teardown race.
+
+        `executor.spin()` used to run bare. Anything it raised killed this
+        daemon thread outright, and with it every subscription in the process —
+        ASR, OCR, vop, the lot — while the MCP HTTP server kept answering, so
+        the service looked healthy and simply stopped perceiving. The one
+        observed trigger was rclpy's
+
+            InvalidHandle: cannot use Destroyable because destruction was
+            requested
+
+        raised from `_take_subscription` when a node's handle is destroyed
+        while the executor still holds it in its wait list. That is a bug in
+        whoever tore the node down (fixed in vop/vdp: leave the executor
+        before destroying anything), but one plugin's teardown must not be
+        able to silence the whole stack.
+
+        So: log it and resume. The offending entity is already gone, so the
+        next spin proceeds without it. The delay is a brake against a tight
+        loop if some error turns out to be permanent — better a slow log than
+        a pegged core.
+        """
+        while True:
+            try:
+                executor.spin()
+                return                      # clean shutdown
+            except Exception:
+                log.exception("[spin] executor raised; resuming in 1s — "
+                              "ROS callbacks were interrupted")
+                time.sleep(1.0)
 
     threading.Thread(target=_spin, daemon=True, name="perception_spin").start()
 

@@ -873,7 +873,8 @@ function _buildCardEl({ id, mcpId, toolName, driverName, x, y, topicIn: savedTop
         const liveMcp2 = _allMcps.find(m => m.id === mcpId);
         const liveToolObj2 = (liveMcp2?.tools || []).find(t => (typeof t === 'string' ? t : t.name) === toolName);
         const liveConfigSchema = typeof liveToolObj2 === 'object' ? liveToolObj2.configSchema : null;
-        openInstanceConfigModal(mcpId, toolName, id, liveConfigSchema || configSchema);
+        openInstanceConfigModal(mcpId, toolName, id, liveConfigSchema || configSchema,
+          typeof liveToolObj2 === 'object' ? liveToolObj2.description : undefined);
       });
     }
 
@@ -1087,7 +1088,8 @@ function _buildCardEl({ id, mcpId, toolName, driverName, x, y, topicIn: savedTop
         const liveMcp2 = _allMcps.find(m => m.id === mcpId);
         const liveToolObj2 = (liveMcp2?.tools || []).find(t => (typeof t === 'string' ? t : t.name) === toolName);
         const liveConfigSchema = typeof liveToolObj2 === 'object' ? liveToolObj2.configSchema : null;
-        openInstanceConfigModal(mcpId, toolName, id, liveConfigSchema || configSchema);
+        openInstanceConfigModal(mcpId, toolName, id, liveConfigSchema || configSchema,
+          typeof liveToolObj2 === 'object' ? liveToolObj2.description : undefined);
       });
     }
 
@@ -2271,11 +2273,10 @@ async function _executeCard(el, mcpId, toolName, instanceId) {
     const json = await res.json();
 
     if (json.code === 200) {
-      const resultText = typeof json.data === 'string'
-        ? json.data
-        : JSON.stringify(json.data, null, 2);
+      const resultText = _formatCallResult(json.data);
       _showResult(el, resultText, false);
-      _logActivity('mcp_result', `${toolName} → ${resultText}`);
+      // The panel can afford a 144-entry list; one log line cannot.
+      _logActivity('mcp_result', `${toolName} → ${_truncate(resultText, 400)}`);
     } else {
       const errText = json.message || '执行失败';
       _showResult(el, errText, true);
@@ -2290,6 +2291,50 @@ async function _executeCard(el, mcpId, toolName, instanceId) {
   }
 }
 
+function _truncate(text, limit) {
+  return text.length <= limit ? text : `${text.slice(0, limit)}… (${text.length} chars)`;
+}
+
+/**
+ * Render an MCP call result as something a human can read.
+ *
+ * `data` arrives as the MCP content envelope — `[{type:"text", text:"..."}]` —
+ * whose single text part is itself usually a JSON *string*. Stringifying the
+ * envelope therefore showed the wrapper plus an escaped payload: `\"ok\": true`
+ * and every non-ASCII character as `\uXXXX`, so a Chinese OCR result was
+ * unreadable in the one place it matters.
+ *
+ * Unwrap, then parse if it parses. JSON.stringify does not escape non-ASCII, so
+ * pretty-printing the parsed object is also what makes the text legible again.
+ * Anything that is not JSON is shown as the plain string it is, which is still
+ * better than the envelope around it.
+ */
+function _formatCallResult(data) {
+  let payload = data;
+
+  if (Array.isArray(payload)) {
+    const parts = payload
+      .map(part => (typeof part === 'string' ? part : part?.text))
+      .filter(part => typeof part === 'string');
+    // Several parts is rare but legal; keep them all rather than silently
+    // showing only the first.
+    if (parts.length) payload = parts.join('\n');
+  }
+
+  if (typeof payload === 'string') {
+    const trimmed = payload.trim();
+    // Only attempt a parse on something that could be JSON — otherwise a bare
+    // number or the word "true" would be reformatted into something the
+    // service never said.
+    if (/^[[{]/.test(trimmed)) {
+      try { return JSON.stringify(JSON.parse(trimmed), null, 2); } catch { /* not JSON */ }
+    }
+    return payload;
+  }
+
+  return payload === undefined ? '' : JSON.stringify(payload, null, 2);
+}
+
 function _showResult(el, text, isError) {
   const existing = el.querySelector('.canvas-result');
   if (existing) existing.remove();
@@ -2298,8 +2343,29 @@ function _showResult(el, text, isError) {
   const pre = document.createElement('pre');
   pre.className = 'canvas-result-pre' + (isError ? ' error' : '');
   pre.textContent = text;
+  // Focusable so Ctrl/Cmd+A can be scoped to this box. A <pre> is not focusable
+  // by default, so select-all fell through to the document and selected the
+  // whole canvas — every card's text — instead of the result the user was
+  // trying to copy.
+  pre.tabIndex = 0;
+  pre.addEventListener('keydown', (event) => {
+    if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'a') {
+      event.preventDefault();
+      event.stopPropagation();
+      _selectElementText(pre);
+    }
+  });
   wrapper.appendChild(pre);
   el.appendChild(wrapper);
+}
+
+function _selectElementText(node) {
+  const selection = window.getSelection();
+  if (!selection) return;
+  const range = document.createRange();
+  range.selectNodeContents(node);
+  selection.removeAllRanges();
+  selection.addRange(range);
 }
 
 function _flashStartError(msg) {

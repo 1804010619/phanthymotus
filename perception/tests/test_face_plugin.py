@@ -30,6 +30,10 @@ from vision_stubs import (  # noqa: F401
 
 import plugins.face as face_plugin  # noqa: E402
 import plugins.face_db as face_db_module  # noqa: E402
+# The image-source helpers moved to plugins/image_input.py, shared with vop
+# and ocr. Patching them on face_plugin no longer intercepts anything: the
+# call now resolves inside that module.
+import plugins.image_input as image_input  # noqa: E402
 from plugins.face_db import EMBEDDING_DIM, FaceDB  # noqa: E402
 from plugins.face_runtime import DetectedFace  # noqa: E402
 
@@ -157,7 +161,7 @@ def _tmp_models(monkeypatch, tmp_path):
         face_db_module, "require_models_subpath", lambda path, root="/models": str(path)
     )
     monkeypatch.setattr(
-        face_plugin, "_image_roots", lambda cfg: (str(tmp_path),)
+        image_input, "image_roots", lambda cfg: (str(tmp_path),)
     )
 
 
@@ -1334,7 +1338,7 @@ def test_register_by_url_fetches_and_registers(plugin, monkeypatch):
         fetched['url'] = url
         return _FakeFrame.one(600)
 
-    monkeypatch.setattr(face_plugin, '_fetch_url', fake_fetch)
+    monkeypatch.setattr(image_input, 'fetch_url', fake_fetch)
     result = plugin.dispatch("face_recognition", {
         "action": "register_by_url",
         "url": "https://example.com/alice.jpg", "name": "Alice"})
@@ -1349,7 +1353,7 @@ def test_register_by_url_surfaces_a_fetch_failure(plugin, monkeypatch):
     def fake_fetch(url, max_bytes):
         raise face_plugin._BadInput(f"cannot fetch {url!r}: timed out", url)
 
-    monkeypatch.setattr(face_plugin, '_fetch_url', fake_fetch)
+    monkeypatch.setattr(image_input, 'fetch_url', fake_fetch)
     result = plugin.dispatch("face_recognition", {
         "action": "register_by_url", "url": "https://example.com/x.jpg"})
     assert result["ok"] is False
@@ -1360,7 +1364,7 @@ def test_register_by_url_surfaces_a_fetch_failure(plugin, monkeypatch):
 def test_recognize_by_url_is_its_own_action(plugin, monkeypatch):
     engine = plugin._require_engine()
     engine.db.add("Bob", [_unit(610)])
-    monkeypatch.setattr(face_plugin, '_fetch_url',
+    monkeypatch.setattr(image_input, 'fetch_url',
                         lambda url, max_bytes: _FakeFrame.one(610))
 
     result = plugin.dispatch("face_recognition", {
