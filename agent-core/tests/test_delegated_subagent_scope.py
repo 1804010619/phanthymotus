@@ -105,7 +105,19 @@ class TestDelegatedSubagentCannotUsePeerCall(unittest.TestCase):
         fake_instance = type('E', (), {'_sys_tools': fake_tools})()
         agent = Subagent(SubagentSpec(goal='说一句捧哏词', hop_count=hop_count),
                          agent_id='desk01')
-        with mock.patch('event.llm._event_instance', fake_instance):
+        # Patch through the module object, not the dotted string. `event.llm`
+        # is ambiguous: src/event/__init__.py rebinds the name `llm` on the
+        # package to an `Event()` *instance*, shadowing the submodule. Python
+        # 3.12's mock resolves the string by importing the module and finds
+        # `_event_instance`; 3.10's walks it with getattr, lands on the Event
+        # instance, and raises AttributeError. That made these five tests pass
+        # on a developer's 3.12 and fail on the 3.10 the image actually ships.
+        # NOT `import event.llm as llm_module`: that is `getattr(event, 'llm')`
+        # and walks into the same trap. import_module returns the sys.modules
+        # entry, which is the module itself.
+        import importlib
+        llm_module = importlib.import_module('event.llm')
+        with mock.patch.object(llm_module, '_event_instance', fake_instance):
             return {s['name'] for s in agent._get_desktop_tool_schemas()}
 
     def test_delegated_subagent_loses_peer_call(self):
