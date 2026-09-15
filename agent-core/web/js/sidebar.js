@@ -859,7 +859,7 @@ function _hideDetail() {
  * Open a config modal for a specific canvas card instance.
  * Only shows fields with scope === "instance".
  */
-export async function openInstanceConfigModal(mcpId, toolName, instanceId, configSchema) {
+export async function openInstanceConfigModal(mcpId, toolName, instanceId, configSchema, description) {
   if (isProjectRunning()) {
     alert('Stop agent before modifying');
     return;
@@ -872,6 +872,19 @@ export async function openInstanceConfigModal(mcpId, toolName, instanceId, confi
 
   titleEl.textContent = `Instance Config: ${toolName}`;
   bodyEl.innerHTML = '';
+
+  // The fields below state what can be *changed*; nothing else in this dialog
+  // states what the tool is or what it is fixed to. That gap is invisible for a
+  // tool whose settings are the whole story, and misleading for one whose
+  // capability is baked in at build time — vop runs a TensorRT engine with a
+  // frozen class list, so "confidence and fps" is the complete set of knobs and
+  // the dialog read as though the tool had simply lost its configuration.
+  if (description) {
+    const note = document.createElement('p');
+    note.className = 'tool-config-desc';
+    note.textContent = description;
+    bodyEl.appendChild(note);
+  }
 
   const props = (configSchema && configSchema.properties) || {};
   const required = (configSchema && configSchema.required) || [];
@@ -1027,7 +1040,12 @@ export async function openInstanceConfigModal(mcpId, toolName, instanceId, confi
   }
 
   if (!hasFields) {
-    bodyEl.innerHTML = '<p style="color:var(--text-secondary)">No instance config fields</p>';
+    // Appended, not assigned: replacing innerHTML here would wipe the
+    // description above, which is exactly the case where it matters most.
+    const empty = document.createElement('p');
+    empty.style.color = 'var(--text-secondary)';
+    empty.textContent = 'No instance config fields';
+    bodyEl.appendChild(empty);
   }
 
   const close = () => { overlay.classList.add('hidden'); };

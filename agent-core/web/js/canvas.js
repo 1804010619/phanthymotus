@@ -873,7 +873,8 @@ function _buildCardEl({ id, mcpId, toolName, driverName, x, y, topicIn: savedTop
         const liveMcp2 = _allMcps.find(m => m.id === mcpId);
         const liveToolObj2 = (liveMcp2?.tools || []).find(t => (typeof t === 'string' ? t : t.name) === toolName);
         const liveConfigSchema = typeof liveToolObj2 === 'object' ? liveToolObj2.configSchema : null;
-        openInstanceConfigModal(mcpId, toolName, id, liveConfigSchema || configSchema);
+        openInstanceConfigModal(mcpId, toolName, id, liveConfigSchema || configSchema,
+          typeof liveToolObj2 === 'object' ? liveToolObj2.description : undefined);
       });
     }
 
@@ -1087,7 +1088,8 @@ function _buildCardEl({ id, mcpId, toolName, driverName, x, y, topicIn: savedTop
         const liveMcp2 = _allMcps.find(m => m.id === mcpId);
         const liveToolObj2 = (liveMcp2?.tools || []).find(t => (typeof t === 'string' ? t : t.name) === toolName);
         const liveConfigSchema = typeof liveToolObj2 === 'object' ? liveToolObj2.configSchema : null;
-        openInstanceConfigModal(mcpId, toolName, id, liveConfigSchema || configSchema);
+        openInstanceConfigModal(mcpId, toolName, id, liveConfigSchema || configSchema,
+          typeof liveToolObj2 === 'object' ? liveToolObj2.description : undefined);
       });
     }
 
