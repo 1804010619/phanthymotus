@@ -504,6 +504,11 @@ function _findFreeSlot(placed, colSpan, rowSpan) {
 
 let _drag = null;     // { kind: 'move' | 'resize', ... }
 let _edgeTimer = null;
+let _hold = null;     // 触摸时的"按住不动"计时，见 _armHold
+
+// 按住多久算"拿起卡片"，以及这期间允许的手指晃动。
+const HOLD_MS = 450;
+const HOLD_SLOP = 8;
 
 /** Controls inside a card that must keep their own click behaviour. */
 function _isInteractive(target) {
@@ -515,9 +520,69 @@ function _beginPointer(e, topicPath, kind) {
   if (kind === 'move' && _isInteractive(e.target)) return;
   const card = _cards.get(topicPath);
   if (!card) return;
+
+  // 触摸：手指按下先一律当成滚动，按住不动 450ms 才算拿起卡片。
+  //
+  // 鼠标能把"滚动"和"拖动"分给两个不同的动作（滚轮 / 按住左键），触摸只有一个
+  // 手指，两件事的起手式一模一样。原来这里在 pointerdown 上就 preventDefault，
+  // 而在触摸上那等于取消本次手势的原生滚动 —— 结果是手指落在任何一张卡片上都
+  // 开始搬卡片，整个看板只能从卡片之间的缝隙里滚。默认必须是滚动：在手机上看
+  // 数据是常态，调位置是偶尔为之。
+  if (e.pointerType && e.pointerType !== 'mouse') {
+    _armHold(e, topicPath, card, kind);
+    return;
+  }
   e.preventDefault();
   e.stopPropagation();
+  _startDrag(e, topicPath, card, kind);
+}
 
+/** 手指按住不动到点，才真正进入拖动。中途移动或抬起则作罢，让页面照常滚。 */
+function _armHold(e, topicPath, card, kind) {
+  _cancelHold();
+  const startX = e.clientX, startY = e.clientY;
+  let last = e;
+
+  const onMove = (ev) => {
+    last = ev;
+    if (Math.abs(ev.clientX - startX) > HOLD_SLOP ||
+        Math.abs(ev.clientY - startY) > HOLD_SLOP) _cancelHold();
+  };
+  const onEnd = () => _cancelHold();
+
+  const timer = setTimeout(() => {
+    _cancelHold();
+    _startDrag(last, topicPath, card, kind);
+    // 手势已经开始但还没滚动（手指没动过），此时拦 touchmove 才拦得住页面滚动 ——
+    // pointermove 上的 preventDefault 对滚动没有作用。
+    document.addEventListener('touchmove', _blockTouchScroll, { passive: false });
+    card.el.classList.add('lifted');
+    navigator.vibrate?.(12);   // 拿起的确认；iOS Safari 没有，静默跳过
+  }, HOLD_MS);
+
+  _hold = { timer, onMove, onEnd };
+  document.addEventListener('pointermove', onMove);
+  document.addEventListener('pointerup', onEnd);
+  document.addEventListener('pointercancel', onEnd);
+  // 页面滚起来了就说明这是一次滚动，不是要搬卡片。
+  _grid.addEventListener('scroll', onEnd, { once: true });
+}
+
+function _cancelHold() {
+  if (!_hold) return;
+  clearTimeout(_hold.timer);
+  document.removeEventListener('pointermove', _hold.onMove);
+  document.removeEventListener('pointerup', _hold.onEnd);
+  document.removeEventListener('pointercancel', _hold.onEnd);
+  _grid.removeEventListener('scroll', _hold.onEnd);
+  _hold = null;
+}
+
+function _blockTouchScroll(e) {
+  if (_drag) e.preventDefault();
+}
+
+function _startDrag(e, topicPath, card, kind) {
   const pt = _pointerCell(e);
   const rowPitch = _rowPitch();
   const colPitch = _colPitch();
@@ -637,7 +702,7 @@ function _onPointerEnd() {
     _displace(topicPath, card, displacing);
   }
 
-  card.el.classList.remove('dragging', 'resizing', 'drag-invalid', 'drag-swap');
+  card.el.classList.remove('dragging', 'resizing', 'drag-invalid', 'drag-swap', 'lifted');
   const changed = moved && valid;
   const resized = changed && kind === 'resize';
   _drag = null;
@@ -645,6 +710,7 @@ function _onPointerEnd() {
   document.removeEventListener('pointermove', _onPointerMove);
   document.removeEventListener('pointerup', _onPointerEnd);
   document.removeEventListener('pointercancel', _onPointerEnd);
+  document.removeEventListener('touchmove', _blockTouchScroll, { passive: false });
 
   if (changed) _saveLayout();
   if (resized) _refreshRenderer(topicPath);

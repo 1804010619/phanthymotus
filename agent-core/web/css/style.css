@@ -4014,6 +4014,17 @@ html, body {
 .monitor-reset-btn {
   font-size: 11px !important;
 }
+/* 只对触摸设备说这句：鼠标上按住卡片就能直接拖，没有需要解释的隐藏手势。 */
+.monitor-drag-hint { display: none; }
+@media (pointer: coarse) {
+  .monitor-drag-hint {
+    display: inline;
+    margin-left: 10px;
+    font-size: 11px;
+    color: var(--text-dim);
+    letter-spacing: 0;
+  }
+}
 
 /* Dashboard grid — explicit cell-based layout (Apple widget style, 5 cols, rows grow) */
 .monitor-dashboard-grid {
@@ -4046,7 +4057,7 @@ html, body {
   flex-direction: column;
   overflow: hidden;
   position: relative;
-  transition: border-color 0.2s, box-shadow 0.2s;
+  transition: border-color 0.2s, box-shadow 0.2s, transform 0.15s;
   cursor: grab;
   /* The card chrome is a drag handle, so it must not be selectable text.
      Suppression used to rest entirely on a preventDefault() inside the drag
@@ -4077,6 +4088,18 @@ html, body {
   opacity: 0.6;
   z-index: 10;
   box-shadow: 0 8px 24px rgba(0,0,0,0.12);
+}
+/* 触摸上"按住拿起来了"必须看得见 —— 除了这个变化，用户没有别的方式知道下一次
+   移动是搬卡片而不是滚页面。 */
+.monitor-card.lifted {
+  opacity: 0.92;
+  transform: scale(1.03);
+  border-color: var(--accent);
+  box-shadow: 0 12px 28px rgba(0,0,0,0.18);
+}
+@media (prefers-reduced-motion: reduce) {
+  .monitor-card { transition: border-color 0.2s, box-shadow 0.2s; }
+  .monitor-card.lifted { transform: none; }   /* 边框和阴影仍然变，状态照样看得见 */
 }
 .monitor-card.drag-invalid {
   border-color: var(--red) !important;
