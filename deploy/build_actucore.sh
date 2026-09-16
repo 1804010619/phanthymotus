@@ -5,9 +5,12 @@
 # 没有 CPU 变体。
 #
 # Usage:
-#   ./build_actucore.sh                          # JetPack 5.11（默认），交互选源
-#   ./build_actucore.sh --jp-version 6.1         # JetPack 6.1
+#   ./build_actucore.sh                          # JetPack 6.1（唯一支持的线），交互选源
 #   ./build_actucore.sh --mirror tuna
+#
+# JetPack 5.11 不支持，也补不上：那条线的镜像是 Python 3.8，而 lerobot 要求
+# >= 3.10；jetson-ai-lab 也没有 jp5 索引可以换更新的 torch。
+# 基础镜像见 deploy/prepare_actucore_base.sh。
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -23,13 +26,22 @@ fi
 eval "$(parse_mirror_arg "$@")"
 
 # ── 解析参数 ─────────────────────────────────────────────────────────
-JP_VERSION="5.11"
+JP_VERSION="6.1"
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --jp-version) JP_VERSION="$2"; shift 2 ;;
         *) echo "Unknown option: $1"; exit 1 ;;
     esac
 done
+
+# Refuse rather than build something that cannot work: the jp5.11 image line is
+# Python 3.8 and lerobot requires >= 3.10, so the vla card's local provider
+# could never load there.
+if [ "${JP_VERSION}" != "6.1" ]; then
+    echo "[error] actucore 只支持 JetPack 6.1（收到 ${JP_VERSION}）。"
+    echo "        jp5.11 是 Python 3.8，lerobot 要求 >= 3.10。"
+    exit 1
+fi
 
 RESOURCE_CENTER_URL="${RESOURCE_CENTER_URL:-https://motus.phanthy.com}"
 
