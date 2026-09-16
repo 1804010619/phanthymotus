@@ -365,21 +365,56 @@ html, body {
    收起键和搜索框同一行。它原先待在一行只写着「工具」的标题行里，而那四个字
    搜索框的 placeholder 已经说过一遍，于是整整一个 ledge 的高度只换来一个重复的
    标签。现在这一行就是 ledge，搜索框吃掉左边，收起键守在右端。 */
-.sidebar-collapse-btn {
+/* ── Ledge icon button ──────────────────────────────────────────────────────
+   收起键这类图标按钮：命中区仍是整个 ledge 的方格，但**画出来**的只是里面一块
+   内缩的圆角面。原来是直接给按钮铺 `background: var(--bg-hover)`，于是 hover
+   时出现一块顶天立地、直角、紧贴着搜索框的灰方块，像表格裂开一条缝。
+   图标本身也从实心三角 ◀ / ▼ 换成描边折角，和顶栏那套 24×24、round cap 的图标
+   同一族。 */
+.ledge-icon-btn {
   flex-shrink: 0;
   width: var(--ledge-h);
   align-self: stretch;
+  position: relative;
+  display: grid;
+  place-items: center;
   background: none;
   border: none;
+  padding: 0;
   color: var(--text-dim);
-  font-size: 10px;
   cursor: pointer;
-  transition: transform .2s ease, background .15s;
+  -webkit-tap-highlight-color: transparent;
 }
-.sidebar-collapse-btn:hover { background: var(--bg-hover); }
+.ledge-icon-btn::before {
+  content: '';
+  position: absolute;
+  inset: 4px;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  transition: background .15s ease;
+}
+.ledge-icon-btn svg {
+  position: relative;
+  width: 15px;
+  height: 15px;
+  transition: transform .2s ease, color .15s ease;
+}
+.ledge-icon-btn:hover { color: var(--text); }
+.ledge-icon-btn:hover::before { background: var(--bg-hover); }
+.ledge-icon-btn:active::before { background: var(--border-med); }
+.ledge-icon-btn:active svg { transform: scale(0.88); }
+.ledge-icon-btn:focus-visible::before {
+  background: var(--bg-hover);
+  outline: 2px solid var(--accent);
+  outline-offset: -1px;
+}
+@media (prefers-reduced-motion: reduce) {
+  .ledge-icon-btn svg { transition: color .15s ease; }
+  .ledge-icon-btn:active svg { transform: none; }
+}
 
 .sidebar.collapsed { width: var(--sidebar-rail-w); }
-.sidebar.collapsed .sidebar-collapse-btn { transform: rotate(180deg); }
+.sidebar.collapsed .sidebar-collapse-btn svg { transform: rotate(180deg); }
 /* 收起后这一行只剩收起键 —— 它是唯一能再展开的入口，所以搜索框让位，键居中。 */
 .sidebar.collapsed .sidebar-filter { padding: 0; justify-content: center; }
 .sidebar.collapsed #sidebar-search { display: none; }
@@ -390,9 +425,8 @@ html, body {
 .sidebar.collapsed .sidebar-tool-list { display: none; }
 .sidebar.collapsed .sidebar-scroll { padding: 8px 0; gap: 10px; align-items: center; }
 .sidebar.collapsed .sidebar-section-header { padding: 0; justify-content: center; }
-/* 7px reads as a speck once it is the only thing in the column. */
-.sidebar.collapsed .sidebar-section-dot { width: 9px; height: 9px; }
-.sidebar.collapsed .sidebar-section-icon { font-size: 14px; }
+/* 只剩这一列时，13px 的图标偏小，放大到 16px。 */
+.sidebar.collapsed .sidebar-section-icon svg { width: 16px; height: 16px; }
 
 /* 侧栏的 ledge —— 与活动栏同一套：一行、一个高度、右端一个与行等宽的收起键。
    搜索框占满余下的宽度，因为那才是这行里真正会被用的东西。 */
@@ -449,28 +483,27 @@ html, body {
   padding: 4px 4px 2px;
 }
 
-.sidebar-section-dot {
-  width: 7px;
-  height: 7px;
-  border-radius: 50%;
-  flex-shrink: 0;
-  background: var(--text-dim);
-}
-.sidebar-section-dot.online  { background: var(--green); }
-.sidebar-section-dot.offline { background: var(--red); }
-.sidebar-section-dot.pending { background: var(--yellow); }
-
+/* 分区图标。尺寸按标签的字高来定：标签是 10px/700 的大写，13px 的图标盒子让
+   两者的视觉高度对齐；`display:block` 去掉 inline 元素的基线留白，剩下的垂直
+   居中由 .sidebar-section-header 的 align-items:center 负责。 */
 .sidebar-section-icon {
-  font-size: 12px;
-  color: var(--purple);
+  display: flex;
+  align-items: center;
   flex-shrink: 0;
+  color: var(--purple);
 }
-.sidebar-section-icon.controller {
-  color: var(--emerald);
+.sidebar-section-icon svg {
+  display: block;
+  width: 13px;
+  height: 13px;
 }
-.sidebar-section-icon.actucore {
-  color: var(--blue);
-}
+.sidebar-section-icon.controller { color: var(--emerald); }
+.sidebar-section-icon.actucore   { color: var(--blue); }
+/* driver 的颜色表示在线状态 —— 这件事原来由一个圆点承担。 */
+.sidebar-section-icon.driver          { color: var(--text-dim); }
+.sidebar-section-icon.driver.online   { color: var(--green); }
+.sidebar-section-icon.driver.offline  { color: var(--red); }
+.sidebar-section-icon.driver.pending  { color: var(--yellow); }
 
 .sidebar-section-name {
   font-size: 10px;
@@ -1917,22 +1950,11 @@ html, body {
 
 .activity-strip.collapsed .activity-log { display: none; }
 
-.activity-collapse-btn {
-  flex-shrink: 0;
-  width: var(--ledge-h);
-  align-self: stretch;
-  background: none;
-  border: none;
-  color: var(--text-dim);
-  font-size: 10px;
-  cursor: pointer;
-  transition: transform .25s ease, background .15s;
-}
-.activity-collapse-btn:hover { background: var(--bg-hover); }
+/* 几何与交互见 .ledge-icon-btn —— 两个面板的收起键共用一套。 */
 /* Points where the bar will go: down to shut it, up to bring it back. It used
    to rotate a quarter turn and read as a right-pointing arrow on a panel that
    only ever moves vertically. */
-.activity-strip.collapsed .activity-collapse-btn { transform: rotate(180deg); }
+.activity-strip.collapsed .activity-collapse-btn svg { transform: rotate(180deg); }
 
 .activity-log {
   flex: 1;
@@ -6326,7 +6348,7 @@ html, body {
   .activity-resize-handle { display: none; }
   .activity-strip.collapsed { height: auto !important; min-height: 0; }
   .activity-strip.collapsed .activity-log { display: block; }
-  .activity-strip.collapsed .activity-collapse-btn { transform: none; }
+  .activity-strip.collapsed .activity-collapse-btn svg { transform: none; }
   .activity-strip.mobile-log-open {
     transform: translateX(0);
   }
