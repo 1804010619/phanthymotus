@@ -115,5 +115,40 @@ class ResumePicksMainSessionTest(unittest.TestCase):
         self.assertIsNone(chat_history.get_last_session_turns())
 
 
+class SummaryTextTest(unittest.TestCase):
+    """会话列表的标题要是人说的那句话，不是事件信封。
+
+    trigger 文本常常是 `<event source=… channel=… ts=…>\\n{"text": "早上好。"}`，
+    而 summary 只存前 100 字 —— 整行都是属性，正文被截在外面，列表里看不出这是
+    哪一次对话。
+    """
+
+    def test_event_envelope_is_unwrapped(self):
+        raw = ('<event source="dds:/remote_control/message" channel="remote_web" '
+               'ts="2026-09-14T11:05:38">\n'
+               '{"text": "早上好，帮我看下电量", "audio_duration_ms": 1676}\n</event>')
+        self.assertEqual(chat_history.summary_text(raw), '早上好，帮我看下电量')
+
+    def test_plain_text_is_untouched(self):
+        self.assertEqual(chat_history.summary_text('普通文本触发'), '普通文本触发')
+
+    def test_non_json_body_survives(self):
+        self.assertEqual(
+            chat_history.summary_text('<event source="x">\n不是 JSON 的正文\n</event>'),
+            '不是 JSON 的正文')
+
+    def test_empty_body_falls_back_to_the_original(self):
+        raw = '<event source="x"></event>'
+        self.assertEqual(chat_history.summary_text(raw), raw)
+
+    def test_stored_summary_is_the_unwrapped_text(self):
+        sid = chat_history.create_session()
+        chat_history.save_turn(sid, 0, [{'role': 'user', 'content': 'x'}])
+        chat_history.update_summary(
+            sid, '<event source="dds:/a" ts="t">\n{"text": "把灯打开"}\n</event>')
+        summaries = {s['id']: s['summary'] for s in chat_history.list_sessions()[0]}
+        self.assertEqual(summaries[sid], '把灯打开')
+
+
 if __name__ == '__main__':
     unittest.main()

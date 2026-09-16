@@ -2,7 +2,7 @@
  * history.js — 历史日志 Modal（会话记录 + 任务管理）
  */
 
-let _overlay, _list, _chat, _btnDeleteSelected, _selectedIds;
+let _overlay, _list, _chat, _btnDeleteSelected, _selectedIds, _btnBack, _detailTitle;
 let _pollTimer = null;
 let _activeSessionId = null;
 let _activeTab = 'sessions';
@@ -24,6 +24,8 @@ export function initHistory() {
   _list = document.getElementById('history-list');
   _chat = document.getElementById('history-chat');
   _btnDeleteSelected = document.getElementById('history-delete-selected');
+  _btnBack = document.getElementById('history-back');
+  _detailTitle = document.getElementById('history-detail-title');
   _selectedIds = new Set();
 
   document.getElementById('btn-history').addEventListener('click', showHistory);
@@ -32,6 +34,7 @@ export function initHistory() {
   document.getElementById('history-clear-all').addEventListener('click', clearAll);
   document.getElementById('history-refresh').addEventListener('click', () => _refreshCurrentTab());
   _btnDeleteSelected.addEventListener('click', deleteSelected);
+  _btnBack.addEventListener('click', _closeDetail);
 
   // Tab switching
   _overlay.querySelectorAll('.history-tab').forEach(tab => {
@@ -49,6 +52,7 @@ export async function showHistory() {
 
 function hide() {
   _overlay.classList.add('hidden');
+  _closeDetail();
   _stopPoll();
 }
 
@@ -72,7 +76,7 @@ async function _loadSessions() {
     const data = await res.json();
     _renderList(data.sessions);
   } catch (e) {
-    _list.innerHTML = '<div class="history-empty">加载失败</div>';
+    _list.innerHTML = '<div class="history-empty">读不到会话列表。确认机器在线后点「刷新」重试。</div>';
     _listSig = '';
   }
 }
@@ -91,10 +95,23 @@ function _sessionKind(s) {
   return s.kind || 'main';
 }
 
-/** summary 里的 [subagent:id] / [bg] 已经由分区和 id 标签表达，正文里去掉。 */
+/** 列表标题：摘掉分区和 id 标签已经表达过的前缀，以及 `<event …>` 信封。
+ *
+ * 信封现在由后端 `summary_text` 在存之前就剥掉了，这里处理的是那之前存下的老记录：
+ * 它们存的是截断在 100 字的信封本身，正文早就被截掉了，剥完只剩 `{"text": …` 这种
+ * 残片。那种情况下退回信封里的 source —— 「这段对话从哪个渠道进来的」是这行里仅存
+ * 的有用信息，比一段 JSON 残片强。
+ */
 function _sessionTitle(s) {
-  const sum = (s.summary || '').replace(/^\[subagent:[^\]]+\]\s*/, '').replace(/^\[bg\]\s*/, '');
-  return sum || '(无标题)';
+  const raw = (s.summary || '')
+    .replace(/^\[subagent:[^\]]+\]\s*/, '')
+    .replace(/^\[bg\]\s*/, '');
+  if (!/<event\b/.test(raw)) return raw.trim() || '(无标题)';
+  const body = raw.replace(/<\/?event\b[^>]*>/g, '').trim();
+  // `{"text": …`（截断的 JSON）不算正文
+  if (body && !/^\{\s*"[^"]*"\s*:?\s*…?$/.test(body)) return body;
+  const source = raw.match(/source="([^"]+)"/);
+  return source ? `来自 ${source[1]}` : '(无标题)';
 }
 
 function _sessionAgentId(s) {
@@ -104,7 +121,7 @@ function _sessionAgentId(s) {
 
 function _renderList(sessions) {
   if (!sessions.length) {
-    _list.innerHTML = '<div class="history-empty">暂无对话记录</div>';
+    _list.innerHTML = '<div class="history-empty">还没有对话。代理收到消息或事件后，会话会出现在这里。</div>';
     _listSig = '';
     return;
   }
@@ -154,7 +171,7 @@ function _renderList(sessions) {
       const item = el.closest('.history-session-item');
       _list.querySelectorAll('.history-session-item').forEach(i => i.classList.remove('active'));
       item.classList.add('active');
-      _loadSession(item.dataset.id);
+      _loadSession(item.dataset.id, el.querySelector('.history-session-summary').textContent);
     });
   });
 
@@ -188,6 +205,7 @@ async function deleteSelected() {
 }
 
 function _clearChatPane() {
+  _closeDetail();
   _activeSessionId = null;
   _chatSig = '';
   _chat.innerHTML = '<div class="history-placeholder">选择一个会话查看对话记录</div>';
@@ -208,11 +226,24 @@ async function clearAll() {
   await _loadSessions();
 }
 
-async function _loadSession(sessionId) {
+async function _loadSession(sessionId, title = '') {
   _activeSessionId = sessionId;
   _chatSig = '';
   _chat.innerHTML = '<div class="history-placeholder">加载中…</div>';
+  _openDetail(title);
   await _fetchSession(sessionId);
+}
+
+/* 手机上列表和对话各占满一屏，点开一条会话是「推进」到详情，而不是把两个都压扁。
+   两个 pane 在桌面端并排不变 —— 这几个类只在 768px 以下有布局效果。 */
+function _openDetail(title) {
+  _overlay.classList.add('showing-detail');
+  _detailTitle.textContent = title;
+}
+
+function _closeDetail() {
+  _overlay.classList.remove('showing-detail');
+  _detailTitle.textContent = '';
 }
 
 /** 轮询时刷新右侧，但保留滚动位置和展开的卡片。 */
@@ -227,7 +258,7 @@ async function _fetchSession(sessionId) {
     if (sessionId !== _activeSessionId) return;  // 期间切走了
     _renderChat(data.messages, data.turn_times || []);
   } catch (e) {
-    if (!_chatSig) _chat.innerHTML = '<div class="history-placeholder">加载失败</div>';
+    if (!_chatSig) _chat.innerHTML = '<div class="history-placeholder">读不到这段对话。确认机器在线后点「刷新」重试。</div>';
   }
 }
 
@@ -410,6 +441,7 @@ function _formatTime(ts) {
 
 function _switchTab(tab) {
   _activeTab = tab;
+  _closeDetail();
   _overlay.querySelectorAll('.history-tab').forEach(t => {
     t.classList.toggle('active', t.dataset.tab === tab);
   });
@@ -448,13 +480,13 @@ async function _loadTasks() {
     const data = await res.json();
     _renderTasks(el, data.tasks || []);
   } catch {
-    el.innerHTML = '<div class="history-empty">加载失败</div>';
+    el.innerHTML = '<div class="history-empty">读不到任务列表。确认机器在线后点「刷新」重试。</div>';
   }
 }
 
 function _renderTasks(el, tasks) {
   if (!tasks.length) {
-    el.innerHTML = '<div class="history-empty">当前没有活跃任务</div>';
+    el.innerHTML = '<div class="history-empty">没有进行中的任务。代理接到长期目标时会在这里建任务并跟踪进度。</div>';
     return;
   }
 
@@ -469,7 +501,7 @@ function _renderTasks(el, tasks) {
         <div class="task-meta">
           ${t.progress ? `<div>进度: ${_escape(t.progress)}</div>` : ''}
           ${t.check_cron ? `<div>定时: ${_escape(t.check_cron)}</div>` : ''}
-          <div>${elapsed} · ID: ${t.id}</div>
+          <div class="task-meta-foot">已运行 ${elapsed}<span class="task-id">${t.id}</span></div>
         </div>
         <div class="task-actions">
           <button class="task-edit-btn" data-id="${t.id}">编辑</button>

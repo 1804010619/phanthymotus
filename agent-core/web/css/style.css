@@ -5036,6 +5036,8 @@ html, body {
   height: 75vh;
   display: flex;
   flex-direction: column;
+  /* 手机上 .history-toolbar 绝对定位到底部，锚点是这里。 */
+  position: relative;
 }
 
 .history-modal .modal-header {
@@ -5049,6 +5051,20 @@ html, body {
   align-items: center;
   gap: 8px;
 }
+.history-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+/* 手机上工具栏在底部、✕ 在顶部，「清空全部」放最后没问题。桌面端两者同一行相邻，
+   把它挪回中间，别让「清空全部」紧挨着关闭键。 */
+@media (min-width: 769px) {
+  .history-toolbar .history-clear { order: 1; }
+  .history-toolbar #history-delete-selected { order: 2; }
+}
+/* 返回键和详情标题只属于手机上的两级导航，桌面端两个 pane 并排，不需要它们。 */
+.history-back,
+.history-detail-title { display: none; }
 
 /* ── Tabs ── */
 .history-tabs { display: flex; gap: 0; }
@@ -5080,6 +5096,8 @@ html, body {
 .task-badge.paused { background: rgba(234,179,8,0.15); color: #eab308; }
 .task-badge.pending { background: rgba(107,114,128,0.15); color: #6b7280; }
 .task-meta { font-size: 0.75rem; color: var(--text-dim); margin-top: 6px; line-height: 1.6; }
+.task-meta-foot { display: flex; gap: 8px; }
+.task-id { margin-left: auto; font-family: 'JetBrains Mono', monospace; }
 .task-actions { display: flex; gap: 6px; margin-top: 10px; }
 .task-actions button {
   font-size: 0.72rem; padding: 4px 12px;
@@ -5216,8 +5234,12 @@ html, body {
   align-items: center;
   justify-content: center;
   height: 100%;
+  padding: 24px;
   color: var(--text-dim);
   font-size: 0.9rem;
+  line-height: 1.6;
+  text-align: center;
+  text-wrap: balance;
 }
 
 .history-messages {
@@ -6355,10 +6377,124 @@ html, body {
     box-shadow: none;
   }
 
-  /* History modal: stacked layout */
-  .history-body { flex-direction: column; }
-  .history-list { width: 100%; min-width: unset; max-height: 35vh; border-right: none; border-bottom: 1px solid var(--border); }
-  .history-chat { flex: 1; }
+  /* ── 会话记录 / 任务：手机上改成「推进式」两级导航 ──────────────────────
+     之前这里写的是 `.history-body { flex-direction: column }`，但真正并排的那层是
+     `.history-sessions-pane` —— 规则落空，手机上得到的是 318px 列表 + 40px 对话，
+     对话窄成一条竖缝。改布局之前先把选择器修对。
+
+     不改成上下 35/65 分屏的原因：两半都太矮，列表只剩三行、对话只剩两条消息，
+     而手机上也没有「一边看列表一边看对话」的场景 —— 先选一条，再读它。所以
+     列表和对话各占满一屏，点开是推进，返回是回退，跟手机系统自己的做法一致。 */
+  .history-modal .modal-body { padding: 0; }
+  .history-sessions-pane { flex-direction: column; min-height: 0; }
+  .history-list {
+    width: 100%;
+    min-width: 0;
+    flex: 1;
+    max-height: none;
+    border-right: none;
+    -webkit-overflow-scrolling: touch;
+  }
+  .history-chat { display: none; }
+  #history-overlay.showing-detail .history-list { display: none; }
+  #history-overlay.showing-detail .history-chat {
+    display: block;
+    flex: 1;
+    min-height: 0;
+    padding: 12px 14px calc(12px + env(safe-area-inset-bottom, 0px));
+  }
+
+  /* 标题栏在详情里换成「返回 + 正在读的是哪一条」，tabs 让位 */
+  #history-overlay.showing-detail .history-tabs,
+  #history-overlay.showing-detail .history-toolbar { display: none; }
+  #history-overlay.showing-detail .history-back { display: inline-flex; }
+  #history-overlay.showing-detail .history-detail-title { display: block; }
+  .history-back {
+    align-items: center;
+    gap: 2px;
+    min-height: 44px;
+    padding: 0 10px 0 0;
+    border: none;
+    background: none;
+    color: var(--accent);
+    font-size: 15px;
+    font-family: inherit;
+    cursor: pointer;
+    flex-shrink: 0;
+  }
+  .history-back span { font-size: 22px; line-height: 1; }
+  .history-detail-title {
+    flex: 1;
+    min-width: 0;
+    font-size: 14px;
+    font-weight: 500;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  /* 列表：整宽、更大的行、可点的复选框 */
+  .history-modal .modal-header { padding: 8px 12px; }
+  .history-tab { padding: 10px 12px; font-size: 15px; min-height: 44px; }
+  .history-group-head { padding: 7px 14px 6px; font-size: 13px; }
+  .history-session-item { padding: 12px 14px; gap: 4px; }
+  .history-session-check {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 44px;
+    min-height: 44px;
+    margin: -12px 0 -12px -6px;
+  }
+  .history-session-check input { width: 20px; height: 20px; }
+  .history-session-info { padding: 2px 0; }
+  /* 两行封顶：一条 trigger 可以有 100 字，任它换行会一条占掉半屏，列表就没法扫了。 */
+  .history-session-summary {
+    font-size: 15px;
+    line-height: 1.35;
+    white-space: normal;
+    display: -webkit-box;
+    -webkit-box-orient: vertical;
+    -webkit-line-clamp: 2;
+    overflow: hidden;
+  }
+  .history-session-meta { font-size: 12px; margin-top: 4px; }
+
+  /* 工具栏挪到拇指够得着的底部；清空全部单独一格，别和刷新长得一样 */
+  .history-toolbar {
+    position: absolute;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    z-index: 5;
+    display: flex;
+    gap: 8px;
+    padding: 8px 12px calc(8px + env(safe-area-inset-bottom, 0px));
+    border-top: 1px solid var(--border);
+    background: var(--bg);
+  }
+  .history-toolbar button { flex: 1; min-height: 44px; font-size: 14px; }
+  .history-toolbar .history-clear { color: var(--red); }
+  .history-list,
+  .history-tasks-pane { padding-bottom: 64px; }
+
+  /* 对话：气泡放宽，工具卡片整宽（80% 会把 JSON 挤成一列） */
+  #history-overlay .history-msg { max-width: 92%; font-size: 14px; }
+  #history-overlay .history-tool-card { max-width: 100%; }
+  #history-overlay .history-tool-body { font-size: 12px; max-height: 240px; }
+  #history-overlay .history-usage,
+  #history-overlay .history-turn-time { font-size: 11px; }
+  #history-overlay .history-turn-divider { flex-wrap: wrap; gap: 2px 10px; }
+
+  /* 任务卡片：动作各占一行宽度，输入框 16px（低于 16px 时 iOS 会缩放页面） */
+  .history-tasks-pane { padding: 10px 12px 64px; }
+  .task-card { padding: 14px; }
+  .task-goal { font-size: 15px; line-height: 1.35; }
+  .task-meta { font-size: 12px; }
+  .task-actions { gap: 8px; }
+  .task-actions button { flex: 1; min-height: 44px; font-size: 14px; }
+  .task-input { font-size: 16px; padding: 10px; min-height: 44px; }
+  .task-edit-form label { font-size: 12px; margin-top: 10px; }
 
   /* Deploy confirm: responsive versions */
   .deploy-confirm-item-versions { flex-wrap: wrap; }

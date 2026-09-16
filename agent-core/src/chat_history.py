@@ -1,6 +1,7 @@
 """Persistent chat history storage."""
 
 import json
+import re
 import time
 import uuid
 
@@ -75,8 +76,31 @@ def save_turn(session_id: str, turn_index: int, turn_messages: list[dict]):
         conn.commit()
 
 
+_EVENT_TAG_RE = re.compile(r'</?event\b[^>]*>')
+
+
+def summary_text(text: str) -> str:
+    """把一条 trigger 压成人能读的一行，供会话列表当标题用。
+
+    trigger 的文本常常是 `<event source="dds:/…" channel="…" ts="…">\\n{"text": "早上好。"}`
+    这种信封。直接截 100 字的结果是整行都是 source/channel/ts，真正说了什么被截在
+    外面 —— 列表里那一条长这样：`<event source="dds:/remote_control/message"
+    channel="remote_web" ts="2026-09-14T11:05:38">\\n{"text": …`，看不出是哪次对话。
+    """
+    body = _EVENT_TAG_RE.sub('', text).strip()
+    if body.startswith('{'):
+        try:
+            data = json.loads(body)
+            if isinstance(data, dict) and isinstance(data.get('text'), str):
+                body = data['text'].strip()
+        except (ValueError, TypeError):
+            pass
+    return body or text.strip()
+
+
 def update_summary(session_id: str, text: str):
     """Set session summary (first user trigger text)."""
+    text = summary_text(text)
     # Truncate to 100 chars for display
     summary = (text[:100] + '…') if len(text) > 100 else text
     with _get_conn() as conn:
