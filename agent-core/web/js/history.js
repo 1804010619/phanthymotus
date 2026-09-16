@@ -77,12 +77,18 @@ async function _loadSessions() {
   }
 }
 
-/** 老记录没有 kind 列，从 summary 前缀反推。 */
+/** 判定一条记录的来源。
+ *
+ * summary 的前缀优先于 kind 列：kind 是后加的列，迁移时给所有老记录填了默认值
+ * 'main'，所以库里已有的子代理记录都自称主代理。`[subagent:` 这个前缀只有子代理
+ * 的落盘路径会写，用它兜底比相信老行的 kind 准。
+ */
 function _sessionKind(s) {
-  if (s.kind) return s.kind;
   const sum = s.summary || '';
-  if (!sum.startsWith('[subagent:')) return 'main';
-  return sum.includes('[bg]') ? 'bg_subagent' : 'subagent';
+  if (sum.startsWith('[subagent:')) {
+    return sum.includes('[bg]') ? 'bg_subagent' : 'subagent';
+  }
+  return s.kind || 'main';
 }
 
 /** summary 里的 [subagent:id] / [bg] 已经由分区和 id 标签表达，正文里去掉。 */
