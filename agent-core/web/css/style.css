@@ -8394,6 +8394,9 @@ html, body {
   justify-content: center;
   z-index: 10000;
 }
+/* 卡片本身不滚动：它是一列（标题固定 + 主体自适应），超出的部分由主体里的日志区
+   自己滚。之前卡片 overflow:auto，日志一多就在卡片最右边贴一条通栏滚动条，和里面
+   日志区自己的那条并排出现。 */
 .deploy-progress-content {
   background: var(--bg-card);
   border: 1px solid var(--border);
@@ -8403,10 +8406,22 @@ html, body {
   min-width: 500px;
   max-width: 700px;
   max-height: 80vh;
-  overflow: auto;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
   color: var(--text);
   font-family: var(--font-ui);
 }
+.deploy-progress-body {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;          /* 没有它，flex 子项不肯收缩到内容高度以下 */
+  overflow: hidden;
+}
+.deploy-progress-header,
+.deploy-progress-checks,
+.deploy-progress-main { flex-shrink: 0; }
 .deploy-progress-header {
   display: flex;
   align-items: center;
@@ -8496,8 +8511,13 @@ html, body {
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);
   padding: 10px;
-  max-height: 200px;
+  /* 吃掉卡片剩下的高度：日志少时卡片就矮，日志多时在这里面滚，不会把滚动条挤到
+     卡片边缘。min-height 保证挤到 80vh 时日志区还剩几行可读。 */
+  flex: 1;
+  min-height: 96px;
   overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-width: thin;
   font-family: var(--font-mono);
   font-size: 12px;
 }

@@ -169,8 +169,11 @@ def _pull_with_progress(client, image: str, base: float, span: float) -> str:
         done = sum(l['current'] for l in layers.values())
         frac = done / total_size
         speed = (done / (1 << 20)) / max(0.1, now - start)
+        # 消息里不再自带百分比：日志行会由前端拼成「<消息> - <percent>% (<speed>)」，
+        # 而 percent 是折算进 [base, base+span] 的整体进度，两个数字并排出现只会让人
+        # 以为哪个错了。
         _set_step(
-            f'拉取镜像：{len(layers)} 层，{frac * 100:.1f}%',
+            f'拉取镜像：{len(layers)} 层',
             percent=base + span * frac,
             stage='pull',
             speed=f'{speed:.1f} MB/s',
