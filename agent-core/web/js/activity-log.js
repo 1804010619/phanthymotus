@@ -37,36 +37,30 @@ function _initResize() {
 
   let startY = 0;
   let startH = 0;
-  let moved = false;
 
   handle.addEventListener('pointerdown', (e) => {
     if (strip.classList.contains('collapsed')) return;
     startY = e.clientY;
     startH = strip.getBoundingClientRect().height;
-    moved = false;
-    handle.setPointerCapture(e.pointerId);
+    // Mark the drag as live before anything that can throw: setPointerCapture
+    // is redundant for touch, which captures implicitly, and raises on some
+    // pointer ids. Letting it abort here would leave the strip without the
+    // 'resizing' class, and every later move would bail on that check.
     strip.classList.add('resizing');
+    try { handle.setPointerCapture(e.pointerId); } catch { /* implicit capture */ }
     e.preventDefault();
   });
 
   handle.addEventListener('pointermove', (e) => {
     if (!strip.classList.contains('resizing')) return;
     const dy = startY - e.clientY;      // drag up = taller
-    if (Math.abs(dy) > 3) moved = true;
     strip.style.height = `${Math.min(Math.max(startH + dy, _MIN_H), _maxH())}px`;
   });
 
   const end = () => {
     if (!strip.classList.contains('resizing')) return;
     strip.classList.remove('resizing');
-    if (moved) {
-      localStorage.setItem('activity-height', String(Math.round(strip.getBoundingClientRect().height)));
-    } else {
-      // The handle sits over the top of the header, which is itself the
-      // collapse toggle. A press that never moved was meant for the toggle, so
-      // hand it on rather than swallowing it.
-      toggleLog();
-    }
+    localStorage.setItem('activity-height', String(Math.round(strip.getBoundingClientRect().height)));
   };
   handle.addEventListener('pointerup', end);
   handle.addEventListener('pointercancel', end);

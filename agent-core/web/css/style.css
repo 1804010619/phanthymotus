@@ -63,6 +63,9 @@
   /* ── Layout ── */
   --topbar-h:    52px;
   --activity-h:  220px;
+  /* Header height + its 1px border. Overridden for touch, where the header is
+     taller. */
+  --activity-collapsed-h: 32px;
 
   /* ── Shadows ── */
   --shadow-sm:   0 1px 3px rgba(0,0,0,.08), 0 1px 2px rgba(0,0,0,.05);
@@ -1762,24 +1765,29 @@ html, body {
 /* Dragging sets the height every frame; the ease would fight it. */
 .activity-strip.resizing { transition: none; }
 .activity-strip.collapsed {
-  /* 44px, not the old 32px: when shut this header is the only way back, and a
-     32px row is under the minimum touch target. The inset keeps those 44px
-     above the home indicator rather than partly behind it. */
-  height: calc(44px + env(safe-area-inset-bottom, 0px)) !important;
-  min-height: calc(44px + env(safe-area-inset-bottom, 0px));
+  /* Must be at least as tall as the header, or `overflow: hidden` clips the one
+     control that can reopen the bar. The var tracks the header's own height,
+     which grows on touch — see the coarse-pointer block. `height: auto` would
+     be self-maintaining but does not animate, and the collapse transition is
+     worth keeping. The inset holds those pixels above the home indicator
+     instead of partly behind it. */
+  height: calc(var(--activity-collapsed-h) + env(safe-area-inset-bottom, 0px)) !important;
+  min-height: calc(var(--activity-collapsed-h) + env(safe-area-inset-bottom, 0px));
 }
 
 /* Native `resize: vertical` was unreachable by touch — the handle responds to
    mouse only, so on a tablet the log was stuck at whichever of the two preset
    heights it happened to be in. A pointer-event handle covers both inputs
    through one code path. */
+/* A band of its own rather than an overlay on the header. Overlapping the two
+   looked tidier but made a tap ambiguous, and resolving that ambiguity is not
+   reliable: a tap that fell through to the collapse toggle shrank the strip,
+   and the click Chrome synthesises after touchend then hit-tested against the
+   *new* layout, landed on the header, and toggled straight back. */
 .activity-resize-handle {
-  position: absolute;
-  top: 0;
-  left: 0;
-  right: 0;
+  position: relative;
+  flex-shrink: 0;
   height: 10px;
-  z-index: 2;
   cursor: ns-resize;
   touch-action: none;
   -webkit-tap-highlight-color: transparent;
@@ -6364,10 +6372,12 @@ html, body {
     min-height: 44px;
     padding: 8px;
   }
-  .activity-strip-header { min-height: 44px; }
-  /* Grabbable by thumb, but kept to well under half the 44px header so most of
-     it stays a plain toggle. A press that never moves falls through to the
-     toggle anyway — see activity-log.js. */
+  /* The 44px button supplies the height on its own, so the vertical padding
+     would only push the header past the collapsed bar and get it clipped. */
+  :root { --activity-collapsed-h: 46px; }
+  .activity-strip-header { min-height: 44px; padding-top: 0; padding-bottom: 0; }
+  /* Thumb-grabbable, and always showing its grip line since there is no hover
+     to reveal it on. */
   .activity-resize-handle { height: 16px; }
   .activity-resize-handle::after { top: 6px; opacity: 1; }
 
