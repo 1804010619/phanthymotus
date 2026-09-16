@@ -119,50 +119,196 @@ async def get_project_running():
 
 # ── Start / Stop Project (统一入口) ─────────────────────────────────────────────
 
+def order_cards_by_dependency(cards, connections):
+    """Start order: no card before the cards that feed it.
+
+    A card's input topic is only knowable once its source is running and has
+    answered `info` — a derived topic (ASR publishes `{input_topic}/asr`) exists
+    nowhere until then. So the order the cards are started in decides whether
+    the graph can be resolved at all.
+
+    The previous split — sources (no inbound connection) then processors (some
+    inbound connection) — is only a topological order for a graph two levels
+    deep. `mic → asr → decision_core` is three, and asr and decision_core both
+    landed in the second group, ordered by their position in the layout: the
+    card built first started first. On R1 decision_core had been on the canvas
+    for four days and asr was added that morning, so decision_core started
+    ahead of its own source, found no topic for it, and subscribed to nothing.
+    ASR heard the wake word and published; the agent loop was not listening.
+    Nothing failed and nothing was logged — the only visible symptom was that
+    speaking to the robot did nothing while typing to it worked.
+
+    Kahn's algorithm, levelled, so cards that do not depend on each other keep
+    their layout order and the two-level case still starts exactly as before.
+    Returns `(ordered, leftover)`; `leftover` is non-empty only for a cycle,
+    which has no valid order — the caller starts those last and says so.
+    """
+    ids = {c.get('id') for c in cards if c.get('id')}
+    # Self-loops and connections naming a card that is no longer on the canvas
+    # are ignored rather than treated as unsatisfiable: they would strand every
+    # card behind them, turning stale layout data into a total failure to start.
+    deps = {}
+    for conn in connections or []:
+        src, dst = conn.get('fromCardId'), conn.get('toCardId')
+        if src in ids and dst in ids and src != dst:
+            deps.setdefault(dst, set()).add(src)
+
+    ordered, started = [], set()
+    remaining = list(cards)
+    while remaining:
+        ready = [c for c in remaining
+                 if deps.get(c.get('id'), set()) <= started]
+        if not ready:
+            break
+        ordered.extend(ready)
+        started.update(c.get('id') for c in ready)
+        remaining = [c for c in remaining if c.get('id') not in started]
+    return ordered, remaining
+
+
+_start_project_lock = False
+
+
 async def _do_start_project():
+    """Serializes concurrent callers behind a flag.
+
+    The frontend's start button used to accept a second click while the first
+    start was still in flight (it only flips to "running" after the fetch
+    resolves), and api_start_project() had no guard either — two overlapping
+    calls each pushed their own project_start_begin/item/done sequence on
+    /ws/motus. Both browser-side listeners are registered with mcp_id=null
+    (they match every event, not just their own run's), so each one reacted to
+    *both* streams: extra modals, item updates applied against the wrong
+    modal's index, and whichever run errored first called offMotusEvent() on
+    both listeners, silently orphaning the other run's still-loading cards.
+    """
+    global _start_project_lock
+    if _start_project_lock:
+        print('[start-project] already in progress, ignoring concurrent call')
+        return None
+    _start_project_lock = True
+    try:
+        return await _do_start_project_impl()
+    finally:
+        _start_project_lock = False
+
+
+def payload_of(result) -> dict:
+    """Unwrap an MCP call result of either shape into a dict.
+
+    Module-level rather than a closure so the state rules below can be tested
+    directly; nothing here depends on a running start-project.
+    """
+    import json as _json
+    if result.get('code') != 200:
+        return {}
+    payload = result.get('data')
+    if isinstance(payload, list) and payload:
+        try:
+            payload = _json.loads(payload[0].get('text', '{}'))
+        except Exception:
+            payload = {}
+    elif isinstance(payload, str):
+        try:
+            payload = _json.loads(payload)
+        except Exception:
+            payload = {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def tool_state_of(result) -> tuple[str | None, str]:
+    """Pull (state, message) out of an MCP call result of either shape.
+
+    A tool that answers `{"error": "..."}` with no `state` has failed. Only
+    `state` used to be read, and mcp_call_tool returns every ordinary tool
+    result as `code: 200` — so such an answer fell through to the ready branch
+    in _start_and_resolve and was reported 已就绪. On a Unitree speaker that
+    could not bind its input that is exactly what happens: the driver
+    (unitree/{g1,r1,go2}/device.py) returns `{"error": "Missing input_topic"}`,
+    the project came up green, and the robot was silent with nothing in any
+    log. The same answer during a `loading` poll used to read as "still
+    loading" and sat there until the 15-minute timeout.
+
+    `error` decides only when `state` is absent. A tool that reports both —
+    `{"state": "running", "error": "last frame dropped"}` — is describing a
+    live instance, and letting the key alone condemn it would turn a warning
+    into a failed start. Drivers that do mean failure and say so properly
+    (engineai/t800, noetix/bumi) set `state` and are unaffected.
+    """
+    if result.get('code') != 200:
+        return None, str(result.get('message') or '')[:200]
+    payload = payload_of(result)
+    if not payload:
+        return None, ''
+    message = str(
+        payload.get('error') or payload.get('message') or payload.get('desc') or ''
+    )[:200]
+    state = payload.get('state')
+    if state is None and payload.get('error'):
+        state = 'error'
+    return state, message
+
+
+def _bound_inputs(info: dict) -> list:
+    """The input topics a started tool says it actually bound, per its info().
+
+    Only entries carrying a real `topic`. A multiInstance tool's schema declares
+    format-only inputs, and a tool that binds nothing reports the same shape —
+    neither is an answer to "which of these did you take".
+    """
+    return [t.get('topic') for t in (info.get('topic_in') or []) if t.get('topic')]
+
+
+def _dropped_inputs(info: dict, wanted: list) -> list:
+    """Which of the topics we handed a card it did not bind.
+
+    The canvas lets an operator draw several connections into one card, and
+    _resolve_input_topics faithfully passes every one of them. Almost nothing
+    downstream consumes more than the first: no driver reads `input_topics` at
+    all, perception's tts/ocr/face don't either, and asr/vop/visual_depth read
+    it only to take `topics_list[0]`. Today the extra connections are simply
+    not there at runtime, and the card reports 已就绪 — the operator sees two
+    lines on the canvas and one of them does nothing.
+
+    Judged on what the tool reports, not on a list of tools known to be
+    single-input: agentcore genuinely does subscribe to all of them and says
+    so, so it passes without needing an exemption, and a plugin that gains real
+    multi-input support stops being flagged the moment its info() reflects it.
+
+    Silent when there is nothing to judge on — fewer than two topics sent, or a
+    tool that reports no bound input at all. Absence of an answer is not
+    evidence of dropping, and a start-project that rolls back on a tool's
+    reticence would be worse than the bug.
+    """
+    if len(wanted) < 2:
+        return []
+    bound = _bound_inputs(info)
+    if not bound:
+        return []
+    return [t for t in wanted if t not in bound]
+
+
+async def _do_start_project_impl():
     """启动所有 canvas cards — 前端按钮和 auto-start 共用此函数。
 
     Topic resolution strategy:
-      1. Start source cards first, then call info() to get their actual topic_out
-      2. Build a resolved_topics map: card_id → [topic_out entries]
-      3. When starting processor cards, look up source card's topic_out via connections
-      4. Fallback: use connection's persisted fromTopic if info() didn't return topic_out
+      1. Order the cards so every card starts after the cards feeding it
+         (order_cards_by_dependency)
+      2. Start each card, then call info() to get its actual topic_out, and
+         record it in resolved_topics: card_id → [topic_out entries]
+      3. A card's input_topic is read from its sources' resolved_topics, which
+         step 1 guarantees are already populated
+      4. Fallbacks, for a source that could not answer info(): the connection's
+         persisted fromTopic, then the source card's persisted topicOut
+      5. An inbound connection that resolves to no topic at all fails its card
+         rather than starting it deaf — see _resolve_input_topics
     """
     from api.mcp_manage import mcp_call_tool, MCPCallRequest
     from api.motus_stream import push_event
     import asyncio as _asyncio
-    import json as _json
 
     LOADING_POLL_S = 3
     LOADING_TIMEOUT_S = 900
-
-    def _payload(result) -> dict:
-        """Unwrap an MCP call result of either shape into a dict."""
-        if result.get('code') != 200:
-            return {}
-        payload = result.get('data')
-        if isinstance(payload, list) and payload:
-            try:
-                payload = _json.loads(payload[0].get('text', '{}'))
-            except Exception:
-                payload = {}
-        elif isinstance(payload, str):
-            try:
-                payload = _json.loads(payload)
-            except Exception:
-                payload = {}
-        return payload if isinstance(payload, dict) else {}
-
-    def _tool_state(result) -> tuple[str | None, str]:
-        """Pull (state, message) out of an MCP call result of either shape."""
-        if result.get('code') != 200:
-            return None, str(result.get('message') or '')[:200]
-        payload = _payload(result)
-        if not payload:
-            return None, ''
-        return payload.get('state'), str(
-            payload.get('error') or payload.get('message') or payload.get('desc') or ''
-        )[:200]
 
     async def _resolve_and_register(mcp_id: str, tool_name: str, card_id: str,
                                    info_args: dict) -> dict:
@@ -178,7 +324,7 @@ async def _do_start_project():
             tool=tool_name, arguments={'action': 'info', 'instance_id': card_id,
                                        **info_args},
         ))
-        data = _payload(info)
+        data = payload_of(info)
         topic_out = data.get('topic_out') or []
         if topic_out:
             resolved_topics[card_id] = topic_out
@@ -198,6 +344,7 @@ async def _do_start_project():
         node existed, so only now can the card report the real ones.
         """
         deadline = time.time() + LOADING_TIMEOUT_S
+        last_message = ''
         while time.time() < deadline:
             await _asyncio.sleep(LOADING_POLL_S)
             try:
@@ -208,8 +355,20 @@ async def _do_start_project():
             except Exception as error:
                 print(f'[start-project] {tool_name} info during load failed: {error}')
                 continue
-            state, message = _tool_state(info)
+            state, message = tool_state_of(info)
             if state == 'loading' or state is None:
+                # Relay the tool's own phase text as it changes. The card sits
+                # here for minutes on a cold model, and "模型加载中" for the whole
+                # of it tells the operator nothing about whether it is pulling
+                # 100 MB over the network or warming up — which are very
+                # different things to wait for. Only on change: the poll is
+                # every LOADING_POLL_S and identical events would just churn.
+                if message and message != last_message:
+                    last_message = message
+                    await push_event({'type': 'project_start_item', 'payload': {
+                        'tool': tool_name, 'mcp_id': mcp_id, 'status': 'loading',
+                        'message': message,
+                    }})
                 continue
             if state == 'idle':
                 # The start was cancelled or the project stopped while the model
@@ -246,14 +405,16 @@ async def _do_start_project():
     if not cards:
         return
 
-    # 分类：sources (无入连接) 和 processors (有入连接)
-    cards_with_inbound = set()
-    for conn in connections:
-        cards_with_inbound.add(conn.get('toCardId'))
-
-    sources = [c for c in cards if c['id'] not in cards_with_inbound]
-    processors = [c for c in cards if c['id'] in cards_with_inbound]
-    all_ordered = sources + processors
+    ordered, cyclic = order_cards_by_dependency(cards, connections)
+    if cyclic:
+        # No order satisfies a cycle. Starting them last at least gives every
+        # acyclic card a resolved input; say which ones so a graph that quietly
+        # cannot resolve is not mistaken for the bug this ordering fixed.
+        print('[start-project] connection cycle involving '
+              f'{", ".join(c.get("toolName", "?") for c in cyclic)}'
+              ' — starting those last, input topics may not resolve')
+        ordered = ordered + cyclic
+    all_ordered = ordered
 
     # 广播启动开始
     await push_event({'type': 'project_start_begin', 'payload': {
@@ -263,6 +424,44 @@ async def _do_start_project():
     errors = []
     # Resolved topic_out per card (populated after starting sources)
     resolved_topics: dict[str, list] = {}
+
+    def _topic_clash(card_id: str, info: dict):
+        """Another card already publishing a topic this one just claimed.
+
+        A derived output topic is `{input_topic}/{tool}` — the tool name, with
+        no trace of the instance (perception/plugins/asr.py, tts.py). Two cards
+        of the same multiInstance tool fed by the same source therefore derive
+        the *same* output topic, and the canvas permits exactly that: the
+        duplicate-card guard is skipped for multiInstance tools. Both instances
+        get their own ROS node (node_key is the instance id) and both publish to
+        the one topic, so every utterance arrives twice and the bus registration
+        silently reassigns the topic to whichever card registered last.
+
+        Compared against cards that have already started, which the dependency
+        order makes meaningful: the collision is reported on the second card,
+        naming the first.
+
+        Returns `(other_card_id, [shared topics])` or None.
+        """
+        mine = {t['topic'] for t in (info.get('topic_out') or []) if t.get('topic')}
+        if not mine:
+            return None
+        for other_id, out in resolved_topics.items():
+            if other_id == card_id:
+                continue
+            shared = mine & {t.get('topic') for t in out if t.get('topic')}
+            if shared:
+                return other_id, sorted(shared)
+        return None
+
+    async def _try_resolve(mcp_id: str, tool_name: str, card_id: str,
+                           info_args: dict) -> dict:
+        """_resolve_and_register, with its failure kept non-fatal."""
+        try:
+            return await _resolve_and_register(mcp_id, tool_name, card_id, info_args)
+        except Exception as error:
+            print(f'[start-project] {tool_name} info() failed: {error}')
+            return {}
 
     async def _start_and_resolve(card, input_topic: str = '', input_topics: list = None):
         """Start a card, then call info() to get its resolved topic_out."""
@@ -278,10 +477,29 @@ async def _do_start_project():
 
         args = {'action': 'start', 'instance_id': card_id}
         info_args: dict = {}
+        wanted: list = []
         if input_topics and len(input_topics) > 1:
+            wanted = list(input_topics)
             args['input_topics'] = input_topics
             info_args['input_topics'] = input_topics
+            # Send the singular form as well, naming the first input. No driver
+            # reads `input_topics` at all (grep phanthymotus-driver: zero hits)
+            # and perception's tts/ocr/face don't either, so the plural-only
+            # argument reached them as no input whatsoever — a multi-input card
+            # started bound to nothing. Consumers that do read the list check
+            # `input_topic` first and would have taken `topics_list[0]` anyway,
+            # so this changes nothing for them; agentcore merges the two and
+            # subscribes to the union.
+            #
+            # This is a floor, not multi-input support: a tool that binds only
+            # the first is still wrong, and _dropped_inputs below fails it. The
+            # point is that it fails saying which topic was ignored, instead of
+            # the driver's "Missing input_topic", which names neither the cause
+            # nor the card's second connection.
+            args['input_topic'] = input_topics[0]
+            info_args['input_topic'] = input_topics[0]
         elif input_topic:
+            wanted = [input_topic]
             args['input_topic'] = input_topic
             info_args['input_topic'] = input_topic
 
@@ -289,20 +507,12 @@ async def _do_start_project():
             req = MCPCallRequest(tool=tool_name, arguments=args)
             result = await mcp_call_tool(mcp_id, req)
             if result.get('code') == 200:
-                # Check if tool reported an error state in its response
-                resp_data = result.get('data')
-                tool_state = None
-                tool_message = ''
-                if isinstance(resp_data, dict):
-                    tool_state = resp_data.get('state')
-                    tool_message = resp_data.get('message', '')
-                elif isinstance(resp_data, list) and resp_data:
-                    try:
-                        parsed = _json.loads(resp_data[0].get('text', '{}')) if isinstance(resp_data[0], dict) else {}
-                        tool_state = parsed.get('state')
-                        tool_message = parsed.get('message', '')
-                    except Exception:
-                        pass
+                # Check if tool reported an error state in its response.
+                # _tool_state rather than a second inline parse: this copy read
+                # only `state` and only `message`, so it missed both a driver's
+                # bare `{"error": ...}` and the reason text such drivers put
+                # under `error` — the operator got 已就绪 and no explanation.
+                tool_state, tool_message = tool_state_of(result)
 
                 if tool_state == 'error':
                     print(f'[start-project] {tool_name} ({mcp_id}) self-check failed: {tool_message}')
@@ -310,6 +520,10 @@ async def _do_start_project():
                         'tool': tool_name, 'mcp_id': mcp_id, 'status': 'error', 'message': tool_message,
                     }})
                     errors.append(tool_name)
+                    # Kept for a failed card too, as before: the project is about
+                    # to roll back, but changing that here would be an unrelated
+                    # behaviour change riding along with this fix.
+                    await _try_resolve(mcp_id, tool_name, card_id, info_args)
                 elif tool_state == 'loading':
                     # The tool accepted the start but is not usable yet — it is
                     # fetching or building a model (perception TTS/OCR do this;
@@ -327,17 +541,47 @@ async def _do_start_project():
                     _asyncio.create_task(
                         _settle_loading_item(mcp_id, tool_name, card_id, info_args)
                     )
+                    # Resolve topic_out for the downstream cards and register it
+                    # on the bus. Non-fatal: a card that cannot answer info()
+                    # still runs.
+                    await _try_resolve(mcp_id, tool_name, card_id, info_args)
                 else:
-                    print(f'[start-project] started {tool_name} ({mcp_id})')
-                    await push_event({'type': 'project_start_item', 'payload': {
-                        'tool': tool_name, 'mcp_id': mcp_id, 'status': 'ready',
-                    }})
-                # Resolve topic_out for the downstream cards and register it on
-                # the bus. Non-fatal: a card that cannot answer info() still runs.
-                try:
-                    await _resolve_and_register(mcp_id, tool_name, card_id, info_args)
-                except Exception as error:
-                    print(f'[start-project] {tool_name} info() failed: {error}')
+                    # info() has to run *before* the verdict, not after it: it is
+                    # what reveals which of the inputs the tool actually bound,
+                    # and a card that dropped one must not have been announced
+                    # ready first.
+                    info = await _try_resolve(mcp_id, tool_name, card_id, info_args)
+                    clash = _topic_clash(card_id, info)
+                    dropped = _dropped_inputs(info, wanted)
+                    if clash:
+                        other_id, shared = clash
+                        other = next((c for c in cards if c.get('id') == other_id), None)
+                        message = (f'{tool_name} 和 {(other or {}).get("toolName", "?")} '
+                                   f'都发布到 {", ".join(shared)} —— 两张卡片会同时往同一个 '
+                                   f'topic 发数据，下游会收到重复的内容。请让它们接不同的输入')
+                        print(f'[start-project] {tool_name} ({mcp_id}) topic clash with '
+                              f'{other_id}: {shared}')
+                        await push_event({'type': 'project_start_item', 'payload': {
+                            'tool': tool_name, 'mcp_id': mcp_id, 'status': 'error',
+                            'message': message,
+                        }})
+                        errors.append(tool_name)
+                    elif dropped:
+                        kept = [t for t in wanted if t not in dropped]
+                        message = (f'{tool_name} 只消费了 {", ".join(kept)}，'
+                                   f'忽略了 {", ".join(dropped)} —— 该工具一次只接一路输入，'
+                                   f'请把多余的连线拆到另一张卡片上')
+                        print(f'[start-project] {tool_name} ({mcp_id}) dropped inputs: {dropped}')
+                        await push_event({'type': 'project_start_item', 'payload': {
+                            'tool': tool_name, 'mcp_id': mcp_id, 'status': 'error',
+                            'message': message,
+                        }})
+                        errors.append(tool_name)
+                    else:
+                        print(f'[start-project] started {tool_name} ({mcp_id})')
+                        await push_event({'type': 'project_start_item', 'payload': {
+                            'tool': tool_name, 'mcp_id': mcp_id, 'status': 'ready',
+                        }})
             else:
                 # `message` is where mcp_call_tool puts the human-readable
                 # reason; `data` is None on those responses, so reading data
@@ -358,38 +602,87 @@ async def _do_start_project():
             }})
             errors.append(tool_name)
 
-    def _resolve_input_topic(card_id: str) -> tuple[str, list]:
-        """Resolve input_topic(s) for a processor card from its inbound connections."""
-        in_conns = [c for c in connections if c.get('toCardId') == card_id]
-        topics = []
-        for conn in in_conns:
-            from_card_id = conn.get('fromCardId', '')
-            port_idx = int(conn.get('fromPortIdx', 0))
-            # Primary: use resolved topic_out from source card's info() response
-            if from_card_id in resolved_topics:
-                out_list = resolved_topics[from_card_id]
-                if port_idx < len(out_list) and out_list[port_idx].get('topic'):
-                    topics.append(out_list[port_idx]['topic'])
-                elif out_list and out_list[0].get('topic'):
-                    topics.append(out_list[0]['topic'])
-            # Fallback: use persisted fromTopic in connection data
-            elif conn.get('fromTopic'):
-                topics.append(conn['fromTopic'])
-            # Fallback 2: use source card's persisted topicOut
-            else:
-                from_card = next((c for c in cards if c.get('id') == from_card_id), None)
-                if from_card:
-                    card_topic_out = from_card.get('topicOut') or []
-                    if port_idx < len(card_topic_out) and card_topic_out[port_idx].get('topic'):
-                        topics.append(card_topic_out[port_idx]['topic'])
-                    elif card_topic_out and card_topic_out[0].get('topic'):
-                        topics.append(card_topic_out[0]['topic'])
-        topics = list(set(t for t in topics if t))
+    def _port_topic(out_list: list, port_idx: int) -> str:
+        """The topic a source publishes on `port_idx`.
+
+        A port that exists but carries no topic resolves to '' rather than to
+        the first port's. Falling back across ports meant a link drawn from a
+        camera's depth output silently carried its colour stream whenever depth
+        had not resolved — wrong data on a live link, which is worse than a link
+        the operator can see is unresolved. Mirrors topicOfPort in
+        web/js/topic-derive.js; the two must agree or the canvas and the start
+        disagree about what a connection carries.
+
+        Out of range on a *single*-output source keeps the fallback: that is a
+        layout saved before the card's ports changed, where the index can only
+        have meant the one port there is.
+        """
+        if 0 <= port_idx < len(out_list):
+            return out_list[port_idx].get('topic') or ''
+        return (out_list[0].get('topic') or '') if len(out_list) == 1 else ''
+
+    def _topic_of_connection(conn: dict) -> str:
+        """The topic carried by one connection, best answer first.
+
+        The three sources are tried in turn rather than chosen by which one
+        *exists*: the old code took the source card's presence in
+        resolved_topics as proof it had an answer, so a card that started and
+        reported topic_out without a topic on the wanted port consumed its turn
+        and blocked both fallbacks.
+        """
+        from_card_id = conn.get('fromCardId', '')
+        try:
+            port_idx = int(conn.get('fromPortIdx', 0) or 0)
+        except (TypeError, ValueError):
+            port_idx = 0
+        # Live info() answer from the source, which the start order guarantees
+        # has already run.
+        topic = _port_topic(resolved_topics.get(from_card_id) or [], port_idx)
+        # Persisted fallbacks, for a source that could not answer info(). Both
+        # are snapshots taken by the canvas page and can be stale or, for a
+        # derived topic never resolved in a browser, empty.
+        if not topic:
+            topic = conn.get('fromTopic') or ''
+        if not topic:
+            from_card = next((c for c in cards if c.get('id') == from_card_id), None)
+            topic = _port_topic((from_card or {}).get('topicOut') or [], port_idx)
+        return topic
+
+    def _resolve_input_topics(card_id: str) -> tuple[str, list, list]:
+        """Resolve input_topic(s) for a card from its inbound connections.
+
+        Returns `(input_topic, input_topics, unresolved)`. `unresolved` holds
+        the inbound connections that carry no topic — checked per connection,
+        not per card, because a card fed by several sources of which only some
+        resolve used to start with the rest silently missing. That is how
+        decision_core came up subscribed to `/remote_control/message` alone
+        while its ASR input was dropped, which looks from the outside like
+        multi-input never having worked.
+
+        Insertion order is kept: `list(set(...))` made the argument sent to the
+        driver differ between runs of an unchanged canvas.
+        """
+        topics, unresolved = [], []
+        for conn in [c for c in connections if c.get('toCardId') == card_id]:
+            topic = _topic_of_connection(conn)
+            if not topic:
+                unresolved.append(conn)
+            elif topic not in topics:
+                topics.append(topic)
         if len(topics) > 1:
-            return '', topics
+            return '', topics, unresolved
         elif len(topics) == 1:
-            return topics[0], []
-        return '', []
+            return topics[0], [], unresolved
+        return '', [], unresolved
+
+    def _unresolved_message(card: dict, unresolved: list) -> str:
+        """Name the upstream cards whose topic could not be found."""
+        names = []
+        for conn in unresolved:
+            src = next((c for c in cards if c.get('id') == conn.get('fromCardId')), None)
+            names.append((src or {}).get('toolName') or '?')
+        return (f'连线缺少 topic: {", ".join(names)} → '
+                f'{card.get("toolName", "?")}，请检查上游卡片是否能报出输出话题')
 
     # 先确保 channel adapters 已连接（被 Stop 过 / 上次启动失败的在此拉起）。
     # 必须在卡片启动之前：channel 卡片的自检要求 adapter 真的连通，
@@ -404,13 +697,25 @@ async def _do_start_project():
             except Exception as e:
                 print(f'[start-project] channel {ch_id} restart failed: {e}')
 
-    # Phase 1: start sources (no input_topic needed) and collect their topic_out
-    for card in sources:
-        await _start_and_resolve(card)
-
-    # Phase 2: start processors with resolved input_topic from sources
-    for card in processors:
-        input_topic, input_topics = _resolve_input_topic(card['id'])
+    # One pass in dependency order: a card's sources have already started and
+    # answered info(), so a card with no inbound connection resolves to no
+    # input_topic exactly as the old "sources first" phase gave it.
+    for card in all_ordered:
+        input_topic, input_topics, unresolved = _resolve_input_topics(card.get('id', ''))
+        if unresolved:
+            # Starting it anyway is what made this class of bug invisible: the
+            # card comes up subscribed to nothing and reports 已就绪. Fail it
+            # instead and let strict mode roll the project back, which is what
+            # the frontend did before this function took over the start.
+            message = _unresolved_message(card, unresolved)
+            tool_name = card.get('toolName', '')
+            print(f'[start-project] {tool_name}: {message}')
+            await push_event({'type': 'project_start_item', 'payload': {
+                'tool': tool_name, 'mcp_id': card.get('mcpId', ''),
+                'status': 'error', 'message': message,
+            }})
+            errors.append(tool_name)
+            continue
         await _start_and_resolve(card, input_topic=input_topic, input_topics=input_topics)
 
     # 有 card 失败 → 全部回滚，不标记 running
@@ -499,6 +804,11 @@ async def _do_stop_project():
 
 @router.post('/start-project')
 async def api_start_project():
+    if _start_project_lock:
+        return fastapi.responses.JSONResponse(
+            status_code=409,
+            content={'ok': False, 'detail': '启动已在进行中，请稍候'}
+        )
     success = await _do_start_project()
     if success is False:
         return fastapi.responses.JSONResponse(
@@ -984,8 +1294,12 @@ async def reset_config(req: ResetRequest):
         for skill in skills_cfg.get('installed', []):
             skill['active'] = False
         config.main['skills'] = skills_cfg
-        import event.skills
-        event.skills._runtime_activated.clear()
+        # event.skills (attribute) is rebound to a Tools() instance by
+        # event/__init__.py, shadowing the submodule where _runtime_activated
+        # actually lives — must go through sys.modules, not `import event.skills`.
+        import sys
+        import event.skills  # ensure it's imported/registered in sys.modules
+        sys.modules['event.skills']._runtime_activated.clear()
         reset_items.append('skills')
 
     if req.restart_services:
