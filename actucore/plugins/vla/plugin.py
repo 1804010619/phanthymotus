@@ -105,7 +105,7 @@ class VLAPlugin:
                 "x-hooks": {"on_interrupt_all": {"action": "stop"},
                             "on_interrupt_motion": {"action": "stop"}},
                 "x-is-dangerous": True,
-                "x-resource": self._cfg.get("resource") or "arm",
+                "x-resource": self._resources(),
             },
             "configSchema": {
                 "type": "object",
@@ -360,6 +360,33 @@ class VLAPlugin:
 
     def _format(self) -> str:
         return FORMATS.get(self._descriptor.get("mode"), "control/joint")
+
+    def _resources(self) -> list:
+        """Physical channels this card occupies, for the ACP barrier.
+
+        Taken from the negotiated descriptor's `groups` once there is one: only
+        the downstream driver knows what it actually owns. Tianyi's action space
+        is four channels (both arms, both hands); a card that kept claiming a
+        single configured `arm` would let something else drive the hands while a
+        policy was moving them.
+
+        Before `start` there is no descriptor — the tool list is fetched long
+        before anything is wired — so the configured value stands in. agent-core
+        re-reads the schema on heartbeat (`api/mcp_manage.py` extracts
+        `x-resource` there as well as at registration), so the negotiated set
+        replaces it shortly after the card starts.
+        """
+        groups = self._descriptor.get("groups") or []
+        negotiated = []
+        for group in groups:
+            resource = (group or {}).get("resource")
+            if resource and resource not in negotiated:
+                negotiated.append(resource)
+        if negotiated:
+            return negotiated
+
+        configured = self._cfg.get("resource") or "arm"
+        return configured if isinstance(configured, list) else [configured]
 
     def _error(self, message: str) -> dict:
         with self._lock:

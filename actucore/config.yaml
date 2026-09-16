@@ -7,10 +7,16 @@ mcp_port: 15730
 
 plugins:
   vla:
-    # 默认关闭：这张卡片会持续驱动电机，不应该因为容器起来了就开始跑。
-    # 打开它之后还要在画布上把它的输出连到一张驱动命令卡片（control/* 端口），
-    # 否则 start 会因为拿不到下游动作空间而拒绝启动。
-    enabled: false
+    # enabled 只决定这张卡片**出不出现**在工具列表和侧边栏里，不决定它动不动。
+    # 关掉的话 actucore 又变回一个空的 MCP host，画布上无从连起。
+    #
+    # 真正的门槛都在别处：
+    #   1. 必须在画布上把它的输出连到一张驱动命令卡片（control/* 端口），
+    #      否则 start 拿不到下游动作空间，直接拒绝；
+    #   2. 协商不通过（动作维度、频率对不上）同样拒绝启动；
+    #   3. 每一条指令还要过驱动侧 ControlSink 的检查链。
+    # 容器重启也不会让它自己跑起来（bundle 的 start() 是空的）。
+    enabled: true
     # provider 由 plugins/vla/providers/ 目录发现，不写死在这里。
     # mock = 正弦轨迹，无模型、无网络、无 GPU，用来验证整条通路与急停。
     provider: mock
@@ -21,7 +27,9 @@ plugins:
     rate_hz: null
     # 指令流的优先级。遥控器一类应当高于策略，驱动侧 ControlSink 据此仲裁。
     priority: 50
-    # ACP 物理通道，决定这张卡片和谁互斥。
+    # ACP 物理通道，决定这张卡片和谁互斥。只是**协商之前**的占位：
+    # start 之后以下游 descriptor 的 groups 为准（天轶是 arm_l/arm_r/hand_l/hand_r），
+    # agent-core 在心跳时会重新读 schema，拿到真实的那一组。
     resource: arm
     # 以下只有 mock 读：正弦幅度是各关节半行程的比例，默认很小。
     amplitude: 0.05

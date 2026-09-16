@@ -255,8 +255,34 @@ def test_the_card_declares_a_resource_and_no_completion():
     # A policy runs until stopped; an ACP pending held for its lifetime would
     # block every other actuator behind the barrier.
     assert "x-completion" not in schema
-    assert schema["x-resource"] == "arm"
+    assert schema["x-resource"] == ["arm"]          # pre-negotiation placeholder
     assert schema["x-hooks"]["on_interrupt_all"]["action"] == "stop"
+
+
+def test_the_negotiated_groups_replace_the_configured_resource():
+    """Only the downstream driver knows what it actually owns.
+
+    A humanoid's action space is several channels — Tianyi's is both arms and
+    both hands. A card still claiming one configured `arm` would let something
+    else drive the hands while a policy was moving them.
+    """
+    card = make_card()
+    card._descriptor = {
+        **DESCRIPTOR,
+        "groups": [
+            {"name": "arm_l", "offset": 0, "count": 7, "resource": "arm_l"},
+            {"name": "hand_l", "offset": 7, "count": 6, "resource": "hand_l"},
+        ],
+    }
+
+    assert card.get_tools()[0]["inputSchema"]["x-resource"] == ["arm_l", "hand_l"]
+
+
+def test_a_descriptor_without_groups_keeps_the_configured_resource():
+    card = make_card(resource="waist")
+    card._descriptor = DESCRIPTOR                   # no groups — a single-arm driver
+
+    assert card.get_tools()[0]["inputSchema"]["x-resource"] == ["waist"]
 
 
 def test_info_answers_before_anything_has_started():
