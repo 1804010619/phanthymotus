@@ -6,7 +6,7 @@
  *   Tab 2 「驱动市场」— 浏览和安装新驱动（flat grid + filter chips）
  */
 
-import { DeployProgressUI } from './deploy-progress.js';
+import { startDeploy } from './deploy-progress.js';
 
 let _overlay  = null;
 let _polling  = null;
@@ -184,6 +184,28 @@ async function _loadStatuses() {
   } catch { /* keep existing */ }
   // Update dots if visible
   _updateStatusDots();
+  _rerenderIfServicesChanged();
+}
+
+// 版本号和「升级」按钮是渲染那一刻的快照，而 5 秒一次的轮询以前只更新状态圆点。
+// 升级成功后那一行因此还挂着「升级」，再点一次得到的是后端的「已经在运行相同版本，
+// 跳过部署」—— 看起来像升级没生效。这里在服务集合真的变了时重渲染一次。
+let _lastServiceSig = '';
+
+function _rerenderIfServicesChanged() {
+  const sig = Object.entries(_statuses).sort(([a], [b]) => a < b ? -1 : 1)
+    .map(([id, s]) => `${id}|${s.running ? 1 : 0}|${s.status}|${s.running_image}|${s.image}`)
+    .join('\n');
+  if (sig === _lastServiceSig) return;
+  const first = _lastServiceSig === '';
+  _lastServiceSig = sig;
+  if (first) return;                      // 首次加载由 _load() 自己渲染
+
+  // 重渲染会重建整个列表，正开着的版本下拉和展开的日志会被一起换掉 —— 那比版本号
+  // 晚几秒更新更烦人，所以这两种情况让给用户，下一次轮询再说。
+  if (document.querySelector('.svc-ver-dropdown:not(.hidden)')) return;
+  if (document.querySelector('.deploy-log:not(.hidden)')) return;
+  _render();
 }
 
 // ── Rendering ─────────────────────────────────────────────────────────────
@@ -941,23 +963,19 @@ async function _startDriver(driverId, image, btn) {
   if (!image) return;
   btn.disabled    = true;
   btn.textContent = '启动中…';
-  _showDeployLog(driverId, '正在启动…');
-  try {
-    const res = await fetch(`/api/drivers/${driverId}/deploy`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ image }),
-    });
-    const json = await res.json();
-    if (json.code !== 200) {
-      _appendLog(driverId, `✗ 错误: ${json.message || '未知错误'}`, 'error');
-    } else {
-      _appendLog(driverId, '容器启动中…');
-      _startLogPolling(driverId);
-    }
-  } catch (e) {
-    _appendLog(driverId, `✗ 网络错误: ${e.message}`, 'error');
+  // Starting a stopped service is a deployment of the image it last ran, so it
+  // goes through the same window as every other deployment. It used to be the
+  // one path on the old /deploy endpoint, reporting into a single inline log
+  // line with no preflight checks and no pull progress.
+  _showDeployLogAny(driverId, '启动中…（查看进度窗口）');
+  const name = (_statuses[driverId] || {}).name || driverId;
+  const { ok } = await startDeploy({ driverId, driverName: name, image });
+  if (!ok) {
+    btn.disabled = false;
+    btn.textContent = '启动';
+    return;
   }
+  _startLogPolling(driverId);
 }
 
 async function _removeDriver(driverId, btn) {
@@ -994,65 +1012,25 @@ async function _executeDeploys(entries) {
 
   for (const [driverId, { image }] of entries) {
     const isCoreDriver = (_catalog.core || []).some(item => _driverIdForItem(item, 'core') === driverId);
+    const name = (_statuses[driverId] || {}).name || driverId;
 
-    if (isCoreDriver) {
-      // Same progress window as a driver deploy. It cannot use the deploy
-      // WebSocket — agent-core upgrades go through /api/system/update, which
-      // publishes a step string that _startCoreUpdatePolling reads — so the
-      // window is constructed without a monitor and driven by that poll.
-      const coreName = (_statuses[driverId] || {}).name || driverId;
-      const progressUI = new DeployProgressUI(driverId, coreName, { monitor: false });
-      progressUI.show();
-      progressUI.pushProgress('正在启动升级…', 5);
-
-      _showDeployLog(driverId, '正在启动升级…');
-      try {
-        const res = await fetch('/api/system/update', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ image }),
-        });
-        const json = await res.json();
-        if (json.code !== 200) {
-          const msg = json.message || '未知错误';
-          _appendLog(driverId, `✗ 错误: ${msg}`, 'error');
-          progressUI.pushError({ message: msg });
-        } else {
-          _appendLog(driverId, '升级任务已启动，拉取镜像中…');
-          _startCoreUpdatePolling(driverId, image, progressUI);
-        }
-      } catch (e) {
-        _appendLog(driverId, `✗ 网络错误: ${e.message}`, 'error');
-        progressUI.pushError({ message: `网络错误: ${e.message}` });
-      }
-    } else {
-      // Try new deploy-v2 with progress, fallback to old API
-      const s = _statuses[driverId] || {};
-      const driverName = s.name || driverId;
-
-      // Show progress UI
-      const progressUI = new DeployProgressUI(driverId, driverName);
-      progressUI.show();
-
-      try {
-        const res = await fetch(`/api/drivers/${driverId}/deploy-v2`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ image }),
-        });
-        const json = await res.json();
-        if (json.code !== 200) {
-          _appendLogAny(driverId, `✗ 错误: ${json.message || '未知错误'}`, 'error');
-          progressUI.close();
-        } else {
-          _appendLogAny(driverId, '部署中…（查看进度窗口）');
-          // Progress UI will auto-close on completion
-        }
-      } catch (e) {
-        _appendLogAny(driverId, `✗ 网络错误: ${e.message}`, 'error');
-        progressUI.close();
-      }
-    }
+    // core and drivers differ only in which endpoint startDeploy posts to —
+    // both render through the same window. The inline row log stays as a
+    // pointer to it, not as a second, differently-worded account of the deploy.
+    _showDeployLogAny(driverId, '部署中…（查看进度窗口）');
+    const { ok, ui } = await startDeploy({
+      driverId,
+      driverName: name,
+      image,
+      kind: isCoreDriver ? 'core' : 'driver',
+    });
+    // 部署完（或窗口被关掉）再回来刷新这一行。否则版本号和「升级」按钮仍是打开面板
+    // 那一刻的快照，用户会对着一个已经升级好的服务再点一次「升级」。
+    if (ok) ui.settled.then(async () => {
+      _getLogEl(driverId)?.classList.add('hidden');
+      await _loadStatuses();
+      _render();
+    });
   }
 
   _pending = {};
@@ -1108,24 +1086,9 @@ async function _toggleLog(driverId) {
   }
 }
 
-function _showDeployLog(driverId, msg) {
-  const el = document.getElementById(`log-${driverId}`);
-  if (!el) return;
-  el.innerHTML = `<div class="deploy-log-line">${msg}</div>`;
-  el.classList.remove('hidden');
-}
-
-function _appendLog(driverId, msg, type = '') {
-  const el = document.getElementById(`log-${driverId}`);
-  if (!el) return;
-  const line = document.createElement('div');
-  line.className = 'deploy-log-line' + (type ? ` ${type}` : '');
-  line.textContent = msg;
-  el.appendChild(line);
-  el.scrollTop = el.scrollHeight;
-}
-
-// Variants that check both marketplace (mp-log-) and my-services (log-) elements
+// _showDeployLog / _appendLog (my-services rows only) are gone: every deploy
+// now reports in the progress window, and the row log is written through the
+// `*Any` variants below, which also find a marketplace card's log element.
 function _getLogEl(driverId) {
   return document.getElementById(`mp-log-${driverId}`) || document.getElementById(`log-${driverId}`);
 }
@@ -1217,84 +1180,4 @@ function _stopLogPolling(driverId) {
     clearInterval(_logPolls[driverId]);
     delete _logPolls[driverId];
   }
-}
-
-// ── Core update polling ───────────────────────────────────────────────────
-
-function _startCoreUpdatePolling(driverId, targetImage, progressUI) {
-  if (_logPolls[driverId]) clearInterval(_logPolls[driverId]);
-
-  const targetTag = (targetImage || '').split(':').pop();
-  let attempts = 0;
-  let lastStep = '';
-  let stepsSeen = 0;
-  // True once the API has gone away at least once. agent-core restarts itself
-  // as the last act of the upgrade, so a dropped connection here is the
-  // expected path to success, not a failure.
-  let sawRestart = false;
-
-  const finish = (fn) => { _stopLogPolling(driverId); if (progressUI) fn(); };
-
-  _logPolls[driverId] = setInterval(async () => {
-    attempts++;
-    try {
-      const res  = await fetch('/api/system/update-status');
-      const json = await res.json();
-      const data = json.data || {};
-
-      if (data.error) {
-        _appendLog(driverId, `✗ 升级失败：${data.error}`, 'error');
-        finish(() => progressUI.pushError({ message: data.error }));
-        return;
-      }
-
-      if (sawRestart) {
-        // We are talking to a process that came back. Confirm it is the new
-        // image rather than the old one having merely survived a blip —
-        // reporting success on reconnect alone would call a failed upgrade
-        // that rolled back a success.
-        await _loadStatuses();
-        const running = (_statuses[driverId] || {}).running_image || '';
-        const tag = running.includes(':') ? running.split(':').pop() : '';
-        if (tag && targetTag && tag === targetTag) {
-          _appendLog(driverId, `✓ 已升级到 ${tag}`, 'success');
-          finish(() => progressUI.pushDone({ message: `升级完成：${tag}` }));
-          _render();
-          return;
-        }
-      }
-
-      if (data.step && data.step !== lastStep) {
-        lastStep = data.step;
-        stepsSeen++;
-        const el = document.getElementById(`log-${driverId}`);
-        if (el) {
-          el.querySelectorAll('.log-output').forEach(e => e.remove());
-          const pre = document.createElement('div');
-          pre.className = 'log-output';
-          pre.textContent = data.step;
-          el.appendChild(pre);
-        }
-        // /api/system/update reports a step string and no percentage — there is
-        // nothing to compute one from. The bar advances per distinct step so it
-        // reflects progress through the sequence rather than bytes, capped
-        // below 100 so only a confirmed restart completes it.
-        if (progressUI) progressUI.pushProgress(data.step, Math.min(85, 15 * stepsSeen));
-      }
-
-      if (attempts > 90) {
-        _appendLog(driverId, '✗ 升级超时', 'error');
-        finish(() => progressUI.pushError({
-          message: '升级超时',
-          suggestion: '容器可能仍在切换中，刷新页面查看当前版本。',
-        }));
-      }
-    } catch {
-      // 服务重启中，连接断开是正常的 —— 这正是升级成功的必经之路。
-      if (!sawRestart) {
-        sawRestart = true;
-        if (progressUI) progressUI.pushProgress('服务重启中，等待重新连接…', 90);
-      }
-    }
-  }, 2000);
 }
