@@ -55,12 +55,34 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-# JetPack 5.11 is not supported and cannot be: its image line is Python 3.8 and
-# lerobot requires >=3.10. jetson-ai-lab has no jp5 index either, so there is no
-# newer torch to move to. Stated here rather than discovered by a failing build.
+# JetPack 5.11 has no version of this image, and the reason is worth stating in
+# full because the obvious summary ("just upgrade Python") is wrong and would
+# send somebody down a long road to a wall. Three doors, measured on Orin 5:
+#
+#  1. **Python.** That line is Ubuntu 20.04, system Python 3.8.10, and lerobot
+#     requires >= 3.10. ROS2 Humble is built from source into
+#     /opt/ros/humble/install/lib/python3.8, so moving Python means rebuilding
+#     ROS2 as well — and every compiled wheel in the image with it.
+#
+#  2. **No CUDA torch for cp310.** NVIDIA publishes JetPack 5 wheels only as
+#     cp38 (checked v51, v511, v512), and pypi.jetson-ai-lab.io has no jp5 index
+#     at all — its root lists jp6/{cu126,cu128,cu129} and nothing else. So the
+#     wheel would have to be built from source.
+#
+#  3. **And a source build still cannot work.** JetPack 5.11 is CUDA 11.4.
+#     lerobot needs torch >= 2.2.1, and PyTorch's own support matrix floors
+#     torch 2.2 at CUDA 11.8. No amount of building produces a torch that is
+#     both new enough for lerobot and able to use this CUDA.
+#
+# Door 3 is closed, so doors 1 and 2 do not matter. The jp5.11 line runs actucore
+# with remote providers only, on the plain jetson-base — see build_actucore.sh,
+# which builds exactly that from the same Dockerfile.
 if [ "${JP_VERSION}" != "6.1" ]; then
-    echo "[error] only JetPack 6.1 is supported."
-    echo "        JetPack 5.11 is Python 3.8 and lerobot requires >=3.10."
+    echo "[error] JetPack ${JP_VERSION} 没有这个 base，也不可能有。"
+    echo "        jp5.11 是 CUDA 11.4，而 lerobot 要 torch >= 2.2.1，"
+    echo "        没有任何 torch >= 2.2 支持 CUDA 11.4（官方矩阵最低 11.8）。"
+    echo "        那条线用 ./build_actucore.sh --jp-version 5.11 构建薄镜像，"
+    echo "        只跑远端 provider。"
     exit 1
 fi
 

@@ -25,7 +25,20 @@ Hardware → Driver·Sensor → Perception → Agent Loop → ActuCore → Drive
 | provider | 说明 |
 |---|---|
 | `mock` | 正弦轨迹，无模型、无网络、无 GPU、无 torch。默认值 |
-| `local` | LeRobot SmolVLA，进程内推理。需要镜像带 lerobot（`--build-arg WITH_LEROBOT=1`） |
+| `local` | LeRobot SmolVLA，进程内推理。**只有 JetPack 6.1 的镜像有**，见下 |
+
+### 两条 JetPack 线
+
+同一份 Dockerfile，只有 base 不同，应用层逐字节一样：
+
+| | base | 可用 provider | 大小 |
+|---|---|---|---|
+| **jp6.1** | `jetson-base-actucore`（CUDA torch 2.9 + lerobot） | 全部 | ~18.6 GB |
+| **jp5.11** | `jetson-base`（共享的那个） | `mock` + 远端 | 薄 |
+
+这个差别是**被迫的，不是取舍**：jp5.11 是 CUDA 11.4，而 lerobot 要 `torch >= 2.2.1`，PyTorch 官方矩阵里 torch 2.2 的最低 CUDA 是 11.8——那条线上**不可能**有本地推理，升 Python、自己编 torch 都绕不过去。所以 `local` provider 在 jp5.11 上会**在 start 时直接拒绝并说明原因**，而不是在后台一直报 unhealthy 让人以为等一等就好。远端 provider 不受影响，那才是那条线的形态。
+
+完整的调研记录（三道门、为什么前两道不重要）在 `deploy/prepare_actucore_base.sh` 里。
 
 `local` 的三条规矩都在 `providers/local.py` 里：**懒 import**（torch/lerobot 在用到它们的函数里才 import，所以没装 lerobot 的镜像照常启动、照常提供 `mock`）、**懒下载**（COS + size/sha256 pin，复用 perception 的 `model_downloader`，不重写）、**懒加载且不占调用线程**（`__init__` 只读 checkpoint 的 config —— 便宜，且足够回答 `capabilities()` 让卡片先完成协商 —— 权重在后台线程加载，期间 `health()` 为 False，卡片报 `loading` 而不是 ready）。
 

@@ -76,6 +76,7 @@ class LocalProvider:
         self._lock = threading.RLock()
         self._closed = False
 
+        self._require_lerobot()
         self._ensure_checkpoint()
         self._config = self._read_config()
         # Weights in the background: `capabilities()` is answerable from the
@@ -137,6 +138,32 @@ class LocalProvider:
             pass
 
     # ── loading ──────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _require_lerobot():
+        """Refuse at start on an image that cannot have lerobot, and say why.
+
+        `find_spec` rather than an import: the point of this file is that torch
+        and lerobot are only imported when something is actually going to run,
+        and a presence check must not undo that.
+
+        This is the normal state on the JetPack 5.11 image line, and it is not
+        a packaging oversight — that line is CUDA 11.4, lerobot needs
+        torch >= 2.2.1, and no torch >= 2.2 supports CUDA 11.4. Local inference
+        cannot exist there, so the honest thing is to fail the start with the
+        reason instead of loading in the background and reporting `unhealthy`
+        forever.
+        """
+        import importlib.util
+
+        if importlib.util.find_spec("lerobot") is None:
+            raise ModuleNotFoundError(
+                "lerobot is not installed in this image. On JetPack 5.11 that is "
+                "expected and permanent: CUDA 11.4 cannot host torch >= 2.2.1, "
+                "which lerobot requires — use a remote provider there. On "
+                "JetPack 6.1 the actucore base image carries it; check the image "
+                "was built from jetson-base-actucore."
+            )
 
     def _ensure_checkpoint(self):
         """Fetch the checkpoint from COS if it is not already on disk.

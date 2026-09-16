@@ -37,6 +37,10 @@ sys.path.insert(0, str(ROOT))
 
 from plugins.vla.providers.local import LocalProvider  # noqa: E402
 
+# Captured before the autouse fixture below replaces it, so the one test that
+# wants the real guard can put it back.
+_REAL_REQUIRE_LEROBOT = LocalProvider.__dict__["_require_lerobot"]
+
 
 # A LeRobot checkpoint config, trimmed to the fields capabilities() reads.
 CHECKPOINT_CONFIG = {
@@ -51,6 +55,18 @@ CHECKPOINT_CONFIG = {
         "action": {"type": "ACTION", "shape": [6]},
     },
 }
+
+
+@pytest.fixture(autouse=True)
+def lerobot_present(monkeypatch):
+    """Pretend the library is installed, for every test but the two about it.
+
+    `LocalProvider.__init__` refuses when lerobot is absent — which it is on a
+    laptop, and permanently on the JetPack 5.11 image line. Every test about
+    capabilities, loading or feature mapping is about behaviour *after* that
+    check, so it is stubbed here rather than repeated in each of them.
+    """
+    monkeypatch.setattr(LocalProvider, "_require_lerobot", staticmethod(lambda: None))
 
 
 @pytest.fixture
@@ -152,14 +168,23 @@ def test_capabilities_answer_before_the_weights_do(checkpoint):
     assert provider.capabilities()["action_dim"] == 6
 
 
-def test_a_missing_library_is_recorded_not_raised(checkpoint):
-    """An actucore image without lerobot still starts and still offers mock."""
-    provider = LocalProvider({}, {"model_dir": str(checkpoint), "device": "cpu"})
-    provider._loader.join(timeout=5)
+def test_a_missing_library_refuses_at_start_with_the_reason(checkpoint, monkeypatch):
+    """On JetPack 5.11 this is permanent, so say so rather than load forever.
 
-    assert provider.health() is False
-    assert provider.capabilities()["error"]          # says what went wrong
-    assert provider.capabilities()["action_dim"] == 6   # still negotiable
+    That line is CUDA 11.4 and lerobot needs torch >= 2.2.1, which no torch
+    >= 2.2 supports on 11.4. Reporting `unhealthy` in the background would read
+    as a transient failure somebody could wait out.
+    """
+    monkeypatch.setattr(LocalProvider, "_require_lerobot", _REAL_REQUIRE_LEROBOT)
+    import importlib.util
+    monkeypatch.setattr(importlib.util, "find_spec", lambda name: None)
+
+    with pytest.raises(ModuleNotFoundError) as excinfo:
+        LocalProvider({}, {"model_dir": str(checkpoint), "device": "cpu"})
+
+    message = str(excinfo.value)
+    assert "5.11" in message and "CUDA 11.4" in message
+    assert "remote provider" in message
 
 
 def test_inference_before_the_weights_are_in_says_so(checkpoint):

@@ -5,12 +5,19 @@
 # 没有 CPU 变体。
 #
 # Usage:
-#   ./build_actucore.sh                          # JetPack 6.1（唯一支持的线），交互选源
+#   ./build_actucore.sh                          # JetPack 6.1（默认），交互选源
+#   ./build_actucore.sh --jp-version 5.11        # JetPack 5.11
 #   ./build_actucore.sh --mirror tuna
 #
-# JetPack 5.11 不支持，也补不上：那条线的镜像是 Python 3.8，而 lerobot 要求
-# >= 3.10；jetson-ai-lab 也没有 jp5 索引可以换更新的 torch。
-# 基础镜像见 deploy/prepare_actucore_base.sh。
+# 两条 JetPack 线用同一份 Dockerfile，只有 base 不同 —— 应用层是逐字节一样的：
+#
+#   6.1   jetson-base-actucore  本地推理（lerobot + CUDA torch 2.9），~18.6 GB
+#   5.11  jetson-base           只有远端 provider，薄镜像
+#
+# 这个差别不是取舍，是事实：jp5.11 的 CUDA 是 11.4，而 lerobot 要 torch >= 2.2.1，
+# 没有任何 torch >= 2.2 支持 CUDA 11.4（官方矩阵最低 11.8）。所以那条线上
+# **不可能**有本地推理，跑远端 provider 才是它的形态。详见
+# deploy/prepare_actucore_base.sh 的说明。
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -34,14 +41,7 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-# Refuse rather than build something that cannot work: the jp5.11 image line is
-# Python 3.8 and lerobot requires >= 3.10, so the vla card's local provider
-# could never load there.
-if [ "${JP_VERSION}" != "6.1" ]; then
-    echo "[error] actucore 只支持 JetPack 6.1（收到 ${JP_VERSION}）。"
-    echo "        jp5.11 是 Python 3.8，lerobot 要求 >= 3.10。"
-    exit 1
-fi
+
 
 RESOURCE_CENTER_URL="${RESOURCE_CENTER_URL:-https://motus.phanthy.com}"
 
@@ -67,6 +67,21 @@ BUILD_ARGS=""
 # 表在 build_common.sh 的 jetpack_vars 里，build_perception.sh 共用同一份。
 jetpack_vars "${JP_VERSION}" || exit 1
 BUILD_ARGS="${BUILD_ARGS} JP_VERSION=${JP_ARG}"
+
+# 同一份 Dockerfile，两个 base。只有 6.1 那条线有本地推理所需的 torch/lerobot。
+REGISTRY_FOR_BASE="${REGISTRY:-bj-warehouse.tencentcloudcr.com}"
+NS_FOR_BASE="${IMAGE_NAMESPACE:-phanthy-motus}"
+if [ "${JP_VERSION}" = "6.1" ]; then
+    BASE_IMAGE="${REGISTRY_FOR_BASE}/${NS_FOR_BASE}/jetson-base-actucore:jp${JP_ARG}-torch"
+else
+    BASE_IMAGE="${REGISTRY_FOR_BASE}/${NS_FOR_BASE}/jetson-base:jp${JP_ARG}-torch"
+    echo ""
+    echo "[note] JetPack ${JP_VERSION}：只构建远端 provider 可用的薄镜像。"
+    echo "       本地推理（provider: local）在这条线上装不了 —— CUDA 11.4 撑不住"
+    echo "       lerobot 要求的 torch >= 2.2.1。卡片会在启动时说明，不会静默失败。"
+    echo ""
+fi
+BUILD_ARGS="${BUILD_ARGS} BASE_IMAGE=${BASE_IMAGE}"
 
 # Dockerfile.jetson 基于 L4T base image —— 只有 arm64
 CPU_ARCH="arm64"
