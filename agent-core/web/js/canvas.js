@@ -217,6 +217,53 @@ const ZOOM_MIN  = 0.25;
 const ZOOM_MAX  = 2.5;
 const ZOOM_STEP = 0.1;
 
+// ── Per-client viewport persistence ───────────────────────────────────────────
+//
+// Where you are looking is a property of *this* viewer, not of the shared
+// document. It used to be written only inside _saveLayout, which returns early
+// unless this session holds the editor lock — and the lock has to be claimed
+// explicitly, so for an ordinary viewer the transform was never stored anywhere
+// and every refresh snapped back to wherever the last editor had left it.
+// localStorage also keeps one person's panning from yanking everyone else's view
+// on their next load, which sharing it through the layout did.
+const VIEWPORT_KEY = 'canvas-viewport-v1';
+
+let _viewportTimer = null;
+/** Remember this browser's zoom/pan. Debounced — a pinch fires continuously. */
+function _saveViewport() {
+  clearTimeout(_viewportTimer);
+  _viewportTimer = setTimeout(() => {
+    try {
+      localStorage.setItem(VIEWPORT_KEY, JSON.stringify({ zoom: _zoom, tx: _tx, ty: _ty }));
+    } catch { /* private mode or quota — a remembered view is a nicety, never a blocker */ }
+  }, 300);
+}
+
+/**
+ * This browser's last transform, or null if it has none.
+ *
+ * Validated rather than trusted: a NaN or an out-of-range zoom coming back out
+ * of storage would render the canvas blank or microscopic, and — being
+ * persisted — it would do so on every subsequent load with no way back short of
+ * clearing site data.
+ */
+function _loadViewport() {
+  let raw = null;
+  try { raw = localStorage.getItem(VIEWPORT_KEY); } catch { return null; }
+  if (!raw) return null;
+  try {
+    const v = JSON.parse(raw);
+    if (!Number.isFinite(v?.zoom) || !Number.isFinite(v?.tx) || !Number.isFinite(v?.ty)) return null;
+    return { zoom: Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, v.zoom)), tx: v.tx, ty: v.ty };
+  } catch { return null; }
+}
+
+/** Called after any zoom or pan the user drove. */
+function _viewportChanged() {
+  _saveViewport();
+  _debouncedSave();  // keeps the server copy current when this session is the editor
+}
+
 // ── Init ─────────────────────────────────────────────────────────────────────
 
 export async function initCanvas(initialMcps) {
@@ -262,17 +309,29 @@ export async function initCanvas(initialMcps) {
     // connection, which missed both a stale non-empty topic and a leaf card like
     // TTS.
 
-    // Restore viewport transform if saved
-    if (layoutJson.data?.transform) {
-      _zoom = layoutJson.data.transform.zoom ?? 1;
-      _tx   = layoutJson.data.transform.tx   ?? 0;
-      _ty   = layoutJson.data.transform.ty   ?? 0;
+    // Restore the viewport. This browser's own last position wins over the one
+    // in the shared layout, which is only ever whatever the last editor left;
+    // the layout copy is the fallback for a browser that has none of its own.
+    const savedView  = _loadViewport();
+    const serverView = layoutJson.data?.transform;
+    if (savedView) {
+      ({ zoom: _zoom, tx: _tx, ty: _ty } = savedView);
+      _applyTransform();
+    } else if (serverView) {
+      _zoom = Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, serverView.zoom ?? 1));
+      _tx   = serverView.tx ?? 0;
+      _ty   = serverView.ty ?? 0;
       _applyTransform();
     }
 
-    // On mobile, auto-fit cards to viewport instead of using saved desktop transform
-    if (window.innerWidth <= 768 && _cards.length > 0) {
+    // First visit on a phone: a transform set on a desktop frames nothing
+    // useful at this width, so fit the cards instead — and remember the result,
+    // so the next load restores rather than re-fits. Only when this browser has
+    // no view of its own: re-fitting unconditionally, as this did before,
+    // discarded the pinch-zoom the user had just set on every single refresh.
+    if (window.innerWidth <= 768 && _cards.length > 0 && !savedView) {
       _fitToViewport();
+      _saveViewport();
     }
 
     // Initialize editor lock state from layout response
@@ -454,7 +513,7 @@ function _setupZoomPan() {
     e.preventDefault();
     const delta = e.deltaY < 0 ? ZOOM_STEP : -ZOOM_STEP;
     _zoomAt(e.clientX, e.clientY, delta);
-    _debouncedSave();
+    _viewportChanged();
   }, { passive: false });
 
   // ── Pinch-to-zoom (mobile two-finger gesture) ──
@@ -488,7 +547,7 @@ function _setupZoomPan() {
   _canvasEl.addEventListener('touchend', (e) => {
     if (e.touches.length < 2) {
       _pinching = false;
-      _debouncedSave();
+      _viewportChanged();
     }
   });
 
@@ -525,7 +584,7 @@ function _setupZoomPan() {
     if (!_panning) return;
     _panning = false;
     _canvasEl.style.cursor = '';
-    _debouncedSave();
+    _viewportChanged();
   });
 
   _canvasEl.addEventListener('pointercancel', () => {
@@ -538,19 +597,19 @@ function _setupControlButtons() {
   document.getElementById('canvas-zoom-in')?.addEventListener('click', () => {
     const r = _canvasEl.getBoundingClientRect();
     _zoomAt(r.left + r.width / 2, r.top + r.height / 2, ZOOM_STEP);
-    _debouncedSave();
+    _viewportChanged();
   });
 
   document.getElementById('canvas-zoom-out')?.addEventListener('click', () => {
     const r = _canvasEl.getBoundingClientRect();
     _zoomAt(r.left + r.width / 2, r.top + r.height / 2, -ZOOM_STEP);
-    _debouncedSave();
+    _viewportChanged();
   });
 
   document.getElementById('canvas-zoom-reset')?.addEventListener('click', () => {
     _zoom = 1; _tx = 0; _ty = 0;
     _applyTransform();
-    _debouncedSave();
+    _viewportChanged();
   });
 
   document.getElementById('canvas-project-toggle')?.addEventListener('click', () => {

@@ -19,19 +19,31 @@ import { resolveDerivedTopics, syncConnectionTopics } from './topic-derive.js';
 
 const RENDERERS = [VideoRenderer, CameraRenderer, DepthRenderer, DepthZlibRenderer, ImageRenderer, AudioRenderer, PointCloudRenderer, MappingRenderer, LidarRenderer, SkeletonRenderer, TextRenderer, ActivityRenderer];
 const STORAGE_KEY = 'monitor-dashboard-layout-v2';
-const GRID_COLS = 5;    // fixed 5 columns (desktop)
+// Column count by viewport width. Desktop used to be a flat 5 whatever the
+// window was, which is only right near 1080p: at 1280 a column is 237px and a
+// KV panel fits one key per row, at 800 it is 131px and video/skeleton cards
+// are unreadable, and on a 3440 ultrawide it is 665px of mostly empty card.
+// Bands target ~300px per column, which given the grid's 48px of padding and
+// 12px gaps puts every threshold from three columns up exactly 300 apart.
+// A column narrower than ~280px is where the KV panel drops to one key per row
+// and video stops being worth looking at, so that is the floor the ladder keeps.
+const COL_BANDS = [
+  [480, 1], [900, 2], [1200, 3], [1500, 4], [1800, 5],
+  [2100, 6], [2400, 7], [2700, 8], [3000, 9],
+];
+const MAX_COLS = 10;    // above the last band
 const EDGE = 48;        // px from a grid edge where a drag starts auto-scrolling
 const EDGE_SPEED = 14;  // px per frame of auto-scroll
 let _topicMcpMap = {};  // topic → mcpId, populated on fetch
 
 let _grid = null;
 let _cards = new Map(); // topicPath → { el, renderer, ws, format, mode, col, row, colSpan, rowSpan }
-let _totalCols = GRID_COLS;
+let _totalCols = MAX_COLS;
 
 function _getResponsiveCols() {
-  if (window.innerWidth <= 480) return 1;
-  if (window.innerWidth <= 768) return 2;
-  return GRID_COLS;
+  const w = window.innerWidth;
+  for (const [maxWidth, cols] of COL_BANDS) if (w <= maxWidth) return cols;
+  return MAX_COLS;
 }
 
 export function activate() {
@@ -96,13 +108,14 @@ function _applyGridStyle() {
 // ── Grid geometry ─────────────────────────────────────────────────────────────
 //
 // Measured from the DOM, never re-derived. The stylesheet owns these numbers and
-// changes them per breakpoint — rows are `20%` of the viewport on desktop but a
-// fixed 180px below 768px and 200px below 480px, with the gap dropping 12px → 8px.
-// The old code hardcoded `rect.height * 0.2 + 12`, which was wrong two ways: the
-// percentage resolves against the content box while getBoundingClientRect
-// includes padding (5px of drift per row on desktop), and below 768px it bore no
-// relation to the real 188px pitch at all, so dragging by one row moved the card
-// two. Reading a real card's box is exact and self-correcting.
+// changes them per breakpoint — rows step 140/160/190/220px by viewport height,
+// with the gap dropping 12px → 8px below 768px wide. An earlier version
+// hardcoded `rect.height * 0.2 + 12` to match a `20%` row height, and was wrong
+// two ways: the percentage resolved against the content box while
+// getBoundingClientRect includes padding (5px of drift per row), and below 768px
+// it bore no relation to the real pitch at all, so dragging by one row moved the
+// card two. Reading a real card's box is exact and survives any band change
+// here without a matching constant.
 
 function _gaps() {
   const cs = getComputedStyle(_grid);
