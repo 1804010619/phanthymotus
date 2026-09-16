@@ -20,7 +20,18 @@ Hardware → Driver·Sensor → Perception → Agent Loop → ActuCore → Drive
 
 启动时**协商一次**：provider 的 `capabilities()` 和下游 descriptor 对账（动作维度、频率），对不上直接拒绝启动并说明是哪两个数字对不上——而不是启动后在 30 Hz 上一条条失败，那时候操作员看到的是一台停住的机器人和没有原因。
 
-随卡片自带的 provider 只有 `mock`：一条正弦轨迹，无模型、无网络、无 GPU、无 torch。它的用途不是演示，是**在接任何模型之前验证整条通路**——画布连线、协商、消息构造、驱动侧检查链、watchdog、拔网线。它按各关节半行程的比例构造，因此**在结构上就出不了限位**，默认幅度很小。
+现有两个 provider：
+
+| provider | 说明 |
+|---|---|
+| `mock` | 正弦轨迹，无模型、无网络、无 GPU、无 torch。默认值 |
+| `local` | LeRobot SmolVLA，进程内推理。需要镜像带 lerobot（`--build-arg WITH_LEROBOT=1`） |
+
+`local` 的三条规矩都在 `providers/local.py` 里：**懒 import**（torch/lerobot 在用到它们的函数里才 import，所以没装 lerobot 的镜像照常启动、照常提供 `mock`）、**懒下载**（COS + size/sha256 pin，复用 perception 的 `model_downloader`，不重写）、**懒加载且不占调用线程**（`__init__` 只读 checkpoint 的 config —— 便宜，且足够回答 `capabilities()` 让卡片先完成协商 —— 权重在后台线程加载，期间 `health()` 为 False，卡片报 `loading` 而不是 ready）。
+
+有一件事它替你做不了：**SmolVLA 的 checkpoint 是为某台具体机器人训练的，动作维度就是那台机器人的。** 指到一台 26 维的人形上会在协商这一步直接失败——那是微调或动作重定向的问题，不是配置问题，错误信息会这么说，而不是让不匹配走到电机上。
+
+`mock` 的用途不是演示，是**在接任何模型之前验证整条通路**——画布连线、协商、消息构造、驱动侧检查链、watchdog、拔网线。它按各关节半行程的比例构造，因此**在结构上就出不了限位**，默认幅度很小。
 
 安全上这张卡片自己只做很少的事：
 

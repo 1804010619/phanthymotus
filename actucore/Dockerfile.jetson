@@ -54,6 +54,13 @@ COPY actucore/config.yaml /work/config.yaml
 # perception's copy instead of adding a fourth one to keep in sync — see the
 # DUPLICATION note in perception/utils/logsafe.py.
 COPY perception/utils/logsafe.py /work/logsafe.py
+# COS downloader with size/SHA256 pinning, for cards that fetch weights at
+# runtime (plugins/vla's local provider). Same reasoning as logsafe above:
+# reuse perception's copy rather than keeping a second one in sync. It carries
+# the parts that are easy to get wrong — a check file that must not appear
+# until the model behind it is complete, a lock so concurrent starts fetch one
+# copy, archives staged before they are merged.
+COPY perception/utils/model_downloader.py /work/model_downloader.py
 # Agent Core reads /deploy/service.yml out of the image to merge the compose
 # fragment — dropping this COPY silently falls back to the legacy docker-run path.
 COPY actucore/deploy/     /deploy/
@@ -70,6 +77,27 @@ ENV AMENT_PREFIX_PATH="/ros_ws/install/audio_msgs:/opt/ros/humble/install"
 
 ENV RMW_IMPLEMENTATION=rmw_fastrtps_cpp
 ENV ROS_DOMAIN_ID=42
+
+# ── plugins/vla local provider (optional) ──────────────────────────────────
+# LeRobot, for running SmolVLA in-process. Its own layer, per the card-dependency
+# rule in README.md, and deliberately at the very end of the file so that turning
+# it on does not invalidate any layer above it.
+#
+# Off by default. It pulls transformers and its friends on top of the base
+# image's CUDA torch — a few GB — and the image is kept thin on purpose, so a
+# card nobody has enabled should not cost that. The `local` provider degrades
+# honestly without it: discovery still finds it, `capabilities()` still answers
+# from the checkpoint config so negotiation works, and `health()` reports the
+# import failure instead of the process dying.
+#
+#   ./deploy/build_actucore.sh --build-arg WITH_LEROBOT=1
+#
+# NOT YET BUILT on either JetPack line — the resolver is exactly what tends to
+# fail there, so treat the first build as the thing that confirms it.
+ARG WITH_LEROBOT=0
+RUN if [ "${WITH_LEROBOT}" = "1" ]; then \
+        pip3 install --no-cache-dir -i ${PYPI_MIRROR} lerobot; \
+    fi
 
 CMD ["/bin/bash", "-c", \
     "export LD_PRELOAD=/usr/lib/aarch64-linux-gnu/libgomp.so.1 && \

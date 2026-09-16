@@ -36,6 +36,28 @@ plugins:
     period_s: 8.0
     chunk_size: 10
 
+    # ── provider: local（LeRobot SmolVLA，进程内）──────────────────────────
+    # 需要镜像带 lerobot：构建时加 --build-arg WITH_LEROBOT=1（见 Dockerfile.jetson）。
+    # 没有也不会崩：卡片照常被发现，capabilities 仍能从 checkpoint config 答出来
+    # 用于协商，health() 报出 import 失败。
+    model_dir: /models/vla/smolvla
+    device: cuda
+    # 权重清单。COS 是机器人侧唯一来源，size + sha256 都要 pin。
+    # 留空时：model_dir 里已有 checkpoint 就直接用，没有就明确报错 ——
+    # 给一个没人上传过的文件编哈希，或者不校验就下载一个要驱动电机的东西，
+    # 两者都不比一条清楚的错误强。上游优先 ModelScope（lerobot/smolvla_base）。
+    weights: {}
+    #   base_url: https://<bucket>.cos.<region>.myqcloud.com/public/smolvla_base
+    #   files:
+    #     config.json:            {size: 0, sha256: ""}
+    #     model.safetensors:      {size: 0, sha256: ""}
+    # checkpoint 的输入 key 跟着它的训练数据集走（有的叫 observation.images.top，
+    # 有的叫 cam_high），所以这里是配置而不是约定：猜错的结果是策略对着一张黑图
+    # 推理，而不是报错。
+    feature_map: {}
+    #   main:  observation.images.top
+    #   state: observation.state
+
   # nav:
   #   enabled: true
   #   map_dir: /models/maps

@@ -217,9 +217,15 @@ class VLAPlugin:
 
         log.info("vla started: provider=%s topic=%s %.1f Hz ttl=%d ms task=%r",
                  provider_name, self._topic, rate, self._ttl_ms, self._task)
-        return {"state": "running", "topic": self._topic, "rate_hz": rate,
-                "ttl_ms": self._ttl_ms, "provider": provider_name,
-                "capabilities": capabilities}
+        result = {"state": self._state(), "topic": self._topic, "rate_hz": rate,
+                  "ttl_ms": self._ttl_ms, "provider": provider_name,
+                  "capabilities": capabilities}
+        if result["state"] == "loading":
+            # agent-core keeps the card visibly starting and polls info() until
+            # it settles. Reporting ready here is how an operator ends up with a
+            # card that claims ready seconds before it can act.
+            result["message"] = "模型加载中，就绪后自动开始发布"
+        return result
 
     def _stop(self):
         with self._lock:
@@ -252,7 +258,7 @@ class VLAPlugin:
     def _info(self):
         with self._lock:
             return {
-                "state": "running" if self._running else "idle",
+                "state": self._state(),
                 "topic": self._topic,
                 "format": self._format(),
                 "provider": self._cfg.get("provider") or "mock",
@@ -302,6 +308,13 @@ class VLAPlugin:
     def _tick(self):
         publisher = self._publisher
         if publisher is None or not self._running:
+            return
+        provider = self._provider
+        # A provider that loads its weights in the background is not an error
+        # while it does so — it simply has nothing to say yet. Publishing
+        # nothing keeps the receiver's watchdog holding the arm, which is the
+        # right state for "no policy is driving".
+        if provider is not None and not provider.health():
             return
         try:
             message = self.next_command()
@@ -357,6 +370,22 @@ class VLAPlugin:
         )
 
     # ── helpers ──────────────────────────────────────────────────────────────
+
+    def _state(self) -> str:
+        """idle | loading | running.
+
+        `loading` is a real state, not a nicety: a local provider reads its
+        checkpoint's config in milliseconds and its weights in seconds, and
+        agent-core has a watcher for exactly this (`api/config.py`
+        `_settle_loading_item`). Skipping it would report ready while the card
+        still cannot produce a command.
+        """
+        if not self._running:
+            return "idle"
+        provider = self._provider
+        if provider is not None and not provider.health():
+            return "loading"
+        return "running"
 
     def _format(self) -> str:
         return FORMATS.get(self._descriptor.get("mode"), "control/joint")
