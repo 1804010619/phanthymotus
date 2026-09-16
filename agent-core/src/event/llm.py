@@ -31,6 +31,32 @@ import prompt as prompt_mod
 from api.motus_stream import push_event
 
 
+def _decoded_json(value):
+    """Unwrap a JSON string into the value it encodes, or return it unchanged.
+
+    A tool call's `arguments` is a *string* by the OpenAI schema, and providers
+    emit it with non-ASCII escaped — so publishing it verbatim put things like
+    `\\u4f60\\u597d` on /decision_core where `你好` was meant, defeating the
+    `ensure_ascii=False` the surrounding dump already uses. Decoding it once here
+    means the bus carries structured data rather than source text.
+
+    Anything that is not a JSON object or array is returned as-is: a model that
+    emits a malformed argument string should still show up on the bus as what it
+    actually sent.
+    """
+    if not isinstance(value, str):
+        return value
+    text = value.strip()
+    if not (text.startswith('{') and text.endswith('}')) and \
+       not (text.startswith('[') and text.endswith(']')):
+        return value
+    try:
+        parsed = json.loads(text)
+    except (ValueError, TypeError):
+        return value
+    return parsed if isinstance(parsed, (dict, list)) else value
+
+
 # ── Turn 取消异常 ────────────────────────────────────────────────────────────────
 
 class TurnCancelled(Exception):
@@ -2354,7 +2380,8 @@ class Event:
                     'round': round_idx,
                     'text': text,
                     'tool_calls': [
-                        {'name': c['function']['name'], 'args': c['function'].get('arguments', '{}'),
+                        {'name': c['function']['name'],
+                         'args': _decoded_json(c['function'].get('arguments', '{}')),
                          'result': next((r['result'] for r in results if r['id'] == c['id']), None)}
                         for c in tool_calls
                     ],
