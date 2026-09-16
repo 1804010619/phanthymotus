@@ -227,10 +227,18 @@ def search(query: str, limit: int = 10) -> list[dict]:
 # ── 重启续跑 ──────────────────────────────────────────────────────────────────
 
 def get_last_session_turns(limit: int = 10) -> dict | None:
-    """获取最近一个 session 的最后 N 轮，用于重启续跑。"""
+    """获取主代理最近一个 session 的最后 N 轮，用于重启续跑。
+
+    只认 main：子代理的对话也存在同一张表里，而"最近的一个 session"现在几乎总是
+    某个后台子代理的 —— 它们每轮都落盘。续跑到那上面，主代理会把一段后台监控的
+    transcript 当成自己的历史接着往下写，并且之后每个 turn 都追加进那个会话。
+    老记录的 kind 列是迁移时统一填的 'main'，所以还要排掉带 `[subagent:` 前缀的。
+    """
     with _get_conn() as conn:
         row = conn.execute(
-            'SELECT id FROM chat_sessions WHERE turn_count > 0 ORDER BY started_at DESC LIMIT 1'
+            "SELECT id FROM chat_sessions WHERE turn_count > 0 "
+            "AND kind = 'main' AND summary NOT LIKE '[subagent:%' "
+            'ORDER BY COALESCE(ended_at, started_at) DESC LIMIT 1'
         ).fetchone()
         if not row:
             return None

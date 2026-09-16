@@ -84,5 +84,36 @@ class SessionOrderingTest(unittest.TestCase):
         self.assertGreaterEqual(sessions[0]['last_at'], sessions[1]['last_at'])
 
 
+class ResumePicksMainSessionTest(unittest.TestCase):
+    """重启续跑只能续主代理自己的会话。
+
+    子代理的对话和主代理的存在同一张表里。子代理改成每轮落盘之后，"最近的一个
+    session" 在任何时刻都极可能是某个后台子代理的 —— 续跑到那上面，主代理会把
+    一段后台监控的 transcript 当成自己的历史接着写。Orin5 上实测到过：一个
+    [daily] 子代理的会话 turn_count 从 4 涨到 5，涨的那一轮是主代理写的。
+    """
+
+    def setUp(self):
+        chat_history.clear_all()
+
+    def test_subagent_session_is_not_resumed(self):
+        main = chat_history.create_session(chat_history.KIND_MAIN)
+        chat_history.update_summary(main, '用户：把灯打开')
+        chat_history.save_turn(main, 0, [{'role': 'user', 'content': '把灯打开'}])
+        time.sleep(0.01)
+        bg = chat_history.create_session(chat_history.KIND_BG_SUBAGENT)
+        chat_history.update_summary(bg, '[subagent:abc123] [bg] 后台监控')
+        chat_history.save_turn(bg, 0, [{'role': 'user', 'content': '监控中'}])
+
+        self.assertEqual(chat_history.get_last_session_turns()['session_id'], main)
+
+    def test_legacy_subagent_rows_are_excluded_too(self):
+        # 迁移给老行统一填了 kind='main'，只能靠 summary 前缀排除。
+        legacy = chat_history.create_session(chat_history.KIND_MAIN)
+        chat_history.update_summary(legacy, '[subagent:old999] 旧的子代理会话')
+        chat_history.save_turn(legacy, 0, [{'role': 'user', 'content': 'x'}])
+        self.assertIsNone(chat_history.get_last_session_turns())
+
+
 if __name__ == '__main__':
     unittest.main()
