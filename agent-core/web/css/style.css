@@ -63,6 +63,11 @@
   /* ── Layout ── */
   --topbar-h:    52px;
   --activity-h:  220px;
+  /* One ledge height, shared by the activity header and the sidebar header, so
+     the two panels line up and neither changes size when it opens or shuts.
+     Raised for touch in the coarse-pointer block. */
+  --ledge-h: 32px;
+  --sidebar-rail-w: 36px;
 
   /* ── Shadows ── */
   --shadow-sm:   0 1px 3px rgba(0,0,0,.08), 0 1px 2px rgba(0,0,0,.05);
@@ -86,10 +91,20 @@ html, body {
 /* ══════════════════════════════════════════════════════════════════════════
    APP SHELL
 ══════════════════════════════════════════════════════════════════════════ */
+/* `vh` is always the *large* viewport — the height with the browser toolbar
+   retracted. Tablet Chrome keeps its toolbar up permanently, so `100vh`
+   overshot the visible area by the toolbar's ~56dp, and `overflow: hidden`
+   meant you could not scroll down to what had been pushed off. The bottom of
+   the shell was simply unreachable: the collapsed 32px activity bar landed
+   entirely inside that band, and collapsing it once wrote `activity-collapsed`
+   so it stayed that way on every later visit.
+   `dvh` tracks the viewport that is actually on screen; `vh` stays as the
+   fallback for engines without it. */
 #app {
   display: flex;
   flex-direction: column;
   height: 100vh;
+  height: 100dvh;
   overflow: hidden;
 }
 
@@ -338,7 +353,59 @@ html, body {
   border-right: 1px solid var(--border);
   background: var(--bg-card);
   overflow: hidden;
+  transition: width .2s ease;
 }
+
+/* ── Sidebar ledge ──────────────────────────────────────────────────────────
+   Same height as the activity ledge, so the two panels agree, and the same
+   rule: only the content area collapses. Shut, the sidebar keeps a rail of the
+   section status dots — which devices are up is the one thing worth seeing
+   while the list itself is out of the way. */
+.sidebar-header {
+  display: flex;
+  align-items: center;
+  height: var(--ledge-h);
+  box-sizing: border-box;
+  padding: 0 0 0 16px;
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+.sidebar-header-title {
+  flex: 1;
+  min-width: 0;
+  font-size: 10px;
+  font-weight: 700;
+  color: var(--text-dim);
+  letter-spacing: 1px;
+}
+.sidebar-collapse-btn {
+  flex-shrink: 0;
+  width: var(--ledge-h);
+  align-self: stretch;
+  background: none;
+  border: none;
+  color: var(--text-dim);
+  font-size: 10px;
+  cursor: pointer;
+  transition: transform .2s ease, background .15s;
+}
+.sidebar-collapse-btn:hover { background: var(--bg-hover); }
+
+.sidebar.collapsed { width: var(--sidebar-rail-w); }
+.sidebar.collapsed .sidebar-header { padding-left: 0; justify-content: center; }
+.sidebar.collapsed .sidebar-collapse-btn { transform: rotate(180deg); }
+.sidebar.collapsed .sidebar-header-title,
+.sidebar.collapsed .sidebar-filter,
+.sidebar.collapsed .sidebar-empty,
+.sidebar.collapsed .sidebar-section-name,
+.sidebar.collapsed .sidebar-section-count,
+.sidebar.collapsed .sidebar-subgroup-label,
+.sidebar.collapsed .sidebar-tool-list { display: none; }
+.sidebar.collapsed .sidebar-scroll { padding: 8px 0; gap: 10px; align-items: center; }
+.sidebar.collapsed .sidebar-section-header { padding: 0; justify-content: center; }
+/* 7px reads as a speck once it is the only thing in the column. */
+.sidebar.collapsed .sidebar-section-dot { width: 9px; height: 9px; }
+.sidebar.collapsed .sidebar-section-icon { font-size: 14px; }
 
 .sidebar-filter {
   padding: 8px;
@@ -1733,61 +1800,143 @@ html, body {
 
 /* ── Activity Strip ───────────────────────────────────────────────────────── */
 .activity-strip {
+  position: relative;
   height: var(--activity-h);
   min-height: 80px;
   max-height: 60vh;
+  max-height: 60dvh;
   flex-shrink: 0;
   border-top: 1px solid var(--border);
   background: var(--bg-card);
   display: flex;
   flex-direction: column;
-  resize: vertical;
   overflow: hidden;
+  /* `viewport-fit=cover` lets the page run under the home indicator, so the
+     last rows of the log would sit beneath it without this. */
+  padding-bottom: env(safe-area-inset-bottom, 0px);
   transition: height .25s ease, min-height .25s ease;
 }
+/* Dragging sets the height every frame; the ease would fight it. */
+.activity-strip.resizing { transition: none; }
 .activity-strip.collapsed {
-  height: 32px !important;
-  min-height: 32px;
-  resize: none;
-}
-.activity-strip.collapsed .activity-log {
-  display: none;
-}
-.activity-collapse-btn {
-  background: none;
-  border: none;
-  color: var(--text-dim);
-  font-size: 10px;
-  cursor: pointer;
-  padding: 2px 6px;
-  border-radius: 3px;
-  transition: transform .25s ease, background .15s;
-}
-.activity-collapse-btn:hover {
-  background: var(--bg-hover);
-}
-.activity-strip.collapsed .activity-collapse-btn {
-  transform: rotate(-90deg);
+  /* The ledge, plus the strip's own 1px top border — everything is border-box,
+     so without it the header overflows the strip by exactly that pixel and
+     `overflow: hidden` shaves the bottom of the reopen button. The header's
+     bottom border is dropped when shut, so there is nothing else to add. The
+     inset holds these pixels above the home indicator rather than behind it. */
+  height: calc(var(--ledge-h) + 1px + env(safe-area-inset-bottom, 0px)) !important;
+  min-height: calc(var(--ledge-h) + 1px + env(safe-area-inset-bottom, 0px));
 }
 
+/* ── The ledge ──────────────────────────────────────────────────────────────
+   One row, one height, whatever the state. It was 45px of header plus a 16px
+   grab band when open against 46px when shut, so the whole row jumped on every
+   toggle — and 46px carrying a 10px label read as mostly empty box.
+   Open:  [ ACTIVITY ............... grip ... ▼ ]
+   Shut:  [ 14:22:07 mcp_call loco(stand) .... ▲ ]
+   Shut, the label names a panel you can no longer see. The latest line is the
+   thing worth knowing at a glance, so the row carries that instead and earns
+   its height. */
 .activity-strip-header {
   display: flex;
   align-items: center;
-  justify-content: space-between;
-  padding: 7px 16px;
+  gap: 12px;
+  height: var(--ledge-h);
+  box-sizing: border-box;
+  padding: 0 0 0 16px;
   border-bottom: 1px solid var(--border);
   flex-shrink: 0;
-  /* When the bar is shut this strip is the only way back, so it has to look
-     like the control it is rather than like a caption. */
+  /* When the bar is shut this row is the only way back, so it has to look like
+     the control it is rather than like a caption. */
   cursor: pointer;
 }
+.activity-strip.collapsed .activity-strip-header { border-bottom: none; }
 .activity-strip.collapsed .activity-strip-header:hover { background: var(--bg-hover); }
+
 .activity-title {
   font-size: 10px;
   font-weight: 700;
   color: var(--text-dim);
   letter-spacing: 1px;
+  flex: 1;
+  min-width: 0;
 }
+/* Only stands in for the title once there is a line to show; before the first
+   event the label is still the most useful thing in the row. */
+.activity-latest { display: none; }
+.activity-strip.collapsed.has-latest .activity-title { display: none; }
+.activity-strip.collapsed.has-latest .activity-latest {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  flex: 1;
+  min-width: 0;
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  color: var(--text-muted);
+  white-space: nowrap;
+  overflow: hidden;
+  -webkit-mask-image: linear-gradient(to right, #000 calc(100% - 24px), transparent);
+          mask-image: linear-gradient(to right, #000 calc(100% - 24px), transparent);
+}
+.activity-latest .log-time { color: var(--text-dim); }
+
+/* Native `resize: vertical` responds to the mouse only, so on a tablet the log
+   was stuck at whichever preset height it was in. Pointer events cover mouse,
+   pen and touch through one path.
+   The grip is a zone of the ledge rather than a band above it: stacking it
+   vertically is what made the two states different heights, and overlaying it
+   on the header made a tap ambiguous in a way that cannot be resolved — a tap
+   that fell through to the toggle shrank the strip, and the click Chrome
+   synthesises after touchend was then hit-tested against the *new* layout,
+   landed on the header, and toggled straight back. Side by side, neither
+   problem exists. */
+.activity-resize-handle {
+  position: relative;
+  flex-shrink: 0;
+  width: 88px;
+  align-self: stretch;
+  cursor: ns-resize;
+  touch-action: none;
+  -webkit-tap-highlight-color: transparent;
+}
+.activity-resize-handle::before,
+.activity-resize-handle::after {
+  content: '';
+  position: absolute;
+  left: 50%;
+  width: 26px;
+  height: 1px;
+  transform: translateX(-50%);
+  background: var(--border);
+  transition: background .15s;
+}
+.activity-resize-handle::before { top: calc(50% - 3px); }
+.activity-resize-handle::after  { top: calc(50% + 2px); }
+.activity-resize-handle:hover::before,
+.activity-resize-handle:hover::after,
+.activity-strip.resizing .activity-resize-handle::before,
+.activity-strip.resizing .activity-resize-handle::after { background: var(--text-dim); }
+.activity-strip.collapsed .activity-resize-handle { display: none; }
+
+.activity-strip.collapsed .activity-log { display: none; }
+
+.activity-collapse-btn {
+  flex-shrink: 0;
+  width: var(--ledge-h);
+  align-self: stretch;
+  background: none;
+  border: none;
+  color: var(--text-dim);
+  font-size: 10px;
+  cursor: pointer;
+  transition: transform .25s ease, background .15s;
+}
+.activity-collapse-btn:hover { background: var(--bg-hover); }
+/* Points where the bar will go: down to shut it, up to bring it back. It used
+   to rotate a quarter turn and read as a right-pointing arrow on a panel that
+   only ever moves vertically. */
+.activity-strip.collapsed .activity-collapse-btn { transform: rotate(180deg); }
 
 .activity-log {
   flex: 1;
@@ -5958,6 +6107,19 @@ html, body {
   .sidebar.mobile-open {
     transform: translateX(0);
   }
+  /* The drawer opens and closes with the fab; a second, differently-shaped
+     collapse control in the same panel would just be two answers to one
+     question. The rail width must be overridden too — `.sidebar.collapsed`
+     outranks `.sidebar`, media query or not, so a stale flag from a desktop
+     session would otherwise leave the drawer 40px wide. */
+  .sidebar-header { display: none; }
+  .sidebar.collapsed { width: 85vw; }
+  .sidebar.collapsed .sidebar-filter,
+  .sidebar.collapsed .sidebar-section-name,
+  .sidebar.collapsed .sidebar-section-count,
+  .sidebar.collapsed .sidebar-tool-list { display: revert; }
+  .sidebar.collapsed .sidebar-scroll { padding: 8px; align-items: stretch; }
+  .sidebar.collapsed .sidebar-section-header { padding: 4px 4px 2px; justify-content: flex-start; }
 
   /* ── Detail panel → right drawer ── */
   .detail-panel {
@@ -6016,6 +6178,28 @@ html, body {
     z-index: 50;
   }
 
+  /* Bottom-left, opposite the zoom controls — not top-left, which is the
+     sidebar fab's slot. Pinned to exactly 12,12 with `z-index: 100`, it covered
+     the 40x40 fab completely and outranked it, so on a phone there was no way
+     to open the tool list at all; it also grazed the 开启智能控制 button by 5px.
+     The top band is navigate | primary action | navigate and already measures
+     343px of the 390 available, so there is no room for a fourth item — and
+     this is not one. It reports who holds the editor, which belongs with the
+     rest of the canvas state along the bottom.
+     z-index joins the canvas-chrome tier (controls 50, top control 57) below
+     the fabs at 58, so chrome cannot outrank navigation again. */
+  .canvas-editor-bar {
+    position: fixed;
+    top: auto;
+    right: auto;
+    bottom: calc(56px + env(safe-area-inset-bottom, 0px) + 10px);
+    left: 12px;
+    padding: 4px 8px;
+    font-size: 11px;
+    gap: 5px;
+    z-index: 57;
+  }
+
   /* ── Activity strip → right drawer ── */
   .activity-strip {
     position: fixed;
@@ -6032,10 +6216,13 @@ html, body {
     border-top: none;
     border-left: 1px solid var(--border);
     box-shadow: var(--shadow-lg);
-    resize: none;
     transform: translateX(100%);
     transition: transform 0.3s ease;
+    /* Drawer mode stops above the tabbar, which carries the inset itself. */
+    padding-bottom: 0;
   }
+  /* Full-height drawer — there is no height to drag. */
+  .activity-resize-handle { display: none; }
   .activity-strip.collapsed { height: auto !important; min-height: 0; }
   .activity-strip.collapsed .activity-log { display: block; }
   .activity-strip.collapsed .activity-collapse-btn { transform: none; }
@@ -6288,6 +6475,55 @@ html, body {
 }
 
 /* ══════════════════════════════════════════════════════════════════════════
+   TOUCH INPUT (any width) — finger-sized targets and gesture ownership
+══════════════════════════════════════════════════════════════════════════ */
+/* These used to live inside `max-width: 768px` alongside the layout rules, which
+   conflated two different questions: *how wide* is the screen, and *what is
+   pointing at it*. A tablet answers "wide" and "finger", so it got the desktop
+   layout — correct — but with desktop hit targets, which is not: the activity
+   bar's collapse arrow measured 22x16px, and canvas ports 36px.
+   Layout stays keyed on width (tabbar, drawers, full-page panels); only the
+   things that depend on the pointer live here. Phones match both blocks and the
+   values agree, so nothing changes there. */
+@media (pointer: coarse) {
+  .btn-icon { min-width: 44px; min-height: 44px; }
+  .btn-ghost { min-height: 44px; padding: 10px 14px; }
+  .sidebar-chip { padding: 10px 12px; min-height: 44px; }
+  .deploy-tab { padding: 10px 14px; font-size: 14px; min-height: 44px; }
+
+  /* 40px, not 44px. The whole ledge is the toggle — on a tablet that is an
+     820x40 target, and the 44px floor is there for isolated controls, not for
+     a full-width row. The arrow button fills the row height, so the discrete
+     control keeps a real target too. 46px was measurably out of proportion:
+     a 10px label and a 10px glyph in a box more than four times their height. */
+  :root { --ledge-h: 40px; --sidebar-rail-w: 40px; }
+  /* Wider grip and a permanent grip mark — there is no hover to reveal it on. */
+  .activity-resize-handle { width: 104px; }
+  .activity-resize-handle::before,
+  .activity-resize-handle::after { background: var(--text-dim); }
+
+  /* Transparent hit-area expansion, on top of the 36px `::before`. */
+  .canvas-port::after {
+    content: '';
+    position: absolute;
+    width: 44px;
+    height: 44px;
+    top: 50%;
+    left: 50%;
+    transform: translate(-50%, -50%);
+    background: transparent !important;
+    border-radius: 50%;
+    inset: auto;
+  }
+
+  /* Pan and card-drag are driven by pointer events with setPointerCapture. With
+     the default `touch-action` the browser can claim the same gesture and fire
+     pointercancel mid-drag, and it adds the double-tap-zoom delay on top. */
+  .canvas-area { touch-action: none; }
+  .canvas-card-header { touch-action: none; }
+}
+
+/* ══════════════════════════════════════════════════════════════════════════
    BREAKPOINT: ≤480px (Small Phone)
 ══════════════════════════════════════════════════════════════════════════ */
 @media (max-width: 480px) {
@@ -6307,17 +6543,8 @@ html, body {
   .canvas-controls { bottom: 66px; right: 12px; }
   .canvas-top-control { top: 12px; }
 
-  .canvas-editor-bar {
-    position: fixed;
-    top: 12px;
-    left: 12px;
-    bottom: auto;
-    right: auto;
-    padding: 4px 8px;
-    font-size: 11px;
-    gap: 5px;
-    z-index: 100;
-  }
+  /* Stays paired with .canvas-controls, which drops the inset at this size. */
+  .canvas-editor-bar { bottom: 66px; }
   #canvas-toast {
     bottom: calc(56px + env(safe-area-inset-bottom, 0px) + 16px) !important;
   }
