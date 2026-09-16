@@ -182,6 +182,12 @@ class DeployProgressUI {
         this.finished = false;
         this._lastLoggedPercent = -10; // Initialize to -10 so first log happens at 0%
 
+        // Resolves when the window stops following this deployment — done,
+        // error, or dismissed. Callers refresh what they show about the service
+        // here: `startDeploy` returns as soon as the POST is accepted, which is
+        // far too early to re-read a row (the old container is still running).
+        this.settled = new Promise(resolve => { this._settle = resolve; });
+
         this._createUI();
     }
 
@@ -329,6 +335,7 @@ class DeployProgressUI {
     _handleError(event) {
         const { message, suggestion } = event;
         this.finished = true;
+        this._settle({ ok: false, message });
         this._addLog(`错误: ${message}`, 'error');
         if (suggestion) {
             this._addLog(`建议: ${suggestion}`, 'info');
@@ -352,6 +359,7 @@ class DeployProgressUI {
     _handleDone(event) {
         const { message, elapsed } = event;
         this.finished = true;
+        this._settle({ ok: true, message });
         // Only the deploy WebSocket carries `elapsed`; the core upgrade poll has
         // no equivalent. Unguarded this printed a literal "(耗时 undefineds)".
         const took = Number.isFinite(elapsed) ? ` (耗时 ${elapsed}s)` : '';
@@ -453,6 +461,10 @@ class DeployProgressUI {
     }
 
     close() {
+        // Dismissing mid-deploy also settles: the caller's row is left showing
+        // "部署中…" otherwise, and the deployment carries on server-side either
+        // way (it is a background task, not tied to this socket).
+        this._settle({ ok: this.finished, closed: true });
         if (this.monitor) this.monitor.disconnect();
         if (this.container && this.container.parentNode) {
             this.container.parentNode.removeChild(this.container);

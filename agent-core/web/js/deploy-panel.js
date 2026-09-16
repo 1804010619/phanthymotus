@@ -184,6 +184,28 @@ async function _loadStatuses() {
   } catch { /* keep existing */ }
   // Update dots if visible
   _updateStatusDots();
+  _rerenderIfServicesChanged();
+}
+
+// 版本号和「升级」按钮是渲染那一刻的快照，而 5 秒一次的轮询以前只更新状态圆点。
+// 升级成功后那一行因此还挂着「升级」，再点一次得到的是后端的「已经在运行相同版本，
+// 跳过部署」—— 看起来像升级没生效。这里在服务集合真的变了时重渲染一次。
+let _lastServiceSig = '';
+
+function _rerenderIfServicesChanged() {
+  const sig = Object.entries(_statuses).sort(([a], [b]) => a < b ? -1 : 1)
+    .map(([id, s]) => `${id}|${s.running ? 1 : 0}|${s.status}|${s.running_image}|${s.image}`)
+    .join('\n');
+  if (sig === _lastServiceSig) return;
+  const first = _lastServiceSig === '';
+  _lastServiceSig = sig;
+  if (first) return;                      // 首次加载由 _load() 自己渲染
+
+  // 重渲染会重建整个列表，正开着的版本下拉和展开的日志会被一起换掉 —— 那比版本号
+  // 晚几秒更新更烦人，所以这两种情况让给用户，下一次轮询再说。
+  if (document.querySelector('.svc-ver-dropdown:not(.hidden)')) return;
+  if (document.querySelector('.deploy-log:not(.hidden)')) return;
+  _render();
 }
 
 // ── Rendering ─────────────────────────────────────────────────────────────
@@ -996,11 +1018,18 @@ async function _executeDeploys(entries) {
     // both render through the same window. The inline row log stays as a
     // pointer to it, not as a second, differently-worded account of the deploy.
     _showDeployLogAny(driverId, '部署中…（查看进度窗口）');
-    await startDeploy({
+    const { ok, ui } = await startDeploy({
       driverId,
       driverName: name,
       image,
       kind: isCoreDriver ? 'core' : 'driver',
+    });
+    // 部署完（或窗口被关掉）再回来刷新这一行。否则版本号和「升级」按钮仍是打开面板
+    // 那一刻的快照，用户会对着一个已经升级好的服务再点一次「升级」。
+    if (ok) ui.settled.then(async () => {
+      _getLogEl(driverId)?.classList.add('hidden');
+      await _loadStatuses();
+      _render();
     });
   }
 
