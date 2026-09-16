@@ -6178,6 +6178,28 @@ html, body {
     z-index: 50;
   }
 
+  /* Bottom-left, opposite the zoom controls — not top-left, which is the
+     sidebar fab's slot. Pinned to exactly 12,12 with `z-index: 100`, it covered
+     the 40x40 fab completely and outranked it, so on a phone there was no way
+     to open the tool list at all; it also grazed the 开启智能控制 button by 5px.
+     The top band is navigate | primary action | navigate and already measures
+     343px of the 390 available, so there is no room for a fourth item — and
+     this is not one. It reports who holds the editor, which belongs with the
+     rest of the canvas state along the bottom.
+     z-index joins the canvas-chrome tier (controls 50, top control 57) below
+     the fabs at 58, so chrome cannot outrank navigation again. */
+  .canvas-editor-bar {
+    position: fixed;
+    top: auto;
+    right: auto;
+    bottom: calc(56px + env(safe-area-inset-bottom, 0px) + 10px);
+    left: 12px;
+    padding: 4px 8px;
+    font-size: 11px;
+    gap: 5px;
+    z-index: 57;
+  }
+
   /* ── Activity strip → right drawer ── */
   .activity-strip {
     position: fixed;
@@ -6521,17 +6543,8 @@ html, body {
   .canvas-controls { bottom: 66px; right: 12px; }
   .canvas-top-control { top: 12px; }
 
-  .canvas-editor-bar {
-    position: fixed;
-    top: 12px;
-    left: 12px;
-    bottom: auto;
-    right: auto;
-    padding: 4px 8px;
-    font-size: 11px;
-    gap: 5px;
-    z-index: 100;
-  }
+  /* Stays paired with .canvas-controls, which drops the inset at this size. */
+  .canvas-editor-bar { bottom: 66px; }
   #canvas-toast {
     bottom: calc(56px + env(safe-area-inset-bottom, 0px) + 16px) !important;
   }
