@@ -30,8 +30,43 @@ export function initSidebar() {
     searchInput.addEventListener('input', () => _onSearchInput(searchInput.value));
   }
 
+  _initCollapse();
+
   // Load saved tool configs
   _loadToolConfigs();
+}
+
+/**
+ * Collapse the sidebar to a rail.
+ *
+ * 280px is a third of a tablet in portrait, and most of the time the canvas is
+ * what you are looking at. Shut, the panel keeps a rail of the section status
+ * dots rather than disappearing: the toggle stays in the same place whichever
+ * state it is in, and which devices are up is still readable.
+ *
+ * Below 768px the sidebar is a drawer that the fab already opens and closes, so
+ * this control is hidden there and the flag is left alone — it belongs to the
+ * wide layout and should survive a trip through a narrow one.
+ */
+function _initCollapse() {
+  const sidebar = document.getElementById('sidebar');
+  const btn = document.getElementById('sidebar-collapse-btn');
+  if (!sidebar || !btn) return;
+
+  const apply = (on) => {
+    sidebar.classList.toggle('collapsed', on);
+    btn.setAttribute('aria-expanded', on ? 'false' : 'true');
+    btn.title = on ? '展开侧栏' : '收起侧栏';
+    btn.setAttribute('aria-label', btn.title);
+  };
+
+  apply(localStorage.getItem('sidebar-collapsed') === '1');
+
+  btn.addEventListener('click', () => {
+    const on = !sidebar.classList.contains('collapsed');
+    apply(on);
+    localStorage.setItem('sidebar-collapsed', on ? '1' : '0');
+  });
 }
 
 async function _loadToolConfigs() {

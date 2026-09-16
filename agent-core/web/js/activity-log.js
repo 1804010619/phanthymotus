@@ -64,6 +64,11 @@ function _initResize() {
   };
   handle.addEventListener('pointerup', end);
   handle.addEventListener('pointercancel', end);
+
+  // The grip lives inside the header, and the header is the collapse toggle, so
+  // both the click ending a drag and a stray tap on the grip would otherwise
+  // bubble up and toggle the bar.
+  handle.addEventListener('click', (e) => e.stopPropagation());
 }
 
 function _initCollapse() {
@@ -106,6 +111,15 @@ function _append(event) {
     <span class="log-msg">${mcpTag}${msg}</span>
   `;
   log.appendChild(row);
+
+  // Mirror onto the ledge, which shows this instead of the panel's own name
+  // once the bar is shut. Only the type is dropped — it is a coloured chip that
+  // would dominate a single line, and the message usually names the tool anyway.
+  const latest = document.getElementById('activity-latest');
+  if (latest) {
+    latest.innerHTML = `<span class="log-time">${t}</span><span>${mcpTag}${msg}</span>`;
+    document.getElementById('activity-strip')?.classList.add('has-latest');
+  }
 
   while (log.children.length > 1000) log.removeChild(log.firstChild);
 
