@@ -4028,6 +4028,15 @@ html, body {
   position: relative;
 }
 
+/* 视口太矮时给行高一个地板。横屏手机（844×390）宽度过了 768px，走的是这套桌面
+   布局，减掉活动栏后 20% 只剩 21px —— 卡片比自己的表头还矮，「尚未收到数据」那两行
+   直接溢出到卡片外面。超出的部分由网格滚动消化（overflow-y 已经是 auto）。
+   只在矮视口生效：20% 在常见笔记本上算出来是 70–110px，无条件加地板会把桌面端的
+   仪表盘也改了。 */
+@media (min-width: 769px) and (max-height: 600px) {
+  .monitor-dashboard-grid { grid-auto-rows: minmax(160px, 20%); }
+}
+
 /* Dashboard card */
 .monitor-card {
   background: var(--bg-card);
@@ -4201,13 +4210,16 @@ html, body {
    than inside it so no renderer has to know about it. */
 .monitor-card-empty {
   position: absolute;
-  inset: 49px 0 0 0;          /* below the header */
+  /* 表头高度写成 padding 而不是 inset 的偏移，再加 overflow:hidden：卡片矮到放不下
+     这两行时，文字被裁在卡片里，而不是溢出到卡片外面去。 */
+  inset: 0;
+  padding: 49px 16px 8px;
+  overflow: hidden;
   display: flex;
   flex-direction: column;
   align-items: center;
   justify-content: center;
   gap: 4px;
-  padding: 0 16px;
   text-align: center;
   pointer-events: none;
   /* Opaque, not a translucent overlay: the image and video renderers paint a
