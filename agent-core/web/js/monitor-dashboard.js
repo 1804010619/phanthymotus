@@ -23,11 +23,15 @@ const STORAGE_KEY = 'monitor-dashboard-layout-v2';
 // window was, which is only right near 1080p: at 1280 a column is 237px and a
 // KV panel fits one key per row, at 800 it is 131px and video/skeleton cards
 // are unreadable, and on a 3440 ultrawide it is 665px of mostly empty card.
-// Bands are ~340px per column, snapped so the count changes at round widths.
+// Bands target ~300px per column, which given the grid's 48px of padding and
+// 12px gaps puts every threshold from three columns up exactly 300 apart.
+// A column narrower than ~280px is where the KV panel drops to one key per row
+// and video stops being worth looking at, so that is the floor the ladder keeps.
 const COL_BANDS = [
-  [480, 1], [768, 2], [1100, 3], [1500, 4], [2100, 5], [2800, 6],
+  [480, 1], [900, 2], [1200, 3], [1500, 4], [1800, 5],
+  [2100, 6], [2400, 7], [2700, 8], [3000, 9],
 ];
-const MAX_COLS = 7;     // above the last band
+const MAX_COLS = 10;    // above the last band
 const EDGE = 48;        // px from a grid edge where a drag starts auto-scrolling
 const EDGE_SPEED = 14;  // px per frame of auto-scroll
 let _topicMcpMap = {};  // topic → mcpId, populated on fetch
