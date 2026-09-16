@@ -5165,6 +5165,42 @@ html, body {
   color: var(--text-dim);
   margin-top: 2px;
 }
+.history-session-meta span:first-child {
+  font-family: 'JetBrains Mono', monospace;
+}
+.history-session-agent {
+  font-family: 'JetBrains Mono', monospace;
+  margin-left: auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* 分区：主代理 / 子代理 / 后台子代理。谁发起的这段对话，是读它之前要先知道的事，
+   所以分区标题常驻在滚动顶部，条目左侧留一条同色的窄边区分来源。 */
+.history-group-head {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  padding: 6px 14px 5px;
+  background: var(--bg-input);
+  border-bottom: 1px solid var(--border);
+  font-size: 0.72rem;
+  font-weight: 600;
+  color: var(--text-muted);
+}
+.history-group-count {
+  font-family: 'JetBrains Mono', monospace;
+  font-weight: 400;
+  color: var(--text-dim);
+}
+
+.history-session-item { border-left: 3px solid transparent; }
+.history-session-item.kind-main        { border-left-color: var(--accent); }
+.history-session-item.kind-subagent    { border-left-color: var(--blue); }
+.history-session-item.kind-bg_subagent { border-left-color: var(--border-med); }
 
 /* ── Chat Content (right pane) ── */
 
@@ -5263,7 +5299,14 @@ html, body {
   margin: 12px 0;
   padding-top: 4px;
   display: flex;
-  justify-content: flex-end;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 12px;
+}
+.history-turn-time {
+  font-size: 0.7rem;
+  color: var(--text-dim);
+  font-family: 'JetBrains Mono', monospace;
 }
 .history-usage {
   font-size: 0.7rem;

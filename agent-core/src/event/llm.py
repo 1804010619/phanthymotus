@@ -114,6 +114,28 @@ def _build_system_tools(named_functions: list[tuple[str, callable]]) -> dict:
 
 # ── History helpers ────────────────────────────────────────────────────────────
 
+def _compact_turn(turn: list[dict]) -> list[dict]:
+    """返回一份截断了大 tool result 的副本，用于存历史（内存 + SQLite）。
+
+    返回副本而不是原地改：turn 跑到一半也要落盘一次，那时原 turn 还要接着喂给 LLM，
+    不能被截断过的内容替换掉。
+    """
+    llm_cfg = config.main.get('event', {}).get('llm', {})
+    limit = llm_cfg.get('save_compact_chars', 500)
+    out = []
+    for msg in turn:
+        if msg.get('role') == 'tool':
+            content = msg.get('content', '')
+            if isinstance(content, str) and len(content) > limit:
+                out.append({**msg, 'content': content[:limit] + '...(trimmed)'})
+                continue
+            if isinstance(content, list):
+                out.append({**msg, 'content': '(多模态内容已省略)'})
+                continue
+        out.append(msg)
+    return out
+
+
 def _scrub(message_list: list[dict]) -> list[dict]:
     """丢弃结构非法的 tool_call，以及随之失去归属的 tool 结果。
 
@@ -1562,19 +1584,35 @@ class Event:
                 if self._current_turn and not ev.get('_bot_channel_event'):
                     self._save_current_turn(ev)
 
+    def _flush_current_turn(self, trigger_event: dict | None = None):
+        """把正在跑的 turn 写进 SQLite（每轮一次），不动内存历史。
+
+        以前只有 turn 结束时写一次，一个跑了几分钟的 turn 在这期间对历史 modal 完全
+        不存在 —— 手动刷新也刷不出来，因为要刷的行还没有。这里按当前 turn 索引 upsert，
+        turn 结束时 `_save_current_turn` 再写同一个索引覆盖掉（那一份已 compact）。
+        """
+        if not self._current_turn:
+            return
+        import chat_history
+        try:
+            if not self._session_id:
+                self._session_id = chat_history.create_session(chat_history.KIND_MAIN)
+            # 存盘的是截断过的副本 —— 和 turn 结束时那一份同一个规则，也避免把整轮
+            # 未截断的 tool result 每轮重写一遍。原 turn 不能动，LLM 还要用完整内容。
+            chat_history.save_turn(
+                self._session_id, len(self._turns), _compact_turn(self._current_turn))
+            if trigger_event:
+                summary_text = trigger_event.get('text', '') or trigger_event.get('source', '')
+                if summary_text:
+                    chat_history.update_summary(self._session_id, summary_text)
+        except Exception as e:
+            print(f'[chat_history] flush_turn failed: {e}')
+
     def _save_current_turn(self, trigger_event: dict):
         """保存 _current_turn 到内存历史 + SQLite。"""
-        turn = self._current_turn
         # 保存前 compact：截断大 tool results，减少 tier1 历史占用
-        llm_cfg = config.main.get('event', {}).get('llm', {})
-        save_compact_limit = llm_cfg.get('save_compact_chars', 500)
-        for i, msg in enumerate(turn):
-            if msg.get('role') == 'tool':
-                content = msg.get('content', '')
-                if isinstance(content, str) and len(content) > save_compact_limit:
-                    turn[i] = {**msg, 'content': content[:save_compact_limit] + '...(trimmed)'}
-                elif isinstance(content, list):
-                    turn[i] = {**msg, 'content': '(多模态内容已省略)'}
+        turn = _compact_turn(self._current_turn)
+        self._current_turn[:] = turn
         self._turns.append(turn)
         # 持久化（延迟创建 session）
         import chat_history
@@ -1859,7 +1897,29 @@ class Event:
         _trace_id = str(uuid4())
         _turn_start_ts = time.time()
         _spans = []  # 收集所有 span
+        _spans_committed = 0  # 已落盘的 span 数（turn 跑到一半也提交，见 _flush_spans）
         _tool_names_collected = []
+
+        def _flush_spans():
+            """把本轮新产生的 span 落盘，让性能面板能看到正在跑的 turn。
+
+            以前只有 turn 结束时提交一次，所以面板上最新的一条永远是上一个 turn ——
+            正在跑的那个（也就是唯一有人想看的那个）还不存在。
+            """
+            nonlocal _spans_committed
+            new = _spans[_spans_committed:]
+            if not new:
+                return
+            try:
+                perf_log.commit_spans(
+                    trace_id=_trace_id,
+                    spans=new,
+                    source=trigger_event.get('source', ''),
+                    trigger_text=trigger_event.get('text', '')[:300],
+                )
+                _spans_committed = len(_spans)
+            except Exception as _pe:
+                print(f'[perf_log] incremental commit error: {_pe}')
 
         # 从 trigger_event 中提取 perception 上报的 spans
         _perf_spans_from_perception = trigger_event.get('_perf_spans', [])
@@ -2121,6 +2181,8 @@ class Event:
                 else:
                     raise
             turn_messages.append(response)
+            self._flush_current_turn(trigger_event)
+            _flush_spans()
 
             # Log LLM response
             _round_elapsed = _time.perf_counter() - _round_t0
@@ -2422,6 +2484,11 @@ class Event:
                 else:
                     break
 
+            # 工具结果已入列 —— 再落一次盘，这样历史 modal 里这一轮是完整的（调用 + 结果），
+            # 而不是等整个 turn 结束才一起出现。
+            self._flush_current_turn(trigger_event)
+            _flush_spans()
+
             # 本轮的交互状态要在 finish 检测**之前**就记上。`speak(...) + finish()` 同轮
             # 是常见形状，而计数器那段在循环体末尾 —— 等到那里再更新，finish 分支看到的
             # _turn_interacted 还是 False，哑火护栏会凭空多插一轮。
@@ -2556,12 +2623,5 @@ class Event:
         _turn_end_ts = time.time()
         _spans.append({'span': 'turn_total', 'component': 'core',
                        'start_ts': _turn_start_ts, 'end_ts': _turn_end_ts})
-        try:
-            perf_log.commit_spans(
-                trace_id=_trace_id,
-                spans=_spans,
-                source=trigger_event.get('source', ''),
-                trigger_text=trigger_event.get('text', '')[:300],
-            )
-        except Exception as _pe:
-            print(f'[perf_log] commit error: {_pe}')
+        # 只提交尚未落盘的部分 —— 轮内已经提交过的不能再写一遍。
+        _flush_spans()

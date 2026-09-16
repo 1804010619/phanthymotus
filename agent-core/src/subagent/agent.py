@@ -61,6 +61,13 @@ class Subagent:
         self.rounds_completed: int = 0
         self.result: SubagentResult | None = None
 
+        # Chat-history mirror. Turns are written as they finish rather than in one
+        # batch at completion — a background agent that runs for minutes was
+        # invisible in the history modal for its whole life otherwise. The index is
+        # its own counter because context.turns gets compacted under it.
+        self.history_session_id: str | None = None
+        self._history_turn_index = 0
+
         # Context isolation
         self._context = SubagentContext(spec, compress_threshold)
         self._inbox: asyncio.Queue = asyncio.Queue(maxsize=16)
@@ -83,6 +90,27 @@ class Subagent:
     @property
     def context(self) -> SubagentContext:
         return self._context
+
+    def persist_turn(self, messages: list[dict]) -> None:
+        """Append one finished round to this agent's chat-history session."""
+        if not messages:
+            return
+        try:
+            import chat_history
+            if not self.history_session_id:
+                kind = (chat_history.KIND_BG_SUBAGENT
+                        if self.spec.goal.startswith('[bg]')
+                        else chat_history.KIND_SUBAGENT)
+                self.history_session_id = chat_history.create_session(kind)
+                chat_history.update_summary(
+                    self.history_session_id,
+                    f'[subagent:{self.id}] {self.spec.goal[:80]}',
+                )
+            chat_history.save_turn(
+                self.history_session_id, self._history_turn_index, messages)
+            self._history_turn_index += 1
+        except Exception as e:
+            print(f'[subagent:{self.id}] save history failed: {e}')
 
     def get_status(self) -> SubagentStatus:
         return SubagentStatus(
@@ -434,6 +462,7 @@ class Subagent:
 
                 # Add round to context
                 self._context.add_turn(round_messages)
+                self.persist_turn(round_messages)
                 self.rounds_completed = round_idx + 1
                 self.updated_at = time.time()
 

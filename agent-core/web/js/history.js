@@ -6,6 +6,18 @@ let _overlay, _list, _chat, _btnDeleteSelected, _selectedIds;
 let _pollTimer = null;
 let _activeSessionId = null;
 let _activeTab = 'sessions';
+// 上一次渲染的内容指纹。轮询每 3 秒拉一次，内容没变就别重画 —— 重画会清掉
+// 滚动位置和展开的工具卡片。
+let _listSig = '';
+let _chatSig = '';
+
+const POLL_MS = 3000;
+
+const KIND_GROUPS = [
+  { kind: 'main',        label: '主代理' },
+  { kind: 'subagent',    label: '子代理' },
+  { kind: 'bg_subagent', label: '后台子代理' },
+];
 
 export function initHistory() {
   _overlay = document.getElementById('history-overlay');
@@ -32,7 +44,6 @@ export async function showHistory() {
   _selectedIds.clear();
   _updateDeleteBtn();
   await _loadSessions();
-  // 打开时每 5 秒自动刷新 session 列表
   _startPoll();
 }
 
@@ -43,7 +54,12 @@ function hide() {
 
 function _startPoll() {
   _stopPoll();
-  _pollTimer = setInterval(() => _loadSessions(), 5000);
+  // 列表和当前打开的会话一起刷 —— 以前只刷列表，右侧停在打开那一刻的快照，
+  // 一个还在跑的 turn 要等下次手动点开才看得到。
+  _pollTimer = setInterval(() => {
+    if (_activeTab === 'sessions') { _loadSessions(); _refreshOpenSession(); }
+    else _loadTasks();
+  }, POLL_MS);
 }
 
 function _stopPoll() {
@@ -57,28 +73,74 @@ async function _loadSessions() {
     _renderList(data.sessions);
   } catch (e) {
     _list.innerHTML = '<div class="history-empty">加载失败</div>';
+    _listSig = '';
   }
+}
+
+/** 老记录没有 kind 列，从 summary 前缀反推。 */
+function _sessionKind(s) {
+  if (s.kind) return s.kind;
+  const sum = s.summary || '';
+  if (!sum.startsWith('[subagent:')) return 'main';
+  return sum.includes('[bg]') ? 'bg_subagent' : 'subagent';
+}
+
+/** summary 里的 [subagent:id] / [bg] 已经由分区和 id 标签表达，正文里去掉。 */
+function _sessionTitle(s) {
+  const sum = (s.summary || '').replace(/^\[subagent:[^\]]+\]\s*/, '').replace(/^\[bg\]\s*/, '');
+  return sum || '(无标题)';
+}
+
+function _sessionAgentId(s) {
+  const m = (s.summary || '').match(/^\[subagent:([^\]]+)\]/);
+  return m ? m[1] : '';
 }
 
 function _renderList(sessions) {
   if (!sessions.length) {
     _list.innerHTML = '<div class="history-empty">暂无对话记录</div>';
+    _listSig = '';
     return;
   }
-  _list.innerHTML = sessions.map(s => `
-    <div class="history-session-item${s.id === _activeSessionId ? ' active' : ''}" data-id="${s.id}">
-      <label class="history-session-check">
-        <input type="checkbox" class="history-cb" data-id="${s.id}"${_selectedIds.has(s.id) ? ' checked' : ''}>
-      </label>
-      <div class="history-session-info">
-        <div class="history-session-summary">${_escape(s.summary || '(无标题)')}</div>
-        <div class="history-session-meta">
-          <span>${_formatTime(s.started_at)}</span>
-          <span>${s.turn_count} 轮</span>
+
+  // 后端已按最后活动时间倒序返回，分组时保持该顺序即可。
+  const byKind = { main: [], subagent: [], bg_subagent: [] };
+  for (const s of sessions) (byKind[_sessionKind(s)] || byKind.main).push(s);
+
+  const sig = JSON.stringify([
+    _activeSessionId, [..._selectedIds].sort(),
+    sessions.map(s => [s.id, s.turn_count, s.last_at, s.summary]),
+  ]);
+  if (sig === _listSig) return;
+  _listSig = sig;
+
+  const scrollTop = _list.scrollTop;
+  _list.innerHTML = KIND_GROUPS.map(({ kind, label }) => {
+    const group = byKind[kind];
+    if (!group.length) return '';
+    const items = group.map(s => {
+      const agentId = _sessionAgentId(s);
+      return `
+      <div class="history-session-item kind-${kind}${s.id === _activeSessionId ? ' active' : ''}" data-id="${s.id}">
+        <label class="history-session-check">
+          <input type="checkbox" class="history-cb" data-id="${s.id}"${_selectedIds.has(s.id) ? ' checked' : ''}>
+        </label>
+        <div class="history-session-info">
+          <div class="history-session-summary">${_escape(_sessionTitle(s))}</div>
+          <div class="history-session-meta">
+            <span>${_formatTime(s.last_at || s.started_at)}</span>
+            <span>${s.turn_count} 轮</span>
+            ${agentId ? `<span class="history-session-agent">${_escape(agentId)}</span>` : ''}
+          </div>
         </div>
-      </div>
-    </div>
-  `).join('');
+      </div>`;
+    }).join('');
+    return `<div class="history-group">
+      <div class="history-group-head">${label}<span class="history-group-count">${group.length}</span></div>
+      ${items}
+    </div>`;
+  }).join('');
+  _list.scrollTop = scrollTop;
 
   // Click to view
   _list.querySelectorAll('.history-session-info').forEach(el => {
@@ -115,8 +177,14 @@ async function deleteSelected() {
   });
   _selectedIds.clear();
   _updateDeleteBtn();
-  _chat.innerHTML = '<div class="history-placeholder">选择一个会话查看对话记录</div>';
+  _clearChatPane();
   await _loadSessions();
+}
+
+function _clearChatPane() {
+  _activeSessionId = null;
+  _chatSig = '';
+  _chat.innerHTML = '<div class="history-placeholder">选择一个会话查看对话记录</div>';
 }
 
 async function clearAll() {
@@ -130,40 +198,67 @@ async function clearAll() {
   await fetch('/api/history/sessions', { method: 'DELETE' });
   _selectedIds.clear();
   _updateDeleteBtn();
-  _chat.innerHTML = '<div class="history-placeholder">选择一个会话查看对话记录</div>';
+  _clearChatPane();
   await _loadSessions();
 }
 
 async function _loadSession(sessionId) {
   _activeSessionId = sessionId;
+  _chatSig = '';
   _chat.innerHTML = '<div class="history-placeholder">加载中…</div>';
+  await _fetchSession(sessionId);
+}
+
+/** 轮询时刷新右侧，但保留滚动位置和展开的卡片。 */
+async function _refreshOpenSession() {
+  if (_activeSessionId) await _fetchSession(_activeSessionId);
+}
+
+async function _fetchSession(sessionId) {
   try {
     const res = await fetch(`/api/history/sessions/${sessionId}`);
     const data = await res.json();
-    _renderChat(data.messages);
+    if (sessionId !== _activeSessionId) return;  // 期间切走了
+    _renderChat(data.messages, data.turn_times || []);
   } catch (e) {
-    _chat.innerHTML = '<div class="history-placeholder">加载失败</div>';
+    if (!_chatSig) _chat.innerHTML = '<div class="history-placeholder">加载失败</div>';
   }
 }
 
-function _renderChat(turns) {
+function _renderChat(turns, turnTimes) {
   if (!turns.length) {
     _chat.innerHTML = '<div class="history-placeholder">此会话无消息</div>';
+    _chatSig = '';
     return;
   }
+  const sig = JSON.stringify([_activeSessionId, turns, turnTimes]);
+  if (sig === _chatSig) return;
+  const firstRender = !_chatSig;
+  _chatSig = sig;
+
+  // 重画前记住位置：贴着底的会话继续贴底（新轮次自动进入视野），
+  // 往回翻过的保持原处，否则每 3 秒把人弹回底部。
+  const atBottom = firstRender ||
+    (_chat.scrollHeight - _chat.scrollTop - _chat.clientHeight) < 40;
+  const prevTop = _chat.scrollTop;
+  const openCards = new Set();
+  _chat.querySelectorAll('details[open]').forEach(d => openCards.add(d.dataset.key));
+
   const summaryHtml = _renderUsageSummary(turns);
-  const html = turns.map(turn => {
-    const msgs = turn.map(msg => _renderMessage(msg)).join('');
+  const html = turns.map((turn, i) => {
+    const msgs = turn.map((msg, j) => _renderMessage(msg, `${i}-${j}`, openCards)).join('');
     const usage = _extractTurnUsage(turn);
+    const t = turnTimes[i];
+    const timeHtml = t
+      ? `<span class="history-turn-time">${_formatDateTime(t.updated_at || t.started_at)}</span>`
+      : '<span></span>';
     const usageHtml = usage
-      ? `<div class="history-turn-divider">
-           <span class="history-usage">输入 ${_fmtTokens(usage.prompt_tokens)} · 输出 ${_fmtTokens(usage.completion_tokens)} · 缓存 ${_fmtTokens(usage.cached_tokens)}</span>
-         </div>`
-      : '<div class="history-turn-divider"></div>';
-    return msgs + usageHtml;
+      ? `<span class="history-usage">输入 ${_fmtTokens(usage.prompt_tokens)} · 输出 ${_fmtTokens(usage.completion_tokens)} · 缓存 ${_fmtTokens(usage.cached_tokens)}</span>`
+      : '';
+    return msgs + `<div class="history-turn-divider">${timeHtml}${usageHtml}</div>`;
   }).join('');
   _chat.innerHTML = `<div class="history-messages">${summaryHtml}${html}</div>`;
-  _chat.scrollTop = _chat.scrollHeight;
+  _chat.scrollTop = atBottom ? _chat.scrollHeight : prevTop;
 }
 
 function _extractTurnUsage(turn) {
@@ -197,7 +292,7 @@ function _fmtTokens(n) {
   return String(n);
 }
 
-function _renderMessage(msg) {
+function _renderMessage(msg, key = '', openCards = new Set()) {
   if (msg.role === 'user') {
     return `<div class="history-msg history-msg-user">${_renderContent(msg.content)}</div>`;
   }
@@ -210,29 +305,29 @@ function _renderMessage(msg) {
     }
     // Tool calls
     if (msg.tool_calls && msg.tool_calls.length) {
-      html += msg.tool_calls.map(tc => _renderToolCall(tc)).join('');
+      html += msg.tool_calls.map((tc, k) => _renderToolCall(tc, `${key}-c${k}`, openCards)).join('');
     }
     return html;
   }
   if (msg.role === 'tool') {
-    return _renderToolResult(msg);
+    return _renderToolResult(msg, `${key}-r`, openCards);
   }
   return '';
 }
 
-function _renderToolCall(tc) {
+function _renderToolCall(tc, key = '', openCards = new Set()) {
   const name = tc.function?.name || 'unknown';
   let args = tc.function?.arguments || '';
   try { args = JSON.stringify(JSON.parse(args), null, 2); } catch {}
   return `
-    <details class="history-tool-card history-tool-call">
+    <details class="history-tool-card history-tool-call" data-key="${key}"${openCards.has(key) ? ' open' : ''}>
       <summary><span class="history-tool-icon">⚡</span> ${_escape(name)}</summary>
       <pre class="history-tool-body">${_escape(args)}</pre>
     </details>
   `;
 }
 
-function _renderToolResult(msg) {
+function _renderToolResult(msg, key = '', openCards = new Set()) {
   const content = msg.content || '';
   // Try to find the tool name from tool_call_id context (not available here, use generic label)
   let display = content;
@@ -241,7 +336,7 @@ function _renderToolResult(msg) {
     display = JSON.stringify(parsed, null, 2);
   } catch {}
   return `
-    <details class="history-tool-card history-tool-result">
+    <details class="history-tool-card history-tool-result" data-key="${key}"${openCards.has(key) ? ' open' : ''}>
       <summary><span class="history-tool-icon">📋</span> 执行结果</summary>
       <pre class="history-tool-body">${_escape(display)}</pre>
     </details>
@@ -274,11 +369,34 @@ function _escape(str) {
   return d.innerHTML;
 }
 
+// 一律按北京时间显示：机器人分布在不同机器上，看日志的人和机器人的时区不一定一致，
+// 用浏览器本地时区读出来的时间没法和机器上的日志对齐。
+const _BJ_PARTS = new Intl.DateTimeFormat('en-GB', {
+  timeZone: 'Asia/Shanghai',
+  year: 'numeric', month: '2-digit', day: '2-digit',
+  hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false,
+});
+
+function _bjParts(ts) {
+  const p = {};
+  for (const { type, value } of _BJ_PARTS.formatToParts(new Date(ts * 1000))) p[type] = value;
+  return p;
+}
+
+/** 完整日期时间，用于每一轮的时间戳。 */
+function _formatDateTime(ts) {
+  if (!ts) return '';
+  const p = _bjParts(ts);
+  return `${p.year}-${p.month}-${p.day} ${p.hour}:${p.minute}:${p.second}`;
+}
+
+/** 列表里的紧凑形式：今年的记录省掉年份。 */
 function _formatTime(ts) {
   if (!ts) return '';
-  const d = new Date(ts * 1000);
-  const pad = n => String(n).padStart(2, '0');
-  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+  const p = _bjParts(ts);
+  const thisYear = _bjParts(Date.now() / 1000).year;
+  const date = p.year === thisYear ? `${p.month}-${p.day}` : `${p.year}-${p.month}-${p.day}`;
+  return `${date} ${p.hour}:${p.minute}`;
 }
 
 
