@@ -86,10 +86,20 @@ html, body {
 /* ══════════════════════════════════════════════════════════════════════════
    APP SHELL
 ══════════════════════════════════════════════════════════════════════════ */
+/* `vh` is always the *large* viewport — the height with the browser toolbar
+   retracted. Tablet Chrome keeps its toolbar up permanently, so `100vh`
+   overshot the visible area by the toolbar's ~56dp, and `overflow: hidden`
+   meant you could not scroll down to what had been pushed off. The bottom of
+   the shell was simply unreachable: the collapsed 32px activity bar landed
+   entirely inside that band, and collapsing it once wrote `activity-collapsed`
+   so it stayed that way on every later visit.
+   `dvh` tracks the viewport that is actually on screen; `vh` stays as the
+   fallback for engines without it. */
 #app {
   display: flex;
   flex-direction: column;
   height: 100vh;
+  height: 100dvh;
   overflow: hidden;
 }
 
@@ -1733,23 +1743,63 @@ html, body {
 
 /* ── Activity Strip ───────────────────────────────────────────────────────── */
 .activity-strip {
+  position: relative;
   height: var(--activity-h);
   min-height: 80px;
   max-height: 60vh;
+  max-height: 60dvh;
   flex-shrink: 0;
   border-top: 1px solid var(--border);
   background: var(--bg-card);
   display: flex;
   flex-direction: column;
-  resize: vertical;
   overflow: hidden;
+  /* `viewport-fit=cover` lets the page run under the home indicator, so the
+     last rows of the log would sit beneath it without this. */
+  padding-bottom: env(safe-area-inset-bottom, 0px);
   transition: height .25s ease, min-height .25s ease;
 }
+/* Dragging sets the height every frame; the ease would fight it. */
+.activity-strip.resizing { transition: none; }
 .activity-strip.collapsed {
-  height: 32px !important;
-  min-height: 32px;
-  resize: none;
+  /* 44px, not the old 32px: when shut this header is the only way back, and a
+     32px row is under the minimum touch target. The inset keeps those 44px
+     above the home indicator rather than partly behind it. */
+  height: calc(44px + env(safe-area-inset-bottom, 0px)) !important;
+  min-height: calc(44px + env(safe-area-inset-bottom, 0px));
 }
+
+/* Native `resize: vertical` was unreachable by touch — the handle responds to
+   mouse only, so on a tablet the log was stuck at whichever of the two preset
+   heights it happened to be in. A pointer-event handle covers both inputs
+   through one code path. */
+.activity-resize-handle {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 10px;
+  z-index: 2;
+  cursor: ns-resize;
+  touch-action: none;
+  -webkit-tap-highlight-color: transparent;
+}
+.activity-resize-handle::after {
+  content: '';
+  position: absolute;
+  top: 3px;
+  left: 50%;
+  transform: translateX(-50%);
+  width: 36px;
+  height: 3px;
+  border-radius: 2px;
+  background: var(--border);
+  opacity: 0;
+  transition: opacity .15s;
+}
+.activity-resize-handle:hover::after,
+.activity-strip.resizing .activity-resize-handle::after { opacity: 1; }
+.activity-strip.collapsed .activity-resize-handle { display: none; }
 .activity-strip.collapsed .activity-log {
   display: none;
 }
@@ -6032,10 +6082,13 @@ html, body {
     border-top: none;
     border-left: 1px solid var(--border);
     box-shadow: var(--shadow-lg);
-    resize: none;
     transform: translateX(100%);
     transition: transform 0.3s ease;
+    /* Drawer mode stops above the tabbar, which carries the inset itself. */
+    padding-bottom: 0;
   }
+  /* Full-height drawer — there is no height to drag. */
+  .activity-resize-handle { display: none; }
   .activity-strip.collapsed { height: auto !important; min-height: 0; }
   .activity-strip.collapsed .activity-log { display: block; }
   .activity-strip.collapsed .activity-collapse-btn { transform: none; }
@@ -6285,6 +6338,58 @@ html, body {
   #app.settings-active .sidebar { display: none !important; }
   #app.settings-active .monitor-dashboard { display: none !important; }
   #app.settings-active .activity-strip { display: none !important; }
+}
+
+/* ══════════════════════════════════════════════════════════════════════════
+   TOUCH INPUT (any width) — finger-sized targets and gesture ownership
+══════════════════════════════════════════════════════════════════════════ */
+/* These used to live inside `max-width: 768px` alongside the layout rules, which
+   conflated two different questions: *how wide* is the screen, and *what is
+   pointing at it*. A tablet answers "wide" and "finger", so it got the desktop
+   layout — correct — but with desktop hit targets, which is not: the activity
+   bar's collapse arrow measured 22x16px, and canvas ports 36px.
+   Layout stays keyed on width (tabbar, drawers, full-page panels); only the
+   things that depend on the pointer live here. Phones match both blocks and the
+   values agree, so nothing changes there. */
+@media (pointer: coarse) {
+  .btn-icon { min-width: 44px; min-height: 44px; }
+  .btn-ghost { min-height: 44px; padding: 10px 14px; }
+  .sidebar-chip { padding: 10px 12px; min-height: 44px; }
+  .deploy-tab { padding: 10px 14px; font-size: 14px; min-height: 44px; }
+
+  /* Only the box grows. The arrow's rotation is layout state (it points down in
+     the bottom bar, sideways in the drawer), so it is left to those blocks. */
+  .activity-collapse-btn {
+    min-width: 44px;
+    min-height: 44px;
+    padding: 8px;
+  }
+  .activity-strip-header { min-height: 44px; }
+  /* Grabbable by thumb, but kept to well under half the 44px header so most of
+     it stays a plain toggle. A press that never moves falls through to the
+     toggle anyway — see activity-log.js. */
+  .activity-resize-handle { height: 16px; }
+  .activity-resize-handle::after { top: 6px; opacity: 1; }
+
+  /* Transparent hit-area expansion, on top of the 36px `::before`. */
+  .canvas-port::after {
+    content: '';
+    position: absolute;
+    width: 44px;
+    height: 44px;
+    top: 50%;
+    left: 50%;
+    transform: translate(-50%, -50%);
+    background: transparent !important;
+    border-radius: 50%;
+    inset: auto;
+  }
+
+  /* Pan and card-drag are driven by pointer events with setPointerCapture. With
+     the default `touch-action` the browser can claim the same gesture and fire
+     pointercancel mid-drag, and it adds the double-tap-zoom delay on top. */
+  .canvas-area { touch-action: none; }
+  .canvas-card-header { touch-action: none; }
 }
 
 /* ══════════════════════════════════════════════════════════════════════════

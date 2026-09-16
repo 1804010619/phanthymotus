@@ -9,6 +9,67 @@ import { toggleLog } from './mobile.js';
 export function initActivityLog() {
   onMotusEvent(null, _append);
   _initCollapse();
+  _initResize();
+}
+
+// Kept in step with `.activity-strip`'s own min-height / max-height, so a drag
+// cannot leave the element at a size the stylesheet then clamps back.
+const _MIN_H = 80;
+function _maxH() { return Math.round(window.innerHeight * 0.6); }
+
+/**
+ * Drag the strip's top edge to set its height.
+ *
+ * This replaces CSS `resize: vertical`, whose handle is mouse-only — on a
+ * tablet the log was stuck at whichever of collapsed/expanded it was in, with
+ * no way to see more of it. Pointer events cover mouse, pen and touch through
+ * one path, and unlike the native handle the chosen height can be persisted.
+ */
+function _initResize() {
+  const strip = document.getElementById('activity-strip');
+  const handle = document.getElementById('activity-resize-handle');
+  if (!strip || !handle) return;
+
+  const saved = parseInt(localStorage.getItem('activity-height') || '', 10);
+  if (Number.isFinite(saved)) {
+    strip.style.height = `${Math.min(Math.max(saved, _MIN_H), _maxH())}px`;
+  }
+
+  let startY = 0;
+  let startH = 0;
+  let moved = false;
+
+  handle.addEventListener('pointerdown', (e) => {
+    if (strip.classList.contains('collapsed')) return;
+    startY = e.clientY;
+    startH = strip.getBoundingClientRect().height;
+    moved = false;
+    handle.setPointerCapture(e.pointerId);
+    strip.classList.add('resizing');
+    e.preventDefault();
+  });
+
+  handle.addEventListener('pointermove', (e) => {
+    if (!strip.classList.contains('resizing')) return;
+    const dy = startY - e.clientY;      // drag up = taller
+    if (Math.abs(dy) > 3) moved = true;
+    strip.style.height = `${Math.min(Math.max(startH + dy, _MIN_H), _maxH())}px`;
+  });
+
+  const end = () => {
+    if (!strip.classList.contains('resizing')) return;
+    strip.classList.remove('resizing');
+    if (moved) {
+      localStorage.setItem('activity-height', String(Math.round(strip.getBoundingClientRect().height)));
+    } else {
+      // The handle sits over the top of the header, which is itself the
+      // collapse toggle. A press that never moved was meant for the toggle, so
+      // hand it on rather than swallowing it.
+      toggleLog();
+    }
+  };
+  handle.addEventListener('pointerup', end);
+  handle.addEventListener('pointercancel', end);
 }
 
 function _initCollapse() {
