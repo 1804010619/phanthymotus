@@ -360,24 +360,11 @@ html, body {
    Same height as the activity ledge, so the two panels agree, and the same
    rule: only the content area collapses. Shut, the sidebar keeps a rail of the
    section status dots — which devices are up is the one thing worth seeing
-   while the list itself is out of the way. */
-.sidebar-header {
-  display: flex;
-  align-items: center;
-  height: var(--ledge-h);
-  box-sizing: border-box;
-  padding: 0 0 0 16px;
-  border-bottom: 1px solid var(--border);
-  flex-shrink: 0;
-}
-.sidebar-header-title {
-  flex: 1;
-  min-width: 0;
-  font-size: 10px;
-  font-weight: 700;
-  color: var(--text-dim);
-  letter-spacing: 1px;
-}
+   while the list itself is out of the way.
+
+   收起键和搜索框同一行。它原先待在一行只写着「工具」的标题行里，而那四个字
+   搜索框的 placeholder 已经说过一遍，于是整整一个 ledge 的高度只换来一个重复的
+   标签。现在这一行就是 ledge，搜索框吃掉左边，收起键守在右端。 */
 .sidebar-collapse-btn {
   flex-shrink: 0;
   width: var(--ledge-h);
@@ -392,10 +379,10 @@ html, body {
 .sidebar-collapse-btn:hover { background: var(--bg-hover); }
 
 .sidebar.collapsed { width: var(--sidebar-rail-w); }
-.sidebar.collapsed .sidebar-header { padding-left: 0; justify-content: center; }
 .sidebar.collapsed .sidebar-collapse-btn { transform: rotate(180deg); }
-.sidebar.collapsed .sidebar-header-title,
-.sidebar.collapsed .sidebar-filter,
+/* 收起后这一行只剩收起键 —— 它是唯一能再展开的入口，所以搜索框让位，键居中。 */
+.sidebar.collapsed .sidebar-filter { padding: 0; justify-content: center; }
+.sidebar.collapsed #sidebar-search { display: none; }
 .sidebar.collapsed .sidebar-empty,
 .sidebar.collapsed .sidebar-section-name,
 .sidebar.collapsed .sidebar-section-count,
@@ -407,13 +394,22 @@ html, body {
 .sidebar.collapsed .sidebar-section-dot { width: 9px; height: 9px; }
 .sidebar.collapsed .sidebar-section-icon { font-size: 14px; }
 
+/* 侧栏的 ledge —— 与活动栏同一套：一行、一个高度、右端一个与行等宽的收起键。
+   搜索框占满余下的宽度，因为那才是这行里真正会被用的东西。 */
 .sidebar-filter {
-  padding: 8px;
+  display: flex;
+  align-items: center;
+  height: var(--ledge-h);
+  box-sizing: border-box;
+  padding: 0 0 0 8px;
   border-bottom: 1px solid var(--border);
   background: var(--bg-card);
+  flex-shrink: 0;
 }
 #sidebar-search {
-  width: 100%; height: 28px; padding: 0 8px;
+  flex: 1;
+  min-width: 0;
+  height: 24px; padding: 0 8px;
   border: 1px solid var(--border); border-radius: var(--radius-sm);
   font-size: 11px; background: var(--bg-secondary);
   color: var(--text-primary); outline: none;
@@ -6212,14 +6208,19 @@ html, body {
      question. The rail width must be overridden too — `.sidebar.collapsed`
      outranks `.sidebar`, media query or not, so a stale flag from a desktop
      session would otherwise leave the drawer 40px wide. */
-  .sidebar-header { display: none; }
+  .sidebar-collapse-btn { display: none; }
   .sidebar.collapsed { width: 85vw; }
-  .sidebar.collapsed .sidebar-filter,
+  .sidebar.collapsed .sidebar-filter { padding: 0 0 0 8px; justify-content: flex-start; }
+  .sidebar.collapsed #sidebar-search,
   .sidebar.collapsed .sidebar-section-name,
   .sidebar.collapsed .sidebar-section-count,
   .sidebar.collapsed .sidebar-tool-list { display: revert; }
   .sidebar.collapsed .sidebar-scroll { padding: 8px; align-items: stretch; }
   .sidebar.collapsed .sidebar-section-header { padding: 4px 4px 2px; justify-content: flex-start; }
+  /* 收起键在这里是隐藏的，这行就只剩搜索框 —— 高度交还给它，按触摸尺寸来。
+     16px 是硬要求：低于 16px 时 iOS 会在聚焦输入框时缩放整个页面。 */
+  .sidebar-filter { height: auto; padding: 8px; }
+  #sidebar-search { height: 40px; font-size: 16px; }
 
   /* ── Detail panel → right drawer ── */
   .detail-panel {
