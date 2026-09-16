@@ -12,11 +12,12 @@ import { VideoRenderer }    from './renderers/video.js';
 import { ImageRenderer }    from './renderers/image.js';
 import { AudioRenderer }    from './renderers/audio.js';
 import { LidarRenderer }    from './renderers/lidar.js';
+import { ControlRenderer }  from './renderers/control.js';
 import { SkeletonRenderer } from './renderers/skeleton.js';
 import { CameraRenderer, DepthRenderer, DepthZlibRenderer } from './renderers/camera.js';
 import { openDetailPanelMobile, closeDetailPanelMobile } from './mobile.js';
 
-const RENDERERS = [VideoRenderer, CameraRenderer, DepthRenderer, DepthZlibRenderer, ImageRenderer, AudioRenderer, LidarRenderer, SkeletonRenderer, TextRenderer, ActivityRenderer];
+const RENDERERS = [VideoRenderer, CameraRenderer, DepthRenderer, DepthZlibRenderer, ImageRenderer, AudioRenderer, LidarRenderer, SkeletonRenderer, ControlRenderer, TextRenderer, ActivityRenderer];
 
 let _panel    = null;
 let _renderer = null;
