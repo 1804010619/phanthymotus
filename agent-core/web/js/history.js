@@ -97,19 +97,30 @@ function _sessionKind(s) {
 
 /** 列表标题：摘掉分区和 id 标签已经表达过的前缀，以及 `<event …>` 信封。
  *
- * 信封现在由后端 `summary_text` 在存之前就剥掉了，这里处理的是那之前存下的老记录：
- * 它们存的是截断在 100 字的信封本身，正文早就被截掉了，剥完只剩 `{"text": …` 这种
- * 残片。那种情况下退回信封里的 source —— 「这段对话从哪个渠道进来的」是这行里仅存
- * 的有用信息，比一段 JSON 残片强。
+ * 信封现在由后端 `summary_text` 在存之前就剥掉了，这里处理的是那之前存下的老记录。
+ * 它们存的是截断在 100 字的信封本身，而信封的开标签本身就可能超过 100 字 ——
+ * 天轶上那条就是：`<event source="dds:/nvidia_desktop/ext_mic/card_…/audio/asr"
+ * channel="local_mic" ts="2026…`，连 `>` 都没截到。所以不能指望能匹配到完整标签，
+ * 按「有没有 `>`」分情况，正文取不到就退回显示 source —— 从哪个渠道进来的，是这行
+ * 里仅存的有用信息。
  */
 function _sessionTitle(s) {
   const raw = (s.summary || '')
     .replace(/^\[subagent:[^\]]+\]\s*/, '')
-    .replace(/^\[bg\]\s*/, '');
-  if (!/<event\b/.test(raw)) return raw.trim() || '(无标题)';
-  const body = raw.replace(/<\/?event\b[^>]*>/g, '').trim();
-  // `{"text": …`（截断的 JSON）不算正文
-  if (body && !/^\{\s*"[^"]*"\s*:?\s*…?$/.test(body)) return body;
+    .replace(/^\[bg\]\s*/, '')
+    .trim();
+  if (!raw.startsWith('<event')) return raw || '(无标题)';
+
+  const close = raw.indexOf('>');
+  const body = close >= 0
+    ? raw.slice(close + 1).replace(/<\/?event\b[^>]*>/g, '').trim()
+    : '';
+  if (body) {
+    // 正文常常是 `{"text": "早上好。", "audio_duration_ms": 1676}`，可能也被截断了。
+    const text = body.match(/"text"\s*:\s*"((?:[^"\\]|\\.)*)"/);
+    if (text) return text[1];
+    if (!body.startsWith('{')) return body;
+  }
   const source = raw.match(/source="([^"]+)"/);
   return source ? `来自 ${source[1]}` : '(无标题)';
 }

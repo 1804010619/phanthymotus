@@ -6423,7 +6423,7 @@ html, body {
   #history-overlay.showing-detail .history-detail-title { display: block; }
   .history-back {
     align-items: center;
-    gap: 2px;
+    gap: 4px;
     min-height: 44px;
     padding: 0 10px 0 0;
     border: none;
@@ -6434,7 +6434,13 @@ html, body {
     cursor: pointer;
     flex-shrink: 0;
   }
-  .history-back span { font-size: 22px; line-height: 1; }
+  /* 用 SVG 画折角而不是 `‹` 字形：字形的高度和基线由字体自己决定，放大到能看清的
+     尺寸时就和「返回」两个字对不齐了。SVG 的盒子高度是自己说了算的。 */
+  .history-back svg {
+    width: 17px;
+    height: 17px;
+    flex-shrink: 0;
+  }
   .history-detail-title {
     flex: 1;
     min-width: 0;
