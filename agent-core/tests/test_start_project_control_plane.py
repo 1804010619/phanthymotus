@@ -76,6 +76,9 @@ def driver(monkeypatch):
     consumes commands publishes none.
     """
     starts, infos = {}, []
+    # Cards whose device is not answering — a test adds to this to simulate a
+    # container that is restarting when the project starts.
+    offline: set = set()
 
     descriptors = {ARM: ARM_DESCRIPTOR, ARM2: ARM2_DESCRIPTOR}
     topic_outs = {
@@ -95,6 +98,8 @@ def driver(monkeypatch):
             return {'code': 200, 'data': {'state': 'running'}}
         if action == 'info':
             infos.append(card_id)
+            if card_id in offline:
+                raise RuntimeError('connection refused')
             data = {'state': 'idle', 'topic_out': topic_outs.get(card_id, [])}
             if card_id in descriptors:
                 data['control_interface'] = descriptors[card_id]
@@ -133,7 +138,8 @@ def driver(monkeypatch):
                       ('api.inspection', inspection), ('channel.manager', chan)):
         monkeypatch.setitem(sys.modules, name, mod)
 
-    return types.SimpleNamespace(starts=starts, events=events, infos=infos)
+    return types.SimpleNamespace(starts=starts, events=events, infos=infos,
+                                 offline=offline)
 
 
 def _run(layout) -> bool:
@@ -297,3 +303,37 @@ def test_descriptor_conflict_catches_reordered_joints():
     swapped = {**ARM_DESCRIPTOR,
                'joint_names': list(reversed(ARM_DESCRIPTOR['joint_names']))}
     assert _descriptor_conflict([ARM_DESCRIPTOR, swapped]) is True
+
+
+# ── an unanswering consumer is not a wiring mistake ──────────────────────────
+
+def test_a_consumer_that_cannot_be_reached_names_itself(driver):
+    """The two failures used to be indistinguishable, and the wrong one showed.
+
+    A downstream driver whose container is restarting throws on `info()`. That
+    produced an empty error, so the producer card started with no
+    `control_interface` and reported its own message — "nothing is connected" —
+    against a canvas that was wired correctly. An operator then checks the
+    wiring, which is fine, and not the device, which is not. Seen on a Tianyi.
+    """
+    driver.offline.add(ARM)
+    layout = {'cards': [_card(VLA, 'vla'), _card(ARM, 'servo')],
+              'connections': [_conn(VLA, ARM)]}
+
+    assert _run(layout) is False
+
+    message = _errors(driver.events)[0]['message']
+    assert 'servo' in message          # which card
+    assert '连线是对的' in message      # and where not to look
+    assert VLA not in driver.starts     # it never started blind
+
+
+def test_an_unreachable_consumer_does_not_hide_a_reachable_one(driver):
+    """Two links, one device down: the arm that did answer still drives."""
+    driver.offline.add(ARM2)
+    layout = {'cards': [_card(VLA, 'vla'), _card(ARM, 'servo'),
+                        _card(ARM2, 'servo2')],
+              'connections': [_conn(VLA, ARM), _conn(VLA, ARM2)]}
+    _run(layout)
+
+    assert driver.starts[VLA]['control_interface'] == ARM_DESCRIPTOR

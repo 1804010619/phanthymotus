@@ -753,7 +753,7 @@ async def _do_start_project_impl():
         costs one extra `info()` per command link and nothing at all on a canvas
         without one.
         """
-        descriptors, sources = [], []
+        descriptors, sources, unreachable = [], [], []
         for conn in connections:
             if conn.get('fromCardId') != card_id:
                 continue
@@ -770,15 +770,32 @@ async def _do_start_project_impl():
                     tool=tool_name,
                     arguments={'action': 'info', 'instance_id': target.get('id', '')},
                 ))
+                # Answering without a descriptor and not answering at all are
+                # different facts, and only the second is a fault: most cards
+                # have never heard of motus.control/1, and a control link to
+                # one of those must not fail a start.
+                reachable = (info or {}).get('code') == 200
                 descriptor = (payload_of(info) or {}).get('control_interface')
             except Exception as error:
                 print(f'[start-project] {tool_name} descriptor info() failed: {error}')
-                descriptor = None
+                reachable, descriptor = False, None
             if isinstance(descriptor, dict) and descriptor:
                 descriptors.append(descriptor)
                 sources.append(tool_name)
+            elif not reachable:
+                unreachable.append(tool_name)
 
         if not descriptors:
+            # A consumer that cannot be reached and a consumer that simply
+            # has no action space used to produce the same (empty) error, which
+            # the producer card then reported as "nothing is connected" —
+            # sending an operator to check wiring that was correct. Seen on a
+            # Tianyi: the downstream driver's container happened to be
+            # restarting, info() threw, and the canvas blamed the canvas.
+            if unreachable:
+                return {}, (f'下游卡片 {", ".join(unreachable)} 没有应答，拿不到'
+                            f'动作空间。连线是对的 —— 请检查该卡片所在的设备是否'
+                            f'在线、是否刚重启。')
             return {}, ''
         if _descriptor_conflict(descriptors):
             return {}, (f'{card_id} 的控制输出接到了动作空间不一致的卡片：'
