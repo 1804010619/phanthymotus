@@ -19,7 +19,7 @@ problems already live. That is the same split OpenAI's ecosystem uses: the spec
 is a document, vLLM and SGLang each implement it, and no client carries an
 adapter per server.
 
-Spec: phanthymotus/docs/vla-integration.md § 5.2.
+Spec: phanthymotus/docs/vla-integration.md §"云端边界".
 """
 
 from __future__ import annotations

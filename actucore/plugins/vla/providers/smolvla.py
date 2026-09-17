@@ -15,7 +15,7 @@ This is also the only kind of provider whose resource use lands on the robot's
 own budget, which is why almost everything below is about *when* things are
 loaded rather than about inference.
 
-Three rules from the design (phanthymotus/docs/vla-integration.md § 4.5), and
+Three rules from the design (phanthymotus/docs/vla-integration.md §"接一个新模型"), and
 each is a thing that goes wrong if skipped:
 
 **Lazy import.** torch and lerobot are imported inside the functions that need
@@ -64,8 +64,8 @@ class SmolVLAProvider:
     Config keys:
         model_dir      where the checkpoint lives (default /models/vla/smolvla)
         model_id       upstream id, for the record — ModelScope first (see
-                       docs/vla-integration.md § 4.5.4). Not fetched from
-                       directly: the robot pulls from COS.
+                       docs/vla-integration.md §"接一个新模型"). Not fetched
+                       from directly: the robot pulls from a pinned manifest.
         weights        optional {base_url, files:{name:{size,sha256}}} manifest;
                        fetched into model_dir when the checkpoint is absent
         vlm_dir        where the backbone lives (default
@@ -251,7 +251,7 @@ class SmolVLAProvider:
             raise FileNotFoundError(
                 f"no checkpoint at {self._model_dir} and no `weights` manifest "
                 f"configured. Stage the checkpoint on COS (ModelScope first — "
-                f"see docs/vla-integration.md § 4.5.4) and put its base_url plus "
+                f"see docs/vla-integration.md §接一个新模型) and put its base_url plus "
                 f"per-file size/sha256 in the card's `weights` config."
             )
         # perception's downloader: existing → size → sha256 → reuse, otherwise
