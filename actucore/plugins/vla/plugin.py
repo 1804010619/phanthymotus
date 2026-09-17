@@ -68,6 +68,9 @@ class VLAPlugin:
         self._timer = None
         self._running = False
         self._task = ""
+        # Paused by `pause` or `interrupt`; both stop emitting, and the chunk
+        # state above is what tells them apart. See `_halt`.
+        self._paused = False
         self._rate_hz = 30.0
         self._ttl_ms = 100
         self._seq = 0
@@ -102,7 +105,8 @@ class VLAPlugin:
                 "type": "object",
                 "properties": {
                     "action": {"type": "string",
-                               "enum": ["start", "stop", "info", "config"]},
+                               "enum": ["start", "stop", "interrupt", "pause",
+                                        "resume", "info", "config"]},
                     "task": {"type": "string", "description": "自然语言指令"},
                     # Handed over by agent-core from the card wired downstream.
                     # Not operator-editable: it is a reading of the other card,
@@ -114,8 +118,40 @@ class VLAPlugin:
                 # runs until stopped. Declaring x-completion would hold an ACP
                 # pending open for the life of the card and block every other
                 # actuator behind the barrier.
-                "x-hooks": {"on_interrupt_all": {"action": "stop"},
-                            "on_interrupt_motion": {"action": "stop"}},
+                # This list is the model's entire reach: agent-core splits a
+                # tool into one LLM-callable function per entry (mcp_client.py
+                # `_to_openai_schema`), so an action absent here is callable by
+                # the canvas and not by the model. `start`/`stop` are absent
+                # deliberately — they belong to the project lifecycle, and
+                # `start` needs the downstream `control_interface`, which only
+                # agent-core can supply. A model that stopped this card could
+                # not start it again.
+                #
+                # The three that are here are the levers over a policy that is
+                # already running, and the two halts are genuinely different
+                # because this card emits *chunks* — a plan several steps into
+                # the future:
+                #
+                #   pause      stop emitting, keep the chunk. Resume continues
+                #              the plan the policy already made.
+                #   interrupt  stop emitting and throw the chunk away. Resume
+                #              re-infers from the world as it is now.
+                #
+                # That distinction is the whole reason both exist. "Hold on a
+                # second" and "no, stop, that is wrong" are different
+                # instructions, and carrying out the second by replaying a plan
+                # made before the objection would be the wrong answer.
+                "x-action-params": {
+                    "pause": {"params": [],
+                              "description": "暂停执行，保留策略已经规划好的动作块；"
+                                             "resume 从原计划继续"},
+                    "interrupt": {"params": [],
+                                  "description": "立即停止并丢弃已规划的动作块；"
+                                                 "resume 会基于当前情况重新推理"},
+                    "resume": {"params": [], "description": "继续执行"},
+                },
+                "x-hooks": {"on_interrupt_all": {"action": "interrupt"},
+                            "on_interrupt_motion": {"action": "interrupt"}},
                 "x-is-dangerous": True,
                 "x-resource": self._resources(),
             },
@@ -185,6 +221,12 @@ class VLAPlugin:
             return self._start(args)
         if action == "stop":
             return self._stop()
+        if action == "pause":
+            return self._halt(drop_chunk=False)
+        if action == "interrupt":
+            return self._halt(drop_chunk=True)
+        if action == "resume":
+            return self._resume()
         if action == "info":
             return self._info()
         if action == "config":
@@ -252,6 +294,7 @@ class VLAPlugin:
             self._seq = 0
             self._chunk = []
             self._chunk_index = 0
+            self._paused = False
             self._published = 0
             self._last_error = ""
             self._running = True
@@ -276,6 +319,40 @@ class VLAPlugin:
             # card that claims ready seconds before it can act.
             result["message"] = "模型加载中，就绪后自动开始发布"
         return result
+
+    def _halt(self, *, drop_chunk: bool):
+        """`pause` (keep the plan) and `interrupt` (throw it away).
+
+        Both stop emitting immediately. Neither unsubscribes or tears the card
+        down: the receiving driver's watchdog sees the silence and holds the
+        arm within `watchdog_ms`, which is the correct resting state, and the
+        project's view of what is running stays true.
+
+        The difference is what `resume` then does, and it matters because this
+        card emits a chunk — a plan made some steps ago. Resuming a *pause*
+        replays the rest of that plan, which is right for "hold on". Resuming
+        an *interrupt* re-infers, which is right for "no, that is wrong":
+        replaying a plan made before the objection is exactly what the
+        objection was about.
+        """
+        with self._lock:
+            if not self._running:
+                return {"state": "idle", "message": "卡片未在运行"}
+            self._paused = True
+            if drop_chunk:
+                self._chunk = []
+                self._chunk_index = 0
+        return {"state": "interrupted" if drop_chunk else "paused",
+                "topic": self._topic,
+                "chunk_pending": 0 if drop_chunk
+                                 else max(0, len(self._chunk) - self._chunk_index)}
+
+    def _resume(self):
+        with self._lock:
+            if not self._running:
+                return {"state": "idle", "message": "卡片未在运行"}
+            self._paused = False
+        return {"state": "running", "topic": self._topic}
 
     def _stop(self):
         with self._lock:
@@ -357,7 +434,10 @@ class VLAPlugin:
 
     def _tick(self):
         publisher = self._publisher
-        if publisher is None or not self._running:
+        if publisher is None or not self._running or self._paused:
+            # Emitting nothing is how a halt reaches the arm: the driver's
+            # watchdog holds within watchdog_ms. Nothing here needs to command
+            # a stop, and commanding one would fight the hold.
             return
         provider = self._provider
         # A provider that loads its weights in the background is not an error
@@ -422,7 +502,7 @@ class VLAPlugin:
     # ── helpers ──────────────────────────────────────────────────────────────
 
     def _state(self) -> str:
-        """idle | loading | running.
+        """idle | loading | paused | running.
 
         `loading` is a real state, not a nicety: a local provider reads its
         checkpoint's config in milliseconds and its weights in seconds, and
@@ -435,6 +515,12 @@ class VLAPlugin:
         provider = self._provider
         if provider is not None and not provider.health():
             return "loading"
+        # Its own state rather than "running": an operator reading running
+        # beside a motionless arm goes looking for a fault that is not there.
+        # `loading` still wins — a paused card whose weights are not in yet is
+        # not ready either, and saying "paused" would claim it is.
+        if self._paused:
+            return "paused"
         return "running"
 
     def _format(self) -> str:

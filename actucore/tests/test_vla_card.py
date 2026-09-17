@@ -54,6 +54,20 @@ def make_card(**cfg):
     return VLAPlugin(base, executor=None)
 
 
+def _started_card(**cfg):
+    """A card in the state `start` leaves it in, without a ROS node.
+
+    `_start` would build a publisher and a timer; these tests are about what is
+    emitted and when, which `next_command` and `_tick` answer on their own.
+    """
+    card = make_card(**cfg)
+    card._descriptor = DESCRIPTOR
+    card._provider = MOCK(DESCRIPTOR, {"chunk_size": 5})
+    card._ttl_ms = 100
+    card._running = True
+    return card
+
+
 # ── provider discovery ───────────────────────────────────────────────────────
 
 def test_mock_is_discovered_without_being_named_anywhere():
@@ -256,7 +270,10 @@ def test_the_card_declares_a_resource_and_no_completion():
     # block every other actuator behind the barrier.
     assert "x-completion" not in schema
     assert schema["x-resource"] == ["arm"]          # pre-negotiation placeholder
-    assert schema["x-hooks"]["on_interrupt_all"]["action"] == "stop"
+    # An interrupt throws the planned chunk away rather than tearing the card
+    # down: the driver's watchdog holds the arm, and a card that stopped itself
+    # could not be started again by whoever interrupted it.
+    assert schema["x-hooks"]["on_interrupt_all"]["action"] == "interrupt"
 
 
 def test_the_negotiated_groups_replace_the_configured_resource():
@@ -441,3 +458,88 @@ def test_the_field_lists_come_from_what_providers_declare():
     declared_staged = sorted(n for n, f in discover().items()
                              if getattr(f, "MODEL_NAMES", None) == "staged")
     assert props["model_name"]["x-show-when"]["provider"] == declared_staged
+
+
+# ── the levers over a running policy ─────────────────────────────────────────
+
+def test_the_model_gets_the_three_levers_and_not_start_or_stop():
+    """agent-core splits a tool into one LLM-callable function per
+    `x-action-params` entry (mcp_client.py `_to_openai_schema`), so this list is
+    the model's entire reach. `start` needs the downstream `control_interface`,
+    which only agent-core can supply — a model that stopped this card could not
+    start it again.
+    """
+    schema = make_card().get_tools()[0]["inputSchema"]
+
+    assert set(schema["x-action-params"]) == {"pause", "interrupt", "resume"}
+    # Still dispatchable by the canvas, just not offered to the model.
+    assert {"start", "stop"} <= set(schema["properties"]["action"]["enum"])
+
+
+def test_pause_keeps_the_planned_chunk_and_interrupt_throws_it_away():
+    """The whole reason both exist.
+
+    "Hold on a second" and "no, that is wrong" are different instructions, and
+    carrying out the second by replaying a plan made before the objection would
+    be the wrong answer.
+    """
+    card = _started_card()
+    card.next_command()                      # pull one command, leaving a chunk
+    pending = len(card._chunk) - card._chunk_index
+    assert pending > 0, "this test needs a provider that plans ahead"
+
+    assert card.dispatch("vla", {"action": "pause"})["chunk_pending"] == pending
+
+    card.dispatch("vla", {"action": "resume"})
+    assert card.dispatch("vla", {"action": "interrupt"})["chunk_pending"] == 0
+    assert card._chunk == []
+
+
+def test_a_halted_card_emits_nothing():
+    """Emitting nothing is how the halt reaches the arm: the driver's watchdog
+    holds it. Commanding a stop here would fight that hold."""
+    card = _started_card()
+    card._publisher = _CountingPublisher()
+
+    card.dispatch("vla", {"action": "pause"})
+    card._tick()
+
+    assert card._publisher.published == 0
+
+
+def test_resuming_after_an_interrupt_infers_again():
+    card = _started_card()
+    card.next_command()
+    card.dispatch("vla", {"action": "interrupt"})
+    card.dispatch("vla", {"action": "resume"})
+
+    message = card.next_command()            # refills, because the chunk is gone
+
+    assert card._chunk_index == 1
+    assert message["seq"] > 1
+
+
+def test_a_halt_reports_its_own_state_not_running():
+    """An operator reading "running" beside a motionless arm goes looking for a
+    fault that is not there."""
+    card = _started_card()
+
+    card.dispatch("vla", {"action": "pause"})
+    assert card.dispatch("vla", {"action": "info"})["state"] == "paused"
+
+    card.dispatch("vla", {"action": "resume"})
+    assert card.dispatch("vla", {"action": "info"})["state"] == "running"
+
+
+def test_halting_a_card_that_is_not_running_is_not_an_error():
+    card = make_card()
+    for action in ("pause", "interrupt", "resume"):
+        assert card.dispatch("vla", {"action": action})["state"] == "idle"
+
+
+class _CountingPublisher:
+    def __init__(self):
+        self.published = 0
+
+    def publish(self, _message):
+        self.published += 1
