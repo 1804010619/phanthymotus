@@ -130,8 +130,8 @@ class VLAPlugin:
                 "type": "object",
                 "properties": {
                     "action": {"type": "string",
-                               "enum": ["start", "stop", "interrupt", "pause",
-                                        "resume", "info", "config"]},
+                               "enum": ["start", "stop", "execute", "interrupt",
+                                        "pause", "resume", "info", "config"]},
                     "task": {"type": "string", "description": "自然语言指令"},
                     # Handed over by agent-core from the card wired downstream.
                     # Not operator-editable: it is a reading of the other card,
@@ -167,6 +167,9 @@ class VLAPlugin:
                 # instructions, and carrying out the second by replaying a plan
                 # made before the objection would be the wrong answer.
                 "x-action-params": {
+                    "execute": {"params": ["task"],
+                                "description": "下达自然语言指令并开始执行；"
+                                               "已在执行时即为换指令"},
                     "pause": {"params": [],
                               "description": "暂停执行，保留策略已经规划好的动作块；"
                                              "resume 从原计划继续"},
@@ -269,6 +272,8 @@ class VLAPlugin:
             return self._start(args)
         if action == "stop":
             return self._stop()
+        if action == "execute":
+            return self._execute(args)
         if action == "pause":
             return self._halt(drop_chunk=False)
         if action == "interrupt":
@@ -388,6 +393,30 @@ class VLAPlugin:
             # card that claims ready seconds before it can act.
             result["message"] = "模型加载中，就绪后自动开始发布"
         return result
+
+    def _execute(self, args: dict):
+        """下达指令。这是模型对这张卡唯一的输入口。
+
+        换指令**必然丢掉在飞的动作块**。块是为上一条指令算出来的一段未来计划；
+        留着它执行，等于拿旧指令的计划去做新指令，而且前几十毫秒的动作会看起来
+        完全合理 —— 这正是最难发现的那种错。所以这里走的是 interrupt 那条路，
+        不是 pause。
+
+        同时解除暂停：说"去把杯子递给我"的人，意思不会是"记下但先别动"。
+        """
+        task = (args.get("task") or "").strip()
+        if not task:
+            return self._error("execute 需要 task —— 一句自然语言指令")
+        with self._lock:
+            if not self._running:
+                return {"state": "idle",
+                        "message": "卡片未在运行，请先在画布上启动"}
+            self._task = task
+            self._chunk = []
+            self._chunk_index = 0
+            self._paused = False
+        log.info("vla execute: task=%r", task)
+        return {"state": self._state(), "task": task, "topic": self._topic}
 
     def _halt(self, *, drop_chunk: bool):
         """`pause` (keep the plan) and `interrupt` (throw it away).

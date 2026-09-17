@@ -462,7 +462,7 @@ def test_the_field_lists_come_from_what_providers_declare():
 
 # ── the levers over a running policy ─────────────────────────────────────────
 
-def test_the_model_gets_the_three_levers_and_not_start_or_stop():
+def test_the_model_gets_the_levers_and_not_start_or_stop():
     """agent-core splits a tool into one LLM-callable function per
     `x-action-params` entry (mcp_client.py `_to_openai_schema`), so this list is
     the model's entire reach. `start` needs the downstream `control_interface`,
@@ -471,7 +471,8 @@ def test_the_model_gets_the_three_levers_and_not_start_or_stop():
     """
     schema = make_card().get_tools()[0]["inputSchema"]
 
-    assert set(schema["x-action-params"]) == {"pause", "interrupt", "resume"}
+    assert set(schema["x-action-params"]) == {"execute", "pause", "interrupt",
+                                              "resume"}
     # Still dispatchable by the canvas, just not offered to the model.
     assert {"start", "stop"} <= set(schema["properties"]["action"]["enum"])
 
@@ -699,3 +700,62 @@ def test_the_observation_carries_the_task_as_the_prompt():
 def test_the_card_declares_both_input_ports():
     ports = make_card().get_tools()[0]["topic_in"]
     assert [p["format"] for p in ports] == ["image/jpeg", "state/joint"]
+
+
+# ── execute ──────────────────────────────────────────────────────────────────
+
+def test_execute_is_how_a_model_tells_the_policy_what_to_do():
+    card = _started_card()
+
+    result = card.dispatch("vla", {"action": "execute", "task": "把杯子递给我"})
+
+    assert result["task"] == "把杯子递给我"
+    assert card.observation().prompt == "把杯子递给我"
+
+
+def test_changing_the_task_throws_away_the_plan_made_for_the_old_one():
+    """A chunk is a stretch of future computed for the previous instruction.
+    Running it under the new one looks entirely reasonable for the first tens
+    of milliseconds, which is what makes it the dangerous kind of wrong."""
+    card = _started_card()
+    card.dispatch("vla", {"action": "execute", "task": "第一个任务"})
+    card.next_command()
+    assert len(card._chunk) - card._chunk_index > 0
+
+    card.dispatch("vla", {"action": "execute", "task": "第二个任务"})
+
+    assert card._chunk == []
+    assert card._chunk_index == 0
+
+
+def test_execute_also_lifts_a_pause():
+    """Someone who says "go and fetch the cup" does not mean "note that down
+    but keep still"."""
+    card = _started_card()
+    card.dispatch("vla", {"action": "pause"})
+
+    card.dispatch("vla", {"action": "execute", "task": "去拿杯子"})
+
+    assert card.dispatch("vla", {"action": "info"})["state"] == "running"
+
+
+def test_execute_without_a_task_is_refused():
+    card = _started_card()
+    result = card.dispatch("vla", {"action": "execute", "task": "   "})
+    assert result["state"] == "error"
+
+
+def test_execute_on_a_card_that_is_not_running_says_so():
+    result = make_card().dispatch("vla", {"action": "execute", "task": "x"})
+    assert result["state"] == "idle"
+
+
+def test_the_model_can_reach_execute():
+    """`x-action-params` is the model's entire reach (mcp_client.py
+    `_to_openai_schema`). Without execute listed there, a policy could be
+    paused and resumed but never told what to do."""
+    schema = make_card().get_tools()[0]["inputSchema"]
+
+    assert set(schema["x-action-params"]) == {"execute", "pause", "interrupt", "resume"}
+    assert schema["x-action-params"]["execute"]["params"] == ["task"]
+    assert {"start", "stop"} <= set(schema["properties"]["action"]["enum"])
