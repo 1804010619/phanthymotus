@@ -80,11 +80,16 @@ class VLAPlugin:
     # ── tools ────────────────────────────────────────────────────────────────
 
     def get_tools(self) -> list:
-        available = sorted(discover())
-        # Names of the checkpoints staged for local providers. Offered as an
-        # enum so the operator picks one rather than typing a name that has to
-        # match a config key exactly — and left absent for a remote provider,
-        # whose model names live on the server and are not ours to enumerate.
+        providers = discover()
+        available = sorted(providers)
+        # Each provider declares what kind of model name it takes, so the form
+        # can offer the right control instead of one field pretending to serve
+        # all three. Adding a provider is still adding a file.
+        def _wanting(kind):
+            return sorted(n for n, factory in providers.items()
+                          if getattr(factory, "MODEL_NAMES", None) == kind)
+        staged_providers = _wanting("staged")
+        remote_providers = _wanting("remote")
         local_models = sorted(self._cfg.get("models") or {})
         default_model = self._cfg.get("model_name") or (
             local_models[0] if local_models else "")
@@ -134,26 +139,35 @@ class VLAPlugin:
                     # robot gets a name that says so (`smolvla_tianyi`,
                     # `smolvla_q5`), because the action space it fits is the
                     # thing an operator has to get right.
-                    # No `description`/`title`: the form renders
-                    # `title || description || key` as the label, with no
-                    # separate hint element, so prose here would replace the
-                    # field name rather than accompany it. The explanation
-                    # belongs in config.yaml where it can be read in full.
+                    # Two fields, not one, because they are two different
+                    # controls and the form cannot switch a field between them:
+                    # `enum` renders as a <select>, so a single field carrying
+                    # the staged names would leave an operator on vla_cloud
+                    # unable to type the name their server knows. That is worse
+                    # than the cosmetic problem it would have solved.
+                    #
+                    # No `description`/`title` on either: the form renders
+                    # `title || description || key` as the label with no separate
+                    # hint element, so prose here replaces the field name rather
+                    # than accompanying it. The explanation lives in config.yaml.
                     "model_name": {"type": "string", "default": default_model,
                                    "scope": "shared",
+                                   "x-show-when": {"provider": staged_providers},
                                    **({"enum": local_models} if local_models else {})},
+                    "cloud_model_name": {"type": "string", "scope": "shared",
+                                         "x-show-when": {"provider": remote_providers}},
                     # Only vla_cloud has anywhere to send a request. Hiding
                     # these for a local provider is not cosmetic: a filled-in
                     # endpoint beside `provider: smolvla` reads as configured
                     # and is ignored, which is the kind of thing an operator
                     # spends an afternoon on.
                     "endpoint": {"type": "string", "scope": "shared",
-                                 "x-show-when": {"provider": "vla_cloud"}},
+                                 "x-show-when": {"provider": remote_providers}},
                     "api_key": {"type": "string", "scope": "shared",
-                                "x-show-when": {"provider": "vla_cloud"}},
+                                "x-show-when": {"provider": remote_providers}},
                     "timeout_ms": {"type": "number", "default": 500,
                                    "scope": "shared",
-                                   "x-show-when": {"provider": "vla_cloud"}},
+                                   "x-show-when": {"provider": remote_providers}},
                     "topic": {"type": "string", "default": DEFAULT_TOPIC,
                               "scope": "instance"},
                     "rate_hz": {"type": "number", "scope": "instance"},

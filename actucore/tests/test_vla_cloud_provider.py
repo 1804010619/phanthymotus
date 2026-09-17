@@ -85,7 +85,7 @@ def http(monkeypatch):
 
 def make_provider(**config):
     base = {"endpoint": "https://vla.internal:8443", "api_key": "k",
-            "model_name": "pi05", "timeout_ms": 150}
+            "cloud_model_name": "pi05", "timeout_ms": 150}
     base.update(config)
     return VLACloudProvider({}, base)
 
@@ -260,15 +260,32 @@ def test_the_default_deadline_is_500ms():
     assert provider._timeout == pytest.approx(0.5)
 
 
-def test_the_config_key_is_model_name_but_the_wire_field_is_model(http):
-    """Two different names on purpose — one is ours, one is the protocol's.
+def test_the_config_key_is_cloud_model_name_but_the_wire_field_is_model(http):
+    """Three names, each for a different reader, and none interchangeable.
 
-    `model_name` is what an operator sets in the card's form; `model` is what
-    motus.vla/1 puts on the wire. Collapsing them would make renaming either
-    side a protocol change.
+    `cloud_model_name` is what an operator sets for a remote provider;
+    `model_name` is the locally staged checkpoint and must never be sent
+    anywhere — it would be a plausible-looking request for something the server
+    has never heard of; `model` is what motus.vla/1 puts on the wire.
     """
     http._responses["/infer"] = lambda req: {"actions": [[0.0] * 14]}
 
-    make_provider(model_name="pi05-droid").infer(_observation())
+    make_provider(cloud_model_name="pi05-droid").infer(_observation())
 
     assert http.payload()["model"] == "pi05-droid"
+
+
+def test_a_locally_staged_checkpoint_name_is_never_sent(http):
+    """`model_name` belongs to the local providers and must not leak here.
+
+    Sending it would be a plausible-looking request for a checkpoint the server
+    has never heard of — the server would answer something, and the card would
+    drive an arm with it.
+    """
+    http._responses["/infer"] = lambda req: {"actions": [[0.0] * 14]}
+    provider = VLACloudProvider({}, {"endpoint": "https://vla.internal",
+                                     "model_name": "smolvla_base"})
+
+    provider.infer(_observation())
+
+    assert "model" not in http.payload()

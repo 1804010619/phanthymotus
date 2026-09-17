@@ -41,7 +41,8 @@ class VLACloudProvider:
     Config keys:
         endpoint   base URL, e.g. https://vla.internal:8443
         api_key    bearer token; issued and checked by the server
-        model_name which model to ask for, when the endpoint serves several
+        cloud_model_name  which model to ask for, when the endpoint serves
+                   several. Free text: these names live on the server.
         timeout_ms per-request deadline, default 500 ms.
 
                    This is the point of giving up, not the expected latency. A
@@ -63,7 +64,10 @@ class VLACloudProvider:
                 "model; point this at a motus.vla/1 server (phanthymotus-cloud)."
             )
         self._key = str(config.get("api_key") or "")
-        self._model = str(config.get("model_name") or "")
+        # `cloud_model_name`, not `model_name`: that one holds a locally
+        # staged checkpoint, and sending its name to a server would be a
+        # plausible-looking request for something the server has never heard of.
+        self._model = str(config.get("cloud_model_name") or "")
         self._timeout = float(config.get("timeout_ms", 500)) / 1000.0
         self._session = None
         self._seq = 0
@@ -200,3 +204,9 @@ def PROVIDER(descriptor: dict, config: dict | None = None) -> VLACloudProvider:
 
 for _name in ("capabilities", "infer", "health", "close"):
     setattr(PROVIDER, _name, getattr(VLACloudProvider, _name))
+
+# Free text. The model names here live on the server and are not ours to
+# enumerate — offering the locally staged checkpoints as a dropdown would be
+# worse than useless, because the form renders an enum as a <select> and the
+# operator could then not type the name the server actually knows.
+PROVIDER.MODEL_NAMES = "remote"

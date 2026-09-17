@@ -361,18 +361,24 @@ def test_remote_only_fields_are_hidden_for_a_local_provider():
     props = _properties()
 
     for field in ("endpoint", "api_key", "timeout_ms"):
-        assert props[field]["x-show-when"] == {"provider": "vla_cloud"}, field
+        assert props[field]["x-show-when"] == {"provider": ["vla_cloud"]}, field
 
 
-def test_the_show_when_value_is_a_string():
+def test_every_show_when_value_is_a_string_or_a_list_of_them():
     """A boolean here renders the field permanently hidden, silently.
 
-    The frontend compares `actual === condVal` against a value that arrives as
-    a string, so a JSON boolean never matches — agent-core has a whole test
-    (test_config_schema_show_when.py) about the time that cost someone.
+    The frontend compares `actual === condVal`, or `condVal.includes(actual)`
+    for a list, against a value that arrives from the form as a string — so a
+    JSON boolean never matches. agent-core has a whole test
+    (test_config_schema_show_when.py) about the afternoon that cost someone.
     """
-    props = _properties()
-    assert isinstance(props["endpoint"]["x-show-when"]["provider"], str)
+    for key, definition in _properties().items():
+        condition = definition.get("x-show-when")
+        if not condition:
+            continue
+        for value in condition.values():
+            values = value if isinstance(value, list) else [value]
+            assert all(isinstance(v, str) for v in values), key
 
 
 def test_the_model_field_offers_the_staged_checkpoints():
@@ -394,3 +400,44 @@ def test_the_configured_model_is_the_default_shown():
     props = _properties(model_name="smolvla_tianyi",
                         models={"smolvla_base": {}, "smolvla_tianyi": {}})
     assert props["model_name"]["default"] == "smolvla_tianyi"
+
+
+def test_mock_is_not_asked_for_a_model_name():
+    """A sine wave has no weights and no server; offering a name is noise.
+
+    Worse than noise, in fact: the name shown would be a real checkpoint, which
+    reads as "this is what is running".
+    """
+    props = _properties(models={"smolvla_base": {}})
+
+    shown_for = props["model_name"]["x-show-when"]["provider"]
+    assert "mock" not in shown_for
+    assert "smolvla" in shown_for
+
+
+def test_a_remote_provider_gets_a_free_text_model_field():
+    """`enum` renders as a <select>, so one shared field would lock vla_cloud
+    to the locally staged names and leave no way to type the server's."""
+    props = _properties(models={"smolvla_base": {}})
+
+    assert "enum" not in props["cloud_model_name"]
+    assert props["cloud_model_name"]["x-show-when"]["provider"] == ["vla_cloud"]
+    assert "vla_cloud" not in props["model_name"]["x-show-when"]["provider"]
+
+
+def test_the_two_model_fields_never_show_together():
+    props = _properties(models={"smolvla_base": {}})
+
+    local = set(props["model_name"]["x-show-when"]["provider"])
+    remote = set(props["cloud_model_name"]["x-show-when"]["provider"])
+    assert not (local & remote)
+
+
+def test_the_field_lists_come_from_what_providers_declare():
+    """Adding a provider stays "add a file" — the card enumerates nothing."""
+    from plugins.vla.providers import discover
+
+    props = _properties()
+    declared_staged = sorted(n for n, f in discover().items()
+                             if getattr(f, "MODEL_NAMES", None) == "staged")
+    assert props["model_name"]["x-show-when"]["provider"] == declared_staged

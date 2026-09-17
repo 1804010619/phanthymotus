@@ -49,6 +49,11 @@ plugins:
     # 本机 provider 旁边填着一个 endpoint，看起来像配好了，实际被忽略。
     endpoint: ""
     api_key: ""
+    # 服务端认得的模型名，自由填写 —— 这些名字住在服务端，不是我们能枚举的。
+    # 和下面本机的 model_name 是**两个字段**，因为表单把 enum 渲染成 <select>：
+    # 一个字段同时承载两者的话，选了 vla_cloud 就只能从本机 checkpoint 里挑，
+    # 反而填不了服务端的名字。
+    cloud_model_name: ""
     # 每次请求的超时——是"放弃的时刻"，不是预期延迟。
     # 回包迟到不是安全问题：驱动会丢掉观测年龄超过 descriptor 里 max_obs_age_ms
     # 的指令（当前 300ms），而它的 watchdog 早已让机械臂保持住了。超时设得过大
@@ -56,7 +61,7 @@ plugins:
     timeout_ms: 500
 
     # ── 选哪个 checkpoint ────────────────────────────────────────────────
-    # 本机 provider 从下面 models: 里挑；vla_cloud 则是服务端认得的名字。
+    # 本机 provider 从下面 models: 里挑（远端的是上面的 cloud_model_name）。
     # 开源发布的沿用上游原名；为某台机器人微调过的用带机器人名的名字，
     # 因为"它适配的动作空间"正是操作员必须搞对的东西。
     #

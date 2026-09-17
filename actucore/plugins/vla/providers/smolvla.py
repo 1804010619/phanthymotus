@@ -487,3 +487,8 @@ def PROVIDER(descriptor: dict, config: dict | None = None) -> SmolVLAProvider:
 # has none of them, so they are advertised here.
 for _name in ("capabilities", "infer", "health", "close"):
     setattr(PROVIDER, _name, getattr(SmolVLAProvider, _name))
+
+# Picks from the checkpoints staged under `models:`, so the card can offer them
+# as a list — the names have to match a config key exactly, and typing one is
+# the kind of thing a dropdown exists to prevent.
+PROVIDER.MODEL_NAMES = "staged"

@@ -131,3 +131,7 @@ def PROVIDER(descriptor: dict, config: dict | None = None) -> MockProvider:
 # factory function has none of them, so they are advertised here.
 for _name in ("capabilities", "infer", "health", "close"):
     setattr(PROVIDER, _name, getattr(MockProvider, _name))
+
+# No model to name. A sine wave has no weights and no server, so the card hides
+# the model field entirely rather than offering a name that means nothing here.
+PROVIDER.MODEL_NAMES = None
