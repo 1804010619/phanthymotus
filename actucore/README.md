@@ -9,7 +9,7 @@ Hardware → Driver·Sensor → Perception → Agent Loop → ActuCore → Drive
 
 执行模型（VLA 策略、导航、抓取策略、locomotion、whole-body control）以**卡片**的形式挂在这里，聚合成一个 MCP HTTP server，由 Agent Core 通过 MCP JSON-RPC 调用。
 
-**当前有一张卡片：`vla`，默认关闭。** 打开之前 `tools/list` 返回空数组，服务照样注册、探活、在 Dashboard 侧边栏「执行」分区里显示（count 0）。
+**当前有一张卡片：`vla`，默认开启。** `enabled` 只决定这张卡片出不出现在工具列表里，不决定它动不动 —— 真正的门槛在画布连线、协商和驱动侧的检查链，见下。
 
 ## `vla` 卡片
 
@@ -20,27 +20,21 @@ Hardware → Driver·Sensor → Perception → Agent Loop → ActuCore → Drive
 
 启动时**协商一次**：provider 的 `capabilities()` 和下游 descriptor 对账（动作维度、频率），对不上直接拒绝启动并说明是哪两个数字对不上——而不是启动后在 30 Hz 上一条条失败，那时候操作员看到的是一台停住的机器人和没有原因。
 
-现有两个 provider：
+Provider 的组织方式是**非对称的**，而且是刻意的：
 
 | provider | 说明 |
 |---|---|
 | `mock` | 正弦轨迹，无模型、无网络、无 GPU、无 torch。默认值 |
-| `local` | LeRobot SmolVLA，进程内推理。**只有 JetPack 6.1 的镜像有**，见下 |
+| `smolvla` | LeRobot SmolVLA，本机推理。**只有 JetPack 6.1 的镜像有**，见下 |
+| `vla_cloud` | 任何跑在别处的模型。只配 `{endpoint, api_key, model}` |
 
-### 两条 JetPack 线
+**本地一个模型一个文件，按模型名命名** —— 和 `perception/plugins/` 一样（`asr.py`、`tts.py`、`vop.py` 各自管自己的权重、下载和加载）。一个笼统的 `local` 会变成一个按模型族分支的 switch，SmolVLA 的动作 padding、π0 的 JAX 栈、UnifoLM 的 flash-attn 构建全堆在它后面。共用的部分（发现、四方法契约、与机械臂的协商）在卡片和 `providers/__init__.py` 里。
 
-同一份 Dockerfile，只有 base 不同，应用层逐字节一样：
+**远端只有一个文件。** 模型跑在别处时，它自己的那些麻烦就不是机器人的事了：回来的是一个 action chunk，唯一变化的是地址。配置形状和 agent-core 配 LLM 完全一样——这个项目里 `config.main['client']['llm']` 就是一组 `{url, key, model}`，旁边没有一行 serving 代码。
 
-| | base | 可用 provider | 大小 |
-|---|---|---|---|
-| **jp6.1** | `jetson-base-actucore`（CUDA torch 2.9 + lerobot） | 全部 | ~18.6 GB |
-| **jp5.11** | `jetson-base`（共享的那个） | `mock` + 远端 | 薄 |
+需要说清楚的一个后果：`vla_cloud` 说的是**我们自己的 `motus.vla/1`**，不是 openpi 的 msgpack-over-WebSocket，也不是 LeRobot 的 gRPC。指向一个原始的上游服务器不会work——翻译属于服务端（`phanthymotus-cloud`），那里本来就住着吞吐和扩缩容的问题。这和 OpenAI 生态的分工是同一个：spec 是文档，vLLM 和 SGLang 各自实现，客户端不背每种服务器一个适配器。
 
-这个差别是**被迫的，不是取舍**：jp5.11 是 CUDA 11.4，而 lerobot 要 `torch >= 2.2.1`，PyTorch 官方矩阵里 torch 2.2 的最低 CUDA 是 11.8——那条线上**不可能**有本地推理，升 Python、自己编 torch 都绕不过去。所以 `local` provider 在 jp5.11 上会**在 start 时直接拒绝并说明原因**，而不是在后台一直报 unhealthy 让人以为等一等就好。远端 provider 不受影响，那才是那条线的形态。
-
-完整的调研记录（三道门、为什么前两道不重要）在 `deploy/prepare_actucore_base.sh` 里。
-
-`local` 的三条规矩都在 `providers/local.py` 里：**懒 import**（torch/lerobot 在用到它们的函数里才 import，所以没装 lerobot 的镜像照常启动、照常提供 `mock`）、**懒下载**（COS + size/sha256 pin，复用 perception 的 `model_downloader`，不重写）、**懒加载且不占调用线程**（`__init__` 只读 checkpoint 的 config —— 便宜，且足够回答 `capabilities()` 让卡片先完成协商 —— 权重在后台线程加载，期间 `health()` 为 False，卡片报 `loading` 而不是 ready）。
+`smolvla` 的三条规矩都在 `providers/smolvla.py` 里：**懒 import**（torch/lerobot 在用到它们的函数里才 import，所以没装 lerobot 的镜像照常启动、照常提供 `mock` 和 `vla_cloud`）、**懒下载**（COS + size/sha256 pin，复用 perception 的 `model_downloader`，不重写）、**懒加载且不占调用线程**（`__init__` 只读 checkpoint 的 config —— 便宜，且足够回答 `capabilities()` 让卡片先完成协商 —— 权重在后台线程加载，期间 `health()` 为 False，卡片报 `loading` 而不是 ready）。
 
 有一件事它替你做不了：**SmolVLA 的 checkpoint 是为某台具体机器人训练的，动作维度就是那台机器人的。** 指到一台 26 维的人形上会在协商这一步直接失败——那是微调或动作重定向的问题，不是配置问题，错误信息会这么说，而不是让不匹配走到电机上。
 
@@ -77,12 +71,21 @@ cd actucore && PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python3 -m pytest tests -q
 只有 Jetson GPU 版 —— 执行模型（VLA、抓取策略、locomotion）都要 GPU，没有 CPU 变体。
 
 ```bash
-./deploy/build_actucore.sh                    # JetPack 5.11（默认）
-./deploy/build_actucore.sh --jp-version 6.1   # JetPack 6.1
+./deploy/build_actucore.sh                    # JetPack 6.1（默认）
+./deploy/build_actucore.sh --jp-version 5.11  # JetPack 5.11，只有远端 provider
 ./deploy/build_actucore.sh --mirror tuna      # 指定 pip / apt 源
 ```
 
-镜像刻意做薄 —— 除了 MCP server 本身，只保留 base 镜像自带的 CUDA torch 和 ROS2 环境。加卡片时把该卡片的依赖放在它自己的 `RUN` 层，不要预装在基础层里。
+**同一份 Dockerfile，两个 base**，应用层逐字节一样：
+
+| | base | 可用 provider | 大小 |
+|---|---|---|---|
+| jp6.1 | `jetson-base-actucore`（CUDA torch 2.9 + lerobot） | 全部 | ~18.6 GB |
+| jp5.11 | `jetson-base`（共享的那个） | `mock` + `vla_cloud` | ~13.8 GB |
+
+这个差别是**被迫的，不是取舍**：jp5.11 是 CUDA 11.4，而 lerobot 要 `torch >= 2.2.1`，PyTorch 官方矩阵里 torch 2.2 的最低 CUDA 是 11.8 —— 那条线上**不可能**有本机推理。`smolvla` 在那里会在 start 时直接拒绝并说明原因。完整调研见 `deploy/prepare_actucore_base.sh`。
+
+jp6.1 的 base 由 `deploy/prepare_actucore_base.sh` 构建（只支持 6.1）。加本机模型卡片时，如果它的依赖不在 base 里，放在它自己的 `RUN` 层，不要预装在共享基础层里。
 
 部署走 Dashboard 的服务部署页，或直接把 `deploy/service.yml` 合并进 `/opt/phanthy-motus/docker-compose.yml`（Agent Core 会从镜像里抽这个片段，见 `agent-core/src/api/drivers.py`）。
 

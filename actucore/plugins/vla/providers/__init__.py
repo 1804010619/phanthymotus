@@ -9,6 +9,18 @@ So: drop a module in this directory that exposes `PROVIDER`, and it is
 available. Same duck typing the cards themselves use — no base class, no
 registry decorator.
 
+Two shapes live here, and the asymmetry is deliberate:
+
+- **One file per local model**, named after the model — `smolvla.py`, and
+  whatever comes next. Each owns its weights, its download and its load, the
+  way `perception/plugins/` is organised. A single `local` provider would have
+  become a switch over model families with every quirk piled up behind it.
+
+- **One file for everything remote** — `vla_cloud.py`. Off the robot, the model
+  brings none of its own problems here: what arrives is an action chunk, and
+  the only thing that varies is the address. Configuring it is
+  `{endpoint, key, model}`, the same shape agent-core already uses for LLMs.
+
 A provider implements four methods:
 
     capabilities() -> dict

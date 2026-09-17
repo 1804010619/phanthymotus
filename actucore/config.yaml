@@ -18,10 +18,11 @@ plugins:
     # 容器重启也不会让它自己跑起来（bundle 的 start() 是空的）。
     enabled: true
     # provider 由 plugins/vla/providers/ 目录发现，不写死在这里。
-    # mock = 正弦轨迹，无模型、无网络、无 GPU，用来验证整条通路与急停。
+    # 本地一个模型一个（按模型名），远端统一一个。
+    #   mock       正弦轨迹，无模型、无网络、无 GPU —— 验证通路用
+    #   smolvla    LeRobot SmolVLA，本机推理（只有 jp6.1 的镜像有）
+    #   vla_cloud  任何跑在别处的模型，只配 endpoint + key + model
     provider: mock
-    # endpoint / api_key 给远端 provider 用；mock 不读。
-    endpoint: ""
     topic: /actucore/vla/cmd
     # 留空则取 min(模型 control_hz, 下游 expected_hz)，再被下游 max_hz 夹住。
     rate_hz: null
@@ -31,15 +32,28 @@ plugins:
     # start 之后以下游 descriptor 的 groups 为准（天轶是 arm_l/arm_r/hand_l/hand_r），
     # agent-core 在心跳时会重新读 schema，拿到真实的那一组。
     resource: arm
-    # 以下只有 mock 读：正弦幅度是各关节半行程的比例，默认很小。
+
+    # ── provider: mock ───────────────────────────────────────────────────
+    # 正弦幅度是各关节半行程的比例，默认很小。
     amplitude: 0.05
     period_s: 8.0
     chunk_size: 10
 
-    # ── provider: local（LeRobot SmolVLA，进程内）──────────────────────────
-    # 需要镜像带 lerobot：构建时加 --build-arg WITH_LEROBOT=1（见 Dockerfile.jetson）。
-    # 没有也不会崩：卡片照常被发现，capabilities 仍能从 checkpoint config 答出来
-    # 用于协商，health() 报出 import 失败。
+    # ── provider: vla_cloud（远端）────────────────────────────────────────
+    # 和 agent-core 配 LLM 是同一个形状：地址 + key + 模型名，没有别的。
+    # 注意它说的是我们自己的 motus.vla/1 协议，不是 openpi 的 WebSocket 或
+    # LeRobot 的 gRPC —— 翻译在服务端（phanthymotus-cloud）做，机器人这侧
+    # 不背每种服务器一个适配器。
+    endpoint: ""
+    api_key: ""
+    model: ""
+    # 每次请求的超时。**必须短于下游驱动的 watchdog**，否则迟到的 chunk 会在
+    # 机械臂已经被命令保持之后才到。
+    timeout_ms: 200
+
+    # ── provider: smolvla（本机）──────────────────────────────────────────
+    # 需要镜像带 lerobot，即 jp6.1 的 jetson-base-actucore。jp5.11 上会在
+    # start 时明确拒绝并说明原因（CUDA 11.4 撑不住 torch >= 2.2.1）。
     model_dir: /models/vla/smolvla
     device: cuda
     # 权重清单。COS 是机器人侧唯一来源，size + sha256 都要 pin。

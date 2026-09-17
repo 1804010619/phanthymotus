@@ -1,9 +1,19 @@
-"""SmolVLA in this process, via LeRobot.
+"""SmolVLA on this robot, via LeRobot.
 
-The one provider that keeps working with no network and no edge server. It is
-also the only one whose resource use lands on the robot's own budget, which is
-why almost everything here is about *when* things are loaded rather than about
-inference.
+**One provider per model, named after the model** — the same shape
+`perception/plugins/` has, where `asr.py`, `tts.py` and `vop.py` each own their
+weights, their download and their load. A single `local` provider would have had
+to grow a switch over model families, and every model's quirks would have piled
+up behind it: SmolVLA's action padding, π0's JAX stack, UnifoLM's flash-attn
+build. They do not belong in one file.
+
+What is shared lives in the card and in `providers/__init__.py`: discovery, the
+four-method protocol, and the negotiation against the arm. What is specific to
+*this checkpoint family* lives here.
+
+This is also the only kind of provider whose resource use lands on the robot's
+own budget, which is why almost everything below is about *when* things are
+loaded rather than about inference.
 
 Three rules from the design (phanthymotus/docs/vla-integration.md § 4.5), and
 each is a thing that goes wrong if skipped:
@@ -48,11 +58,14 @@ log = logging.getLogger(__name__)
 CONFIG_FILE = "config.json"
 
 
-class LocalProvider:
-    """A LeRobot policy loaded in this process.
+class SmolVLAProvider:
+    """A SmolVLA checkpoint loaded in this process.
 
     Config keys:
         model_dir      where the checkpoint lives (default /models/vla/smolvla)
+        model_id       upstream id, for the record — ModelScope first (see
+                       docs/vla-integration.md § 4.5.4). Not fetched from
+                       directly: the robot pulls from COS.
         weights        optional {base_url, files:{name:{size,sha256}}} manifest;
                        fetched into model_dir when the checkpoint is absent
         device         "cuda" | "cpu" (default cuda, falling back to cpu)
@@ -208,13 +221,13 @@ class LocalProvider:
             policy = self._build_policy()
         except Exception as error:      # noqa: BLE001 — reported via health()
             self._error = f"{type(error).__name__}: {error}"
-            log.warning("local provider failed to load: %s", self._error)
+            log.warning("smolvla provider failed to load: %s", self._error)
             return
         with self._lock:
             if self._closed:            # stopped while we were loading
                 return
             self._policy = policy
-        log.info("local provider ready: %s on %s",
+        log.info("smolvla provider ready: %s on %s",
                  self._config.get("type"), self._device)
 
     def _build_policy(self):
@@ -241,7 +254,7 @@ class LocalProvider:
                 return "cuda"
         except Exception:       # noqa: BLE001
             pass
-        log.warning("cuda unavailable; local provider falling back to cpu")
+        log.warning("cuda unavailable; smolvla provider falling back to cpu")
         return "cpu"
 
     # ── inference ────────────────────────────────────────────────────────────
@@ -257,7 +270,7 @@ class LocalProvider:
         import torch
 
         if observation is None:
-            raise ValueError("local provider needs an observation")
+            raise ValueError("smolvla provider needs an observation")
 
         expected = set(self._config.get("input_features") or {})
         batch, missing = {}, []
@@ -347,11 +360,11 @@ class LocalProvider:
         return 0
 
 
-def PROVIDER(descriptor: dict, config: dict | None = None) -> LocalProvider:
-    return LocalProvider(descriptor, config)
+def PROVIDER(descriptor: dict, config: dict | None = None) -> SmolVLAProvider:
+    return SmolVLAProvider(descriptor, config)
 
 
 # Discovery checks the four methods on whatever PROVIDER is; a factory function
 # has none of them, so they are advertised here.
 for _name in ("capabilities", "infer", "health", "close"):
-    setattr(PROVIDER, _name, getattr(LocalProvider, _name))
+    setattr(PROVIDER, _name, getattr(SmolVLAProvider, _name))

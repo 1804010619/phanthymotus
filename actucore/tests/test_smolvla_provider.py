@@ -1,4 +1,4 @@
-"""The local provider, without torch, lerobot, weights or a GPU.
+"""The SmolVLA provider, without torch, lerobot, weights or a GPU.
 
 Everything here except two calls works against plain dicts, which is
 deliberate: `_build_policy` and `_predict` are the version-sensitive boundary
@@ -20,7 +20,7 @@ What these pin down:
                  a missing mapping must say so rather than feed the policy a
                  black image
 
-Run: cd actucore && PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python3 -m pytest tests/test_local_provider.py -q
+Run: cd actucore && PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python3 -m pytest tests/test_smolvla_provider.py -q
 """
 
 from __future__ import annotations
@@ -35,11 +35,11 @@ import pytest
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from plugins.vla.providers.local import LocalProvider  # noqa: E402
+from plugins.vla.providers.smolvla import SmolVLAProvider  # noqa: E402
 
 # Captured before the autouse fixture below replaces it, so the one test that
 # wants the real guard can put it back.
-_REAL_REQUIRE_LEROBOT = LocalProvider.__dict__["_require_lerobot"]
+_REAL_REQUIRE_LEROBOT = SmolVLAProvider.__dict__["_require_lerobot"]
 
 
 # A LeRobot checkpoint config, trimmed to the fields capabilities() reads.
@@ -61,12 +61,12 @@ CHECKPOINT_CONFIG = {
 def lerobot_present(monkeypatch):
     """Pretend the library is installed, for every test but the two about it.
 
-    `LocalProvider.__init__` refuses when lerobot is absent — which it is on a
+    `SmolVLAProvider.__init__` refuses when lerobot is absent — which it is on a
     laptop, and permanently on the JetPack 5.11 image line. Every test about
     capabilities, loading or feature mapping is about behaviour *after* that
     check, so it is stubbed here rather than repeated in each of them.
     """
-    monkeypatch.setattr(LocalProvider, "_require_lerobot", staticmethod(lambda: None))
+    monkeypatch.setattr(SmolVLAProvider, "_require_lerobot", staticmethod(lambda: None))
 
 
 @pytest.fixture
@@ -79,12 +79,12 @@ def make_provider(checkpoint, **config):
     """A provider whose background load is neutered, so tests stay synchronous."""
     base = {"model_dir": str(checkpoint), "device": "cpu"}
     base.update(config)
-    original = LocalProvider._load
-    LocalProvider._load = lambda self: None
+    original = SmolVLAProvider._load
+    SmolVLAProvider._load = lambda self: None
     try:
-        provider = LocalProvider({}, base)
+        provider = SmolVLAProvider({}, base)
     finally:
-        LocalProvider._load = original
+        SmolVLAProvider._load = original
     provider._loader.join(timeout=1)
     return provider
 
@@ -175,12 +175,12 @@ def test_a_missing_library_refuses_at_start_with_the_reason(checkpoint, monkeypa
     >= 2.2 supports on 11.4. Reporting `unhealthy` in the background would read
     as a transient failure somebody could wait out.
     """
-    monkeypatch.setattr(LocalProvider, "_require_lerobot", _REAL_REQUIRE_LEROBOT)
+    monkeypatch.setattr(SmolVLAProvider, "_require_lerobot", _REAL_REQUIRE_LEROBOT)
     import importlib.util
     monkeypatch.setattr(importlib.util, "find_spec", lambda name: None)
 
     with pytest.raises(ModuleNotFoundError) as excinfo:
-        LocalProvider({}, {"model_dir": str(checkpoint), "device": "cpu"})
+        SmolVLAProvider({}, {"model_dir": str(checkpoint), "device": "cpu"})
 
     message = str(excinfo.value)
     assert "5.11" in message and "CUDA 11.4" in message
@@ -217,7 +217,7 @@ def test_closing_during_a_load_does_not_resurrect_the_policy(checkpoint):
 
 def test_no_checkpoint_and_no_manifest_is_a_clear_refusal(tmp_path):
     with pytest.raises(FileNotFoundError) as excinfo:
-        LocalProvider({}, {"model_dir": str(tmp_path / "nothing")})
+        SmolVLAProvider({}, {"model_dir": str(tmp_path / "nothing")})
     message = str(excinfo.value)
     assert "weights" in message and "COS" in message
 
@@ -225,7 +225,7 @@ def test_no_checkpoint_and_no_manifest_is_a_clear_refusal(tmp_path):
 def test_an_unreadable_config_explains_why_it_matters(tmp_path):
     (tmp_path / "config.json").write_text("{not json")
     with pytest.raises(RuntimeError) as excinfo:
-        LocalProvider({}, {"model_dir": str(tmp_path)})
+        SmolVLAProvider({}, {"model_dir": str(tmp_path)})
     assert "capabilities" in str(excinfo.value)
 
 
@@ -349,11 +349,11 @@ def test_every_chunk_shape_becomes_a_list_of_steps(returned, expected, fake_torc
     policy = types.SimpleNamespace(
         predict_action_chunk=lambda batch: _FakeTensor(returned))
 
-    assert LocalProvider._predict(policy, {}) == expected
+    assert SmolVLAProvider._predict(policy, {}) == expected
 
 
 def test_a_policy_without_a_chunk_method_falls_back_to_single_step(fake_torch):
     policy = types.SimpleNamespace(
         select_action=lambda batch: _FakeTensor([0.5, 0.6]))
 
-    assert LocalProvider._predict(policy, {}) == [[0.5, 0.6]]
+    assert SmolVLAProvider._predict(policy, {}) == [[0.5, 0.6]]
