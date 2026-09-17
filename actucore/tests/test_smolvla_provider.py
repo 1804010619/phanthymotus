@@ -393,9 +393,12 @@ def real_checkpoint(tmp_path):
 def test_the_published_checkpoint_reads_as_six_dof_not_thirty_two(real_checkpoint):
     """`max_action_dim: 32` sits beside `action.shape: [6]` in the real file.
 
-    Reading the padded width would have the card negotiate against 32 and
-    happily drive a 32-DOF arm that does not exist. The dataset's width is the
-    one that means anything.
+    Two different numbers, and reading the wrong one is a live hazard. 32 is the
+    *network's* width — SmolVLA pads actions to `max_action_dim` for the
+    projection layers and crops back to `action_feature.shape[0]` at inference.
+    6 is what this checkpoint was trained on. Negotiating against 32 would have
+    the card cheerfully agree to drive a 32-DOF arm out of a model that only
+    ever learned six of those slots.
     """
     caps = make_provider(real_checkpoint).capabilities()
 
@@ -409,12 +412,24 @@ def test_the_published_checkpoint_wants_three_cameras(real_checkpoint):
     assert make_provider(real_checkpoint).capabilities()["n_cameras"] == 3
 
 
-def test_it_will_not_drive_tianyi(real_checkpoint):
-    """Recorded as the expected outcome, not a defect.
+def test_this_checkpoint_will_not_drive_tianyi(real_checkpoint):
+    """Expected outcome, and *not* an architecture limit — the distinction matters.
 
-    smolvla_base is trained for a 6-DOF arm; Tianyi's action space is 26. The
-    card refuses at start and says which two numbers disagree. Making this run
-    is a fine-tuning or retargeting job, not a configuration one.
+    SmolVLA's ceiling is `max_action_dim: 32`, and the dimension is inferred
+    from the dataset at fine-tune time with the projection layers resized to
+    match. Tianyi's 26 fits under that comfortably, so the model family is a
+    viable target for this robot.
+
+    What does not work is *this* checkpoint: `smolvla_base` is pretrained on
+    SO-100/SO-101 and its action head only ever learned six slots, with
+    normalisation statistics for that arm. Pointed at 26 dimensions it would
+    emit numbers rather than fail — which is worse than refusing, and is why
+    negotiation compares the checkpoint's width and not the network's.
+
+    The path is fine-tuning on Tianyi data, not configuration. Worth knowing
+    before trying: LeRobot's own issue tracker has fine-tunes that converge
+    nicely and still evaluate at 0% when the state/action layout does not line
+    up with the recording.
     """
     from plugins.vla import negotiate
 
