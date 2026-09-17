@@ -25,11 +25,16 @@ let _ws       = null;
 let _status   = null;   // overlay that says why nothing is on screen
 let _staleTimer = null;
 let _frames   = 0;
+let _textLike = false;  // 文本/活动流；其余都是画布
 
 // How long without a frame before the panel stops implying the stream is live.
 // A <canvas> keeps its last painted pixels forever, so a stalled stream is
 // indistinguishable from a running one unless something says so.
 const STALE_MS = 10000;
+
+// 连接中／等待数据这类提示始终居中：那时面板上本来就没有内容可遮。
+const _CENTERED = 'position:absolute;left:0;right:0;top:50%;transform:translateY(-50%);' +
+  'text-align:center;font-size:13px;padding:0 16px;pointer-events:none;z-index:2';
 
 export function initDetailPanel() {
   _panel = document.getElementById('detail-panel');
@@ -53,10 +58,32 @@ function _setStatus(text, tone = 'dim') {
   _status.style.color = tone === 'warn' ? 'var(--orange, #d77757)' : 'var(--text-dim, #888)';
 }
 
+/**
+ * 停止推送时说什么、说在哪 —— 两者都取决于下面是画布还是文字。
+ *
+ * 画布会把最后一帧永远留在屏幕上，所以那句话是"画面是最后一帧"，压在正中间也
+ * 没关系：底下那张图正是它在描述的东西。
+ *
+ * 文本面板底下是一段滚动日志，不是一张停住的画。说"画面"没有指涉，而居中的
+ * 无背景文字会正好糊在一行数据上，两边都读不成 —— 截图里就是这样。所以文本
+ * 面板改成顶部的一条带底色的横幅：不遮最新的那几行，也不会和内容混在一起。
+ */
+function _staleNotice() {
+  const seconds = Math.round(STALE_MS / 1000);
+  if (_textLike) {
+    _status.style.cssText = 'position:absolute;left:0;right:0;top:0;text-align:center;' +
+      'font-size:12px;padding:4px 16px;pointer-events:none;z-index:2;' +
+      'background:var(--bg-card, #fdfcfa);border-bottom:1px solid var(--border, #e6e0d8)';
+    return `已暂停 — ${seconds} 秒没有新数据，以下是最后收到的内容`;
+  }
+  _status.style.cssText = _CENTERED;
+  return `已暂停 — ${seconds} 秒没有新数据，画面是最后一帧`;
+}
+
 function _armStaleTimer() {
   clearTimeout(_staleTimer);
   _staleTimer = setTimeout(() => {
-    if (_frames > 0) _setStatus(`已暂停 — ${Math.round(STALE_MS / 1000)} 秒没有新数据，画面是最后一帧`, 'warn');
+    if (_frames > 0) _setStatus(_staleNotice(), 'warn');
   }, STALE_MS);
 }
 
@@ -73,15 +100,18 @@ export function showTopicDetail(topicPath, format) {
 
   const hint     = format || 'activity';
   const Renderer = RENDERERS.find(r => r.canRender(hint)) || ActivityRenderer;
+  _textLike = Renderer === TextRenderer || Renderer === ActivityRenderer;
 
   _renderer = Object.assign(Object.create(Object.getPrototypeOf(Renderer)), Renderer);
   _renderer.mount(body, 'detail');
 
   _frames = 0;
+  // 每次重新挂载都把样式恢复成居中的那套 —— 上一个话题如果是文本面板，
+  // _staleNotice 会把它改成顶部横幅，留着的话下一个视频面板的"正在连接…"
+  // 会贴在顶边上。
   _status = document.createElement('div');
   _status.className = 'detail-status';
-  _status.style.cssText = 'position:absolute;left:0;right:0;top:50%;transform:translateY(-50%);' +
-    'text-align:center;font-size:13px;padding:0 16px;pointer-events:none;z-index:2';
+  _status.style.cssText = _CENTERED;
   body.style.position = body.style.position || 'relative';
   body.appendChild(_status);
   _setStatus('正在连接…');
@@ -199,6 +229,7 @@ function _cleanup() {
   clearTimeout(_staleTimer);
   _staleTimer = null;
   _frames = 0;
+  _textLike = false;
   if (_status) {
     _status.remove();
     _status = null;
