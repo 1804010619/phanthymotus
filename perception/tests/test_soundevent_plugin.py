@@ -113,52 +113,29 @@ def test_labels_from_model_rejects_missing_associated_file(tmp_path):
 _COS_SOURCE = f"{model_downloader.COS_BASE}/soundevent"
 _MODELSCOPE_SOURCE = model_downloader.SOUNDEVENT_MODELSCOPE_BASE
 _ENV_SOURCE = "https://models.example/soundevent"
-_ALL_SOURCES = {
-    _ENV_SOURCE: "environment",
-    _COS_SOURCE: "COS",
-    _MODELSCOPE_SOURCE: "ModelScope",
-}
+_ALL_SOURCES = [_COS_SOURCE, _MODELSCOPE_SOURCE]
 
 
+# The sources are assembled at import, like every other bundle's base_url in
+# model_downloader, and the environment variable *replaces* the first one the
+# way OCR_MODEL_BASE_URL and FACE_MODEL_BASE_URL do. So this is where the
+# override is observable; patching the module attribute afterwards would only
+# prove the patch took.
 def test_soundevent_model_base_honors_environment(monkeypatch):
     monkeypatch.delenv("SOUNDEVENT_MODEL_BASE_URL", raising=False)
     default_module = _load_model_downloader_copy("model_downloader_default_test")
-    assert default_module.SOUNDEVENT_MODEL_BASE == ""
+    assert default_module.SOUNDEVENT_MODEL_BASE == _COS_SOURCE
+    assert default_module.SOUNDEVENT_MODEL_SOURCES == [_COS_SOURCE, _MODELSCOPE_SOURCE]
 
     monkeypatch.setenv("SOUNDEVENT_MODEL_BASE_URL", _ENV_SOURCE)
     configured_module = _load_model_downloader_copy("model_downloader_env_test")
     assert configured_module.SOUNDEVENT_MODEL_BASE == _ENV_SOURCE
-
-
-# The source list is assembled at import, like every other bundle's base_url in
-# model_downloader — so this is where the environment override, the empty-value
-# rule and the dedup rule are observable. Testing them by patching the module
-# attribute afterwards would only prove the patch took.
-@pytest.mark.parametrize("configured, expected", [
-    (None, {_COS_SOURCE: "COS", _MODELSCOPE_SOURCE: "ModelScope"}),
-    ("", {_COS_SOURCE: "COS", _MODELSCOPE_SOURCE: "ModelScope"}),
-    # Whitespace is not a mirror: an operator who exported the variable empty
-    # must not get a source whose URL is a space.
-    ("   ", {_COS_SOURCE: "COS", _MODELSCOPE_SOURCE: "ModelScope"}),
-    (_ENV_SOURCE, _ALL_SOURCES),
-    # A trailing slash is the same host, not a second one.
-    (f" {_ENV_SOURCE}/ ", _ALL_SOURCES),
-    # Pointing the override at a host already registered must not get that host
-    # probed and retried twice; it keeps its canonical label.
-    (_COS_SOURCE, {_COS_SOURCE: "COS", _MODELSCOPE_SOURCE: "ModelScope"}),
-    (_MODELSCOPE_SOURCE, {_MODELSCOPE_SOURCE: "ModelScope", _COS_SOURCE: "COS"}),
-])
-def test_soundevent_sources_are_assembled_at_import(configured, expected, monkeypatch):
-    if configured is None:
-        monkeypatch.delenv("SOUNDEVENT_MODEL_BASE_URL", raising=False)
-    else:
-        monkeypatch.setenv("SOUNDEVENT_MODEL_BASE_URL", configured)
-    module = _load_model_downloader_copy("model_downloader_sources_test")
-
-    assert module.SOUNDEVENT_MODEL_SOURCES == expected
-    # Order is the tiebreak used when every probe fails, so it is part of the
-    # contract, not an artefact of dict equality above.
-    assert list(module.SOUNDEVENT_MODEL_SOURCES) == list(expected)
+    # The override takes COS's place rather than being added in front of it:
+    # a site that redirects this variable at its own mirror is not asking for
+    # the public bucket to stay in the list.
+    assert configured_module.SOUNDEVENT_MODEL_SOURCES == [
+        _ENV_SOURCE, _MODELSCOPE_SOURCE
+    ]
 
 
 def test_soundevent_model_download_uses_pinned_manifest(tmp_path, monkeypatch):
@@ -192,7 +169,7 @@ def test_soundevent_model_download_uses_pinned_manifest(tmp_path, monkeypatch):
         # what lets the downloader probe them and pick, instead of always
         # paying for the first one in the list.
         "model_dir": str(tmp_path),
-        "base_url": [_ENV_SOURCE, _COS_SOURCE, _MODELSCOPE_SOURCE],
+        "base_url": _ALL_SOURCES,
         "files": {
             "yamnet_classification.tflite": {
                 "size": 4_126_810,
@@ -210,8 +187,6 @@ def test_soundevent_sources_are_ordered_by_measured_speed(tmp_path, monkeypatch)
     The pinned size and SHA256 are what make choosing by speed a performance
     decision rather than a trust one — both hosts must serve the same bytes.
     """
-    monkeypatch.setattr(model_downloader, "SOUNDEVENT_MODEL_SOURCES",
-                        {_COS_SOURCE: "COS", _MODELSCOPE_SOURCE: "ModelScope"})
     monkeypatch.setattr(
         model_downloader, "require_models_subpath", lambda path: str(tmp_path)
     )
@@ -251,7 +226,7 @@ def soundevent_download(tmp_path, monkeypatch):
     return payload
 
 
-@pytest.mark.parametrize("successful_source", [0, 1, 2])
+@pytest.mark.parametrize("successful_source", [0, 1])
 def test_soundevent_download_tries_sources_in_order(
     successful_source, soundevent_download, monkeypatch
 ):
@@ -280,8 +255,6 @@ def test_soundevent_download_tries_sources_in_order(
 def test_soundevent_falls_back_when_cos_download_or_validation_fails(
     failure, soundevent_download, monkeypatch, caplog
 ):
-    monkeypatch.setattr(model_downloader, "SOUNDEVENT_MODEL_SOURCES",
-                        {_COS_SOURCE: "COS", _MODELSCOPE_SOURCE: "ModelScope"})
     cos_url = f"{_COS_SOURCE}/yamnet_classification.tflite"
     fallback_url = f"{_MODELSCOPE_SOURCE}/yamnet_classification.tflite"
     requests = []
@@ -321,10 +294,8 @@ def test_soundevent_contacts_each_source_once_per_retry_set(
 ):
     """Every source is tried, each exactly three times, then the attempt fails.
 
-    Deduplication itself is an import-time property — see
-    test_soundevent_sources_are_assembled_at_import. What this holds up is the
-    consequence a robot feels: a source cannot be retried more than the policy
-    says, so an unreachable mirror costs a bounded amount of a cold start.
+    The bound is what a robot feels: an unreachable mirror costs a fixed slice
+    of a cold start rather than an open-ended one, and the next `start` retries.
     """
     requests = []
 
@@ -333,7 +304,7 @@ def test_soundevent_contacts_each_source_once_per_retry_set(
         raise HTTPError(url, 404, "Not Found", None, None)
 
     monkeypatch.setattr(model_downloader, "urlopen", urlopen)
-    with pytest.raises(RuntimeError, match="all model sources failed"):
+    with pytest.raises(RuntimeError, match="failed to download"):
         model_downloader.ensure_soundevent_model()
 
     assert requests == [
@@ -352,11 +323,13 @@ def test_soundevent_reports_all_sources_failed_without_caching_invalid_model(
         return io.BytesIO(b"x" * len(soundevent_download))
 
     monkeypatch.setattr(model_downloader, "urlopen", urlopen)
-    with pytest.raises(RuntimeError, match="environment, COS, ModelScope") as error:
+    with pytest.raises(RuntimeError, match="failed to download") as error:
         model_downloader.ensure_soundevent_model()
 
-    assert len(requests) == 9
-    assert "SHA256 mismatch" in str(error.value.__cause__.__cause__)
+    # Three attempts at each of the two sources, and the corrupt bytes none of
+    # them delivered correctly are not left behind as a cache.
+    assert len(requests) == 3 * len(_ALL_SOURCES)
+    assert "SHA256 mismatch" in str(error.value.__cause__)
     assert not (tmp_path / model_downloader.SOUNDEVENT_MODEL_FILENAME).exists()
     assert not list(tmp_path.glob(".soundevent-*/"))
 

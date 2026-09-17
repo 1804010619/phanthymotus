@@ -712,7 +712,9 @@ def ensure_gpu_model(name: str, model_dir: str, progress_cb=None) -> dict[str, s
 # ── SoundEvent (Google YAMNet TFLite) ───────────────────────────────────────
 SOUNDEVENT_MODEL_DIR = "/models/soundevent"
 SOUNDEVENT_MODEL_FILENAME = "yamnet_classification.tflite"
-SOUNDEVENT_MODEL_BASE = os.environ.get("SOUNDEVENT_MODEL_BASE_URL", "")
+SOUNDEVENT_MODEL_BASE = os.environ.get(
+    "SOUNDEVENT_MODEL_BASE_URL", f"{COS_BASE}/soundevent"
+)
 SOUNDEVENT_MODELSCOPE_BASE = (
     "https://www.modelscope.cn/models/zhangyiqun/"
     "yamnet-audio-classification-tflite/resolve/master"
@@ -723,46 +725,21 @@ SOUNDEVENT_MODEL_FILES = {
         "sha256": "10c95ea3eb9a7bb4cb8bddf6feb023250381008177ac162ce169694d05c317de",
     },
 }
-# The download sources, as `{base_url: label}`. Unlike every other bundle here
-# this one registers more than one host, so the shared downloader probes them
-# and uses the fastest — declared order is only the tiebreak when every probe
-# fails, which is what keeps an air-gapped site's own mirror first. Deciding by
+# Two hosts rather than one, so the shared downloader probes them and uses the
+# fastest — COS wins from inside the VPC, ModelScope from several of the rigs.
+# Declared order is only the tiebreak when every probe fails. Deciding by
 # measurement is safe because the file is pinned by size and SHA256 above, so
-# each source must deliver byte-identical content. The label is what the
-# all-sources-failed error names.
-#
-# Empty and duplicate base URLs collapse out: an unset SOUNDEVENT_MODEL_BASE_URL
-# must not become a source, and pointing it at COS must not get COS probed and
-# retried twice (it then keeps the canonical label, since the later pair wins).
-SOUNDEVENT_MODEL_SOURCES = {
-    base_url.strip().rstrip("/"): label
-    for label, base_url in (
-        ("environment", SOUNDEVENT_MODEL_BASE),
-        ("COS", f"{COS_BASE}/soundevent"),
-        ("ModelScope", SOUNDEVENT_MODELSCOPE_BASE),
-    )
-    if base_url.strip()
-}
+# both hosts must deliver byte-identical content.
+SOUNDEVENT_MODEL_SOURCES = [SOUNDEVENT_MODEL_BASE, SOUNDEVENT_MODELSCOPE_BASE]
 
 
 def ensure_soundevent_model(progress_cb=None) -> str:
     """Fetch pinned YAMNet from whichever of its sources answers fastest."""
     model_dir = require_models_subpath(SOUNDEVENT_MODEL_DIR)
-    sources = SOUNDEVENT_MODEL_SOURCES
-    try:
-        paths = ensure_verified_bundle(
-            "soundevent", model_dir, list(sources), SOUNDEVENT_MODEL_FILES,
-            progress_cb=progress_cb,
-        )
-    except RuntimeError as error:
-        # The shared downloader has fallen through every source and retried each
-        # one; it raises the last failure. Name the sources it covered, because
-        # that error is what a stuck card shows and "which mirrors were even
-        # tried" is the first question it has to answer.
-        raise RuntimeError(
-            "[model_downloader] soundevent: all model sources failed (%s)"
-            % ", ".join(sources.values())
-        ) from error
+    paths = ensure_verified_bundle(
+        "soundevent", model_dir, SOUNDEVENT_MODEL_SOURCES, SOUNDEVENT_MODEL_FILES,
+        progress_cb=progress_cb,
+    )
     return paths[SOUNDEVENT_MODEL_FILENAME]
 
 
