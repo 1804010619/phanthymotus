@@ -704,6 +704,58 @@ def ensure_gpu_model(name: str, model_dir: str, progress_cb=None) -> dict[str, s
                                   bundle["files"], progress_cb=progress_cb)
 
 
+# ── SoundEvent (Google YAMNet TFLite) ───────────────────────────────────────
+SOUNDEVENT_MODEL_DIR = "/models/soundevent"
+SOUNDEVENT_MODEL_FILENAME = "yamnet_classification.tflite"
+SOUNDEVENT_MODEL_BASE = os.environ.get("SOUNDEVENT_MODEL_BASE_URL", "")
+SOUNDEVENT_MODELSCOPE_BASE = (
+    "https://www.modelscope.cn/models/zhangyiqun/"
+    "yamnet-audio-classification-tflite/resolve/master"
+)
+SOUNDEVENT_MODEL_FILES = {
+    SOUNDEVENT_MODEL_FILENAME: {
+        "size": 4126810,
+        "sha256": "10c95ea3eb9a7bb4cb8bddf6feb023250381008177ac162ce169694d05c317de",
+    },
+}
+
+
+def ensure_soundevent_model() -> str:
+    """Fetch pinned YAMNet from the environment, COS, then ModelScope."""
+    model_dir = require_models_subpath(SOUNDEVENT_MODEL_DIR)
+    sources = {}
+    for label, base_url in (
+        ("environment", SOUNDEVENT_MODEL_BASE),
+        ("COS", f"{COS_BASE}/soundevent"),
+        ("ModelScope", SOUNDEVENT_MODELSCOPE_BASE),
+    ):
+        base_url = base_url.strip().rstrip("/")
+        if base_url and base_url not in sources:
+            sources[base_url] = label
+
+    last_error = None
+    for base_url, label in sources.items():
+        try:
+            paths = ensure_verified_bundle(
+                "soundevent", model_dir, base_url, SOUNDEVENT_MODEL_FILES
+            )
+            return paths[SOUNDEVENT_MODEL_FILENAME]
+        except RuntimeError as error:
+            # The shared downloader raises after exhausting its retries for
+            # network or integrity failures. Keep its verification, locking
+            # and atomic replacement; only the source changes on the next try.
+            last_error = error
+            cause = error.__cause__ if error.__cause__ is not None else error
+            log.warning(
+                "[model_downloader] soundevent: %s source failed after retries (%s)",
+                label, type(cause).__name__,
+            )
+    raise RuntimeError(
+        "[model_downloader] soundevent: all model sources failed (%s)"
+        % ", ".join(sources.values())
+    ) from last_error
+
+
 # ── OCR (PP-OCRv6 small, TensorRT engines; one bundle per JetPack family) ──
 # The engines are built per TensorRT major and are not portable, so the
 # bundle is chosen from the TensorRT that is importable at runtime. Only the

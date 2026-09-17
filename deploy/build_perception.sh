@@ -108,7 +108,7 @@ if ${PUSH_ENABLED} && [ -n "${RESOURCE_CENTER_API_KEY:-}" ]; then
         echo "Registering image to resource-center (${RESOURCE_CENTER_URL})..."
         # cards 与 perception/plugins/*.py 里各自的 TOOLS 声明手动保持一致 —— name 用
         # 插件的 PREFIX（resource-center 会把这个字符串原样显示在镜像详情页上），type
-        # 用 TOOLS[0]["type"]，目前六个插件全是 processor。列进来的都是 config.yaml 里
+        # 用 TOOLS[0]["type"]，当前列出的插件均为 processor。列进来的都是 config.yaml 里
         # enabled 默认为 true 的插件。新增插件时别忘了在这里补一行。
         HTTP_STATUS=$(curl -s -o /tmp/rc_register_resp.json -w "%{http_code}" \
             -X POST "${RESOURCE_CENTER_URL}/api/admin/register" \
@@ -129,7 +129,8 @@ if ${PUSH_ENABLED} && [ -n "${RESOURCE_CENTER_API_KEY:-}" ]; then
                     {\"name\": \"vop\", \"type\": \"processor\"},
                     {\"name\": \"visual_depth\", \"type\": \"processor\"},
                     {\"name\": \"ocr\", \"type\": \"processor\"},
-                    {\"name\": \"face_recognition\", \"type\": \"processor\"}
+                    {\"name\": \"face_recognition\", \"type\": \"processor\"},
+                    {\"name\": \"soundevent\", \"type\": \"processor\"}
                 ]
             }")
 

@@ -163,6 +163,10 @@ class PerceptionBundle:
             self._plugins.append(OCRPlugin(plugins_cfg["ocr"], executor))
             log.info("OCRPlugin loaded")
 
+        if plugins_cfg.get("soundevent", {}).get("enabled", False):
+            from plugins.soundevent import SoundEventPlugin
+            self._plugins.append(SoundEventPlugin(plugins_cfg["soundevent"], executor))
+            log.info("SoundEventPlugin loaded")
         if plugins_cfg.get("face_recognition", {}).get("enabled", False):
             from plugins.face import FaceRecognitionPlugin
             # Guarded like TTSPlugin: this plugin needs the standalone

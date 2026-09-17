@@ -191,6 +191,8 @@ plugins:
       det_box_thresh: 0.1
     min_interval_ms: 0
 
+  soundevent:
+    enabled: true
   face_recognition:
     enabled: true
     # InsightFace buffalo_sc: SCRFD-500M detector + ArcFace MobileFaceNet.
