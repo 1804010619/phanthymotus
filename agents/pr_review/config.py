@@ -103,7 +103,10 @@ class Config:
 
     # Tests — run inside the images built from the PR. See tester.py.
     tests_enabled: bool = True
-    test_components: tuple[str, ...] = ("agent-core", "perception")
+    # actucore was missing here while its 117 tests sat in the repo: an
+    # actucore PR got a build and a review, and a test section that did not
+    # mention it at all.
+    test_components: tuple[str, ...] = ("agent-core", "perception", "actucore")
     # Deliberately far above what a suite costs, because these bound a wedged
     # container, not a slow one. Measured on the perception suite (787 tests):
     # 34s native on Orin 6, 61s under qemu on the x86 build host — emulation is
@@ -235,7 +238,9 @@ def load_config() -> Config:
         data_dir=os.environ.get("DATA_DIR", "/data/repos"),
         data_host_dir=os.environ.get("DATA_HOST_DIR", ""),
         tests_enabled=_env_bool("TESTS_ENABLED", True),
-        test_components=_env_csv("TEST_COMPONENTS", ("agent-core", "perception")),
+        test_components=_env_csv(
+            "TEST_COMPONENTS", ("agent-core", "perception", "actucore")
+        ),
         test_timeout_seconds=_env_int("TEST_TIMEOUT_SECONDS", 3600),
         test_idle_timeout_seconds=_env_int("TEST_IDLE_TIMEOUT_SECONDS", 900),
         test_pytest_spec=os.environ.get(

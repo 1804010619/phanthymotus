@@ -796,9 +796,9 @@ Triggers a full build and review of the current PR head commit.
   /request_bot_review build-only
   ```
 
-- **`skip-tests`** — Skip running `agent-core/tests` / `perception/tests` in the
-  images this job builds. They run by default, do not block the review, and are
-  fed to the reviewer as context.
+- **`skip-tests`** — Skip running `agent-core/tests` / `perception/tests` /
+  `actucore/tests` in the images this job builds. They run by default, do not
+  block the review, and are fed to the reviewer as context.
   ```
   /request_bot_review skip-tests
   ```
@@ -807,14 +807,18 @@ Triggers a full build and review of the current PR head commit.
   ```
   /request_bot_review core           # Build core only
   /request_bot_review perception     # Build perception only
+  /request_bot_review actucore       # Build actucore only
   /request_bot_review unitree/g1     # Build specific driver
   ```
 
-- **JetPack Variants** — Build perception for specific JetPack versions
+- **JetPack Variants** — Build perception or actucore for specific JetPack
+  versions. A version on its own means perception; next to `actucore` it
+  applies to actucore alone.
   ```
-  /request_bot_review jp511          # JetPack 5.11
-  /request_bot_review jp61           # JetPack 6.1
-  /request_bot_review jp511 jp61     # Both versions
+  /request_bot_review jp511            # perception, JetPack 5.11
+  /request_bot_review jp61             # perception, JetPack 6.1
+  /request_bot_review jp511 jp61       # Both versions
+  /request_bot_review actucore jp61    # actucore only, JetPack 6.1
   ```
 
 ### Combining Options
