@@ -565,3 +565,137 @@ def test_the_output_topic_is_declared_not_only_discovered():
 def test_a_configured_topic_reaches_the_declaration():
     card = make_card(topic="/robot/arm/cmd")
     assert card.get_tools()[0]["topic_out"][0]["topic"] == "/robot/arm/cmd"
+
+
+# ── observations ─────────────────────────────────────────────────────────────
+
+def _stub_ros_messages():
+    """The two message modules `_bind_inputs` imports when it actually subscribes.
+
+    Stubbed rather than skipped: the thing under test is which topic is given
+    which role, and that decision must hold on a machine with ROS as well as on
+    this one.
+    """
+    import types as _types
+
+    for name, members in (("sensor_msgs", ("CompressedImage", "Image")),
+                          ("std_msgs", ("String",))):
+        package = _types.ModuleType(name)
+        module = _types.ModuleType(f"{name}.msg")
+        for member in members:
+            setattr(module, member, type(member, (), {}))
+        package.msg = module
+        sys.modules[name] = package
+        sys.modules[f"{name}.msg"] = module
+
+
+class _Graph:
+    """A node stub that answers the ROS graph query and records subscriptions."""
+
+    def __init__(self, topics):
+        self._topics = topics
+        self.subscribed = []
+
+    def get_topic_names_and_types(self):
+        return list(self._topics.items())
+
+    def create_subscription(self, message_type, topic, callback, qos):
+        self.subscribed.append((message_type.__name__, topic, callback))
+
+
+def _caps(**over):
+    base = {"n_cameras": 0, "needs_state": False}
+    base.update(over)
+    return base
+
+
+def test_roles_come_from_the_message_type_not_the_topic_name():
+    """agent-core passes topic names and no formats, so the name is all a card
+    would otherwise have — and `/robot/state` is free to be anything at all.
+    The graph gives a definite answer, which is how t800 and lynx_m20 already
+    resolve topics in this project."""
+    _stub_ros_messages()
+    card = make_card()
+    node = _Graph({"/cam": ["sensor_msgs/msg/CompressedImage"],
+                   "/st": ["std_msgs/msg/String"]})
+
+    binding, problem = card._bind_inputs(node, ["/st", "/cam"],
+                                         _caps(n_cameras=1, needs_state=True))
+
+    assert problem == ""
+    assert binding["state"] == "/st"
+    assert list(binding["images"].values()) == ["/cam"]
+
+
+def test_a_model_that_needs_a_camera_refuses_to_start_without_one():
+    """The providers have always declared needs_state and n_cameras honestly;
+    nothing read them, so picking smolvla without wiring a camera produced a
+    card reporting `running` that never emitted a command, with the reason
+    buried in info().error."""
+    card = make_card()
+    node = _Graph({"/st": ["std_msgs/msg/String"]})
+
+    binding, problem = card._bind_inputs(node, ["/st"],
+                                         _caps(n_cameras=1, needs_state=True))
+
+    assert binding is None
+    assert "相机" in problem
+
+
+def test_an_open_loop_provider_needs_nothing_wired():
+    """mock declares n_cameras=0; it is open-loop by construction and must not
+    be made to demand a camera it would ignore."""
+    card = make_card()
+    binding, problem = card._bind_inputs(_Graph({}), [], _caps())
+
+    assert problem == ""
+    assert binding == {"images": {}, "state": None}
+
+
+def test_an_unrecognised_input_is_named_in_the_refusal():
+    card = make_card()
+    node = _Graph({"/odd": ["geometry_msgs/msg/Twist"]})
+
+    _, problem = card._bind_inputs(node, ["/odd"], _caps(n_cameras=1))
+
+    assert "/odd" in problem
+
+
+def test_the_capture_time_is_the_oldest_channel_not_now():
+    """RTC's inference_delay is computed from observation age. Reporting now()
+    claims every channel just updated, when the stalest one may be seconds old
+    — and the compensation is then made against the wrong instant."""
+    card = make_card()
+    card._capabilities = _caps(n_cameras=1, needs_state=True)
+    card._images = {"cam0": b"jpeg"}
+    card._image_ms = {"cam0": 5_000}
+    card._proprio = [0.0] * 26
+    card._state_ms = 3_000
+
+    assert card.observation().t_capture_ms == 3_000
+
+
+def test_no_observation_means_no_command_rather_than_a_stale_one():
+    """Publishing nothing lets the driver's watchdog hold the arm, which is the
+    right state for "no policy is driving". Repeating the last command would
+    keep driving on a policy that is no longer seeing anything."""
+    card = _started_card()
+    card._capabilities = _caps(n_cameras=1)
+    card._publisher = _CountingPublisher()
+
+    card._tick()
+
+    assert card._publisher.published == 0
+
+
+def test_the_observation_carries_the_task_as_the_prompt():
+    card = make_card()
+    card._capabilities = _caps()
+    card._task = "把杯子递给我"
+
+    assert card.observation().prompt == "把杯子递给我"
+
+
+def test_the_card_declares_both_input_ports():
+    ports = make_card().get_tools()[0]["topic_in"]
+    assert [p["format"] for p in ports] == ["image/jpeg", "state/joint"]

@@ -46,6 +46,22 @@ FORMATS = {"joint_position": "control/joint",
            "eef_pose": "control/waypoint"}
 
 
+class Observation:
+    """一帧观测。字段名就是 provider 协议里的那几个。
+
+    刻意做成普通容器而不是 dataclass：provider 用 getattr 读它，云端那个也用
+    同样的字段名往 motus.vla/1 的 payload 里塞，两边都不该依赖这里的类型。
+    """
+
+    __slots__ = ("images", "state", "prompt", "t_capture_ms")
+
+    def __init__(self, images=None, state=None, prompt="", t_capture_ms=0):
+        self.images = images or {}
+        self.state = state
+        self.prompt = prompt
+        self.t_capture_ms = int(t_capture_ms or 0)
+
+
 class VLAPlugin:
     PREFIX = "vla"        # no underscore — dispatch routes on partition("_")
 
@@ -71,6 +87,15 @@ class VLAPlugin:
         # Paused by `pause` or `interrupt`; both stop emitting, and the chunk
         # state above is what tells them apart. See `_halt`.
         self._paused = False
+
+        # 观测。独立的锁：图像和状态回调来自 ROS 执行器线程，而 _tick 在定时器
+        # 线程上读它们；和 _lock 共用会让发布排在一帧图像的解码后面。
+        self._obs_lock = threading.RLock()
+        self._images: dict = {}
+        self._image_ms: dict = {}
+        self._proprio = None
+        self._state_ms = 0
+        self._binding = None
         self._rate_hz = 30.0
         self._ttl_ms = 100
         self._seq = 0
@@ -229,6 +254,13 @@ class VLAPlugin:
             # learn its input from a source that has already started.
             "topic_out": [{"topic": self._topic, "format": self._format(),
                            "desc": "motus.control/1 命令流"}],
+            # 观测。连哪几路由 provider 的 capabilities() 说了算 —— mock 声明
+            # n_cameras=0/needs_state=false，开环，不连也能跑；smolvla 两样都要，
+            # 缺了会在启动时被拒绝，而不是跑起来空转。见 _bind_inputs。
+            "topic_in": [
+                {"format": "image/jpeg", "desc": "主视角相机"},
+                {"format": "state/joint", "desc": "本体状态（接驱动命令卡片的状态输出）"},
+            ],
         }]
 
     def dispatch(self, name: str, args: dict):
@@ -315,14 +347,35 @@ class VLAPlugin:
             self._last_error = ""
             self._running = True
 
+        # 连上来的观测源。单数形式是 agent-core 对单连接的写法，复数是多连接；
+        # 两个都读并取并集，因为它同时发两者（见 agent-core _start_and_resolve
+        # 里那段关于只发复数会让卡片"绑定到空"的注释）。
+        inputs = list(args.get("input_topics") or [])
+        single = args.get("input_topic")
+        if single and single not in inputs:
+            inputs.insert(0, single)
+
         try:
             self._open_publisher(mode)
+            binding, problem = self._bind_inputs(self._node, inputs, capabilities)
         except Exception as error:      # noqa: BLE001
             with self._lock:
                 self._running = False
                 self._provider = None
+            self._close_node()
             self._close(provider)
             return self._error(f"publisher 启动失败：{error}")
+
+        if problem:
+            with self._lock:
+                self._running = False
+                self._provider = None
+            self._close_node()
+            self._close(provider)
+            # 启动就拒绝，而不是跑起来一条指令都不发：后者的原因只留在
+            # info().error 里，而画布上那张卡看着是 running 的。
+            return self._error(problem)
+        self._binding = binding
 
         log.info("vla started: provider=%s topic=%s %.1f Hz ttl=%d ms task=%r",
                  provider_name, self._topic, rate, self._ttl_ms, self._task)
@@ -427,6 +480,134 @@ class VLAPlugin:
 
     # ── publishing ───────────────────────────────────────────────────────────
 
+    # ── 观测输入 ─────────────────────────────────────────────────────────────
+
+    def _bind_inputs(self, node, topics, capabilities):
+        """把连上来的话题按**消息类型**分派到角色，并对账 provider 的需求。
+
+        agent-core 只传话题名，不传格式，所以角色不能靠名字猜 —— 一个叫
+        `/robot/state` 的话题完全可能是别的东西。问 ROS 图它上面发的是什么类型
+        是确定的答案，项目里已有先例（t800、lynx_m20 都这么查图）。
+
+        对账放在这里、放在启动时，是因为 provider 早就如实声明了 needs_state /
+        n_cameras，而在此之前**全项目没有一个地方读它们**。于是"选了 smolvla 却
+        没连相机"会一路跑起来、报 running、一条指令都不发，原因只藏在
+        info().error 里。缺什么就在启动时说清楚，是这条对账唯一的意义。
+        """
+        # ROS 的 import 留到真要建订阅时 —— 角色判断只看类型名的字符串，而
+        # "什么都没连所以拒绝"这条路不该需要一个 ROS 环境才能走到。
+        by_type = dict(node.get_topic_names_and_types())
+        bound, unknown = {"images": {}, "state": None}, []
+        for topic in topics:
+            types = by_type.get(topic) or []
+            if any(name.endswith(("CompressedImage", "Image")) for name in types):
+                bound["images"][f"cam{len(bound['images'])}"] = topic
+            elif any(name.endswith("String") for name in types):
+                bound["state"] = topic
+            else:
+                unknown.append(f"{topic}({'/'.join(types) or '无发布者'})")
+
+        needs_state = bool(capabilities.get("needs_state"))
+        n_cameras = int(capabilities.get("n_cameras") or 0)
+        missing = []
+        if n_cameras > len(bound["images"]):
+            missing.append(f"相机 {len(bound['images'])}/{n_cameras} 路")
+        if needs_state and not bound["state"]:
+            missing.append("本体状态")
+        if missing:
+            return None, ("模型需要的观测没有连上：" + "、".join(missing)
+                          + "。请在画布上把相机卡片、以及驱动命令卡片的状态输出"
+                            "连到本卡片的输入端口。"
+                          + (f"（无法识别的输入：{'、'.join(unknown)}）" if unknown else ""))
+
+        # 每种消息类型只在真的要订它时才 import：开环的 provider（mock）不连
+        # 任何东西也能跑，不该因为进程里没有 sensor_msgs 就起不来。
+        if bound["images"]:
+            from sensor_msgs.msg import CompressedImage, Image
+
+            for name, topic in bound["images"].items():
+                types = by_type.get(topic) or []
+                message_type = CompressedImage if any(
+                    n.endswith("CompressedImage") for n in types) else Image
+                node.create_subscription(
+                    message_type, topic,
+                    lambda message, key=name: self._on_image(key, message), 1)
+        if bound["state"]:
+            from std_msgs.msg import String
+
+            node.create_subscription(
+                String, bound["state"], self._on_state, 1)
+        return bound, ""
+
+    def _on_image(self, name, message):
+        data = bytes(getattr(message, "data", b"") or b"")
+        if not data:
+            return
+        with self._obs_lock:
+            self._images[name] = data
+            self._image_ms[name] = self._stamp_of(message)
+
+    def _on_state(self, message):
+        try:
+            payload = json.loads(message.data)
+        except Exception:      # noqa: BLE001 — 一帧坏数据不该拖垮流
+            return
+        values = payload.get("values")
+        if not isinstance(values, list):
+            return
+        with self._obs_lock:
+            self._proprio = [float(v) for v in values]
+            self._state_ms = int(payload.get("stamp_ms") or 0) or int(time.time() * 1000)
+
+    @staticmethod
+    def _stamp_of(message):
+        header = getattr(message, "header", None)
+        stamp = getattr(header, "stamp", None)
+        if stamp is None:
+            return int(time.time() * 1000)
+        return int(stamp.sec * 1000 + stamp.nanosec // 1_000_000)
+
+    def observation(self):
+        """当前观测，或 None —— provider 要而没有的东西缺一样就返回 None。
+
+        `t_capture_ms` 取参与这一帧的各路里**最旧**的那个。RTC 的
+        inference_delay 是按观测年龄算的，报现在等于宣称所有通道刚刚更新过，
+        而实际最旧的那路可能已经很陈旧 —— 那会让补偿按错误的时间做。
+        """
+        with self._obs_lock:
+            images = dict(self._images)
+            image_ms = dict(self._image_ms)
+            state = list(self._proprio) if self._proprio is not None else None
+            state_ms = self._state_ms
+
+        capabilities = self._capabilities or {}
+        if int(capabilities.get("n_cameras") or 0) > len(images):
+            return None
+        if capabilities.get("needs_state") and state is None:
+            return None
+
+        stamps = [ms for ms in image_ms.values() if ms]
+        if state_ms:
+            stamps.append(state_ms)
+        return Observation(images=images, state=state, prompt=self._task,
+                           t_capture_ms=min(stamps) if stamps else 0)
+
+    def _close_node(self):
+        """拆掉 ROS 节点。start 半途失败时必须走这一步 —— 留下一个已注册到
+        executor 的节点，下一次 start 会撞上同名节点而失败，而症状（"节点名已
+        存在"）和真正的原因（上一次启动没清干净）看不出关系。"""
+        with self._lock:
+            node, self._node = self._node, None
+            self._publisher = self._timer = None
+        if node is None:
+            return
+        try:
+            if self._executor is not None:
+                self._executor.remove_node(node)
+            node.destroy_node()
+        except Exception:      # noqa: BLE001
+            pass
+
     def _open_publisher(self, mode: str):
         from rclpy.node import Node
         from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
@@ -462,6 +643,12 @@ class VLAPlugin:
         # right state for "no policy is driving".
         if provider is not None and not provider.health():
             return
+        # 需要观测却还没有，就什么都不发。下游的 watchdog 会 hold 住手臂，那是
+        # "没有策略在驱动"的正确状态；拿上一条指令顶着才是危险的。
+        capabilities = self._capabilities or {}
+        if (int(capabilities.get("n_cameras") or 0) or capabilities.get("needs_state")) \
+                and self.observation() is None:
+            return
         try:
             message = self.next_command()
         except Exception as error:      # noqa: BLE001
@@ -491,8 +678,14 @@ class VLAPlugin:
             # computed, and every command paced out of it carries that same
             # value while its own stamp advances. That is what makes an ageing
             # chunk visible downstream instead of looking perpetually fresh.
-            self._chunk_obs_ms = int(time.time() * 1000)
-            self._chunk = list(self._provider.infer(None) or [])
+            observation = self.observation()
+            # 观测的采集时刻，不是现在 —— 这条 chunk 里每一条指令都带着它，
+            # 下游据此判断指令有多陈旧。用 now() 会让一条基于 800ms 前画面算出
+            # 的指令看起来永远新鲜。
+            self._chunk_obs_ms = (observation.t_capture_ms if observation
+                                  and observation.t_capture_ms
+                                  else int(time.time() * 1000))
+            self._chunk = list(self._provider.infer(observation) or [])
             self._chunk_index = 0
             if not self._chunk:
                 raise RuntimeError("provider returned an empty chunk")
