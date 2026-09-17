@@ -127,6 +127,11 @@ class ActuCoreBundle:
         # 卡片契约（PREFIX 不能含下划线、action.enum 必须含 "info" 等）见 README.md。
         # ──────────────────────────────────────────────────────────────────
 
+        if plugins_cfg.get("vla", {}).get("enabled", False):
+            from plugins.vla import VLAPlugin
+            self._plugins.append(VLAPlugin(plugins_cfg["vla"], executor))
+            log.info("VLAPlugin loaded")
+
         if not self._plugins:
             log.info("no cards enabled — ActuCore is running as an empty MCP host")
 

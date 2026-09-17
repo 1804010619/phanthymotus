@@ -259,6 +259,38 @@ def _bound_inputs(info: dict) -> list:
     return [t.get('topic') for t in (info.get('topic_in') or []) if t.get('topic')]
 
 
+def _control_topics(topic_list: list) -> set:
+    """Topics in a topic_out/topic_in list carried on a `control/*` format.
+
+    `control/*` is the one family with arbitration behind it — see
+    phanthymotus-driver/README_dev.md § "Continuous Control". Everywhere else in
+    this file a second publisher on one topic is a bug; there it is the design.
+    """
+    return {
+        t.get('topic') for t in (topic_list or [])
+        if t.get('topic') and str(t.get('format') or '').startswith('control/')
+    }
+
+
+def _descriptor_conflict(descriptors: list) -> bool:
+    """Do these action space declarations disagree?
+
+    Compared on the fields that decide whether one stream of commands can drive
+    all of them — mode, dof and joint order. Two arms with the same joint names
+    but different limits can share a producer: the stricter driver refuses what
+    it cannot take, which is `ControlSink`'s job and it does it per command.
+    A different `dof` or a different joint order cannot be reconciled at all.
+    """
+    if len(descriptors) < 2:
+        return False
+    first = descriptors[0]
+    key = (first.get('mode'), first.get('dof'), tuple(first.get('joint_names') or []))
+    return any(
+        (d.get('mode'), d.get('dof'), tuple(d.get('joint_names') or [])) != key
+        for d in descriptors[1:]
+    )
+
+
 def _dropped_inputs(info: dict, wanted: list) -> list:
     """Which of the topics we handed a card it did not bind.
 
@@ -446,12 +478,29 @@ async def _do_start_project_impl():
         mine = {t['topic'] for t in (info.get('topic_out') or []) if t.get('topic')}
         if not mine:
             return None
+        control = _control_topics(info.get('topic_out') or [])
         for other_id, out in resolved_topics.items():
             if other_id == card_id:
                 continue
             shared = mine & {t.get('topic') for t in out if t.get('topic')}
-            if shared:
-                return other_id, sorted(shared)
+            if not shared:
+                continue
+            # Several sources on one `control/*` topic is the intended shape,
+            # not a collision. motus.control/1 carries `source` and `priority`
+            # on every message and the driver's ControlSink arbitrates between
+            # them, so a VLA card and a teleop pendant publishing to the same
+            # command topic is how a human takes over. The duplicate-publisher
+            # rule above exists for topics with no arbitration, where the second
+            # card silently reassigns the bus registration.
+            #
+            # Both sides have to say so. One card declaring `control/*` while
+            # the other declares `data/json` is not a negotiated hand-over, it
+            # is the original bug wearing a format string.
+            if shared <= control and shared <= _control_topics(out):
+                print(f'[start-project] {sorted(shared)} has multiple control '
+                      f'sources ({card_id}, {other_id}) — arbitrated by priority')
+                continue
+            return other_id, sorted(shared)
         return None
 
     async def _try_resolve(mcp_id: str, tool_name: str, card_id: str,
@@ -463,7 +512,8 @@ async def _do_start_project_impl():
             print(f'[start-project] {tool_name} info() failed: {error}')
             return {}
 
-    async def _start_and_resolve(card, input_topic: str = '', input_topics: list = None):
+    async def _start_and_resolve(card, input_topic: str = '', input_topics: list = None,
+                                 control_interface: dict = None):
         """Start a card, then call info() to get its resolved topic_out."""
         mcp_id = card.get('mcpId', '')
         tool_name = card.get('toolName', '')
@@ -502,6 +552,12 @@ async def _do_start_project_impl():
             wanted = [input_topic]
             args['input_topic'] = input_topic
             info_args['input_topic'] = input_topic
+
+        if control_interface:
+            # The action space of the card this one drives. Sent on `start` so a
+            # producer can reconcile against it and refuse — not on `info`,
+            # which must stay answerable by a card that has not been given one.
+            args['control_interface'] = control_interface
 
         try:
             req = MCPCallRequest(tool=tool_name, arguments=args)
@@ -675,6 +731,78 @@ async def _do_start_project_impl():
             return topics[0], [], unresolved
         return '', [], unresolved
 
+    async def _downstream_descriptor(card_id: str) -> tuple[dict, str]:
+        """The action space of whatever this card's `control/*` output feeds.
+
+        Returns `(descriptor, error)`; both empty when the card drives nothing.
+
+        This runs *against* the start order on purpose. Everywhere else in this
+        function a card learns from its sources, which dependency order has
+        already started — but a producer of commands needs to know about its
+        *consumer*, which has not started yet and, for a card that streams
+        motion, deliberately will not start itself.
+
+        That works because a descriptor is a **declaration, not runtime state**:
+        a driver's command card answers `info()` with the same action space
+        whether or not it is running. Asking early is therefore not a race, it
+        is reading a constant — and asking at all is what lets a VLA card refuse
+        to start when the model's output does not fit the arm, instead of
+        discovering it one command at a time at 30 Hz.
+
+        Only connections whose port format is `control/*` are asked, so this
+        costs one extra `info()` per command link and nothing at all on a canvas
+        without one.
+        """
+        descriptors, sources, unreachable = [], [], []
+        for conn in connections:
+            if conn.get('fromCardId') != card_id:
+                continue
+            if not str(conn.get('format') or '').startswith('control/'):
+                continue
+            target = next((c for c in cards if c.get('id') == conn.get('toCardId')), None)
+            if not target:
+                continue
+            mcp_id, tool_name = target.get('mcpId', ''), target.get('toolName', '')
+            if not mcp_id or not tool_name:
+                continue
+            try:
+                info = await mcp_call_tool(mcp_id, MCPCallRequest(
+                    tool=tool_name,
+                    arguments={'action': 'info', 'instance_id': target.get('id', '')},
+                ))
+                # Answering without a descriptor and not answering at all are
+                # different facts, and only the second is a fault: most cards
+                # have never heard of motus.control/1, and a control link to
+                # one of those must not fail a start.
+                reachable = (info or {}).get('code') == 200
+                descriptor = (payload_of(info) or {}).get('control_interface')
+            except Exception as error:
+                print(f'[start-project] {tool_name} descriptor info() failed: {error}')
+                reachable, descriptor = False, None
+            if isinstance(descriptor, dict) and descriptor:
+                descriptors.append(descriptor)
+                sources.append(tool_name)
+            elif not reachable:
+                unreachable.append(tool_name)
+
+        if not descriptors:
+            # A consumer that cannot be reached and a consumer that simply
+            # has no action space used to produce the same (empty) error, which
+            # the producer card then reported as "nothing is connected" —
+            # sending an operator to check wiring that was correct. Seen on a
+            # Tianyi: the downstream driver's container happened to be
+            # restarting, info() threw, and the canvas blamed the canvas.
+            if unreachable:
+                return {}, (f'下游卡片 {", ".join(unreachable)} 没有应答，拿不到'
+                            f'动作空间。连线是对的 —— 请检查该卡片所在的设备是否'
+                            f'在线、是否刚重启。')
+            return {}, ''
+        if _descriptor_conflict(descriptors):
+            return {}, (f'{card_id} 的控制输出接到了动作空间不一致的卡片：'
+                        f'{", ".join(sources)}。一路指令流无法同时满足两种动作空间，'
+                        f'请分开连线')
+        return descriptors[0], ''
+
     def _unresolved_message(card: dict, unresolved: list) -> str:
         """Name the upstream cards whose topic could not be found."""
         names = []
@@ -716,7 +844,20 @@ async def _do_start_project_impl():
             }})
             errors.append(tool_name)
             continue
-        await _start_and_resolve(card, input_topic=input_topic, input_topics=input_topics)
+
+        descriptor, descriptor_error = await _downstream_descriptor(card.get('id', ''))
+        if descriptor_error:
+            tool_name = card.get('toolName', '')
+            print(f'[start-project] {tool_name}: {descriptor_error}')
+            await push_event({'type': 'project_start_item', 'payload': {
+                'tool': tool_name, 'mcp_id': card.get('mcpId', ''),
+                'status': 'error', 'message': descriptor_error,
+            }})
+            errors.append(tool_name)
+            continue
+
+        await _start_and_resolve(card, input_topic=input_topic, input_topics=input_topics,
+                                 control_interface=descriptor)
 
     # 有 card 失败 → 全部回滚，不标记 running
     if errors:
