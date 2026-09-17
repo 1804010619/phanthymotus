@@ -79,6 +79,30 @@ The VAD parameters can be adjusted per ASR canvas card via the instance config (
 
 ---
 
+## SoundEvent model downloads
+
+SoundEvent loads its YAMNet TFLite model in the background on the first `start`.
+It reuses a verified cache in `/models/soundevent`; otherwise it tries these
+download base URLs in order:
+
+1. `SOUNDEVENT_MODEL_BASE_URL`, when set to a non-empty value.
+2. The project COS location, `${COS_BASE}/soundevent`.
+3. [ModelScope](https://www.modelscope.cn/models/zhangyiqun/yamnet-audio-classification-tflite/resolve/master).
+
+The downloader appends `yamnet_classification.tflite` to each base URL. Empty
+and duplicate sources are skipped. Each source uses the existing three-attempt
+retry policy; HTTP errors (including a missing COS object), connection errors,
+timeouts, or failed file validation trigger the next source after retries are
+exhausted. If all sources fail, the instance reports a model-loading error and
+a later `start` can retry.
+
+Every source must supply the same 4,126,810-byte file with SHA-256
+`10c95ea3eb9a7bb4cb8bddf6feb023250381008177ac162ce169694d05c317de`.
+Unverified downloads never replace the model cache. Set the environment
+variable before starting Perception to prefer another mirror; it is optional.
+
+---
+
 ## TTS Engines
 
 `tts_engine` (configSchema on the `tts` tool, and `plugins.tts.engine` in
