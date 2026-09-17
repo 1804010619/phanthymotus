@@ -110,22 +110,61 @@ def test_labels_from_model_rejects_missing_associated_file(tmp_path):
         soundevent.labels_from_model(model_path)
 
 
+_COS_SOURCE = f"{model_downloader.COS_BASE}/soundevent"
+_MODELSCOPE_SOURCE = model_downloader.SOUNDEVENT_MODELSCOPE_BASE
+_ENV_SOURCE = "https://models.example/soundevent"
+_ALL_SOURCES = {
+    _ENV_SOURCE: "environment",
+    _COS_SOURCE: "COS",
+    _MODELSCOPE_SOURCE: "ModelScope",
+}
+
+
 def test_soundevent_model_base_honors_environment(monkeypatch):
     monkeypatch.delenv("SOUNDEVENT_MODEL_BASE_URL", raising=False)
     default_module = _load_model_downloader_copy("model_downloader_default_test")
     assert default_module.SOUNDEVENT_MODEL_BASE == ""
 
-    configured_base = "https://models.example/soundevent"
-    monkeypatch.setenv("SOUNDEVENT_MODEL_BASE_URL", configured_base)
+    monkeypatch.setenv("SOUNDEVENT_MODEL_BASE_URL", _ENV_SOURCE)
     configured_module = _load_model_downloader_copy("model_downloader_env_test")
-    assert configured_module.SOUNDEVENT_MODEL_BASE == configured_base
+    assert configured_module.SOUNDEVENT_MODEL_BASE == _ENV_SOURCE
+
+
+# The source list is assembled at import, like every other bundle's base_url in
+# model_downloader — so this is where the environment override, the empty-value
+# rule and the dedup rule are observable. Testing them by patching the module
+# attribute afterwards would only prove the patch took.
+@pytest.mark.parametrize("configured, expected", [
+    (None, {_COS_SOURCE: "COS", _MODELSCOPE_SOURCE: "ModelScope"}),
+    ("", {_COS_SOURCE: "COS", _MODELSCOPE_SOURCE: "ModelScope"}),
+    # Whitespace is not a mirror: an operator who exported the variable empty
+    # must not get a source whose URL is a space.
+    ("   ", {_COS_SOURCE: "COS", _MODELSCOPE_SOURCE: "ModelScope"}),
+    (_ENV_SOURCE, _ALL_SOURCES),
+    # A trailing slash is the same host, not a second one.
+    (f" {_ENV_SOURCE}/ ", _ALL_SOURCES),
+    # Pointing the override at a host already registered must not get that host
+    # probed and retried twice; it keeps its canonical label.
+    (_COS_SOURCE, {_COS_SOURCE: "COS", _MODELSCOPE_SOURCE: "ModelScope"}),
+    (_MODELSCOPE_SOURCE, {_MODELSCOPE_SOURCE: "ModelScope", _COS_SOURCE: "COS"}),
+])
+def test_soundevent_sources_are_assembled_at_import(configured, expected, monkeypatch):
+    if configured is None:
+        monkeypatch.delenv("SOUNDEVENT_MODEL_BASE_URL", raising=False)
+    else:
+        monkeypatch.setenv("SOUNDEVENT_MODEL_BASE_URL", configured)
+    module = _load_model_downloader_copy("model_downloader_sources_test")
+
+    assert module.SOUNDEVENT_MODEL_SOURCES == expected
+    # Order is the tiebreak used when every probe fails, so it is part of the
+    # contract, not an artefact of dict equality above.
+    assert list(module.SOUNDEVENT_MODEL_SOURCES) == list(expected)
 
 
 def test_soundevent_model_download_uses_pinned_manifest(tmp_path, monkeypatch):
-    configured_base = "https://models.example/soundevent"
     captured = {}
 
-    monkeypatch.setattr(model_downloader, "SOUNDEVENT_MODEL_BASE", configured_base)
+    monkeypatch.setattr(model_downloader, "SOUNDEVENT_MODEL_SOURCES", _ALL_SOURCES)
     monkeypatch.setattr(
         model_downloader,
         "require_models_subpath",
@@ -153,11 +192,7 @@ def test_soundevent_model_download_uses_pinned_manifest(tmp_path, monkeypatch):
         # what lets the downloader probe them and pick, instead of always
         # paying for the first one in the list.
         "model_dir": str(tmp_path),
-        "base_url": [
-            configured_base,
-            f"{model_downloader.COS_BASE}/soundevent",
-            model_downloader.SOUNDEVENT_MODELSCOPE_BASE,
-        ],
+        "base_url": [_ENV_SOURCE, _COS_SOURCE, _MODELSCOPE_SOURCE],
         "files": {
             "yamnet_classification.tflite": {
                 "size": 4_126_810,
@@ -175,12 +210,12 @@ def test_soundevent_sources_are_ordered_by_measured_speed(tmp_path, monkeypatch)
     The pinned size and SHA256 are what make choosing by speed a performance
     decision rather than a trust one — both hosts must serve the same bytes.
     """
-    monkeypatch.setattr(model_downloader, "SOUNDEVENT_MODEL_BASE", "")
+    monkeypatch.setattr(model_downloader, "SOUNDEVENT_MODEL_SOURCES",
+                        {_COS_SOURCE: "COS", _MODELSCOPE_SOURCE: "ModelScope"})
     monkeypatch.setattr(
         model_downloader, "require_models_subpath", lambda path: str(tmp_path)
     )
-    cos = f"{model_downloader.COS_BASE}/soundevent"
-    modelscope = model_downloader.SOUNDEVENT_MODELSCOPE_BASE
+    cos, modelscope = _COS_SOURCE, _MODELSCOPE_SOURCE
     # ModelScope measured faster here; COS is declared first and must still lose.
     rates = {cos: 500_000.0, modelscope: 5_000_000.0}
     monkeypatch.setattr(model_downloader, "_probe_source",
@@ -206,9 +241,7 @@ def soundevent_download(tmp_path, monkeypatch):
     monkeypatch.setattr(
         model_downloader, "require_models_subpath", lambda path: str(tmp_path)
     )
-    monkeypatch.setattr(
-        model_downloader, "SOUNDEVENT_MODEL_BASE", "https://models.example/soundevent"
-    )
+    monkeypatch.setattr(model_downloader, "SOUNDEVENT_MODEL_SOURCES", _ALL_SOURCES)
     monkeypatch.setattr(model_downloader, "SOUNDEVENT_MODEL_FILES", {
         model_downloader.SOUNDEVENT_MODEL_FILENAME: {
             "size": len(payload), "sha256": hashlib.sha256(payload).hexdigest(),
@@ -222,12 +255,7 @@ def soundevent_download(tmp_path, monkeypatch):
 def test_soundevent_download_tries_sources_in_order(
     successful_source, soundevent_download, monkeypatch
 ):
-    bases = [
-        model_downloader.SOUNDEVENT_MODEL_BASE,
-        f"{model_downloader.COS_BASE}/soundevent",
-        model_downloader.SOUNDEVENT_MODELSCOPE_BASE,
-    ]
-    urls = [f"{base}/yamnet_classification.tflite" for base in bases]
+    urls = [f"{base}/yamnet_classification.tflite" for base in _ALL_SOURCES]
     requests = []
 
     def urlopen(url, timeout):
@@ -252,11 +280,10 @@ def test_soundevent_download_tries_sources_in_order(
 def test_soundevent_falls_back_when_cos_download_or_validation_fails(
     failure, soundevent_download, monkeypatch, caplog
 ):
-    monkeypatch.setattr(model_downloader, "SOUNDEVENT_MODEL_BASE", "  ")
-    cos_url = f"{model_downloader.COS_BASE}/soundevent/yamnet_classification.tflite"
-    fallback_url = (
-        f"{model_downloader.SOUNDEVENT_MODELSCOPE_BASE}/yamnet_classification.tflite"
-    )
+    monkeypatch.setattr(model_downloader, "SOUNDEVENT_MODEL_SOURCES",
+                        {_COS_SOURCE: "COS", _MODELSCOPE_SOURCE: "ModelScope"})
+    cos_url = f"{_COS_SOURCE}/yamnet_classification.tflite"
+    fallback_url = f"{_MODELSCOPE_SOURCE}/yamnet_classification.tflite"
     requests = []
 
     def urlopen(url, timeout):
@@ -289,15 +316,16 @@ def test_soundevent_falls_back_when_cos_download_or_validation_fails(
     assert not list(Path(path).parent.glob(".soundevent-*/"))
 
 
-@pytest.mark.parametrize("duplicate_source", ["COS", "ModelScope"])
-def test_soundevent_does_not_retry_the_same_source_twice(
-    duplicate_source, soundevent_download, monkeypatch
+def test_soundevent_contacts_each_source_once_per_retry_set(
+    soundevent_download, monkeypatch
 ):
-    cos = f"{model_downloader.COS_BASE}/soundevent"
-    modelscope = model_downloader.SOUNDEVENT_MODELSCOPE_BASE
-    first = cos if duplicate_source == "COS" else modelscope
-    second = modelscope if duplicate_source == "COS" else cos
-    monkeypatch.setattr(model_downloader, "SOUNDEVENT_MODEL_BASE", f" {first}/ ")
+    """Every source is tried, each exactly three times, then the attempt fails.
+
+    Deduplication itself is an import-time property — see
+    test_soundevent_sources_are_assembled_at_import. What this holds up is the
+    consequence a robot feels: a source cannot be retried more than the policy
+    says, so an unreachable mirror costs a bounded amount of a cold start.
+    """
     requests = []
 
     def urlopen(url, timeout):
@@ -310,7 +338,7 @@ def test_soundevent_does_not_retry_the_same_source_twice(
 
     assert requests == [
         f"{base}/yamnet_classification.tflite"
-        for base in (first, second) for _ in range(3)
+        for base in _ALL_SOURCES for _ in range(3)
     ]
 
 

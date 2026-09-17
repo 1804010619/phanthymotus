@@ -723,44 +723,32 @@ SOUNDEVENT_MODEL_FILES = {
         "sha256": "10c95ea3eb9a7bb4cb8bddf6feb023250381008177ac162ce169694d05c317de",
     },
 }
-
-
-def soundevent_sources() -> dict[str, str]:
-    """The YAMNet download sources, as ``{base_url: label}`` in declared order.
-
-    Declared order is environment override, COS, ModelScope — but that order is
-    only a tiebreak. The list is handed to the shared downloader as *one*
-    multi-source bundle, so the sources are probed and used fastest-first on the
-    machine doing the download; see the multi-source note above. Which host
-    answers is safe to decide by measurement because the file is pinned by size
-    and SHA256, so every source must deliver byte-identical content.
-
-    Empty and duplicate base URLs are dropped: an unset `SOUNDEVENT_MODEL_BASE_URL`
-    must not become a source, and pointing it at COS must not make COS be probed
-    and retried twice.
-    """
-    sources = {}
+# The download sources, as `{base_url: label}`. Unlike every other bundle here
+# this one registers more than one host, so the shared downloader probes them
+# and uses the fastest — declared order is only the tiebreak when every probe
+# fails, which is what keeps an air-gapped site's own mirror first. Deciding by
+# measurement is safe because the file is pinned by size and SHA256 above, so
+# each source must deliver byte-identical content. The label is what the
+# all-sources-failed error names.
+#
+# Empty and duplicate base URLs collapse out: an unset SOUNDEVENT_MODEL_BASE_URL
+# must not become a source, and pointing it at COS must not get COS probed and
+# retried twice (it then keeps the canonical label, since the later pair wins).
+SOUNDEVENT_MODEL_SOURCES = {
+    base_url.strip().rstrip("/"): label
     for label, base_url in (
         ("environment", SOUNDEVENT_MODEL_BASE),
         ("COS", f"{COS_BASE}/soundevent"),
         ("ModelScope", SOUNDEVENT_MODELSCOPE_BASE),
-    ):
-        base_url = base_url.strip().rstrip("/")
-        if base_url and base_url not in sources:
-            sources[base_url] = label
-    return sources
+    )
+    if base_url.strip()
+}
 
 
 def ensure_soundevent_model(progress_cb=None) -> str:
-    """Fetch pinned YAMNet from whichever of its sources answers fastest.
-
-    An operator-mandated mirror does not need to be forced to the front: a host
-    the machine cannot reach probes as unusable and is dropped, and if every
-    probe fails the declared order is what remains — so an air-gapped site that
-    sets `SOUNDEVENT_MODEL_BASE_URL` still gets its own mirror tried first.
-    """
+    """Fetch pinned YAMNet from whichever of its sources answers fastest."""
     model_dir = require_models_subpath(SOUNDEVENT_MODEL_DIR)
-    sources = soundevent_sources()
+    sources = SOUNDEVENT_MODEL_SOURCES
     try:
         paths = ensure_verified_bundle(
             "soundevent", model_dir, list(sources), SOUNDEVENT_MODEL_FILES,
