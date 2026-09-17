@@ -212,7 +212,23 @@ class VLAPlugin:
                 },
                 "required": [],
             },
-            "topic_out": [{"format": self._format(), "desc": "motus.control/1 命令流"}],
+            # `topic` is declared, not left to be discovered after start —
+            # every other card in the project does this and this one did not.
+            #
+            # agent-core resolves a consumer's `input_topic` from its source's
+            # *running* `info()`, falling back to the connection's persisted
+            # `fromTopic` and then to this declaration. A card that names no
+            # topic until it starts leaves all three empty, so the moment this
+            # card fails to start — for any reason — the card downstream fails
+            # too, with "连线缺少 topic"， which reads like a wiring problem on a
+            # canvas that is wired correctly. Seen on Tianyi.
+            #
+            # There is nothing to discover anyway: the topic comes from config
+            # and is known here. It also makes the feedback wiring
+            # (vla → servo → vla) resolvable, since in a cycle neither card can
+            # learn its input from a source that has already started.
+            "topic_out": [{"topic": self._topic, "format": self._format(),
+                           "desc": "motus.control/1 命令流"}],
         }]
 
     def dispatch(self, name: str, args: dict):

@@ -543,3 +543,25 @@ class _CountingPublisher:
 
     def publish(self, _message):
         self.published += 1
+
+
+def test_the_output_topic_is_declared_not_only_discovered():
+    """agent-core's fallback chain ends at this declaration.
+
+    A consumer's `input_topic` comes from the source's running `info()`, then
+    the connection's persisted `fromTopic`, then the source card's declared
+    `topic_out`. Naming no topic here leaves all three empty, so any failure to
+    start this card also fails the card downstream — reported as
+    "连线缺少 topic", which sends someone to check wiring that is correct.
+
+    Nothing needs discovering: the topic is configuration and is known here.
+    """
+    port = make_card().get_tools()[0]["topic_out"][0]
+
+    assert port["topic"] == "/actucore/vla/cmd"
+    assert port["format"] == "control/joint"
+
+
+def test_a_configured_topic_reaches_the_declaration():
+    card = make_card(topic="/robot/arm/cmd")
+    assert card.get_tools()[0]["topic_out"][0]["topic"] == "/robot/arm/cmd"
