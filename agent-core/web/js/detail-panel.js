@@ -58,32 +58,19 @@ function _setStatus(text, tone = 'dim') {
   _status.style.color = tone === 'warn' ? 'var(--orange, #d77757)' : 'var(--text-dim, #888)';
 }
 
-/**
- * 停止推送时说什么、说在哪 —— 两者都取决于下面是画布还是文字。
- *
- * 画布会把最后一帧永远留在屏幕上，所以那句话是"画面是最后一帧"，压在正中间也
- * 没关系：底下那张图正是它在描述的东西。
- *
- * 文本面板底下是一段滚动日志，不是一张停住的画。说"画面"没有指涉，而居中的
- * 无背景文字会正好糊在一行数据上，两边都读不成 —— 截图里就是这样。所以文本
- * 面板改成顶部的一条带底色的横幅：不遮最新的那几行，也不会和内容混在一起。
- */
-function _staleNotice() {
-  const seconds = Math.round(STALE_MS / 1000);
-  if (_textLike) {
-    _status.style.cssText = 'position:absolute;left:0;right:0;top:0;text-align:center;' +
-      'font-size:12px;padding:4px 16px;pointer-events:none;z-index:2;' +
-      'background:var(--bg-card, #fdfcfa);border-bottom:1px solid var(--border, #e6e0d8)';
-    return `已暂停 — ${seconds} 秒没有新数据，以下是最后收到的内容`;
-  }
-  _status.style.cssText = _CENTERED;
-  return `已暂停 — ${seconds} 秒没有新数据，画面是最后一帧`;
-}
-
 function _armStaleTimer() {
   clearTimeout(_staleTimer);
+  // 文本和活动流不需要这条提示，所以连定时器都不武装。
+  //
+  // 它存在的理由只对画布成立：canvas 会把最后一帧永远留在屏幕上，停掉的流和
+  // 活着的流长得一模一样，不说一声就分不出来。日志不是这样 —— 每一行自带
+  // 时间戳，停没停它自己就说明了。对着一段会自己说话的内容再压一层提示，
+  // 唯一的效果是盖住一行数据。
+  if (_textLike) return;
   _staleTimer = setTimeout(() => {
-    if (_frames > 0) _setStatus(_staleNotice(), 'warn');
+    if (_frames > 0) {
+      _setStatus(`已暂停 — ${Math.round(STALE_MS / 1000)} 秒没有新数据，画面是最后一帧`, 'warn');
+    }
   }, STALE_MS);
 }
 
@@ -106,9 +93,6 @@ export function showTopicDetail(topicPath, format) {
   _renderer.mount(body, 'detail');
 
   _frames = 0;
-  // 每次重新挂载都把样式恢复成居中的那套 —— 上一个话题如果是文本面板，
-  // _staleNotice 会把它改成顶部横幅，留着的话下一个视频面板的"正在连接…"
-  // 会贴在顶边上。
   _status = document.createElement('div');
   _status.className = 'detail-status';
   _status.style.cssText = _CENTERED;
