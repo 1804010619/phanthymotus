@@ -170,6 +170,58 @@ checker's table (`IN_CODE_PROFILE` or `KNOWN_GAPS`) with the reason — not a si
 
 `ipc` and `pid` are **not** part of this contract; see the section at the end.
 
+## Continuous control (`motus.control/1`) — servo cards
+
+Applies to any PR touching `common/control/`, a `servo.py`, or anything that
+subscribes to a `control/*` topic. Authoritative: `README_dev.md` §"Continuous
+Control (`motus.control/1`)"; architecture and the requirements coming next in
+`phanthymotus/docs/vla-integration.md`.
+
+This is the path an execution model drives the robot through — tens of commands a
+second, no human in the loop per command. **A review miss here moves a real arm.**
+Existing implementations to compare against: `realman/rm75_6f_v/servo.py` (single
+7-DOF arm), `x-humanoid/tianyi2.0/servo.py` (dual arm + hands, uses `groups`).
+
+Block on these:
+
+- **The check chain re-implemented in the card.** Freshness, source arbitration,
+  step clamping, hard limits, watchdog and escalation belong to
+  `common/control.ControlSink`, which is ROS-free, takes an injected clock, and is
+  tested without a robot. A card that does its own bounds check has a second,
+  untested copy of the safety properties. What legitimately belongs in the card:
+  unit conversion at the SDK boundary, the vendor's motion gate, and which call
+  stops the machine.
+- **`force_torque` missing from the descriptor.** It is required *even as `null`* —
+  `parse_descriptor` rejects a descriptor that omits it. Watch for a PR that
+  "fixes" that rejection by defaulting it to a value: omitting it is how a robot
+  ends up assumed to have a protection it does not have, and inventing one is
+  worse.
+- **A descriptor hand-written apart from the feedback path.** The state the driver
+  publishes and the commands it accepts must come from the same
+  `build_descriptor()`. Two hand-maintained tables will eventually disagree about
+  what the machine can do, and nothing will report it.
+- **Unit conversion anywhere but the boundary.** rm75's descriptor is radians and
+  its SDK takes degrees; the conversion sits immediately before the SDK call. A
+  conversion scattered across a file is how half a trajectory ends up in the wrong
+  unit.
+- **The motion gate skipped because commands are frequent.** The vendor's
+  motion-enable / human confirmation is checked once at `start` — that is the point
+  where a person is present. Streaming does not earn an exemption.
+- **Generous `ttl_ms` / `watchdog_ms` / `max_obs_age_ms`.** A generous ttl removes
+  the protection *while still appearing to provide it*: the robot then resumes from
+  a pause on a command computed from an old picture. These are measurements, not
+  preferences — ask what the PR measured.
+- **`obs_stamp_ms` set from anything but the sensor's capture time.** The whole
+  point of the second timestamp is catching a freshly-generated command computed
+  from an 800 ms old picture. Filling it from "when the driver read the value"
+  looks right in every test that does not involve latency.
+- **Pause treated as a safe state.** When commands stop the robot holds, and
+  resumes *without warning* the moment a valid one lands. A PR that calls a held
+  robot safe, or that removes the resume announcement, is wrong about the hardware.
+
+Tests for a new check go in `tests/test_control_sink.py` — it is ROS-free with an
+injected clock, so there is no excuse for an untested safety rule in a bundle.
+
 ## Comparing against an existing driver
 
 Pick the closest existing driver and check the new one against it. Good models:

@@ -35,6 +35,47 @@ does nothing until an `if` block is added to `ActuCoreBundle.__init__` and the
 switch is added to `config.yaml`. Card discovery is explicit, not directory
 scanning.
 
+## The `vla` card and its providers
+
+Architecture and the reasoning behind each rule: `docs/vla-integration.md`. The
+card is one card with pluggable providers — **not one card per model** — and the
+two axes (which model, which robot) are deliberately orthogonal.
+
+**A new provider** is a file in `plugins/vla/providers/` exposing
+`PROVIDER(descriptor, config=None, on_status=None)` plus `capabilities` / `infer`
+/ `health` / `close`. Check:
+
+- **`capabilities()` must be answerable before the weights are loaded.** That is
+  what lets negotiation refuse a mismatched action space before several GB land on
+  disk. A provider that reads its config in `__init__` and loads weights in a
+  background thread is the shape to look for; one that blocks the constructor on a
+  model load is not.
+- **Claimed capabilities must be implemented.** `supports_rtc` is the live example:
+  LeRobot ships RTC for the flow-matching policies, but the `smolvla` provider does
+  not implement the prefix conditioning it needs, so it reports `False`. A provider
+  claiming a capability it lacks makes the card hand it an `inference_delay`
+  nothing acts on.
+- **Lazy import.** torch / lerobot imported inside the functions that need them —
+  a card nobody selected must not pull a GPU stack into the process, and on the
+  jp5.11 line those libraries are permanently absent.
+- **`on_status` accepted even when the provider downloads nothing.** The card
+  passes it without asking which provider it built. See §"Model downloads" above
+  for what it is for.
+- **Weights pinned and progress-reporting** — same two rules as every other model
+  in this project.
+
+**Negotiation belongs at `start`, not per command.** A new capability or descriptor
+field that needs checking goes in `negotiate.check()`, which collects *every*
+disagreement and names the two numbers ("模型输出 32 维动作，下游只接受 14 维"). The
+alternative is discovering the mismatch one command at a time at 30 Hz, by which
+point the arm has moved.
+
+**Do not default safety-relevant fields.** `message.build()` requires `ttl_ms`,
+`stamp_ms` and `obs_stamp_ms` explicitly, because a default invented at the sender
+only moves the mistake somewhere harder to see. `stamp_ms` and `obs_stamp_ms` are
+different numbers — a PR that passes the same value for both has disabled the
+receiver's staleness check while every latency-free test still passes.
+
 ## Tool `type` drives scheduling
 
 `type` is one of `sensor` / `actuator` / `processor` / `resource`, and it changes
