@@ -44,58 +44,69 @@ plugins:
     # 注意它说的是我们自己的 motus.vla/1 协议，不是 openpi 的 WebSocket 或
     # LeRobot 的 gRPC —— 翻译在服务端（phanthymotus-cloud）做，机器人这侧
     # 不背每种服务器一个适配器。
+    #
+    # 这三项只在 provider = vla_cloud 时显示（schema 里的 x-show-when）：
+    # 本机 provider 旁边填着一个 endpoint，看起来像配好了，实际被忽略。
     endpoint: ""
     api_key: ""
-    model: ""
     # 每次请求的超时。**必须短于下游驱动的 watchdog**，否则迟到的 chunk 会在
     # 机械臂已经被命令保持之后才到。
     timeout_ms: 200
 
+    # ── 选哪个 checkpoint ────────────────────────────────────────────────
+    # 本机 provider 从下面 models: 里挑；vla_cloud 则是服务端认得的名字。
+    # 开源发布的沿用上游原名；为某台机器人微调过的用带机器人名的名字，
+    # 因为"它适配的动作空间"正是操作员必须搞对的东西。
+    model: smolvla_base
+
+    models:
+      # 上游原版：SO-100/SO-101 的 6 维，驱动不了天轶（26 维），协商会拒绝。
+      # 留在这里是因为它是唯一公开可得、能验证整条本机推理链路的 checkpoint。
+      smolvla_base:
+        model_dir: /models/vla/smolvla_base
+        weights:
+          # 两条源，机器自己挑。下载器按**最大的那个文件**做一次 Range 探测，
+          # 快的先用，失败则顺延。多源之所以安全，是因为每个文件都 pin 了
+          # size+sha256 —— 校验与来源无关，所以换源不降低任何保证。
+          base_url:
+            - https://www.modelscope.cn/api/v1/models/lerobot/smolvla_base/repo?Revision=master&FilePath={file}
+            - https://agi-phanthy-dev-1252788780.cos.ap-beijing.myqcloud.com/public/vla/smolvla_base
+          files:
+            config.json:
+              size: 2299
+              sha256: "650584b56c104720f7a3c91d1ec6bec9e8de8ac11e60c92ba2fa82d93eda147d"
+            model.safetensors:
+              size: 906712520
+              sha256: "7cd549ac2351fb069c0ddb3c34ad2d09cfc92b56a15dccdfc2e41467aaca01eb"
+            policy_preprocessor.json:
+              size: 1872
+              sha256: "7683d648280a72f0d51e869fb8dd1596beed90b7f84849330cf1bc26634a4bd6"
+            policy_postprocessor.json:
+              size: 660
+              sha256: "2b78bb742065288df2ec63b0ee35f97a1f6950171cf2272f7e34b1fe3873b17b"
+            policy_preprocessor_step_5_normalizer_processor.safetensors:
+              size: 640
+              sha256: "490ab239d96e263687c0b2e386a0afbc235a2eceb9857c36ed32f2f162a3e7c8"
+            policy_postprocessor_step_0_unnormalizer_processor.safetensors:
+              size: 640
+              sha256: "490ab239d96e263687c0b2e386a0afbc235a2eceb9857c36ed32f2f162a3e7c8"
+        # smolvla_base 的 config.json 期望 observation.images.camera1/2/3 和
+        # observation.state（各 6 维）。缺哪个就报哪个，不会拿黑图去推理。
+        feature_map: {}
+        #   main:  observation.images.camera1
+        #   wrist: observation.images.camera2
+        #   state: observation.state
+
+      # 微调版按同样的形状加在这里，各自一份 weights 清单：
+      # smolvla_tianyi:
+      #   model_dir: /models/vla/smolvla_tianyi
+      #   weights: {base_url: [...], files: {...}}
+      #   feature_map: {main: observation.images.camera1, state: observation.state}
+
     # ── provider: smolvla（本机）──────────────────────────────────────────
     # 需要镜像带 lerobot，即 jp6.1 的 jetson-base-actucore。jp5.11 上会在
     # start 时明确拒绝并说明原因（CUDA 11.4 撑不住 torch >= 2.2.1）。
-    model_dir: /models/vla/smolvla
     device: cuda
-    # 权重清单。COS 是机器人侧唯一来源，size + sha256 都要 pin。
-    # 留空时：model_dir 里已有 checkpoint 就直接用，没有就明确报错 ——
-    # 给一个没人上传过的文件编哈希，或者不校验就下载一个要驱动电机的东西，
-    # 两者都不比一条清楚的错误强。上游优先 ModelScope（lerobot/smolvla_base）。
-    # 已上传：ModelScope lerobot/smolvla_base → COS，六个文件的 sha256 与
-    # ModelScope 索引声明的逐一核对过。
-    weights:
-      # 两条源，机器自己挑。下载器按**最大的那个文件**做一次 Range 探测，
-      # 快的先用，失败则顺延。多源之所以安全，是因为每个文件都 pin 了
-      # size+sha256 —— 校验与来源无关，所以换源不降低任何保证。
-      base_url:
-        - https://www.modelscope.cn/api/v1/models/lerobot/smolvla_base/repo?Revision=master&FilePath={file}
-        - https://agi-phanthy-dev-1252788780.cos.ap-beijing.myqcloud.com/public/vla/smolvla_base
-      files:
-        config.json:
-          size: 2299
-          sha256: "650584b56c104720f7a3c91d1ec6bec9e8de8ac11e60c92ba2fa82d93eda147d"
-        model.safetensors:
-          size: 906712520
-          sha256: "7cd549ac2351fb069c0ddb3c34ad2d09cfc92b56a15dccdfc2e41467aaca01eb"
-        policy_preprocessor.json:
-          size: 1872
-          sha256: "7683d648280a72f0d51e869fb8dd1596beed90b7f84849330cf1bc26634a4bd6"
-        policy_postprocessor.json:
-          size: 660
-          sha256: "2b78bb742065288df2ec63b0ee35f97a1f6950171cf2272f7e34b1fe3873b17b"
-        policy_preprocessor_step_5_normalizer_processor.safetensors:
-          size: 640
-          sha256: "490ab239d96e263687c0b2e386a0afbc235a2eceb9857c36ed32f2f162a3e7c8"
-        policy_postprocessor_step_0_unnormalizer_processor.safetensors:
-          size: 640
-          sha256: "490ab239d96e263687c0b2e386a0afbc235a2eceb9857c36ed32f2f162a3e7c8"
-    # checkpoint 的输入 key 跟着它的训练数据集走（有的叫 observation.images.top，
-    # 有的叫 cam_high），所以这里是配置而不是约定：猜错的结果是策略对着一张黑图
-    # 推理，而不是报错。
-    # SmolVLA 的 checkpoint **不自包含**：它的 config 里 vlm_model_name 指向
-    # HuggingFaceTB/SmolVLM2-500M-Video-Instruct，LeRobot 加载时会去 HF 拉 ——
-    # 机器人连不上，而且是在策略权重都已就位之后才失败。所以骨干也要预置。
-    # 同样来自 ModelScope（同名仓库）→ COS，sha256 逐个核对。~2 GB。
-    vlm_dir: /models/vla/smolvlm2_500m
     vlm_weights:
       base_url:
         - https://www.modelscope.cn/api/v1/models/HuggingFaceTB/SmolVLM2-500M-Video-Instruct/repo?Revision=master&FilePath={file}
@@ -137,12 +148,6 @@ plugins:
         vocab.json:
           size: 800662
           sha256: "82b84012e3add4d01d12ba14442026e49b8cbbaead1f79ecf3d919784f82dc79"
-    # smolvla_base 的 config.json 期望 observation.images.camera1/2/3 和
-    # observation.state（各 6 维）。缺哪个就报哪个，不会拿黑图去推理。
-    feature_map: {}
-    #   main:  observation.images.camera1
-    #   wrist: observation.images.camera2
-    #   state: observation.state
 
   # nav:
   #   enabled: true

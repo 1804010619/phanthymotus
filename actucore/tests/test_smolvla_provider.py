@@ -440,3 +440,69 @@ def test_this_checkpoint_will_not_drive_tianyi(real_checkpoint):
 
     assert len(problems) == 1
     assert "6" in problems[0] and "26" in problems[0]
+
+
+# ── choosing a checkpoint by name ────────────────────────────────────────────
+
+def _staged(tmp_path, names):
+    """A `models:` map with a real config.json behind each name."""
+    entries = {}
+    for name in names:
+        directory = tmp_path / name
+        directory.mkdir()
+        (directory / "config.json").write_text(json.dumps(REAL_SMOLVLA_BASE))
+        entries[name] = {"model_dir": str(directory)}
+    return entries
+
+
+def test_the_model_name_selects_which_checkpoint_loads(tmp_path):
+    models = _staged(tmp_path, ["smolvla_base", "smolvla_tianyi"])
+    provider = make_provider(tmp_path, model="smolvla_tianyi", models=models)
+
+    assert provider._model_dir == models["smolvla_tianyi"]["model_dir"]
+    assert provider.capabilities()["model"] == "smolvla_tianyi"
+
+
+def test_capabilities_report_the_checkpoint_not_the_family(tmp_path):
+    """`smolvla` is true of every one of them and says nothing about which."""
+    models = _staged(tmp_path, ["smolvla_tianyi"])
+    provider = make_provider(tmp_path, model="smolvla_tianyi", models=models)
+
+    assert provider.capabilities()["model"] == "smolvla_tianyi"
+
+
+def test_an_unknown_name_is_refused_and_lists_what_is_staged(tmp_path):
+    """Falling back to a default would run a policy that moves and is wrong."""
+    models = _staged(tmp_path, ["smolvla_base"])
+
+    with pytest.raises(ValueError) as excinfo:
+        make_provider(tmp_path, model="smolvla_q5", models=models)
+
+    message = str(excinfo.value)
+    assert "smolvla_q5" in message and "smolvla_base" in message
+
+
+def test_no_name_with_several_staged_is_refused(tmp_path):
+    models = _staged(tmp_path, ["smolvla_base", "smolvla_tianyi"])
+
+    with pytest.raises(ValueError) as excinfo:
+        make_provider(tmp_path, model="", models=models)
+
+    assert "`model` is not set" in str(excinfo.value)
+
+
+def test_a_per_model_feature_map_wins_over_the_card_wide_one(tmp_path):
+    """Input keys travel with the checkpoint's training dataset, not the card."""
+    models = _staged(tmp_path, ["smolvla_tianyi"])
+    models["smolvla_tianyi"]["feature_map"] = {"main": "observation.images.cam_high"}
+
+    provider = make_provider(tmp_path, model="smolvla_tianyi", models=models,
+                             feature_map={"main": "observation.images.camera1"})
+
+    assert provider._feature_map == {"main": "observation.images.cam_high"}
+
+
+def test_a_single_checkpoint_deployment_needs_no_models_map(tmp_path, checkpoint):
+    """`models:` is for choosing; one checkpoint configured directly still works."""
+    provider = make_provider(checkpoint)
+    assert provider._model_dir == str(checkpoint)

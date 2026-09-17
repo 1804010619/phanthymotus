@@ -83,10 +83,19 @@ class SmolVLAProvider:
     def __init__(self, descriptor: dict, config: dict | None = None):
         config = dict(config or {})
         self._descriptor = descriptor or {}
-        self._model_dir = config.get("model_dir") or "/models/vla/smolvla"
+        # Which checkpoint. `smolvla_base` is the published 6-DOF one; a version
+        # fine-tuned for a robot is registered beside it under a name that says
+        # which robot (`smolvla_tianyi`), because the action space it fits is the
+        # thing that has to match the arm.
+        self._model = str(config.get("model") or "").strip()
+        entry = self._model_entry(config)
+        self._model_dir = (entry.get("model_dir")
+                           or config.get("model_dir")
+                           or f"/models/vla/{self._model or 'smolvla'}")
         self._device = str(config.get("device") or "cuda")
-        self._feature_map = dict(config.get("feature_map") or {})
-        self._weights = config.get("weights") or {}
+        self._feature_map = dict(entry.get("feature_map")
+                                 or config.get("feature_map") or {})
+        self._weights = entry.get("weights") or config.get("weights") or {}
         self._vlm_dir = config.get("vlm_dir") or "/models/vla/smolvlm2_500m"
         self._vlm_weights = config.get("vlm_weights") or {}
         self._chunk_override = config.get("chunk_size")
@@ -116,7 +125,10 @@ class SmolVLAProvider:
         features = self._config.get("input_features") or {}
         image_keys = [k for k in features if "image" in k]
         return {
-            "model": self._config.get("type") or "smolvla",
+            # The configured checkpoint name, not the architecture family:
+            # `smolvla` is true of every one of them and tells an operator
+            # reading `info()` nothing about which weights are loaded.
+            "model": self._model or self._config.get("type") or "smolvla",
             "action_dim": self._action_dim(),
             "chunk_size": self._chunk_size(),
             "control_hz": float(self._config.get("fps") or 30.0),
@@ -162,6 +174,34 @@ class SmolVLAProvider:
             pass
 
     # ── loading ──────────────────────────────────────────────────────────────
+
+    def _model_entry(self, config: dict) -> dict:
+        """The `models:` entry for the selected checkpoint.
+
+        Refuses an unknown name rather than falling back to a default: silently
+        loading a different checkpoint than the operator picked would produce a
+        policy that runs, moves, and is wrong — the failure mode this whole
+        negotiation path exists to avoid.
+
+        An empty `models:` is allowed, for a single-checkpoint deployment that
+        configures `model_dir`/`weights` directly.
+        """
+        models = config.get("models") or {}
+        if not models:
+            return {}
+        if not self._model:
+            raise ValueError(
+                f"`model` is not set. This deployment stages "
+                f"{sorted(models)}; pick one."
+            )
+        entry = models.get(self._model)
+        if entry is None:
+            raise ValueError(
+                f"unknown model {self._model!r}. Staged here: {sorted(models)}. "
+                f"A checkpoint has to be registered under `models:` with its own "
+                f"weights manifest before it can be selected."
+            )
+        return dict(entry)
 
     @staticmethod
     def _require_lerobot():

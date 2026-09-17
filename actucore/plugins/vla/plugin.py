@@ -81,6 +81,13 @@ class VLAPlugin:
 
     def get_tools(self) -> list:
         available = sorted(discover())
+        # Names of the checkpoints staged for local providers. Offered as an
+        # enum so the operator picks one rather than typing a name that has to
+        # match a config key exactly — and left absent for a remote provider,
+        # whose model names live on the server and are not ours to enumerate.
+        local_models = sorted(self._cfg.get("models") or {})
+        default_model = self._cfg.get("model") or (
+            local_models[0] if local_models else "")
         return [{
             "name": "vla",
             "type": "processor",
@@ -116,8 +123,33 @@ class VLAPlugin:
                                  "default": "mock" if "mock" in available else
                                  (available[0] if available else ""),
                                  "scope": "shared"},
-                    "endpoint": {"type": "string", "scope": "shared"},
-                    "api_key": {"type": "string", "scope": "shared"},
+                    # Which checkpoint. For a local provider this selects one
+                    # of the staged models under `models:`; for vla_cloud it is
+                    # the name the server knows it by. One field either way —
+                    # the question "which model" is the same question, and
+                    # splitting it would give the same thing two names.
+                    #
+                    # The published checkpoints keep their upstream names
+                    # (`smolvla_base`); a version fine-tuned for a particular
+                    # robot gets a name that says so (`smolvla_tianyi`,
+                    # `smolvla_q5`), because the action space it fits is the
+                    # thing an operator has to get right.
+                    "model": {"type": "string", "default": default_model,
+                              "description": "checkpoint name",
+                              "scope": "shared",
+                              **({"enum": local_models} if local_models else {})},
+                    # Only vla_cloud has anywhere to send a request. Hiding
+                    # these for a local provider is not cosmetic: a filled-in
+                    # endpoint beside `provider: smolvla` reads as configured
+                    # and is ignored, which is the kind of thing an operator
+                    # spends an afternoon on.
+                    "endpoint": {"type": "string", "scope": "shared",
+                                 "x-show-when": {"provider": "vla_cloud"}},
+                    "api_key": {"type": "string", "scope": "shared",
+                                "x-show-when": {"provider": "vla_cloud"}},
+                    "timeout_ms": {"type": "number", "default": 200,
+                                   "scope": "shared",
+                                   "x-show-when": {"provider": "vla_cloud"}},
                     "topic": {"type": "string", "default": DEFAULT_TOPIC,
                               "scope": "instance"},
                     "rate_hz": {"type": "number", "scope": "instance"},

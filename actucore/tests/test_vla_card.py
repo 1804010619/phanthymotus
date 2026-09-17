@@ -344,3 +344,53 @@ def test_the_mock_does_not_claim_to_read_anything():
     """Claiming otherwise would hide a broken observation path behind motion."""
     assert MOCK(DESCRIPTOR).capabilities()["needs_state"] is False
     assert MOCK(DESCRIPTOR).capabilities()["n_cameras"] == 0
+
+
+# ── the config form an operator actually sees ────────────────────────────────
+
+def _properties(**cfg):
+    return make_card(**cfg).get_tools()[0]["configSchema"]["properties"]
+
+
+def test_remote_only_fields_are_hidden_for_a_local_provider():
+    """A filled-in endpoint beside `provider: smolvla` reads as configured.
+
+    It is ignored, and nothing says so — which is an afternoon of an operator's
+    time. `x-show-when` is how every other card in this project expresses that.
+    """
+    props = _properties()
+
+    for field in ("endpoint", "api_key", "timeout_ms"):
+        assert props[field]["x-show-when"] == {"provider": "vla_cloud"}, field
+
+
+def test_the_show_when_value_is_a_string():
+    """A boolean here renders the field permanently hidden, silently.
+
+    The frontend compares `actual === condVal` against a value that arrives as
+    a string, so a JSON boolean never matches — agent-core has a whole test
+    (test_config_schema_show_when.py) about the time that cost someone.
+    """
+    props = _properties()
+    assert isinstance(props["endpoint"]["x-show-when"]["provider"], str)
+
+
+def test_the_model_field_offers_the_staged_checkpoints():
+    props = _properties(models={"smolvla_base": {}, "smolvla_tianyi": {}})
+
+    assert props["model"]["enum"] == ["smolvla_base", "smolvla_tianyi"]
+    assert props["model"]["default"] == "smolvla_base"
+
+
+def test_the_model_field_stays_free_text_with_nothing_staged():
+    """vla_cloud's model names live on the server; they are not ours to list."""
+    props = _properties()
+
+    assert "enum" not in props["model"]
+    assert props["model"]["type"] == "string"
+
+
+def test_the_configured_model_is_the_default_shown():
+    props = _properties(model="smolvla_tianyi",
+                        models={"smolvla_base": {}, "smolvla_tianyi": {}})
+    assert props["model"]["default"] == "smolvla_tianyi"
