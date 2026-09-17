@@ -90,7 +90,8 @@ def ttl_ms(rate_hz: float, descriptor: dict) -> int:
     """How long a command stays valid.
 
     Two periods, floored at 50 ms and capped by the driver's watchdog. The
-    reasoning is in phanthymotus/docs/vla-integration.md § 2.2: a generous ttl
+    reasoning is in phanthymotus/docs/vla-integration.md §"频率与 ttl 的由来":
+    a generous ttl
     removes the protection while still appearing to provide it, because a stale
     command then executes and the robot resumes from a pause on an old picture.
     Longer than the watchdog is meaningless — the driver has already given up.
