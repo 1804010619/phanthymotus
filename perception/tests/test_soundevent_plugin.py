@@ -132,7 +132,7 @@ def test_soundevent_model_download_uses_pinned_manifest(tmp_path, monkeypatch):
         lambda model_dir: str(tmp_path),
     )
 
-    def fake_ensure(name, model_dir, base_url, files):
+    def fake_ensure(name, model_dir, base_url, files, progress_cb=None):
         captured.update(
             name=name, model_dir=model_dir, base_url=base_url, files=files
         )
@@ -149,8 +149,15 @@ def test_soundevent_model_download_uses_pinned_manifest(tmp_path, monkeypatch):
     assert result == str(tmp_path / "yamnet_classification.tflite")
     assert captured == {
         "name": "soundevent",
+        # One bundle carrying every source, not one call per source: that is
+        # what lets the downloader probe them and pick, instead of always
+        # paying for the first one in the list.
         "model_dir": str(tmp_path),
-        "base_url": configured_base,
+        "base_url": [
+            configured_base,
+            f"{model_downloader.COS_BASE}/soundevent",
+            model_downloader.SOUNDEVENT_MODELSCOPE_BASE,
+        ],
         "files": {
             "yamnet_classification.tflite": {
                 "size": 4_126_810,
@@ -160,6 +167,37 @@ def test_soundevent_model_download_uses_pinned_manifest(tmp_path, monkeypatch):
             }
         },
     }
+
+
+def test_soundevent_sources_are_ordered_by_measured_speed(tmp_path, monkeypatch):
+    """COS and ModelScope are both registered; the machine picks.
+
+    The pinned size and SHA256 are what make choosing by speed a performance
+    decision rather than a trust one — both hosts must serve the same bytes.
+    """
+    monkeypatch.setattr(model_downloader, "SOUNDEVENT_MODEL_BASE", "")
+    monkeypatch.setattr(
+        model_downloader, "require_models_subpath", lambda path: str(tmp_path)
+    )
+    cos = f"{model_downloader.COS_BASE}/soundevent"
+    modelscope = model_downloader.SOUNDEVENT_MODELSCOPE_BASE
+    # ModelScope measured faster here; COS is declared first and must still lose.
+    rates = {cos: 500_000.0, modelscope: 5_000_000.0}
+    monkeypatch.setattr(model_downloader, "_probe_source",
+                        lambda source, filename: rates[source])
+    fetched = []
+
+    def fake_fetch(name, url, destination, metadata, **kwargs):
+        fetched.append(url)
+        Path(destination).write_bytes(b"")
+
+    monkeypatch.setattr(model_downloader, "_fetch_pinned_file", fake_fetch)
+    monkeypatch.setattr(model_downloader, "_bundle_matches",
+                        lambda model_dir, files: False)
+
+    model_downloader.ensure_soundevent_model()
+
+    assert fetched == [f"{modelscope}/yamnet_classification.tflite"]
 
 
 @pytest.fixture
@@ -241,7 +279,8 @@ def test_soundevent_falls_back_when_cos_download_or_validation_fails(
 
     assert requests == [cos_url] * 3 + [fallback_url]
     assert Path(path).read_bytes() == soundevent_download
-    assert "COS source failed after retries" in caplog.text
+    assert f"failed from {model_downloader.COS_BASE}/soundevent" in caplog.text
+    assert "1 source(s) left" in caplog.text
     reason = {
         "http": "HTTPError", "connection": "URLError", "timeout": "TimeoutError",
         "size": "ValueError", "sha256": "ValueError",

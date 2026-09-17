@@ -612,9 +612,14 @@ def _download_verified_bundle(
                 except Exception as error:      # noqa: BLE001 — try the next host
                     last_error = error
                     remaining = len(sources) - index - 1
+                    # Name the *root* cause: after its retries _fetch_pinned_file
+                    # raises a uniform "failed to download X", so without this
+                    # every mirror failure reads the same whether the host 404ed,
+                    # timed out, or served a file whose SHA256 did not match.
+                    cause = error.__cause__ if error.__cause__ is not None else error
                     log.warning(
                         f"[model_downloader] {name}: {filename} failed from "
-                        f"{source}: {error}"
+                        f"{source}: {error} ({type(cause).__name__})"
                         + (f"; {remaining} source(s) left" if remaining else "")
                     )
             if last_error is not None:
@@ -720,9 +725,20 @@ SOUNDEVENT_MODEL_FILES = {
 }
 
 
-def ensure_soundevent_model() -> str:
-    """Fetch pinned YAMNet from the environment, COS, then ModelScope."""
-    model_dir = require_models_subpath(SOUNDEVENT_MODEL_DIR)
+def soundevent_sources() -> dict[str, str]:
+    """The YAMNet download sources, as ``{base_url: label}`` in declared order.
+
+    Declared order is environment override, COS, ModelScope — but that order is
+    only a tiebreak. The list is handed to the shared downloader as *one*
+    multi-source bundle, so the sources are probed and used fastest-first on the
+    machine doing the download; see the multi-source note above. Which host
+    answers is safe to decide by measurement because the file is pinned by size
+    and SHA256, so every source must deliver byte-identical content.
+
+    Empty and duplicate base URLs are dropped: an unset `SOUNDEVENT_MODEL_BASE_URL`
+    must not become a source, and pointing it at COS must not make COS be probed
+    and retried twice.
+    """
     sources = {}
     for label, base_url in (
         ("environment", SOUNDEVENT_MODEL_BASE),
@@ -732,28 +748,34 @@ def ensure_soundevent_model() -> str:
         base_url = base_url.strip().rstrip("/")
         if base_url and base_url not in sources:
             sources[base_url] = label
+    return sources
 
-    last_error = None
-    for base_url, label in sources.items():
-        try:
-            paths = ensure_verified_bundle(
-                "soundevent", model_dir, base_url, SOUNDEVENT_MODEL_FILES
-            )
-            return paths[SOUNDEVENT_MODEL_FILENAME]
-        except RuntimeError as error:
-            # The shared downloader raises after exhausting its retries for
-            # network or integrity failures. Keep its verification, locking
-            # and atomic replacement; only the source changes on the next try.
-            last_error = error
-            cause = error.__cause__ if error.__cause__ is not None else error
-            log.warning(
-                "[model_downloader] soundevent: %s source failed after retries (%s)",
-                label, type(cause).__name__,
-            )
-    raise RuntimeError(
-        "[model_downloader] soundevent: all model sources failed (%s)"
-        % ", ".join(sources.values())
-    ) from last_error
+
+def ensure_soundevent_model(progress_cb=None) -> str:
+    """Fetch pinned YAMNet from whichever of its sources answers fastest.
+
+    An operator-mandated mirror does not need to be forced to the front: a host
+    the machine cannot reach probes as unusable and is dropped, and if every
+    probe fails the declared order is what remains — so an air-gapped site that
+    sets `SOUNDEVENT_MODEL_BASE_URL` still gets its own mirror tried first.
+    """
+    model_dir = require_models_subpath(SOUNDEVENT_MODEL_DIR)
+    sources = soundevent_sources()
+    try:
+        paths = ensure_verified_bundle(
+            "soundevent", model_dir, list(sources), SOUNDEVENT_MODEL_FILES,
+            progress_cb=progress_cb,
+        )
+    except RuntimeError as error:
+        # The shared downloader has fallen through every source and retried each
+        # one; it raises the last failure. Name the sources it covered, because
+        # that error is what a stuck card shows and "which mirrors were even
+        # tried" is the first question it has to answer.
+        raise RuntimeError(
+            "[model_downloader] soundevent: all model sources failed (%s)"
+            % ", ".join(sources.values())
+        ) from error
+    return paths[SOUNDEVENT_MODEL_FILENAME]
 
 
 # ── OCR (PP-OCRv6 small, TensorRT engines; one bundle per JetPack family) ──

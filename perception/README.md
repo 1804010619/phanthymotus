@@ -82,19 +82,32 @@ The VAD parameters can be adjusted per ASR canvas card via the instance config (
 ## SoundEvent model downloads
 
 SoundEvent loads its YAMNet TFLite model in the background on the first `start`.
-It reuses a verified cache in `/models/soundevent`; otherwise it tries these
-download base URLs in order:
+It reuses a verified cache in `/models/soundevent`; otherwise it registers these
+download base URLs as one multi-source bundle:
 
 1. `SOUNDEVENT_MODEL_BASE_URL`, when set to a non-empty value.
 2. The project COS location, `${COS_BASE}/soundevent`.
 3. [ModelScope](https://www.modelscope.cn/models/zhangyiqun/yamnet-audio-classification-tflite/resolve/master).
 
-The downloader appends `yamnet_classification.tflite` to each base URL. Empty
-and duplicate sources are skipped. Each source uses the existing three-attempt
-retry policy; HTTP errors (including a missing COS object), connection errors,
-timeouts, or failed file validation trigger the next source after retries are
-exhausted. If all sources fail, the instance reports a model-loading error and
-a later `start` can retry.
+**The order above is only a tiebreak — the machine chooses.** As for every other
+multi-source bundle (`utils/model_downloader.py` § multi-source), the sources
+are probed once with a short ranged read and used **fastest-first**: COS is faster
+from inside the VPC, ModelScope is faster from several of the rigs, and neither
+answer is right everywhere. A source that cannot be reached, or that answers
+quickly with something too short to be the file, measures as unusable and is
+dropped rather than tried; if *every* probe fails the declared order is used, so an
+air-gapped site that sets `SOUNDEVENT_MODEL_BASE_URL` still gets its own mirror
+first.
+
+The downloader appends `yamnet_classification.tflite` to each base URL (or
+substitutes `{file}`, for a host like ModelScope's repo API that takes the path as
+a query parameter). Empty and duplicate sources are skipped, so pointing the
+environment variable at COS does not make COS be probed and retried twice. Each
+source keeps the three-attempt retry policy; HTTP errors (including a missing COS
+object), connection errors, timeouts, or failed file validation fall through to the
+next source, and the warning names the root cause so a down mirror is
+distinguishable from a corrupt one. If all sources fail, the instance reports a
+model-loading error naming the sources tried, and a later `start` can retry.
 
 Every source must supply the same 4,126,810-byte file with SHA-256
 `10c95ea3eb9a7bb4cb8bddf6feb023250381008177ac162ce169694d05c317de`.
