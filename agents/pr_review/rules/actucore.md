@@ -64,6 +64,49 @@ nothing else. A card's dependencies belong in their own `RUN` layer. Watch for
 PRs that pile a card's heavyweight deps into the shared base layers — that is
 how perception's image reached several GB.
 
+The image also copies two files out of `perception/utils/` — `model_downloader.py`
+and `model_progress.py` — flat into `/work`, so cards import them by bare name.
+**They travel together.** `plugins/vla/providers/smolvla.py` imports both; shipping
+one without the other fails at card start, on a robot, with an `ImportError` that
+no test here would have caught. A PR that adds a card fetching weights must check
+both `COPY` lines are present.
+
+## Model downloads
+
+A card that fetches weights follows the same two rules Perception does. They are
+written out in **`perception/README.md` §"Model downloads: the two rules"** — which
+is *not* loaded for an actucore-only PR, so the checks are restated here rather
+than cross-referenced:
+
+1. **Pinned, and free to choose a source.** Every file carries `size` + `sha256`,
+   verified before acceptance; `base_url` may be a list of hosts, probed once and
+   used fastest-first. Flag a new manifest entry without pins, and a hand-rolled
+   loop over sources instead of passing the list to `ensure_verified_bundle`.
+2. **It must say how far along it is.** A download with no progress is
+   indistinguishable from a hang. Flag an `ensure_*` call that omits `progress_cb`
+   where the caller has a status channel, a status line formatted by hand instead
+   of via `model_progress.fetch_status`, and an archive path with no `stage_cb`.
+
+ActuCore does not get an exemption for reusing Perception's downloader — it is the
+*caller* side these rules are about.
+
+The stake is higher here than in Perception: these are the largest downloads in the
+system (a SmolVLA checkpoint ~900 MB, its backbone another ~1 GB), and the fetch
+happens inside provider construction, which happens inside `start`. So the two
+things to check on any such PR:
+
+- `ensure_verified_bundle` is called **with** `progress_cb` (from
+  `model_progress.fetch_status`), not without;
+- the card can answer `info` with that line while the download is in flight. The
+  VLA card could not, until `_starting` was added: `_running` is set only after
+  construction returns, so `_state()` reported `idle` for the whole of a
+  multi-gigabyte fetch and the card looked stopped while doing the longest thing
+  it ever does.
+
+A provider factory takes `(descriptor, config, on_status=None)`. A new provider
+must accept `on_status` even when it downloads nothing — the card hands it to
+whichever provider it built without asking which one that is.
+
 `COPY actucore/deploy/ /deploy/` must stay: Agent Core extracts
 `/deploy/service.yml` from the image to merge the compose fragment, and dropping
 it silently degrades to the legacy `docker run` path — which does **not** carry

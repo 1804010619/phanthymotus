@@ -24,7 +24,8 @@ import logging
 
 import numpy as np
 
-from plugins.face_runtime import DEFAULT_FACE_MODEL, DetectedFace
+from plugins.face_runtime import (DEFAULT_FACE_MODEL, DetectedFace,
+                                  face_bundle_for)
 
 log = logging.getLogger(__name__)
 
@@ -44,7 +45,7 @@ class FaceServiceProxy:
                  det_size=(640, 640), det_thresh: float = 0.5,
                  nms_thresh: float = 0.4, max_image_side: int = 2048,
                  max_image_pixels: float = 60e6, warmup: bool = True,
-                 model: str = DEFAULT_FACE_MODEL):
+                 model: str = DEFAULT_FACE_MODEL, on_status=None):
         from plugins import ort_worker
         from utils.onnx_provider import ort_providers_for_device, warn_on_parked_cores
 
@@ -57,6 +58,18 @@ class FaceServiceProxy:
         # version, and an abort prints no Python traceback. Say the precondition before
         # the child goes near it, so the last line before a silent death names it.
         warn_on_parked_cores("face")
+
+        # Fetch the weights here rather than leaving it to the child. The worker
+        # protocol is request/reply, so a download inside it cannot report how far
+        # along it is, and the card would sit on one static line for the whole
+        # transfer. Downloading is pure HTTP + hashing and creates no ORT session,
+        # so it is safe in this process; the child's own call then finds the
+        # verified bundle and returns immediately.
+        from utils.model_downloader import ensure_face_model
+        from utils.model_progress import fetch_status
+        progress_cb, _ = fetch_status(on_status, model)
+        weights_dir, bundle = face_bundle_for(model, model_dir)
+        ensure_face_model(weights_dir, bundle=bundle, progress_cb=progress_cb)
 
         self._worker = ort_worker.get_worker()
         described = self._worker.service(

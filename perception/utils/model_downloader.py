@@ -25,6 +25,24 @@ log = logging.getLogger(__name__)
 COS_BASE = "https://agi-phanthy-dev-1252788780.cos.ap-beijing.myqcloud.com/public"
 
 
+def _notify_stage(name: str, stage_cb, stage: str) -> None:
+    """Tell the caller which wait it is now in: "download" or "extract".
+
+    Percentages alone are not enough for an archive. Once the bytes are in, a
+    515 MB Kokoro tarball still has to be decompressed and merged, and during
+    that the last progress line — "100% (515/515 MB)" — sits frozen on the card
+    for tens of seconds, which reads exactly like a hang. Callers that only
+    render percentages pass nothing; a failing callback must never abort a
+    download that is otherwise fine.
+    """
+    if stage_cb is None:
+        return
+    try:
+        stage_cb(stage)
+    except Exception as error:  # pragma: no cover - defensive
+        log.debug(f"[model_downloader] {name}: stage_cb failed: {error}")
+
+
 def _progress_hook(name: str, progress_cb=None):
     """Create a reporthook for urlretrieve that logs download progress.
 
@@ -86,7 +104,8 @@ MODELS = {
 }
 
 
-def ensure_model(name: str, model_dir: str, progress_cb=None) -> None:
+def ensure_model(name: str, model_dir: str, progress_cb=None,
+                 stage_cb=None) -> None:
     """Ensure model files exist in model_dir. Download from COS if missing.
 
     Serialized per (model_dir, name) with a file lock, and every download lands
@@ -115,14 +134,15 @@ def ensure_model(name: str, model_dir: str, progress_cb=None) -> None:
             if os.path.exists(check_path):
                 log.info(f"[model_downloader] {name}: fetched by another instance")
                 return
-            _download_model(name, info, model_dir, check_path, progress_cb)
+            _download_model(name, info, model_dir, check_path, progress_cb,
+                            stage_cb)
         finally:
             if fcntl is not None:
                 fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
 
 def _download_model(name: str, info: dict, model_dir: str, check_path: str,
-                    progress_cb=None) -> None:
+                    progress_cb=None, stage_cb=None) -> None:
     """Fetch one legacy model into model_dir. Caller holds the per-model lock."""
     url = info["url"]
     log.info(f"[model_downloader] {name}: downloading from {url} ...")
@@ -155,6 +175,7 @@ def _download_model(name: str, info: dict, model_dir: str, check_path: str,
     try:
         urlretrieve(url, tmp_path, reporthook=_progress_hook(name, progress_cb))
         log.info(f"[model_downloader] {name}: extracting to {model_dir} ...")
+        _notify_stage(name, stage_cb, "extract")
 
         # Extract beside the destination, then move the files in, so a partly
         # extracted archive never publishes check_file either.
@@ -612,9 +633,14 @@ def _download_verified_bundle(
                 except Exception as error:      # noqa: BLE001 — try the next host
                     last_error = error
                     remaining = len(sources) - index - 1
+                    # Name the *root* cause: after its retries _fetch_pinned_file
+                    # raises a uniform "failed to download X", so without this
+                    # every mirror failure reads the same whether the host 404ed,
+                    # timed out, or served a file whose SHA256 did not match.
+                    cause = error.__cause__ if error.__cause__ is not None else error
                     log.warning(
                         f"[model_downloader] {name}: {filename} failed from "
-                        f"{source}: {error}"
+                        f"{source}: {error} ({type(cause).__name__})"
                         + (f"; {remaining} source(s) left" if remaining else "")
                     )
             if last_error is not None:
@@ -707,7 +733,9 @@ def ensure_gpu_model(name: str, model_dir: str, progress_cb=None) -> dict[str, s
 # ── SoundEvent (Google YAMNet TFLite) ───────────────────────────────────────
 SOUNDEVENT_MODEL_DIR = "/models/soundevent"
 SOUNDEVENT_MODEL_FILENAME = "yamnet_classification.tflite"
-SOUNDEVENT_MODEL_BASE = os.environ.get("SOUNDEVENT_MODEL_BASE_URL", "")
+SOUNDEVENT_MODEL_BASE = os.environ.get(
+    "SOUNDEVENT_MODEL_BASE_URL", f"{COS_BASE}/soundevent"
+)
 SOUNDEVENT_MODELSCOPE_BASE = (
     "https://www.modelscope.cn/models/zhangyiqun/"
     "yamnet-audio-classification-tflite/resolve/master"
@@ -718,42 +746,22 @@ SOUNDEVENT_MODEL_FILES = {
         "sha256": "10c95ea3eb9a7bb4cb8bddf6feb023250381008177ac162ce169694d05c317de",
     },
 }
+# Two hosts rather than one, so the shared downloader probes them and uses the
+# fastest — COS wins from inside the VPC, ModelScope from several of the rigs.
+# Declared order is only the tiebreak when every probe fails. Deciding by
+# measurement is safe because the file is pinned by size and SHA256 above, so
+# both hosts must deliver byte-identical content.
+SOUNDEVENT_MODEL_SOURCES = [SOUNDEVENT_MODEL_BASE, SOUNDEVENT_MODELSCOPE_BASE]
 
 
-def ensure_soundevent_model() -> str:
-    """Fetch pinned YAMNet from the environment, COS, then ModelScope."""
+def ensure_soundevent_model(progress_cb=None) -> str:
+    """Fetch pinned YAMNet from whichever of its sources answers fastest."""
     model_dir = require_models_subpath(SOUNDEVENT_MODEL_DIR)
-    sources = {}
-    for label, base_url in (
-        ("environment", SOUNDEVENT_MODEL_BASE),
-        ("COS", f"{COS_BASE}/soundevent"),
-        ("ModelScope", SOUNDEVENT_MODELSCOPE_BASE),
-    ):
-        base_url = base_url.strip().rstrip("/")
-        if base_url and base_url not in sources:
-            sources[base_url] = label
-
-    last_error = None
-    for base_url, label in sources.items():
-        try:
-            paths = ensure_verified_bundle(
-                "soundevent", model_dir, base_url, SOUNDEVENT_MODEL_FILES
-            )
-            return paths[SOUNDEVENT_MODEL_FILENAME]
-        except RuntimeError as error:
-            # The shared downloader raises after exhausting its retries for
-            # network or integrity failures. Keep its verification, locking
-            # and atomic replacement; only the source changes on the next try.
-            last_error = error
-            cause = error.__cause__ if error.__cause__ is not None else error
-            log.warning(
-                "[model_downloader] soundevent: %s source failed after retries (%s)",
-                label, type(cause).__name__,
-            )
-    raise RuntimeError(
-        "[model_downloader] soundevent: all model sources failed (%s)"
-        % ", ".join(sources.values())
-    ) from last_error
+    paths = ensure_verified_bundle(
+        "soundevent", model_dir, SOUNDEVENT_MODEL_SOURCES, SOUNDEVENT_MODEL_FILES,
+        progress_cb=progress_cb,
+    )
+    return paths[SOUNDEVENT_MODEL_FILENAME]
 
 
 # ── OCR (PP-OCRv6 small, TensorRT engines; one bundle per JetPack family) ──
@@ -811,14 +819,16 @@ OCR_MODEL_BUNDLES = {
 }
 
 
-def ensure_ocr_model(model_dir: str, family: str | None = None) -> dict[str, str]:
+def ensure_ocr_model(model_dir: str, family: str | None = None,
+                     progress_cb=None) -> dict[str, str]:
     """Ensure the OCR TensorRT bundle matching the runtime TensorRT is present."""
     model_dir = require_models_subpath(model_dir)
     key = select_bundle_family(OCR_MODEL_BUNDLES, family)
     entry = OCR_MODEL_BUNDLES[key]
     log.info(f"[model_downloader] ocr: using {key} bundle")
     return ensure_verified_bundle(
-        f"ocr/{key}", model_dir, entry["base_url"], entry["files"]
+        f"ocr/{key}", model_dir, entry["base_url"], entry["files"],
+        progress_cb=progress_cb,
     )
 
 
@@ -858,7 +868,8 @@ FACE_MODEL_BUNDLES = {
 }
 
 
-def ensure_face_model(model_dir: str, bundle: str = "face") -> dict[str, str]:
+def ensure_face_model(model_dir: str, bundle: str = "face",
+                      progress_cb=None) -> dict[str, str]:
     """Ensure a face detection + recognition ONNX pair is present.
 
     `bundle` selects which pinned set to fetch, so a second model added to
@@ -873,10 +884,12 @@ def ensure_face_model(model_dir: str, bundle: str = "face") -> dict[str, str]:
             f"{sorted(FACE_MODEL_BUNDLES)}")
     base, files = spec
     model_dir = require_models_subpath(model_dir)
-    return ensure_verified_bundle(bundle, model_dir, base, files)
+    return ensure_verified_bundle(bundle, model_dir, base, files,
+                                  progress_cb=progress_cb)
 
 
-def ensure_verified_archive(name: str, model_dir: str, url: str, entry: dict) -> None:
+def ensure_verified_archive(name: str, model_dir: str, url: str, entry: dict,
+                            progress_cb=None, stage_cb=None) -> None:
     """Ensure a size/SHA256-pinned archive has been unpacked into model_dir.
 
     The bundle helper above fetches one URL per file, which is right for a
@@ -908,9 +921,11 @@ def ensure_verified_archive(name: str, model_dir: str, url: str, entry: dict) ->
                 return
             with tempfile.TemporaryDirectory(prefix=f".{flat}-", dir=model_dir) as staging:
                 archive = os.path.join(staging, os.path.basename(url))
-                _fetch_pinned_file(name, url, archive, entry)
+                _fetch_pinned_file(name, url, archive, entry,
+                                   progress_cb=progress_cb)
                 payload = os.path.join(staging, "payload")
                 os.makedirs(payload)
+                _notify_stage(name, stage_cb, "extract")
                 _extract_verified_tar(archive, payload)
                 os.unlink(archive)
                 _merge_tree(payload, model_dir)
@@ -996,7 +1011,8 @@ VITS2_MODEL_ARCHIVES = {
 }
 
 
-def ensure_vits2_model(model_dir: str, family: str | None = None) -> str:
+def ensure_vits2_model(model_dir: str, family: str | None = None,
+                       progress_cb=None, stage_cb=None) -> str:
     """Ensure the VITS2 release matching the runtime TensorRT is installed.
 
     Returns the engine directory for this runtime, which is what the adapter
@@ -1011,6 +1027,8 @@ def ensure_vits2_model(model_dir: str, family: str | None = None) -> str:
         model_dir,
         f"{VITS2_MODEL_BASE.rstrip('/')}/{entry['archive']}",
         entry,
+        progress_cb=progress_cb,
+        stage_cb=stage_cb,
     )
     return os.path.join(model_dir, "engines", key)
 
@@ -1033,7 +1051,8 @@ THAI_TTS_ARCHIVE = {
 }
 
 
-def ensure_thai_tts_model(model_dir: str) -> str:
+def ensure_thai_tts_model(model_dir: str, progress_cb=None,
+                          stage_cb=None) -> str:
     """Ensure the Thai VITS model + tokens are installed; return the directory."""
     model_dir = require_models_subpath(model_dir)
     if not THAI_TTS_ARCHIVE.get("sha256") or not THAI_TTS_ARCHIVE.get("size"):
@@ -1049,6 +1068,8 @@ def ensure_thai_tts_model(model_dir: str) -> str:
         model_dir,
         f"{THAI_TTS_MODEL_BASE.rstrip('/')}/{THAI_TTS_ARCHIVE['archive']}",
         THAI_TTS_ARCHIVE,
+        progress_cb=progress_cb,
+        stage_cb=stage_cb,
     )
     return model_dir
 
@@ -1101,7 +1122,8 @@ KOKORO_MODEL_ARCHIVES = {
 }
 
 
-def ensure_kokoro_model(model_dir: str, device: str = "gpu") -> str:
+def ensure_kokoro_model(model_dir: str, device: str = "gpu",
+                        progress_cb=None, stage_cb=None) -> str:
     """Ensure the Kokoro release for `device` is installed; return its directory.
 
     Returns `<model_dir>/<device>`, which is what the adapter passes to
@@ -1126,6 +1148,8 @@ def ensure_kokoro_model(model_dir: str, device: str = "gpu") -> str:
         target,
         f"{KOKORO_MODEL_BASE.rstrip('/')}/{entry['archive']}",
         entry,
+        progress_cb=progress_cb,
+        stage_cb=stage_cb,
     )
     return target
 
@@ -1215,7 +1239,8 @@ DEPTH_MODEL_BUNDLES = {
 
 
 def _ensure_vision_bundle(
-    kind: str, bundles: dict, model_dir: str, family: str | None = None
+    kind: str, bundles: dict, model_dir: str, family: str | None = None,
+    progress_cb=None,
 ) -> dict[str, str]:
     """Shared body of ensure_vop_model / ensure_depth_model.
 
@@ -1241,15 +1266,20 @@ def _ensure_vision_bundle(
         )
     log.info(f"[model_downloader] {kind}: using {key} bundle")
     return ensure_verified_bundle(
-        f"{kind}/{key}", model_dir, entry["base_url"], entry["files"]
+        f"{kind}/{key}", model_dir, entry["base_url"], entry["files"],
+        progress_cb=progress_cb,
     )
 
 
-def ensure_vop_model(model_dir: str, family: str | None = None) -> dict[str, str]:
+def ensure_vop_model(model_dir: str, family: str | None = None,
+                     progress_cb=None) -> dict[str, str]:
     """Ensure the vop detection engine + its frozen vocabulary are present."""
-    return _ensure_vision_bundle("vop", VOP_MODEL_BUNDLES, model_dir, family)
+    return _ensure_vision_bundle("vop", VOP_MODEL_BUNDLES, model_dir, family,
+                                 progress_cb=progress_cb)
 
 
-def ensure_depth_model(model_dir: str, family: str | None = None) -> dict[str, str]:
+def ensure_depth_model(model_dir: str, family: str | None = None,
+                       progress_cb=None) -> dict[str, str]:
     """Ensure the monocular depth engine matching the runtime TensorRT is present."""
-    return _ensure_vision_bundle("depth", DEPTH_MODEL_BUNDLES, model_dir, family)
+    return _ensure_vision_bundle("depth", DEPTH_MODEL_BUNDLES, model_dir, family,
+                                 progress_cb=progress_cb)

@@ -383,6 +383,10 @@ class VideoObjectPerceptionPlugin:
         self._model = None  # lazy load
         self._model_loading = False
         self._model_load_error = None
+        # The downloader's progress line while the engine bundle is being
+        # fetched; None once it is in. Read by the "loading" replies below, so a
+        # cold start reports how far along it is instead of a fixed sentence.
+        self._model_load_status = None
         self._model_lock = threading.Lock()
         self._nodes: dict[str, _VOPNode] = {}
         self._instance_configs: dict[str, dict] = {}  # per-instance config overrides
@@ -532,9 +536,12 @@ class VideoObjectPerceptionPlugin:
             )
 
         from utils.model_downloader import ensure_vop_model
+        from utils.model_progress import fetch_status
 
         model_dir = os.environ.get("VOP_MODEL_DIR", "/models/vop")
-        paths = ensure_vop_model(model_dir)
+        progress_cb, _ = fetch_status(
+            lambda text: setattr(self, "_model_load_status", text), "yoloe-26s-seg")
+        paths = ensure_vop_model(model_dir, progress_cb=progress_cb)
         engine = next(p for name, p in paths.items() if name.endswith(".engine"))
         return engine, self._read_vocab(paths.get("vocab.json"))
 
@@ -821,16 +828,20 @@ class VideoObjectPerceptionPlugin:
             if running is None:
                 if self._model is None:
                     if self._model_loading:
-                        return {"state": "loading", "message": "Model is still loading, please wait..."}
+                        return {"state": "loading",
+                                "message": (self._model_load_status
+                                            or "Model is still loading, please wait...")}
                     if self._model_load_error:
                         return {"state": "error", "message": f"Model failed to load: {self._model_load_error}"}
                     # Model not loaded yet — start loading in background
                     def _bg_start():
                         self._model_loading = True
                         self._model_load_error = None
+                        self._model_load_status = None
                         try:
                             self._ensure_model()
                             self._model_loading = False
+                            self._model_load_status = None
                             self._start_node(node_key, input_topic)
                         except Exception as e:
                             self._model_loading = False

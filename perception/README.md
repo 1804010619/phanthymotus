@@ -79,22 +79,104 @@ The VAD parameters can be adjusted per ASR canvas card via the instance config (
 
 ---
 
+## Model downloads: the two rules
+
+Every model in this project is fetched at runtime, never committed. Two things are
+required of any code path that does the fetching. They are not style preferences —
+each one is here because its absence produced a specific bad outcome on a robot.
+
+### 1. Pinned by size and SHA256, and free to choose a source
+
+Every file carries a `size` and a `sha256`, verified before the download is
+accepted (`utils/model_downloader.py`). A `check_file`-exists test is not
+verification: a truncated 780 MB transfer passes it and then fails at session
+creation in a way nobody can diagnose.
+
+Because the pins are what establish trust, `base_url` may be a **list** of hosts
+rather than one, and the machine picks: the sources are probed once with a 512 KB
+ranged read on the largest file and used **fastest-first**, falling through on
+failure. COS is faster from inside the VPC, ModelScope from several of the rigs,
+and no single answer is right everywhere. Choosing by measurement is safe *only*
+because the integrity check does not care which host answered — without the pins,
+"try another mirror" would mean "fetch something unverified from wherever".
+
+A source is a base URL, or a template containing `{file}` for a host that takes
+the path as a query parameter (ModelScope's repo API). An environment override
+(`<X>_MODEL_BASE_URL`) **replaces** the first source rather than being added in
+front of it.
+
+### 2. It must say how far along it is
+
+**A download with no progress is indistinguishable from a hang.** A card shows one
+status line; a cold fetch runs from two seconds (a 4 MB tflite) to minutes (a
+~900 MB SmolVLA checkpoint, and its ~1 GB backbone after it). For a long time only
+ASR reported anything, and every other card sat on a fixed sentence for the whole
+transfer — which is what an operator reads as stuck, and then restarts, and then
+reports as a bug.
+
+So a plugin that downloads weights **must** thread a status sink through to the
+downloader:
+
+```python
+from utils.model_progress import fetch_status
+
+progress_cb, stage_cb = fetch_status(on_status, "sensevoice-small")
+ensure_model(name, model_dir, progress_cb=progress_cb, stage_cb=stage_cb)
+# card shows: 正在下载模型 'sensevoice-small' … 40% (180/449 MB)
+```
+
+Four things follow from that, each learned the hard way:
+
+- **Use `utils/model_progress.fetch_status`, do not format the line yourself.**
+  Seven plugins render this; the wording lives in one place so they cannot drift.
+- **Archives need `stage_cb` too.** A percentage lies at the end of an archive
+  download: a 515 MB Kokoro tarball still has to be decompressed and merged, and
+  `100% (515/515 MB)` frozen on the card for tens of seconds reads as a hang. The
+  helper turns `"extract"` into 正在解压模型 ….
+- **The status line needs somewhere reachable to land.** Adding the callback is
+  half the job — check that the plugin's `info`/`state` can actually be answered
+  while the download is in flight. Two cases found exactly here: the TTS plugin's
+  `_loading` flag had no writer at all, so its "downloading" reply was unreachable
+  code; and the VLA card answered `idle` through a multi-gigabyte fetch because
+  `_running` is only set afterwards.
+- **A download that cannot report progress is a design problem, not an exception.**
+  Face's weights load in the ORT worker child, whose protocol is request/reply with
+  no way to push progress back — so the *parent* fetches them first (pure HTTP and
+  hashing, no ORT session) and the child's own call then finds a verified bundle
+  and returns at once.
+
+Callbacks fire only while work is happening: a verified cache returns without a
+single call, so a warm start never flashes a percentage — which is why the caller
+must still set its own "preparing" line before calling in.
+
+---
+
 ## SoundEvent model downloads
 
 SoundEvent loads its YAMNet TFLite model in the background on the first `start`.
-It reuses a verified cache in `/models/soundevent`; otherwise it tries these
-download base URLs in order:
+It reuses a verified cache in `/models/soundevent`; otherwise it registers two
+download base URLs as one multi-source bundle:
 
-1. `SOUNDEVENT_MODEL_BASE_URL`, when set to a non-empty value.
-2. The project COS location, `${COS_BASE}/soundevent`.
-3. [ModelScope](https://www.modelscope.cn/models/zhangyiqun/yamnet-audio-classification-tflite/resolve/master).
+1. The project COS location, `${COS_BASE}/soundevent` — or whatever
+   `SOUNDEVENT_MODEL_BASE_URL` is set to, which **replaces** it (same convention
+   as `OCR_MODEL_BASE_URL` and `FACE_MODEL_BASE_URL`).
+2. [ModelScope](https://www.modelscope.cn/models/zhangyiqun/yamnet-audio-classification-tflite/resolve/master).
 
-The downloader appends `yamnet_classification.tflite` to each base URL. Empty
-and duplicate sources are skipped. Each source uses the existing three-attempt
-retry policy; HTTP errors (including a missing COS object), connection errors,
-timeouts, or failed file validation trigger the next source after retries are
-exhausted. If all sources fail, the instance reports a model-loading error and
-a later `start` can retry.
+**The order above is only a tiebreak — the machine chooses.** As for every other
+multi-source bundle (`utils/model_downloader.py` § multi-source), the sources
+are probed once with a short ranged read and used **fastest-first**: COS is faster
+from inside the VPC, ModelScope is faster from several of the rigs, and neither
+answer is right everywhere. A source that cannot be reached, or that answers
+quickly with something too short to be the file, measures as unusable and is
+dropped rather than tried; only if *every* probe fails is the declared order used.
+
+The downloader appends `yamnet_classification.tflite` to each base URL (or
+substitutes `{file}`, for a host like ModelScope's repo API that takes the path as
+a query parameter). Each source keeps the three-attempt retry policy; HTTP errors
+(including a missing COS object), connection errors, timeouts, or failed file
+validation fall through to the next source, and the warning names the root cause so
+a down mirror is distinguishable from a corrupt one. If both sources fail, the
+instance reports a model-loading error and a later `start` can retry.
 
 Every source must supply the same 4,126,810-byte file with SHA-256
 `10c95ea3eb9a7bb4cb8bddf6feb023250381008177ac162ce169694d05c317de`.

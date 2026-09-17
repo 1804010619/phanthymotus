@@ -236,7 +236,9 @@ def test_start_refuses_a_mismatched_model_instead_of_failing_per_command():
     card = make_card(provider="wide")
     import plugins.vla.plugin as plugin_mod
     original = plugin_mod.discover
-    plugin_mod.discover = lambda: {"wide": lambda d, c: Wide()}
+    # The factory takes on_status as of the download-progress work: the card
+    # hands it to whichever provider it built, without asking which one.
+    plugin_mod.discover = lambda: {"wide": lambda d, c, on_status=None: Wide()}
     plugin_mod.discover.errors = {}
     try:
         result = card.dispatch("start", {"action": "start",

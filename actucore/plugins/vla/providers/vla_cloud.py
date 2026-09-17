@@ -198,7 +198,12 @@ def _jpeg(image) -> bytes:
     return buffer.tobytes()
 
 
-def PROVIDER(descriptor: dict, config: dict | None = None) -> VLACloudProvider:
+def PROVIDER(descriptor: dict, config: dict | None = None,
+             on_status=None) -> VLACloudProvider:
+    # `on_status` is part of the factory signature so the card can pass it to
+    # any provider without asking which one it got. Ignored here: the weights
+    # live on the server and nothing is downloaded to report on.
+    del on_status
     return VLACloudProvider(descriptor, config)
 
 

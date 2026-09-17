@@ -648,6 +648,8 @@ class VideoDepthPerceptionPlugin:
         self._model = None  # lazy load
         self._model_loading = False
         self._model_load_error = None
+        # Same as vop: the downloader's progress line while bytes are moving.
+        self._model_load_status = None
         self._model_lock = threading.Lock()
         self._nodes: dict[str, _DepthNode] = {}
         self._instance_configs: dict[str, dict] = {}
@@ -663,9 +665,12 @@ class VideoDepthPerceptionPlugin:
                 return
             from plugins.vision_runtime import VisionEngineSession
             from utils.model_downloader import ensure_depth_model
+            from utils.model_progress import fetch_status
 
             model_dir = os.environ.get("DEPTH_MODEL_DIR", "/models/depth")
-            paths = ensure_depth_model(model_dir)
+            progress_cb, _ = fetch_status(
+                lambda text: setattr(self, "_model_load_status", text), "yolo26n-depth")
+            paths = ensure_depth_model(model_dir, progress_cb=progress_cb)
             engine = next(p for name, p in paths.items() if name.endswith(".engine"))
             log.info(f"[visual_depth] loading engine: {engine}")
             self._model = VisionEngineSession(engine)
@@ -969,16 +974,20 @@ class VideoDepthPerceptionPlugin:
             if running is None:
                 if self._model is None:
                     if self._model_loading:
-                        return {"state": "loading", "message": "Engine is still loading, please wait..."}
+                        return {"state": "loading",
+                                "message": (self._model_load_status
+                                            or "Engine is still loading, please wait...")}
                     if self._model_load_error:
                         return {"state": "error", "message": f"Engine failed to load: {self._model_load_error}"}
 
                     def _bg_start():
                         self._model_loading = True
                         self._model_load_error = None
+                        self._model_load_status = None
                         try:
                             self._ensure_model()
                             self._model_loading = False
+                            self._model_load_status = None
                             self._start_node(node_key, input_topic)
                         except Exception as e:
                             self._model_loading = False

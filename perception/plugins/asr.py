@@ -840,16 +840,20 @@ def _build_asr_adapter(cfg: dict, on_status=None) -> Optional[ASRAdapter]:
     # "正在获取模型" line above for that entire time, which an operator reads as
     # hung. (Note this only fires while bytes are moving: an already-verified
     # bundle returns in ~2 s and the caller never sees a percentage.)
-    _on_progress = lambda pct, mb_done, mb_total: _status(
-        f"正在下载模型 '{model_name}' … {pct}% "
-        f"({mb_done:.0f}/{mb_total:.0f} MB)")
+    from utils.model_progress import fetch_status
+    _on_progress, _on_stage = fetch_status(
+        None if on_status is None else _status, model_name)
     if device == "gpu":
         # Size/SHA256-pinned: these are the largest downloads in the stack.
         from utils.model_downloader import ensure_gpu_model
         ensure_gpu_model(spec["download"], model_dir, progress_cb=_on_progress)
     else:
         from utils.model_downloader import ensure_model
-        ensure_model(spec["download"], model_dir, progress_cb=_on_progress)
+        # The cpu weights arrive as an archive, so this path has a second wait
+        # after 100%: stage_cb is what stops the card freezing on the last
+        # percentage while a 229 MB tarball unpacks.
+        ensure_model(spec["download"], model_dir, progress_cb=_on_progress,
+                     stage_cb=_on_stage)
 
     num_threads = int(cfg.get('num_threads', 2))
     _status(f"正在加载模型 '{model_name}' 到内存 …")

@@ -207,10 +207,12 @@ class YamNetLite:
         return result
 
 
-def _build_model() -> YamNetLite:
+def _build_model(on_status=None) -> YamNetLite:
     from utils.model_downloader import ensure_soundevent_model
+    from utils.model_progress import fetch_status
 
-    return YamNetLite(ensure_soundevent_model())
+    progress_cb, _ = fetch_status(on_status, "yamnet")
+    return YamNetLite(ensure_soundevent_model(progress_cb=progress_cb))
 
 
 class _Detector:
@@ -512,14 +514,22 @@ class SoundEventPlugin:
         self._model = None  # type: Optional[YamNetLite]
         self._model_state = "idle"  # idle | loading | ready | error
         self._model_error = None  # type: Optional[str]
+        # Replaced by the downloader's progress line while bytes are moving, so
+        # a cold start says how far along it is rather than "Loading..." for the
+        # whole fetch. Cleared once the model is up.
+        self._model_status = None  # type: Optional[str]
 
-    @staticmethod
-    def _loading_result(input_topic: str) -> Dict[str, Any]:
+    def _loading_result(self, input_topic: str) -> Dict[str, Any]:
+        # No longer a staticmethod: the message now carries the downloader's
+        # progress line when there is one. `_lock` is an RLock, so reading it
+        # here is safe from the callers that already hold it.
+        with self._lock:
+            message = self._model_status or "Loading SoundEvent model..."
         return {
             "state": "loading",
             "input": input_topic,
             "output": "%s/soundevent" % input_topic,
-            "message": "Loading SoundEvent model...",
+            "message": message,
         }
 
     def _spawn_loader_locked(self) -> None:
@@ -536,19 +546,25 @@ class SoundEventPlugin:
         thread.start()
 
     def _loader(self) -> None:
+        def _on_status(text: str) -> None:
+            with self._lock:
+                self._model_status = text
+
         try:
-            model = _build_model()
+            model = _build_model(on_status=_on_status)
         except Exception as error:
             log.exception("[soundevent] model load failed")
             with self._lock:
                 self._model_state = "error"
                 self._model_error = str(error)
+                self._model_status = None
             return
 
         with self._lock:
             self._model = model
             self._model_state = "ready"
             self._model_error = None
+            self._model_status = None
 
         log.info("[soundevent] model ready")
 
@@ -599,7 +615,7 @@ class SoundEventPlugin:
 
     def _desc_locked(self, state: str) -> str:
         if state == "loading":
-            return "Loading SoundEvent model..."
+            return self._model_status or "Loading SoundEvent model..."
         if state == "error" and self._model_error:
             return "Model load failed: %s" % self._model_error
         return self._DESC

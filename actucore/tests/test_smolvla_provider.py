@@ -34,6 +34,11 @@ import pytest
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
+# The image copies perception/utils/model_progress.py to /work, flat beside the
+# plugins (Dockerfile.jetson), so the provider imports it by bare name. Here
+# that directory is added instead of stubbing the module: these tests assert the
+# exact status string, and a stub would be asserting the stub.
+sys.path.insert(0, str(ROOT.parent / "perception" / "utils"))
 
 from plugins.vla.providers.smolvla import SmolVLAProvider  # noqa: E402
 
@@ -75,14 +80,14 @@ def checkpoint(tmp_path):
     return tmp_path
 
 
-def make_provider(checkpoint, **config):
+def make_provider(checkpoint, on_status=None, **config):
     """A provider whose background load is neutered, so tests stay synchronous."""
     base = {"model_dir": str(checkpoint), "device": "cpu"}
     base.update(config)
     original = SmolVLAProvider._load
     SmolVLAProvider._load = lambda self: None
     try:
-        provider = SmolVLAProvider({}, base)
+        provider = SmolVLAProvider({}, base, on_status=on_status)
     finally:
         SmolVLAProvider._load = original
     provider._loader.join(timeout=1)
@@ -506,3 +511,69 @@ def test_a_single_checkpoint_deployment_needs_no_models_map(tmp_path, checkpoint
     """`models:` is for choosing; one checkpoint configured directly still works."""
     provider = make_provider(checkpoint)
     assert provider._model_dir == str(checkpoint)
+
+
+# ── download progress ────────────────────────────────────────────────────────
+
+def test_the_checkpoint_download_reports_progress(tmp_path, monkeypatch):
+    """The card's status line during the biggest download in the system.
+
+    A SmolVLA checkpoint is ~900 MB and its backbone another ~1 GB; before this
+    the card said nothing for the whole of it, which is indistinguishable from a
+    stuck start. The percentage comes from perception's downloader — what is
+    asserted here is only that this provider hands it somewhere to go.
+    """
+    lines = []
+    manifest = {"base_url": ["https://h/ckpt"],
+                "files": {"model.safetensors": {"size": 10, "sha256": "aa"}}}
+
+    def fake_bundle(name, model_dir, base_url, files, progress_cb=None):
+        progress_cb(40, 362.4, 906.0)
+        # The config the provider reads next; written here because the fetch is
+        # the thing that would have produced it.
+        (pathlib.Path(model_dir) / "config.json").write_text(
+            json.dumps(CHECKPOINT_CONFIG))
+        return {}
+
+    module = types.ModuleType("model_downloader")
+    module.ensure_verified_bundle = fake_bundle
+    monkeypatch.setitem(sys.modules, "model_downloader", module)
+
+    make_provider(tmp_path, on_status=lines.append, model_name="smolvla_base",
+                  weights=manifest)
+
+    assert lines == ["正在下载模型 'smolvla_base' … 40% (362/906 MB)"]
+
+
+def test_a_provider_with_no_status_sink_still_downloads(tmp_path, monkeypatch):
+    """`on_status` is optional: config.yaml-driven starts pass none."""
+    seen = {}
+    manifest = {"base_url": ["https://h/ckpt"],
+                "files": {"model.safetensors": {"size": 10, "sha256": "aa"}}}
+
+    def fake_bundle(name, model_dir, base_url, files, progress_cb=None):
+        seen["progress_cb"] = progress_cb
+        (pathlib.Path(model_dir) / "config.json").write_text(
+            json.dumps(CHECKPOINT_CONFIG))
+        return {}
+
+    module = types.ModuleType("model_downloader")
+    module.ensure_verified_bundle = fake_bundle
+    monkeypatch.setitem(sys.modules, "model_downloader", module)
+
+    make_provider(tmp_path, weights=manifest)
+
+    assert seen["progress_cb"] is None
+
+
+def test_every_provider_factory_takes_a_status_sink():
+    """The card passes it without asking which provider it built, so all of them
+    have to accept it — including the ones with nothing to download."""
+    import inspect
+
+    from plugins.vla.providers import mock, smolvla, vla_cloud
+
+    missing = [module.__name__ for module in (mock, smolvla, vla_cloud)
+               if "on_status" not in inspect.signature(module.PROVIDER).parameters]
+
+    assert not missing, f"these factories cannot be handed a status sink: {missing}"

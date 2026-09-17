@@ -75,9 +75,14 @@ class _ModelBuilderProbe:
         self.started = threading.Event()
         self.calls = 0
         self.models = []
+        self.on_status = None
         self._lock = threading.Lock()
 
-    def __call__(self):
+    def __call__(self, on_status=None):
+        # Mirrors _build_model's signature: the plugin hands it a status sink so
+        # the download's progress reaches the card. Recorded so a test can drive
+        # it and assert what the card then shows.
+        self.on_status = on_status
         with self._lock:
             self.calls += 1
             call = self.calls
@@ -110,29 +115,45 @@ def test_labels_from_model_rejects_missing_associated_file(tmp_path):
         soundevent.labels_from_model(model_path)
 
 
+_COS_SOURCE = f"{model_downloader.COS_BASE}/soundevent"
+_MODELSCOPE_SOURCE = model_downloader.SOUNDEVENT_MODELSCOPE_BASE
+_ENV_SOURCE = "https://models.example/soundevent"
+_ALL_SOURCES = [_COS_SOURCE, _MODELSCOPE_SOURCE]
+
+
+# The sources are assembled at import, like every other bundle's base_url in
+# model_downloader, and the environment variable *replaces* the first one the
+# way OCR_MODEL_BASE_URL and FACE_MODEL_BASE_URL do. So this is where the
+# override is observable; patching the module attribute afterwards would only
+# prove the patch took.
 def test_soundevent_model_base_honors_environment(monkeypatch):
     monkeypatch.delenv("SOUNDEVENT_MODEL_BASE_URL", raising=False)
     default_module = _load_model_downloader_copy("model_downloader_default_test")
-    assert default_module.SOUNDEVENT_MODEL_BASE == ""
+    assert default_module.SOUNDEVENT_MODEL_BASE == _COS_SOURCE
+    assert default_module.SOUNDEVENT_MODEL_SOURCES == [_COS_SOURCE, _MODELSCOPE_SOURCE]
 
-    configured_base = "https://models.example/soundevent"
-    monkeypatch.setenv("SOUNDEVENT_MODEL_BASE_URL", configured_base)
+    monkeypatch.setenv("SOUNDEVENT_MODEL_BASE_URL", _ENV_SOURCE)
     configured_module = _load_model_downloader_copy("model_downloader_env_test")
-    assert configured_module.SOUNDEVENT_MODEL_BASE == configured_base
+    assert configured_module.SOUNDEVENT_MODEL_BASE == _ENV_SOURCE
+    # The override takes COS's place rather than being added in front of it:
+    # a site that redirects this variable at its own mirror is not asking for
+    # the public bucket to stay in the list.
+    assert configured_module.SOUNDEVENT_MODEL_SOURCES == [
+        _ENV_SOURCE, _MODELSCOPE_SOURCE
+    ]
 
 
 def test_soundevent_model_download_uses_pinned_manifest(tmp_path, monkeypatch):
-    configured_base = "https://models.example/soundevent"
     captured = {}
 
-    monkeypatch.setattr(model_downloader, "SOUNDEVENT_MODEL_BASE", configured_base)
+    monkeypatch.setattr(model_downloader, "SOUNDEVENT_MODEL_SOURCES", _ALL_SOURCES)
     monkeypatch.setattr(
         model_downloader,
         "require_models_subpath",
         lambda model_dir: str(tmp_path),
     )
 
-    def fake_ensure(name, model_dir, base_url, files):
+    def fake_ensure(name, model_dir, base_url, files, progress_cb=None):
         captured.update(
             name=name, model_dir=model_dir, base_url=base_url, files=files
         )
@@ -149,8 +170,11 @@ def test_soundevent_model_download_uses_pinned_manifest(tmp_path, monkeypatch):
     assert result == str(tmp_path / "yamnet_classification.tflite")
     assert captured == {
         "name": "soundevent",
+        # One bundle carrying every source, not one call per source: that is
+        # what lets the downloader probe them and pick, instead of always
+        # paying for the first one in the list.
         "model_dir": str(tmp_path),
-        "base_url": configured_base,
+        "base_url": _ALL_SOURCES,
         "files": {
             "yamnet_classification.tflite": {
                 "size": 4_126_810,
@@ -162,15 +186,42 @@ def test_soundevent_model_download_uses_pinned_manifest(tmp_path, monkeypatch):
     }
 
 
+def test_soundevent_sources_are_ordered_by_measured_speed(tmp_path, monkeypatch):
+    """COS and ModelScope are both registered; the machine picks.
+
+    The pinned size and SHA256 are what make choosing by speed a performance
+    decision rather than a trust one — both hosts must serve the same bytes.
+    """
+    monkeypatch.setattr(
+        model_downloader, "require_models_subpath", lambda path: str(tmp_path)
+    )
+    cos, modelscope = _COS_SOURCE, _MODELSCOPE_SOURCE
+    # ModelScope measured faster here; COS is declared first and must still lose.
+    rates = {cos: 500_000.0, modelscope: 5_000_000.0}
+    monkeypatch.setattr(model_downloader, "_probe_source",
+                        lambda source, filename: rates[source])
+    fetched = []
+
+    def fake_fetch(name, url, destination, metadata, **kwargs):
+        fetched.append(url)
+        Path(destination).write_bytes(b"")
+
+    monkeypatch.setattr(model_downloader, "_fetch_pinned_file", fake_fetch)
+    monkeypatch.setattr(model_downloader, "_bundle_matches",
+                        lambda model_dir, files: False)
+
+    model_downloader.ensure_soundevent_model()
+
+    assert fetched == [f"{modelscope}/yamnet_classification.tflite"]
+
+
 @pytest.fixture
 def soundevent_download(tmp_path, monkeypatch):
     payload = b"verified soundevent test model"
     monkeypatch.setattr(
         model_downloader, "require_models_subpath", lambda path: str(tmp_path)
     )
-    monkeypatch.setattr(
-        model_downloader, "SOUNDEVENT_MODEL_BASE", "https://models.example/soundevent"
-    )
+    monkeypatch.setattr(model_downloader, "SOUNDEVENT_MODEL_SOURCES", _ALL_SOURCES)
     monkeypatch.setattr(model_downloader, "SOUNDEVENT_MODEL_FILES", {
         model_downloader.SOUNDEVENT_MODEL_FILENAME: {
             "size": len(payload), "sha256": hashlib.sha256(payload).hexdigest(),
@@ -180,16 +231,11 @@ def soundevent_download(tmp_path, monkeypatch):
     return payload
 
 
-@pytest.mark.parametrize("successful_source", [0, 1, 2])
+@pytest.mark.parametrize("successful_source", [0, 1])
 def test_soundevent_download_tries_sources_in_order(
     successful_source, soundevent_download, monkeypatch
 ):
-    bases = [
-        model_downloader.SOUNDEVENT_MODEL_BASE,
-        f"{model_downloader.COS_BASE}/soundevent",
-        model_downloader.SOUNDEVENT_MODELSCOPE_BASE,
-    ]
-    urls = [f"{base}/yamnet_classification.tflite" for base in bases]
+    urls = [f"{base}/yamnet_classification.tflite" for base in _ALL_SOURCES]
     requests = []
 
     def urlopen(url, timeout):
@@ -214,11 +260,8 @@ def test_soundevent_download_tries_sources_in_order(
 def test_soundevent_falls_back_when_cos_download_or_validation_fails(
     failure, soundevent_download, monkeypatch, caplog
 ):
-    monkeypatch.setattr(model_downloader, "SOUNDEVENT_MODEL_BASE", "  ")
-    cos_url = f"{model_downloader.COS_BASE}/soundevent/yamnet_classification.tflite"
-    fallback_url = (
-        f"{model_downloader.SOUNDEVENT_MODELSCOPE_BASE}/yamnet_classification.tflite"
-    )
+    cos_url = f"{_COS_SOURCE}/yamnet_classification.tflite"
+    fallback_url = f"{_MODELSCOPE_SOURCE}/yamnet_classification.tflite"
     requests = []
 
     def urlopen(url, timeout):
@@ -241,7 +284,8 @@ def test_soundevent_falls_back_when_cos_download_or_validation_fails(
 
     assert requests == [cos_url] * 3 + [fallback_url]
     assert Path(path).read_bytes() == soundevent_download
-    assert "COS source failed after retries" in caplog.text
+    assert f"failed from {model_downloader.COS_BASE}/soundevent" in caplog.text
+    assert "1 source(s) left" in caplog.text
     reason = {
         "http": "HTTPError", "connection": "URLError", "timeout": "TimeoutError",
         "size": "ValueError", "sha256": "ValueError",
@@ -250,15 +294,14 @@ def test_soundevent_falls_back_when_cos_download_or_validation_fails(
     assert not list(Path(path).parent.glob(".soundevent-*/"))
 
 
-@pytest.mark.parametrize("duplicate_source", ["COS", "ModelScope"])
-def test_soundevent_does_not_retry_the_same_source_twice(
-    duplicate_source, soundevent_download, monkeypatch
+def test_soundevent_contacts_each_source_once_per_retry_set(
+    soundevent_download, monkeypatch
 ):
-    cos = f"{model_downloader.COS_BASE}/soundevent"
-    modelscope = model_downloader.SOUNDEVENT_MODELSCOPE_BASE
-    first = cos if duplicate_source == "COS" else modelscope
-    second = modelscope if duplicate_source == "COS" else cos
-    monkeypatch.setattr(model_downloader, "SOUNDEVENT_MODEL_BASE", f" {first}/ ")
+    """Every source is tried, each exactly three times, then the attempt fails.
+
+    The bound is what a robot feels: an unreachable mirror costs a fixed slice
+    of a cold start rather than an open-ended one, and the next `start` retries.
+    """
     requests = []
 
     def urlopen(url, timeout):
@@ -266,12 +309,12 @@ def test_soundevent_does_not_retry_the_same_source_twice(
         raise HTTPError(url, 404, "Not Found", None, None)
 
     monkeypatch.setattr(model_downloader, "urlopen", urlopen)
-    with pytest.raises(RuntimeError, match="all model sources failed"):
+    with pytest.raises(RuntimeError, match="failed to download"):
         model_downloader.ensure_soundevent_model()
 
     assert requests == [
         f"{base}/yamnet_classification.tflite"
-        for base in (first, second) for _ in range(3)
+        for base in _ALL_SOURCES for _ in range(3)
     ]
 
 
@@ -285,11 +328,13 @@ def test_soundevent_reports_all_sources_failed_without_caching_invalid_model(
         return io.BytesIO(b"x" * len(soundevent_download))
 
     monkeypatch.setattr(model_downloader, "urlopen", urlopen)
-    with pytest.raises(RuntimeError, match="environment, COS, ModelScope") as error:
+    with pytest.raises(RuntimeError, match="failed to download") as error:
         model_downloader.ensure_soundevent_model()
 
-    assert len(requests) == 9
-    assert "SHA256 mismatch" in str(error.value.__cause__.__cause__)
+    # Three attempts at each of the two sources, and the corrupt bytes none of
+    # them delivered correctly are not left behind as a cache.
+    assert len(requests) == 3 * len(_ALL_SOURCES)
+    assert "SHA256 mismatch" in str(error.value.__cause__)
     assert not (tmp_path / model_downloader.SOUNDEVENT_MODEL_FILENAME).exists()
     assert not list(tmp_path.glob(".soundevent-*/"))
 
