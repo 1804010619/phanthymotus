@@ -316,6 +316,9 @@ class _SoundEventNode(Node):
         return self.stop()
 
     def stop(self) -> Dict[str, Any]:
+        # Leave the subscription alive until dispose_node() removes this node
+        # from the executor. Destroying it here can race the executor's wait
+        # set and raise InvalidHandle; destroy_node() releases it afterwards.
         self._stop_event.set()
         with self._lifecycle_lock:
             if self.state == "idle" and self._thread is None:
@@ -323,9 +326,6 @@ class _SoundEventNode(Node):
             with self._stream_lock:
                 self._stop_event.set()
                 self._stream_generation += 1
-            if self._subscription is not None:
-                self.destroy_subscription(self._subscription)
-                self._subscription = None
             while True:
                 try:
                     self._queue.get_nowait()

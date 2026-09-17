@@ -370,6 +370,105 @@ def test_start_replaces_an_errored_node(monkeypatch):
         plugin.dispatch("soundevent", {"action": "stop"})
 
 
+@pytest.mark.parametrize(
+    "action", ["stop_one", "stop_all", "replace_topic", "replace_error"]
+)
+def test_retire_leaves_the_executor_before_destroying_subscription(
+    action, monkeypatch
+):
+    """No subscription handle may be destroyed while its node is registered."""
+    order = []
+    retained_at_remove = []
+
+    class RecordingExecutor(_FakeExecutor):
+        def remove_node(self, node):
+            order.append(("remove_node", node in self.nodes))
+            retained_at_remove.append(node._subscription in node.subscriptions)
+            super().remove_node(node)
+
+    executor = RecordingExecutor()
+    plugin = soundevent.SoundEventPlugin({}, executor)
+    plugin._model = _LifecycleModel()
+    plugin._model_state = "ready"
+    start_args = {"action": "start", "input_topic": "/mic/a", "instance_id": "a"}
+
+    try:
+        assert plugin.dispatch("soundevent", start_args)["state"] == "running"
+        node = executor.nodes[0]
+        worker = node._thread
+        original_destroy_subscription = node.destroy_subscription
+        original_destroy_node = node.destroy_node
+
+        def destroy_subscription(subscription):
+            order.append(("destroy_subscription", node in executor.nodes))
+            return original_destroy_subscription(subscription)
+
+        def destroy_node():
+            order.append(("destroy_node", node in executor.nodes))
+            # The shared fake only marks the node destroyed. Model rclpy's
+            # ownership here: destroying a node also releases its subscriptions.
+            for subscription in list(node.subscriptions):
+                node.destroy_subscription(subscription)
+            original_destroy_node()
+
+        monkeypatch.setattr(node, "destroy_subscription", destroy_subscription)
+        monkeypatch.setattr(node, "destroy_node", destroy_node)
+
+        if action == "stop_one":
+            args = {"action": "stop", "instance_id": "a"}
+        elif action == "stop_all":
+            args = {"action": "stop"}
+        elif action == "replace_topic":
+            args = {**start_args, "input_topic": "/mic/b"}
+        else:
+            node.state = "error"
+            args = start_args
+
+        result = plugin.dispatch("soundevent", args)
+
+        assert result["state"] == ("idle" if action.startswith("stop") else "running")
+        assert order == [
+            ("remove_node", True),
+            ("destroy_node", False),
+            ("destroy_subscription", False),
+        ]
+        assert retained_at_remove == [True]
+        assert node.destroyed
+        assert node.subscriptions == []
+        assert not worker.is_alive()
+        assert node not in executor.nodes
+
+        if action.startswith("stop"):
+            # A repeated stop is harmless, and a later start uses a fresh node.
+            assert plugin.dispatch("soundevent", args) == {"state": "idle"}
+            assert len(order) == 3
+            assert plugin.dispatch("soundevent", start_args)["state"] == "running"
+        assert len(executor.nodes) == 1
+        assert executor.nodes[0] is not node
+    finally:
+        plugin.dispatch("soundevent", {"action": "stop"})
+
+
+def test_stop_ignores_audio_and_results_before_disposal():
+    node = soundevent._SoundEventNode("/mic/audio", _LifecycleModel(), "test")
+    try:
+        node.start()
+        subscription = node._subscription
+        generation = node._stream_generation
+        assert node.stop() == {"state": "idle"}
+        assert subscription in node.subscriptions
+
+        queued = node._queue.qsize()
+        subscription.callback(_audio_chunk(b"\x00\x00" * 512, 100.0))
+        assert node._queue.qsize() == queued
+        assert node.status()["statistics"]["chunks_received"] == 0
+        assert not node._publish([{"name": "Bark", "confidence": 0.9}], 100.0, generation)
+        assert node.publishers[0].messages == []
+    finally:
+        node.stop()
+        node.destroy_node()
+
+
 def test_pcm_buffering_publishes_window_end_timestamps(monkeypatch):
     class FakeModel:
         labels = ["Bark"]
@@ -412,3 +511,4 @@ def test_pcm_buffering_publishes_window_end_timestamps(monkeypatch):
         assert all(np.allclose(waveform, 0.5) for waveform in model.waveforms)
     finally:
         node.stop()
+        node.destroy_node()
