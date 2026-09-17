@@ -13,7 +13,7 @@ import time
 import zipfile
 from urllib.error import URLError
 from urllib.parse import quote
-from urllib.request import urlopen, urlretrieve
+from urllib.request import Request, urlopen, urlretrieve
 
 try:  # Linux only; the perception images are Linux, dev hosts may not be.
     import fcntl
@@ -323,13 +323,19 @@ def select_bundle_family(bundles: dict, family: str | None = None) -> str:
 
 
 def ensure_verified_bundle(
-    name: str, model_dir: str, base_url: str, files: dict, progress_cb=None
+    name: str, model_dir: str, base_url, files: dict, progress_cb=None
 ) -> dict[str, str]:
     """Ensure a size/SHA256-pinned bundle is present and valid in model_dir.
 
     existing files → size check → SHA256 check → reuse
-    otherwise      → lock → re-check → download (retry) → verify → replace
+    otherwise      → lock → re-check → probe sources → download → verify → replace
     Returns ``{filename: absolute path}``.
+
+    `base_url` may be a single base URL, as it always was, or a **list of
+    sources** to choose between — see the multi-source note above. A source is
+    a base URL or a template containing `{file}`. They are probed once per
+    bundle and tried fastest-first, falling through on failure; the pinned
+    size and SHA256 are what make that safe.
     """
     paths = {
         filename: os.path.join(model_dir, filename) for filename in files
@@ -478,6 +484,96 @@ def _fetch_pinned_file(
     ) from last_error
 
 
+# ── multi-source ─────────────────────────────────────────────────────────────
+#
+# Weights are getting large — a SmolVLA deployment is ~3 GB across two repos —
+# and no single host is fastest from everywhere. Measured on the same wheel:
+# pypi.jetson-ai-lab served a rig at 12 KB/s while COS served it at 5.7 MB/s;
+# ModelScope, for models it mirrors, is another 5.8 MB/s and needs no staging
+# step at all.
+#
+# So a bundle may register several sources and the machine picks. **This is only
+# safe because every file is pinned by size and SHA256**: the integrity check
+# does not care which host answered, so falling through to a second source costs
+# nothing in guarantees. Without the pins, "try another mirror" would mean
+# "fetch something unverified from wherever".
+#
+# A source is a base URL, or a template containing `{file}` for hosts that do
+# not serve paths directly — ModelScope's repo API wants
+# `...?Revision=master&FilePath=model.safetensors`.
+_PROBE_BYTES = 512 * 1024
+_PROBE_TIMEOUT = 8
+# Below this a source is treated as unusable rather than slow, so an
+# unreachable-but-resolving host does not win by returning its error page fast.
+_MIN_USEFUL_BPS = 50 * 1024
+
+
+def _source_url(source: str, filename: str) -> str:
+    quoted = "/".join(quote(part) for part in filename.split("/"))
+    if "{file}" in source:
+        return source.replace("{file}", quoted)
+    return source.rstrip("/") + "/" + quoted
+
+
+def _probe_source(source: str, filename: str) -> float:
+    """Bytes per second for a short ranged read, or 0.0 if unusable.
+
+    A Range request rather than a full download: the point is to choose, not to
+    transfer, and a probe that pulls a gigabyte to decide has already lost.
+    Hosts that ignore Range simply deliver the first chunk before we stop
+    reading, which measures the same thing.
+    """
+    url = _source_url(source, filename)
+    request = Request(url, headers={"Range": f"bytes=0-{_PROBE_BYTES - 1}"})
+    start = time.monotonic()
+    try:
+        with urlopen(request, timeout=_PROBE_TIMEOUT) as response:
+            read = len(response.read(_PROBE_BYTES))
+    except Exception as error:      # noqa: BLE001 — an unusable source is a result
+        log.info(f"[model_downloader] probe failed for {url}: {error}")
+        return 0.0
+    # A host that answers instantly with four bytes of error page measures as
+    # *extremely* fast — rate alone would rank it first and then the real
+    # download would fail over to the good source having already lost the
+    # choice. Require the probe to have actually delivered the content.
+    if read < _PROBE_BYTES // 2:
+        log.info(f"[model_downloader] probe returned {read} B (wanted "
+                 f"{_PROBE_BYTES}) ← {source}; treating as unusable")
+        return 0.0
+    elapsed = max(time.monotonic() - start, 1e-6)
+    rate = read / elapsed
+    log.info(f"[model_downloader] probe {rate / 1024:.0f} KB/s ← {source}")
+    return rate if rate >= _MIN_USEFUL_BPS else 0.0
+
+
+def _order_sources(name: str, sources: list, files: dict) -> list:
+    """Sources fastest-first, measured once per bundle.
+
+    Probed on the *largest* file: it is the one whose transfer time dominates,
+    and small files are often served from a different tier than large ones.
+    A single source is returned as-is — measuring it would only add latency to
+    a decision with one outcome.
+    """
+    if len(sources) < 2:
+        return list(sources)
+    biggest = max(files, key=lambda f: int(files[f].get("size") or 0))
+    if int(files[biggest].get("size") or 0) < _PROBE_BYTES:
+        # Nothing here is big enough to measure with. Whichever source we pick,
+        # the transfer is over before the choice could have mattered.
+        return list(sources)
+    scored = [(_probe_source(source, biggest), source) for source in sources]
+    usable = [source for rate, source in sorted(scored, reverse=True) if rate > 0]
+    if not usable:
+        # Every probe failed. Rather than give up here, hand back the original
+        # order and let the real download produce the real error — a probe is a
+        # heuristic, and a transient failure during it should not mask a host
+        # that would have worked.
+        log.warning(f"[model_downloader] {name}: all source probes failed; "
+                    f"trying them in declared order")
+        return list(sources)
+    return usable
+
+
 def _download_verified_bundle(
     name: str, base_url: str, model_dir: str, files: dict, progress_cb=None
 ) -> None:
@@ -487,6 +583,9 @@ def _download_verified_bundle(
     up front, so a 437 MB model plus a 10 KB tokens.txt reads as one monotonic
     0-100% rather than jumping back to 0% for the second file.
     """
+    sources = base_url if isinstance(base_url, (list, tuple)) else [base_url]
+    sources = _order_sources(name, list(sources), files)
+
     os.makedirs(model_dir, exist_ok=True)
     total_bytes = sum(int(m.get("size") or 0) for m in files.values())
     done_bytes = 0
@@ -494,14 +593,32 @@ def _download_verified_bundle(
     with tempfile.TemporaryDirectory(prefix=staging_prefix, dir=model_dir) as staging:
         for filename, metadata in files.items():
             _check_bundle_relpath(filename)
-            url = "/".join(
-                [base_url.rstrip("/")] + [quote(part) for part in filename.split("/")]
-            )
             destination = os.path.join(staging, filename)
             os.makedirs(os.path.dirname(destination), exist_ok=True)
-            _fetch_pinned_file(name, url, destination, metadata, label=filename,
-                               progress_cb=progress_cb, done_bytes=done_bytes,
-                               total_bytes=total_bytes)
+            # Fall through the remaining sources on failure. Safe precisely
+            # because `_fetch_pinned_file` verifies size and SHA256 before
+            # accepting anything: a second host cannot smuggle in a different
+            # file, only serve the same one faster or not at all.
+            last_error = None
+            for index, source in enumerate(sources):
+                try:
+                    _fetch_pinned_file(name, _source_url(source, filename),
+                                       destination, metadata, label=filename,
+                                       progress_cb=progress_cb,
+                                       done_bytes=done_bytes,
+                                       total_bytes=total_bytes)
+                    last_error = None
+                    break
+                except Exception as error:      # noqa: BLE001 — try the next host
+                    last_error = error
+                    remaining = len(sources) - index - 1
+                    log.warning(
+                        f"[model_downloader] {name}: {filename} failed from "
+                        f"{source}: {error}"
+                        + (f"; {remaining} source(s) left" if remaining else "")
+                    )
+            if last_error is not None:
+                raise last_error
             done_bytes += int(metadata.get("size") or 0)
 
         for filename in files:

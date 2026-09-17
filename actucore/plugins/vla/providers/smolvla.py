@@ -68,6 +68,11 @@ class SmolVLAProvider:
                        directly: the robot pulls from COS.
         weights        optional {base_url, files:{name:{size,sha256}}} manifest;
                        fetched into model_dir when the checkpoint is absent
+        vlm_dir        where the backbone lives (default
+                       /models/vla/smolvlm2_500m)
+        vlm_weights    manifest for the backbone. A separate upstream repo,
+                       ~2 GB, shared by every SmolVLA checkpoint built on it —
+                       see _ensure_backbone
         device         "cuda" | "cpu" (default cuda, falling back to cpu)
         feature_map    {our observation name: the policy's input key}, e.g.
                        {"main": "observation.images.top", "state":
@@ -82,7 +87,12 @@ class SmolVLAProvider:
         self._device = str(config.get("device") or "cuda")
         self._feature_map = dict(config.get("feature_map") or {})
         self._weights = config.get("weights") or {}
+        self._vlm_dir = config.get("vlm_dir") or "/models/vla/smolvlm2_500m"
+        self._vlm_weights = config.get("vlm_weights") or {}
         self._chunk_override = config.get("chunk_size")
+        # Set by _ensure_backbone when the checkpoint has to be presented with a
+        # local backbone path; None means load straight from model_dir.
+        self._resolve_dir = None
 
         self._policy = None
         self._error = ""
@@ -91,6 +101,7 @@ class SmolVLAProvider:
 
         self._require_lerobot()
         self._ensure_checkpoint()
+        self._ensure_backbone()
         self._config = self._read_config()
         # Weights in the background: `capabilities()` is answerable from the
         # config alone, so negotiation can fail fast on a mismatched action
@@ -203,6 +214,74 @@ class SmolVLAProvider:
 
         ensure_verified_bundle("vla-local", self._model_dir, base_url, files)
 
+    def _ensure_backbone(self):
+        """Stage the VLM the checkpoint is built on, and point it at the copy.
+
+        **A SmolVLA checkpoint is not self-contained.** Its config names a
+        backbone — `vlm_model_name: HuggingFaceTB/SmolVLM2-500M-Video-Instruct`
+        — which LeRobot fetches from HuggingFace while loading. On a robot that
+        is a two-gigabyte download from a host it cannot reach, and it happens
+        *after* the policy weights are already on disk, so everything looks
+        staged right up until it fails:
+
+            OSError: We couldn't connect to 'https://huggingface.co'
+
+        Discovering that at deploy time is the deployer's problem to work around;
+        discovering it here makes it ours, which is where it belongs.
+
+        The pinned files are never rewritten. `vlm_model_name` has to become a
+        local path for the library to stop reaching out, so the edited copy goes
+        in a sidecar directory and the originals keep matching their SHA256 —
+        otherwise the first load would invalidate the manifest that verifies it.
+        """
+        config = self._read_config()
+        backbone = config.get("vlm_model_name") or ""
+        if not backbone or os.path.isdir(backbone):
+            return                                  # already local, or none named
+
+        manifest = self._vlm_weights
+        base_url, files = manifest.get("base_url"), manifest.get("files")
+        if os.path.exists(os.path.join(self._vlm_dir, CONFIG_FILE)):
+            pass
+        elif base_url and files:
+            from model_downloader import ensure_verified_bundle
+
+            ensure_verified_bundle("vla-smolvla-backbone", self._vlm_dir,
+                                   base_url, files)
+        else:
+            raise FileNotFoundError(
+                f"this checkpoint needs the {backbone!r} backbone, which LeRobot "
+                f"would fetch from HuggingFace at load time — unreachable from a "
+                f"robot. Stage it on COS the way the policy weights are staged "
+                f"and configure `vlm_weights`, or put it at {self._vlm_dir}."
+            )
+        self._resolve_dir = self._write_resolved_config(config)
+
+    def _write_resolved_config(self, config: dict) -> str:
+        """A load-time view of the checkpoint whose backbone path is local.
+
+        Hard links rather than copies for the weights: a second 900 MB file on a
+        57 GB eMMC for the sake of one edited JSON field is not a trade worth
+        making. Falls back to a copy across filesystems.
+        """
+        resolved = os.path.join(self._model_dir, ".resolved")
+        os.makedirs(resolved, exist_ok=True)
+        for name in os.listdir(self._model_dir):
+            if name.startswith("."):
+                continue
+            source = os.path.join(self._model_dir, name)
+            target = os.path.join(resolved, name)
+            if name == CONFIG_FILE or os.path.exists(target):
+                continue
+            try:
+                os.link(source, target)
+            except OSError:
+                import shutil
+                shutil.copy2(source, target)
+        with open(os.path.join(resolved, CONFIG_FILE), "w", encoding="utf-8") as handle:
+            json.dump({**config, "vlm_model_name": self._vlm_dir}, handle)
+        return resolved
+
     def _read_config(self) -> dict:
         path = os.path.join(self._model_dir, CONFIG_FILE)
         try:
@@ -240,7 +319,7 @@ class SmolVLAProvider:
         from lerobot.policies.factory import make_policy_config  # noqa: F401
         from lerobot.policies.smolvla.modeling_smolvla import SmolVLAPolicy
 
-        policy = SmolVLAPolicy.from_pretrained(self._model_dir)
+        policy = SmolVLAPolicy.from_pretrained(self._resolve_dir or self._model_dir)
         policy.to(self._resolved_device())
         policy.eval()
         return policy

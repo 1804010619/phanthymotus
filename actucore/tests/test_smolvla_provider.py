@@ -357,3 +357,71 @@ def test_a_policy_without_a_chunk_method_falls_back_to_single_step(fake_torch):
         select_action=lambda batch: _FakeTensor([0.5, 0.6]))
 
     assert SmolVLAProvider._predict(policy, {}) == [[0.5, 0.6]]
+
+
+# ── the real published checkpoint ────────────────────────────────────────────
+
+# lerobot/smolvla_base's own config.json, as staged on COS. Trimmed to the keys
+# capabilities() reads, values verbatim.
+#
+# This exists because every other fixture in this file is one I wrote, and a
+# fixture written from the same understanding as the code cannot contradict it.
+# The published checkpoint can.
+REAL_SMOLVLA_BASE = {
+    "type": "smolvla",
+    "n_action_steps": 50,
+    "chunk_size": 50,
+    # The network's padded width, sitting right next to the dataset's real one.
+    "max_action_dim": 32,
+    "max_state_dim": 32,
+    "input_features": {
+        "observation.state": {"type": "STATE", "shape": [6]},
+        "observation.images.camera1": {"type": "VISUAL", "shape": [3, 256, 256]},
+        "observation.images.camera2": {"type": "VISUAL", "shape": [3, 256, 256]},
+        "observation.images.camera3": {"type": "VISUAL", "shape": [3, 256, 256]},
+    },
+    "output_features": {"action": {"type": "ACTION", "shape": [6]}},
+}
+
+
+@pytest.fixture
+def real_checkpoint(tmp_path):
+    (tmp_path / "config.json").write_text(json.dumps(REAL_SMOLVLA_BASE))
+    return tmp_path
+
+
+def test_the_published_checkpoint_reads_as_six_dof_not_thirty_two(real_checkpoint):
+    """`max_action_dim: 32` sits beside `action.shape: [6]` in the real file.
+
+    Reading the padded width would have the card negotiate against 32 and
+    happily drive a 32-DOF arm that does not exist. The dataset's width is the
+    one that means anything.
+    """
+    caps = make_provider(real_checkpoint).capabilities()
+
+    assert caps["action_dim"] == 6
+    assert caps["chunk_size"] == 50
+    assert caps["needs_state"] is True
+
+
+def test_the_published_checkpoint_wants_three_cameras(real_checkpoint):
+    """camera1/2/3, not one — a feature_map with a single entry is incomplete."""
+    assert make_provider(real_checkpoint).capabilities()["n_cameras"] == 3
+
+
+def test_it_will_not_drive_tianyi(real_checkpoint):
+    """Recorded as the expected outcome, not a defect.
+
+    smolvla_base is trained for a 6-DOF arm; Tianyi's action space is 26. The
+    card refuses at start and says which two numbers disagree. Making this run
+    is a fine-tuning or retargeting job, not a configuration one.
+    """
+    from plugins.vla import negotiate
+
+    tianyi = {"control_interface": "motus.control/1", "mode": "joint_position",
+              "dof": 26, "rate": {"max_hz": 50, "expected_hz": 30,
+                                  "watchdog_ms": 200}}
+    problems = negotiate.check(make_provider(real_checkpoint).capabilities(), tianyi)
+
+    assert len(problems) == 1
+    assert "6" in problems[0] and "26" in problems[0]

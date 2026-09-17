@@ -60,16 +60,88 @@ plugins:
     # 留空时：model_dir 里已有 checkpoint 就直接用，没有就明确报错 ——
     # 给一个没人上传过的文件编哈希，或者不校验就下载一个要驱动电机的东西，
     # 两者都不比一条清楚的错误强。上游优先 ModelScope（lerobot/smolvla_base）。
-    weights: {}
-    #   base_url: https://<bucket>.cos.<region>.myqcloud.com/public/smolvla_base
-    #   files:
-    #     config.json:            {size: 0, sha256: ""}
-    #     model.safetensors:      {size: 0, sha256: ""}
+    # 已上传：ModelScope lerobot/smolvla_base → COS，六个文件的 sha256 与
+    # ModelScope 索引声明的逐一核对过。
+    weights:
+      # 两条源，机器自己挑。下载器按**最大的那个文件**做一次 Range 探测，
+      # 快的先用，失败则顺延。多源之所以安全，是因为每个文件都 pin 了
+      # size+sha256 —— 校验与来源无关，所以换源不降低任何保证。
+      base_url:
+        - https://www.modelscope.cn/api/v1/models/lerobot/smolvla_base/repo?Revision=master&FilePath={file}
+        - https://agi-phanthy-dev-1252788780.cos.ap-beijing.myqcloud.com/public/vla/smolvla_base
+      files:
+        config.json:
+          size: 2299
+          sha256: "650584b56c104720f7a3c91d1ec6bec9e8de8ac11e60c92ba2fa82d93eda147d"
+        model.safetensors:
+          size: 906712520
+          sha256: "7cd549ac2351fb069c0ddb3c34ad2d09cfc92b56a15dccdfc2e41467aaca01eb"
+        policy_preprocessor.json:
+          size: 1872
+          sha256: "7683d648280a72f0d51e869fb8dd1596beed90b7f84849330cf1bc26634a4bd6"
+        policy_postprocessor.json:
+          size: 660
+          sha256: "2b78bb742065288df2ec63b0ee35f97a1f6950171cf2272f7e34b1fe3873b17b"
+        policy_preprocessor_step_5_normalizer_processor.safetensors:
+          size: 640
+          sha256: "490ab239d96e263687c0b2e386a0afbc235a2eceb9857c36ed32f2f162a3e7c8"
+        policy_postprocessor_step_0_unnormalizer_processor.safetensors:
+          size: 640
+          sha256: "490ab239d96e263687c0b2e386a0afbc235a2eceb9857c36ed32f2f162a3e7c8"
     # checkpoint 的输入 key 跟着它的训练数据集走（有的叫 observation.images.top，
     # 有的叫 cam_high），所以这里是配置而不是约定：猜错的结果是策略对着一张黑图
     # 推理，而不是报错。
+    # SmolVLA 的 checkpoint **不自包含**：它的 config 里 vlm_model_name 指向
+    # HuggingFaceTB/SmolVLM2-500M-Video-Instruct，LeRobot 加载时会去 HF 拉 ——
+    # 机器人连不上，而且是在策略权重都已就位之后才失败。所以骨干也要预置。
+    # 同样来自 ModelScope（同名仓库）→ COS，sha256 逐个核对。~2 GB。
+    vlm_dir: /models/vla/smolvlm2_500m
+    vlm_weights:
+      base_url:
+        - https://www.modelscope.cn/api/v1/models/HuggingFaceTB/SmolVLM2-500M-Video-Instruct/repo?Revision=master&FilePath={file}
+        - https://agi-phanthy-dev-1252788780.cos.ap-beijing.myqcloud.com/public/vla/smolvlm2_500m
+      files:
+        added_tokens.json:
+          size: 4739
+          sha256: "74135b8664b56088c0006f1c8e848d79a8eba003411f72ebf1dc2ee96227be3a"
+        chat_template.json:
+          size: 430
+          sha256: "b585e3598909a5687f9f9d738d35223724dedef256b9b274e1cbfb32b13c74bf"
+        config.json:
+          size: 3767
+          sha256: "ea6bc1237e96247f6258de3e202e2e62b93d6f386dc47e7b36b5588bf3a15e17"
+        generation_config.json:
+          size: 136
+          sha256: "34835060c9f0f74d1acb456cc72ca32746d3843d9eb5f578f9cbffac1d2eb840"
+        merges.txt:
+          size: 466391
+          sha256: "0b54e8aa4e53d5383e2e4bc635a56b43f9647f7b13832d5d9ecd8f82dac4f510"
+        model.safetensors:
+          size: 2029990624
+          sha256: "b9bfd456c9472c0acd5719d6e514c4b859891af205ee1a736552fd3497b8b0c3"
+        preprocessor_config.json:
+          size: 599
+          sha256: "149e315d9410368e5491455bb06e0f763426e9e56cca731c13b24404a29b6374"
+        processor_config.json:
+          size: 67
+          sha256: "f3ad45028447b3562b4752be0d5916d6806c1ef589091a469608dcf0faa1737c"
+        special_tokens_map.json:
+          size: 868
+          sha256: "2dfea2a426162316ff1567c82bc6d36d9690cd9f90455f075c77daca78b45c60"
+        tokenizer.json:
+          size: 3548256
+          sha256: "5ece781dc8d2b2f3e2f289ca0ae50b17cfc27dd27bfe7971bb8241e0b964331a"
+        tokenizer_config.json:
+          size: 28626
+          sha256: "dd9ce2ab89a3dd881bd9378f1a79b943a064b9275a7e1706d5b7b47b68977913"
+        vocab.json:
+          size: 800662
+          sha256: "82b84012e3add4d01d12ba14442026e49b8cbbaead1f79ecf3d919784f82dc79"
+    # smolvla_base 的 config.json 期望 observation.images.camera1/2/3 和
+    # observation.state（各 6 维）。缺哪个就报哪个，不会拿黑图去推理。
     feature_map: {}
-    #   main:  observation.images.top
+    #   main:  observation.images.camera1
+    #   wrist: observation.images.camera2
     #   state: observation.state
 
   # nav:
