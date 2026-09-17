@@ -80,7 +80,8 @@ class SmolVLAProvider:
         chunk_size     override the checkpoint's action horizon
     """
 
-    def __init__(self, descriptor: dict, config: dict | None = None):
+    def __init__(self, descriptor: dict, config: dict | None = None,
+                 on_status=None):
         config = dict(config or {})
         self._descriptor = descriptor or {}
         # Which checkpoint. `smolvla_base` is the published 6-DOF one; a version
@@ -105,6 +106,11 @@ class SmolVLAProvider:
 
         self._policy = None
         self._error = ""
+        # Where the card's status line comes from while weights are moving.
+        # These are the largest downloads anywhere in the system — a SmolVLA
+        # checkpoint is ~900 MB and its backbone another ~1 GB — and the card
+        # reported nothing at all for the whole of it.
+        self._on_status = on_status
         self._lock = threading.RLock()
         self._closed = False
 
@@ -251,8 +257,11 @@ class SmolVLAProvider:
         # perception's downloader: existing → size → sha256 → reuse, otherwise
         # lock, re-check, download with retry, verify, atomic replace.
         from model_downloader import ensure_verified_bundle
+        from model_progress import fetch_status
 
-        ensure_verified_bundle("vla-local", self._model_dir, base_url, files)
+        progress_cb, _ = fetch_status(self._on_status, self._model or "checkpoint")
+        ensure_verified_bundle("vla-local", self._model_dir, base_url, files,
+                               progress_cb=progress_cb)
 
     def _ensure_backbone(self):
         """Stage the VLM the checkpoint is built on, and point it at the copy.
@@ -285,9 +294,13 @@ class SmolVLAProvider:
             pass
         elif base_url and files:
             from model_downloader import ensure_verified_bundle
+            from model_progress import fetch_status
 
+            # Named after the backbone, not the checkpoint: the two are separate
+            # downloads and one shared label would read as a restart at 0%.
+            progress_cb, _ = fetch_status(self._on_status, backbone.split("/")[-1])
             ensure_verified_bundle("vla-smolvla-backbone", self._vlm_dir,
-                                   base_url, files)
+                                   base_url, files, progress_cb=progress_cb)
         else:
             raise FileNotFoundError(
                 f"this checkpoint needs the {backbone!r} backbone, which LeRobot "
@@ -479,8 +492,9 @@ class SmolVLAProvider:
         return 0
 
 
-def PROVIDER(descriptor: dict, config: dict | None = None) -> SmolVLAProvider:
-    return SmolVLAProvider(descriptor, config)
+def PROVIDER(descriptor: dict, config: dict | None = None,
+             on_status=None) -> SmolVLAProvider:
+    return SmolVLAProvider(descriptor, config, on_status=on_status)
 
 
 # Discovery checks the four methods on whatever PROVIDER is; a factory function

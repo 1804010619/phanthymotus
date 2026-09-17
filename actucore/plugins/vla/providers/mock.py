@@ -115,8 +115,15 @@ class MockProvider:
         return out
 
 
-def PROVIDER(descriptor: dict, config: dict | None = None) -> MockProvider:
-    """Factory. `config` carries the card's provider-specific settings."""
+def PROVIDER(descriptor: dict, config: dict | None = None,
+             on_status=None) -> MockProvider:
+    """Factory. `config` carries the card's provider-specific settings.
+
+    `on_status` is accepted and ignored: a sine wave has no weights, so there is
+    no download to report. It is in the signature because the card passes it to
+    whichever provider it built, without asking which one that is.
+    """
+    del on_status
     config = config or {}
     return MockProvider(
         descriptor,

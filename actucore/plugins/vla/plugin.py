@@ -83,6 +83,13 @@ class VLAPlugin:
         self._publisher = None
         self._timer = None
         self._running = False
+        # Provider construction is where a local checkpoint is *downloaded*, and
+        # that runs inside `start` — several gigabytes on a cold /models. Without
+        # this flag `_state()` answered "idle" for the whole of it, because
+        # `_running` is only set afterwards: the card looked stopped while it was
+        # in fact doing the longest thing it ever does.
+        self._starting = False
+        self._load_status = ""
         self._task = ""
         # Paused by `pause` or `interrupt`; both stop emitting, and the chunk
         # state above is what tells them apart. See `_halt`.
@@ -315,11 +322,23 @@ class VLAPlugin:
                 f"provider {provider_name!r} 不可用"
                 + (f"：{detail}" if detail else f"，可用的有 {sorted(providers)}"))
 
+        # Deliberately outside `_lock` — the comment on that lock says it guards
+        # bookkeeping only, never a provider construction, or a stop would queue
+        # behind the download it is meant to cancel.
+        self._starting = True
+        self._load_status = ""
         try:
-            provider = providers[provider_name](descriptor, self._cfg)
+            provider = providers[provider_name](
+                descriptor, self._cfg,
+                on_status=lambda text: setattr(self, "_load_status", text))
             capabilities = provider.capabilities()
         except Exception as error:      # noqa: BLE001
             return self._error(f"provider {provider_name} 初始化失败：{error}")
+        finally:
+            # Cleared on the failure path too: one failed start must not leave
+            # every later info() claiming to be loading.
+            self._starting = False
+            self._load_status = ""
 
         problems = negotiate.check(capabilities, descriptor)
         if problems:
@@ -496,6 +515,9 @@ class VLAPlugin:
                 "capabilities": dict(self._capabilities),
                 "control_interface": dict(self._descriptor),
                 "error": self._last_error,
+                # Present only while something is being fetched, so a caller can
+                # tell "still loading" from "loading, 40% of 906 MB in".
+                **({"message": self._load_status} if self._load_status else {}),
             }
 
     def _config(self, args: dict):
@@ -748,6 +770,11 @@ class VLAPlugin:
         `_settle_loading_item`). Skipping it would report ready while the card
         still cannot produce a command.
         """
+        if self._starting:
+            # Downloading or constructing. agent-core's `_settle_loading_item`
+            # watcher polls info() until this settles, which is exactly the
+            # behaviour a multi-gigabyte fetch wants.
+            return "loading"
         if not self._running:
             return "idle"
         provider = self._provider
