@@ -5,14 +5,17 @@
 # 没有 CPU 变体。
 #
 # Usage:
-#   ./build_actucore.sh                          # JetPack 6.1（默认），交互选源
-#   ./build_actucore.sh --jp-version 5.11        # JetPack 5.11
+#   ./build_actucore.sh                          # JetPack 5.11（默认，与 build_perception.sh 一致）
+#   ./build_actucore.sh --jp-version 6.1         # JetPack 6.1
 #   ./build_actucore.sh --mirror tuna
 #
-# 两条 JetPack 线用同一份 Dockerfile，只有 base 不同 —— 应用层是逐字节一样的：
+# 默认值与 build_perception.sh 保持一致（5.11）。两个脚本并排放着，不带参数跑
+# 却落到不同的 JetPack 线上，是那种要等到部署时才发现的意外。
 #
+# 两条线用同一份 Dockerfile，只有 base 不同 —— 应用层是逐字节一样的：
+#
+#   5.11  jetson-base           只有远端 provider，薄镜像（默认）
 #   6.1   jetson-base-actucore  本地推理（lerobot + CUDA torch 2.9），~18.6 GB
-#   5.11  jetson-base           只有远端 provider，薄镜像
 #
 # 这个差别不是取舍，是事实：jp5.11 的 CUDA 是 11.4，而 lerobot 要 torch >= 2.2.1，
 # 没有任何 torch >= 2.2 支持 CUDA 11.4（官方矩阵最低 11.8）。所以那条线上
@@ -33,7 +36,7 @@ fi
 eval "$(parse_mirror_arg "$@")"
 
 # ── 解析参数 ─────────────────────────────────────────────────────────
-JP_VERSION="6.1"
+JP_VERSION="5.11"
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --jp-version) JP_VERSION="$2"; shift 2 ;;
@@ -86,7 +89,7 @@ else
     BASE_IMAGE="${BASE_REGISTRY}/${BASE_NAMESPACE}/jetson-base:jp${JP_ARG}-torch"
     echo ""
     echo "[note] JetPack ${JP_VERSION}：只构建远端 provider 可用的薄镜像。"
-    echo "       本地推理（provider: local）在这条线上装不了 —— CUDA 11.4 撑不住"
+    echo "       本机推理（provider: smolvla）在这条线上装不了 —— CUDA 11.4 撑不住"
     echo "       lerobot 要求的 torch >= 2.2.1。卡片会在启动时说明，不会静默失败。"
     echo ""
 fi

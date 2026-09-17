@@ -77,8 +77,8 @@ cd actucore && PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python3 -m pytest tests -q
 只有 Jetson GPU 版 —— 执行模型（VLA、抓取策略、locomotion）都要 GPU，没有 CPU 变体。
 
 ```bash
-./deploy/build_actucore.sh                    # JetPack 6.1（默认）
-./deploy/build_actucore.sh --jp-version 5.11  # JetPack 5.11，只有远端 provider
+./deploy/build_actucore.sh                    # JetPack 5.11（默认，与 build_perception.sh 一致）
+./deploy/build_actucore.sh --jp-version 6.1   # JetPack 6.1，带本机推理
 ./deploy/build_actucore.sh --mirror tuna      # 指定 pip / apt 源
 ```
 
@@ -86,8 +86,8 @@ cd actucore && PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python3 -m pytest tests -q
 
 | | base | 可用 provider | 大小 |
 |---|---|---|---|
+| jp5.11（默认） | `jetson-base`（共享的那个） | `mock` + `vla_cloud` | ~13.8 GB |
 | jp6.1 | `jetson-base-actucore`（CUDA torch 2.9 + lerobot） | 全部 | ~18.6 GB |
-| jp5.11 | `jetson-base`（共享的那个） | `mock` + `vla_cloud` | ~13.8 GB |
 
 这个差别是**被迫的，不是取舍**：jp5.11 是 CUDA 11.4，而 lerobot 要 `torch >= 2.2.1`，PyTorch 官方矩阵里 torch 2.2 的最低 CUDA 是 11.8 —— 那条线上**不可能**有本机推理。`smolvla` 在那里会在 start 时直接拒绝并说明原因。完整调研见 `deploy/prepare_actucore_base.sh`。
 
