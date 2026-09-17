@@ -85,7 +85,7 @@ def http(monkeypatch):
 
 def make_provider(**config):
     base = {"endpoint": "https://vla.internal:8443", "api_key": "k",
-            "model": "pi05", "timeout_ms": 150}
+            "model_name": "pi05", "timeout_ms": 150}
     base.update(config)
     return VLACloudProvider({}, base)
 
@@ -245,3 +245,30 @@ def test_the_request_deadline_is_the_configured_one(http):
     http._responses["/infer"] = lambda req: {"actions": [[0.0] * 14]}
     make_provider(timeout_ms=150).infer(_observation())
     assert http.requests[0][1] == pytest.approx(0.150)
+
+
+def test_the_default_deadline_is_500ms():
+    """The point of giving up, not the expected latency.
+
+    A late reply is not a safety problem: the driver drops anything whose
+    observation is older than the descriptor's `max_obs_age_ms`, and its
+    watchdog has already held the arm. What a long timeout costs is how quickly
+    a dead endpoint is noticed — so there is no reason to set it far above that
+    age limit, and no reason to squeeze it under the watchdog either.
+    """
+    provider = VLACloudProvider({}, {"endpoint": "https://vla.internal"})
+    assert provider._timeout == pytest.approx(0.5)
+
+
+def test_the_config_key_is_model_name_but_the_wire_field_is_model(http):
+    """Two different names on purpose — one is ours, one is the protocol's.
+
+    `model_name` is what an operator sets in the card's form; `model` is what
+    motus.vla/1 puts on the wire. Collapsing them would make renaming either
+    side a protocol change.
+    """
+    http._responses["/infer"] = lambda req: {"actions": [[0.0] * 14]}
+
+    make_provider(model_name="pi05-droid").infer(_observation())
+
+    assert http.payload()["model"] == "pi05-droid"

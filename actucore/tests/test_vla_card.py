@@ -378,19 +378,19 @@ def test_the_show_when_value_is_a_string():
 def test_the_model_field_offers_the_staged_checkpoints():
     props = _properties(models={"smolvla_base": {}, "smolvla_tianyi": {}})
 
-    assert props["model"]["enum"] == ["smolvla_base", "smolvla_tianyi"]
-    assert props["model"]["default"] == "smolvla_base"
+    assert props["model_name"]["enum"] == ["smolvla_base", "smolvla_tianyi"]
+    assert props["model_name"]["default"] == "smolvla_base"
 
 
 def test_the_model_field_stays_free_text_with_nothing_staged():
     """vla_cloud's model names live on the server; they are not ours to list."""
     props = _properties()
 
-    assert "enum" not in props["model"]
-    assert props["model"]["type"] == "string"
+    assert "enum" not in props["model_name"]
+    assert props["model_name"]["type"] == "string"
 
 
 def test_the_configured_model_is_the_default_shown():
-    props = _properties(model="smolvla_tianyi",
+    props = _properties(model_name="smolvla_tianyi",
                         models={"smolvla_base": {}, "smolvla_tianyi": {}})
-    assert props["model"]["default"] == "smolvla_tianyi"
+    assert props["model_name"]["default"] == "smolvla_tianyi"

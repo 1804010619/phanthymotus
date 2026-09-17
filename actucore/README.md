@@ -34,11 +34,11 @@ Provider 的组织方式是**非对称的**，而且是刻意的：
 
 ### 选哪个 checkpoint
 
-`provider` 选"哪个模型族、跑在哪"，`model` 选"具体哪一份权重"：
+`provider` 选"哪个模型族、跑在哪"，`model_name` 选"具体哪一份权重"：
 
 ```yaml
 provider: smolvla
-model: smolvla_base          # 本机 provider 从 models: 里挑
+model_name: smolvla_base     # 本机 provider 从 models: 里挑
 models:
   smolvla_base:              # 上游原版，6 维（SO-100/SO-101）
     model_dir: /models/vla/smolvla_base

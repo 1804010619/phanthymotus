@@ -86,7 +86,7 @@ class VLAPlugin:
         # match a config key exactly — and left absent for a remote provider,
         # whose model names live on the server and are not ours to enumerate.
         local_models = sorted(self._cfg.get("models") or {})
-        default_model = self._cfg.get("model") or (
+        default_model = self._cfg.get("model_name") or (
             local_models[0] if local_models else "")
         return [{
             "name": "vla",
@@ -134,10 +134,14 @@ class VLAPlugin:
                     # robot gets a name that says so (`smolvla_tianyi`,
                     # `smolvla_q5`), because the action space it fits is the
                     # thing an operator has to get right.
-                    "model": {"type": "string", "default": default_model,
-                              "description": "checkpoint name",
-                              "scope": "shared",
-                              **({"enum": local_models} if local_models else {})},
+                    # No `description`/`title`: the form renders
+                    # `title || description || key` as the label, with no
+                    # separate hint element, so prose here would replace the
+                    # field name rather than accompany it. The explanation
+                    # belongs in config.yaml where it can be read in full.
+                    "model_name": {"type": "string", "default": default_model,
+                                   "scope": "shared",
+                                   **({"enum": local_models} if local_models else {})},
                     # Only vla_cloud has anywhere to send a request. Hiding
                     # these for a local provider is not cosmetic: a filled-in
                     # endpoint beside `provider: smolvla` reads as configured
@@ -147,7 +151,7 @@ class VLAPlugin:
                                  "x-show-when": {"provider": "vla_cloud"}},
                     "api_key": {"type": "string", "scope": "shared",
                                 "x-show-when": {"provider": "vla_cloud"}},
-                    "timeout_ms": {"type": "number", "default": 200,
+                    "timeout_ms": {"type": "number", "default": 500,
                                    "scope": "shared",
                                    "x-show-when": {"provider": "vla_cloud"}},
                     "topic": {"type": "string", "default": DEFAULT_TOPIC,

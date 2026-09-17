@@ -87,7 +87,7 @@ class SmolVLAProvider:
         # fine-tuned for a robot is registered beside it under a name that says
         # which robot (`smolvla_tianyi`), because the action space it fits is the
         # thing that has to match the arm.
-        self._model = str(config.get("model") or "").strip()
+        self._model = str(config.get("model_name") or "").strip()
         entry = self._model_entry(config)
         self._model_dir = (entry.get("model_dir")
                            or config.get("model_dir")
@@ -191,7 +191,7 @@ class SmolVLAProvider:
             return {}
         if not self._model:
             raise ValueError(
-                f"`model` is not set. This deployment stages "
+                f"`model_name` is not set. This deployment stages "
                 f"{sorted(models)}; pick one."
             )
         entry = models.get(self._model)

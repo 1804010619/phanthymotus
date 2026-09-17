@@ -49,15 +49,20 @@ plugins:
     # 本机 provider 旁边填着一个 endpoint，看起来像配好了，实际被忽略。
     endpoint: ""
     api_key: ""
-    # 每次请求的超时。**必须短于下游驱动的 watchdog**，否则迟到的 chunk 会在
-    # 机械臂已经被命令保持之后才到。
-    timeout_ms: 200
+    # 每次请求的超时——是"放弃的时刻"，不是预期延迟。
+    # 回包迟到不是安全问题：驱动会丢掉观测年龄超过 descriptor 里 max_obs_age_ms
+    # 的指令（当前 300ms），而它的 watchdog 早已让机械臂保持住了。超时设得过大
+    # 只是让"端点已经死了"这件事更晚被发现，所以没必要远高于那个年龄上限。
+    timeout_ms: 500
 
     # ── 选哪个 checkpoint ────────────────────────────────────────────────
     # 本机 provider 从下面 models: 里挑；vla_cloud 则是服务端认得的名字。
     # 开源发布的沿用上游原名；为某台机器人微调过的用带机器人名的名字，
     # 因为"它适配的动作空间"正是操作员必须搞对的东西。
-    model: smolvla_base
+    #
+    # 说明写在这里而不是 schema 的 description 里：表单的标签是
+    # `title || description || key` 且没有单独的提示位，写在那里会把字段名顶掉。
+    model_name: smolvla_base
 
     models:
       # 上游原版：SO-100/SO-101 的 6 维，驱动不了天轶（26 维），协商会拒绝。

@@ -41,10 +41,16 @@ class VLACloudProvider:
     Config keys:
         endpoint   base URL, e.g. https://vla.internal:8443
         api_key    bearer token; issued and checked by the server
-        model      which model to ask for, when the endpoint serves several
-        timeout_ms per-request deadline. Must be shorter than the receiving
-                   driver's watchdog, or a late chunk arrives after the arm has
-                   already been told to hold.
+        model_name which model to ask for, when the endpoint serves several
+        timeout_ms per-request deadline, default 500 ms.
+
+                   This is the point of giving up, not the expected latency. A
+                   reply that arrives late is not a safety problem — the driver
+                   drops anything whose observation is older than the
+                   descriptor's `max_obs_age_ms`, and its watchdog has already
+                   held the arm. What a long timeout costs is how quickly a
+                   dead endpoint is noticed, so there is little value in setting
+                   it far above that age limit.
     """
 
     def __init__(self, descriptor: dict, config: dict | None = None):
@@ -57,8 +63,8 @@ class VLACloudProvider:
                 "model; point this at a motus.vla/1 server (phanthymotus-cloud)."
             )
         self._key = str(config.get("api_key") or "")
-        self._model = str(config.get("model") or "")
-        self._timeout = float(config.get("timeout_ms", 200)) / 1000.0
+        self._model = str(config.get("model_name") or "")
+        self._timeout = float(config.get("timeout_ms", 500)) / 1000.0
         self._session = None
         self._seq = 0
         self._capabilities = None
