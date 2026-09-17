@@ -152,14 +152,20 @@ def _adapter_signature(cfg: dict) -> tuple:
     return provider, _adapter_options(cfg)
 
 
-def _build_ocr_adapter(cfg: dict) -> RapidOCRAdapter:
-    """根据配置创建 OCR 适配器"""
+def _build_ocr_adapter(cfg: dict, on_status=None) -> RapidOCRAdapter:
+    """根据配置创建 OCR 适配器
+
+    `on_status(text)` 接住下载进度，让卡片在取三个 TensorRT engine 期间显示
+    百分比而不是一行不动的 loading。不关心的调用方不传。
+    """
     provider = cfg.get('provider', 'rapidocr')
     if provider != 'rapidocr':
         raise ValueError(f"unsupported OCR provider: {provider}")
     options = _adapter_options(cfg)
     from utils.model_downloader import ensure_ocr_model
-    ensure_ocr_model(options["model_dir"])
+    from utils.model_progress import fetch_status
+    progress_cb, _ = fetch_status(on_status, "ppocrv6")
+    ensure_ocr_model(options["model_dir"], progress_cb=progress_cb)
     return RapidOCRAdapter(**options)
 
 
@@ -405,6 +411,8 @@ class OCRPlugin:
         self._adapter: RapidOCRAdapter | None = None
         self._adapter_state = "idle"                # idle|loading|ready|error
         self._load_error: str | None = None
+        # The downloader's progress line while bytes are moving; None otherwise.
+        self._load_status: str | None = None
         self._load_generation = 0
 
         log.info(
@@ -421,6 +429,7 @@ class OCRPlugin:
         """Start the one background adapter loader. Caller holds the lock."""
         self._adapter_state = "loading"
         self._load_error = None
+        self._load_status = None
         generation = self._load_generation
         cfg = dict(self._plugin_cfg)
         thread = threading.Thread(
@@ -431,13 +440,15 @@ class OCRPlugin:
 
     def _loader(self, generation: int, cfg: dict) -> None:
         try:
-            adapter = _build_ocr_adapter(cfg)
+            adapter = _build_ocr_adapter(
+                cfg, on_status=lambda text: setattr(self, "_load_status", text))
         except Exception as error:  # noqa: BLE001 - surfaced via state/info
             log.exception("[ocr] adapter load failed")
             with self._state_lock:
                 if generation == self._load_generation:
                     self._adapter_state = "error"
                     self._load_error = str(error)
+                    self._load_status = None
             return
 
         with self._state_lock:
@@ -446,6 +457,7 @@ class OCRPlugin:
             else:
                 self._adapter = adapter
                 self._adapter_state = "ready"
+                self._load_status = None
                 stale = None
         if stale is not None:
             # A config change superseded this load; never install the result.
@@ -622,7 +634,7 @@ class OCRPlugin:
         """Dashboard-facing description, mirroring the ASR plugin (#113): the
         static blurb normally, a reason while loading or after a failure."""
         if state == "loading":
-            return "Loading OCR model and TensorRT engines..."
+            return self._load_status or "Loading OCR model and TensorRT engines..."
         if state == "error" and self._load_error:
             return f"Model load failed: {self._load_error}"
         return self._DESC

@@ -588,7 +588,10 @@ def _sherpa(monkeypatch):
     _CountingAdapter.builds = 0
     holder = {}
 
-    def build(cfg):
+    def build(cfg, on_status=None):
+        # Mirrors _build_tts_adapter: the plugin hands it a status sink so a
+        # rebuild's download progress reaches the card.
+        holder["on_status"] = on_status
         holder["adapter"] = _CountingAdapter(cfg)
         return holder["adapter"]
 

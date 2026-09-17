@@ -193,9 +193,13 @@ class _EngineProbe:
         self.analyzer_cls = analyzer_cls
         self.calls = 0
         self.built: list = []
+        self.on_status = None
         self.lock = threading.Lock()
 
-    def __call__(self, cfg):
+    def __call__(self, cfg, on_status=None):
+        # Mirrors _build_engine: the plugin passes a status sink so the weight
+        # download's progress reaches the card.
+        self.on_status = on_status
         with self.lock:
             self.calls += 1
         if self.delay:
@@ -402,7 +406,7 @@ def test_unknown_action_returns_none(plugin):
 
 
 def test_engine_load_failure_surfaces_in_info(monkeypatch, tmp_path):
-    def explode(cfg):
+    def explode(cfg, on_status=None):
         raise RuntimeError("onnxruntime is not installed")
     monkeypatch.setattr(face_plugin, "_build_engine", explode)
     plugin = face_plugin.FaceRecognitionPlugin(_base_cfg(tmp_path), _FakeExecutor())
@@ -1496,8 +1500,10 @@ def test_the_proxy_forwards_everything_it_takes_to_the_service():
 
     proxy_takes = set(inspect.signature(FaceServiceProxy.__init__).parameters) - {"self"}
     service_takes = set(inspect.signature(FaceService.__init__).parameters) - {"self"}
-    # `device` is resolved to `providers` in the proxy and does not travel as-is.
-    forwarded = proxy_takes - {"device"}
+    # `device` is resolved to `providers` in the proxy and does not travel as-is;
+    # `on_status` is parent-side by construction — the proxy fetches the weights
+    # itself precisely because the child cannot report progress back.
+    forwarded = proxy_takes - {"device", "on_status"}
     assert forwarded <= service_takes, (
         f"the proxy would forward {sorted(forwarded - service_takes)}, which "
         f"FaceService.__init__ does not take")

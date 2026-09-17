@@ -75,9 +75,14 @@ class _ModelBuilderProbe:
         self.started = threading.Event()
         self.calls = 0
         self.models = []
+        self.on_status = None
         self._lock = threading.Lock()
 
-    def __call__(self):
+    def __call__(self, on_status=None):
+        # Mirrors _build_model's signature: the plugin hands it a status sink so
+        # the download's progress reaches the card. Recorded so a test can drive
+        # it and assert what the card then shows.
+        self.on_status = on_status
         with self._lock:
             self.calls += 1
             call = self.calls

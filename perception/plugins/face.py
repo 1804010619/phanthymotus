@@ -397,7 +397,7 @@ class _FaceEngine:
         self.analyzer.close()
 
 
-def _build_engine(cfg: dict) -> _FaceEngine:
+def _build_engine(cfg: dict, on_status=None) -> _FaceEngine:
     """The analyzer runs in the ORT worker child; the database stays here.
 
     A `FaceAnalyzer` in this process would create a standalone ONNX Runtime session
@@ -413,6 +413,7 @@ def _build_engine(cfg: dict) -> _FaceEngine:
     decode = _decode_options(cfg)
     analyzer = FaceServiceProxy(
         **_analyzer_options(cfg),
+        on_status=on_status,
         # _decode_options names these for decode_image's own signature; the service
         # holds them for the life of the child instead of taking them per call.
         max_image_side=decode["max_side"], max_image_pixels=decode["max_pixels"],
@@ -1075,6 +1076,8 @@ class FaceRecognitionPlugin:
         self._engine: _FaceEngine | None = None
         self._engine_state = "idle"          # idle|loading|ready|error
         self._load_error: str | None = None
+        # The downloader's progress line while weights are being fetched.
+        self._load_status: str | None = None
         self._load_generation = 0
 
         log.info("[face] plugin init: device=%s, model_dir=%s, db_dir=%s",
@@ -1090,6 +1093,7 @@ class FaceRecognitionPlugin:
     def _spawn_loader_locked(self) -> None:
         self._engine_state = "loading"
         self._load_error = None
+        self._load_status = None
         generation = self._load_generation
         cfg = dict(self._plugin_cfg)
         threading.Thread(
@@ -1099,13 +1103,15 @@ class FaceRecognitionPlugin:
 
     def _loader(self, generation: int, cfg: dict) -> None:
         try:
-            engine = _build_engine(cfg)
+            engine = _build_engine(
+                cfg, on_status=lambda text: setattr(self, "_load_status", text))
         except Exception as error:  # noqa: BLE001 - surfaced via state/info
             log.exception("[face] engine load failed")
             with self._state_lock:
                 if generation == self._load_generation:
                     self._engine_state = "error"
                     self._load_error = str(error)
+                    self._load_status = None
             return
 
         with self._state_lock:
@@ -1243,7 +1249,8 @@ class FaceRecognitionPlugin:
 
     def _desc_locked(self, state: str) -> str:
         if state == "loading":
-            return "Loading face detection and recognition models..."
+            return (self._load_status
+                    or "Loading face detection and recognition models...")
         if state == "error" and self._load_error:
             return f"Model load failed: {self._load_error}"
         return self._DESC

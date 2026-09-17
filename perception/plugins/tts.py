@@ -341,12 +341,19 @@ class MatchaTTSAdapter(TTSAdapter):
     """On-device TTS using sherpa-onnx Matcha (flow-matching, fast non-autoregressive)."""
 
     def __init__(self, model_dir: str, speaker_id: int = 0, speed: float = 1.0,
-                 device: str = "cpu"):
+                 device: str = "cpu", on_status=None):
         import os
         from utils.model_downloader import ensure_model
+        from utils.model_progress import fetch_status
         from utils.onnx_provider import provider_for_device
-        ensure_model("tts", model_dir)
-        ensure_model("tts_vocoder", model_dir)
+        # Two downloads, so two labels: one shared "matcha" line would jump back
+        # to 0% for the vocoder and read as a restart.
+        acoustic_cb, acoustic_stage = fetch_status(on_status, "matcha")
+        vocoder_cb, vocoder_stage = fetch_status(on_status, "vocos")
+        ensure_model("tts", model_dir, progress_cb=acoustic_cb,
+                     stage_cb=acoustic_stage)
+        ensure_model("tts_vocoder", model_dir, progress_cb=vocoder_cb,
+                     stage_cb=vocoder_stage)
 
         import sherpa_onnx
         # Matcha model files
@@ -436,9 +443,11 @@ class MmsThaiTTSAdapter(TTSAdapter):
     dry_run_text = "ก"
 
     def __init__(self, model_dir: str, speaker_id: int = 0, speed: float = 1.0,
-                 device: str = "cpu", phrase_spacing: bool = False):
+                 device: str = "cpu", phrase_spacing: bool = False,
+                 on_status=None):
         import os
         from utils.model_downloader import ensure_thai_tts_model
+        from utils.model_progress import fetch_status
         from utils.onnx_provider import provider_for_device
 
         if speaker_id != 0:
@@ -465,7 +474,9 @@ class MmsThaiTTSAdapter(TTSAdapter):
                 f"audio rather than spoken: {error}"
             ) from error
 
-        model_dir = ensure_thai_tts_model(model_dir)
+        thai_cb, thai_stage = fetch_status(on_status, "mms-th")
+        model_dir = ensure_thai_tts_model(model_dir, progress_cb=thai_cb,
+                                          stage_cb=thai_stage)
         model_path = os.path.join(model_dir, "model.onnx")
         tokens_path = os.path.join(model_dir, "tokens.txt")
         for path in (model_path, tokens_path):
@@ -743,15 +754,19 @@ class KokoroTTSAdapter(TTSAdapter):
 
     def __init__(self, model_dir: str, speaker_id: int = 0, speed: float = 1.0,
                  device: str = "gpu", language: str = DEFAULT_LANGUAGE,
-                 japanese_worker: bool = True, japanese_worker_device: str = "gpu"):
+                 japanese_worker: bool = True, japanese_worker_device: str = "gpu",
+                 on_status=None):
         import os
         from utils.model_downloader import ensure_kokoro_model
+        from utils.model_progress import fetch_status
         from utils.onnx_provider import normalize_device, pick_weights, provider_for_device
 
         device = normalize_device(device)
         language = self._normalize_language(language)
 
-        model_dir = ensure_kokoro_model(model_dir, device)
+        kokoro_cb, kokoro_stage = fetch_status(on_status, "kokoro-multi")
+        model_dir = ensure_kokoro_model(model_dir, device, progress_cb=kokoro_cb,
+                                        stage_cb=kokoro_stage)
         # gpu directories hold fp32, cpu directories hold int8 — pick_weights'
         # documented behaviour of falling back to the *last* candidate means a
         # missing file produces an error naming the one this device wanted.
@@ -1292,7 +1307,7 @@ def _validate_kokoro_manifest(model_dir: str) -> dict:
     return manifest
 
 
-def _build_tts_adapter(cfg: dict) -> TTSAdapter:
+def _build_tts_adapter(cfg: dict, on_status=None) -> TTSAdapter:
     import os
     from utils.onnx_provider import normalize_device
     engine = str(cfg.get('engine', '')).lower()
@@ -1311,6 +1326,7 @@ def _build_tts_adapter(cfg: dict) -> TTSAdapter:
         return MmsThaiTTSAdapter(
             model_dir, speaker_id, speed, device,
             phrase_spacing=bool(cfg.get('thai_phrase_spacing', False)),
+            on_status=on_status,
         )
     if engine == 'kokoro-multi':
         return KokoroTTSAdapter(
@@ -1326,8 +1342,10 @@ def _build_tts_adapter(cfg: dict) -> TTSAdapter:
             # turn it off to fall back to the in-process CPU session.
             japanese_worker=bool(cfg.get('japanese_worker', True)),
             japanese_worker_device=str(cfg.get('japanese_worker_device') or 'gpu'),
+            on_status=on_status,
         )
-    return MatchaTTSAdapter(model_dir, speaker_id, speed, device)
+    return MatchaTTSAdapter(model_dir, speaker_id, speed, device,
+                            on_status=on_status)
 
 
 # ── ROS2 Node ─────────────────────────────────────────────────────────────────
@@ -1776,8 +1794,15 @@ class SherpaOnnxTTSPlugin:
         self._cfg.update(_session_keys(plugin_cfg))
         self._loading  = False
         self._load_error = None
+        # The downloader's progress line while weights are being fetched. Read by
+        # the `info` reply below, which is served on another thread —
+        # ThreadingHTTPServer gives every tools/call its own — so the dashboard's
+        # heartbeat can show it while a rebuild is still blocked here.
+        self._load_status = None
         try:
-            self._adapter  = _build_tts_adapter(plugin_cfg)
+            self._adapter  = _build_tts_adapter(
+                plugin_cfg,
+                on_status=lambda text: setattr(self, "_load_status", text))
         except Exception as e:
             log.error(f"[tts] failed to load model: {e}", exc_info=True)
             self._adapter = None
@@ -1850,7 +1875,7 @@ class SherpaOnnxTTSPlugin:
                 return {
                     "name": "TTS", "manufacture": "Embodied", "model": "tts",
                     "state": "loading",
-                    "desc": "Downloading TTS model...",
+                    "desc": self._load_status or "Downloading TTS model...",
                 }
             if self._load_error:
                 return {
@@ -1903,7 +1928,9 @@ class SherpaOnnxTTSPlugin:
 
         elif action == "start":
             if self._loading:
-                return {"state": "loading", "message": "TTS model is being downloaded, please wait..."}
+                return {"state": "loading",
+                        "message": (self._load_status
+                                    or "TTS model is being downloaded, please wait...")}
             if self._load_error:
                 return {"state": "error", "message": f"TTS model failed to load: {self._load_error}"}
             if not self._adapter:
@@ -1946,7 +1973,9 @@ class SherpaOnnxTTSPlugin:
 
         elif action == "speak":
             if self._loading:
-                return {"state": "loading", "message": "TTS model is being downloaded, please wait..."}
+                return {"state": "loading",
+                        "message": (self._load_status
+                                    or "TTS model is being downloaded, please wait...")}
             if self._load_error or not self._adapter:
                 return {"state": "error", "message": f"TTS model not available: {self._load_error or 'not loaded'}"}
             text = args.get("text", "")
@@ -2034,7 +2063,22 @@ class SherpaOnnxTTSPlugin:
             if needs_rebuild or self._adapter is None:
                 changed = sorted(incoming) if needs_rebuild else ['(no model loaded)']
                 log.info("[tts] rebuilding the adapter: %s changed", ", ".join(changed))
-                self._adapter = _build_tts_adapter(self._cfg)
+                # `_loading` had no writer before this: the flag and the "loading"
+                # reply below both existed, so `info` could never report a rebuild
+                # that was actually in progress. Setting it here is what makes the
+                # progress line reachable — a Kokoro rebuild is a 515 MB download
+                # on a cold /models, and until now the card said nothing at all.
+                self._loading = True
+                self._load_status = None
+                try:
+                    self._adapter = _build_tts_adapter(
+                        self._cfg,
+                        on_status=lambda text: setattr(self, "_load_status", text))
+                finally:
+                    # Cleared on the failure path too, or one failed rebuild would
+                    # leave every later `info` claiming to be loading forever.
+                    self._loading = False
+                    self._load_status = None
                 self._load_error = None
                 # Nodes hold the old adapter, so they have to go — but only when
                 # there really is a new adapter for them to pick up.

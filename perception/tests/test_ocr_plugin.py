@@ -48,9 +48,13 @@ class _BuilderProbe:
         self.delay = delay
         self.calls = 0
         self.built = []
+        self.on_status = None
         self.lock = threading.Lock()
 
-    def __call__(self, cfg):
+    def __call__(self, cfg, on_status=None):
+        # Mirrors _build_ocr_adapter: the plugin passes a status sink so the
+        # bundle download's progress reaches the card.
+        self.on_status = on_status
         with self.lock:
             self.calls += 1
         if self.delay:
@@ -337,7 +341,7 @@ def test_ocr_add_node_failure_leaks_nothing(monkeypatch):
 def test_ocr_load_failure_reports_error_and_retries(monkeypatch):
     calls = {"n": 0}
 
-    def flaky_builder(cfg):
+    def flaky_builder(cfg, on_status=None):
         calls["n"] += 1
         if calls["n"] == 1:
             raise RuntimeError("download failed")
@@ -551,7 +555,7 @@ def test_recognize_by_url_shares_the_photo_path(monkeypatch, tmp_path):
 
 
 def test_recognize_surfaces_an_adapter_load_failure(monkeypatch, tmp_path):
-    def explode(cfg):
+    def explode(cfg, on_status=None):
         raise RuntimeError("no engines")
 
     cfg = {"provider": "rapidocr", "image_roots": [str(tmp_path)]}

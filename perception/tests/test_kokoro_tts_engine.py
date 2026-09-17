@@ -69,7 +69,10 @@ def _kokoro(monkeypatch):
     _LangCountingAdapter.builds = 0
     holder = {}
 
-    def build(cfg):
+    def build(cfg, on_status=None):
+        # Mirrors _build_tts_adapter: the plugin hands it a status sink so a
+        # rebuild's download progress reaches the card.
+        holder["on_status"] = on_status
         holder["adapter"] = _LangCountingAdapter(cfg)
         return holder["adapter"]
 
@@ -210,7 +213,7 @@ def test_kokoro_defaults_to_gpu_and_the_others_to_cpu(monkeypatch):
 
     monkeypatch.setattr(tts, "KokoroTTSAdapter", _Recorder)
     monkeypatch.setattr(tts, "MatchaTTSAdapter",
-                        lambda md, sid, sp, dev: seen.update(device=dev) or object())
+                        lambda md, sid, sp, dev, on_status=None: seen.update(device=dev) or object())
 
     tts._build_tts_adapter({"engine": "kokoro-multi"})
     assert seen["device"] == "gpu", "kokoro must default to gpu"
@@ -603,8 +606,10 @@ def _downloader(monkeypatch):
     calls = []
     monkeypatch.setattr(
         model_downloader, "ensure_verified_archive",
-        lambda name, model_dir, url, entry: calls.append(
-            {"name": name, "model_dir": model_dir, "url": url, "entry": entry}),
+        lambda name, model_dir, url, entry, progress_cb=None, stage_cb=None:
+            calls.append({"name": name, "model_dir": model_dir, "url": url,
+                          "entry": entry, "progress_cb": progress_cb,
+                          "stage_cb": stage_cb}),
     )
     monkeypatch.setitem(model_downloader.KOKORO_MODEL_ARCHIVES, "gpu", {
         "archive": "kokoro-multi-v1_0-24k-fp32.tar.gz", "size": 1, "sha256": "aa"})

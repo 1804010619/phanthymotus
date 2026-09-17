@@ -103,6 +103,28 @@ FACE_MODELS = {
 }
 DEFAULT_FACE_MODEL = "buffalo_sc"
 
+
+def face_bundle_for(model: str, model_dir: str) -> tuple[str, str]:
+    """Resolve a model name to the ``(directory, bundle)`` its weights live in.
+
+    Shared with the parent process rather than kept inside FaceAnalyzer: the
+    analyzer is built in the ORT worker child, whose protocol is request/reply
+    with no way to push download progress back. So the parent fetches the
+    weights first (a pure HTTP + hashing job — it creates no ORT session) and
+    the child's own ensure_face_model call then finds a verified bundle and
+    returns at once. Both sides must agree on where that is, and this is the
+    one function that decides.
+    """
+    spec = FACE_MODELS.get(model)
+    if spec is None:
+        raise ValueError(
+            f"unknown face model {model!r}; this build has {sorted(FACE_MODELS)}")
+    # An explicitly configured model_dir wins, so an operator can point at a local
+    # copy; otherwise the registry's own directory is used.
+    if model_dir == DEFAULT_FACE_MODEL_DIR:
+        model_dir = spec["dir"]
+    return model_dir, spec.get("bundle", "face")
+
 DET_MODEL_FILE = "det_500m.onnx"
 REC_MODEL_FILE = "w600k_mbf.onnx"
 
@@ -281,12 +303,12 @@ class FaceAnalyzer:
             )
         self._model = model
         det_name, rec_name = spec["det"], spec["rec"]
-        # An explicitly configured model_dir wins, so an operator can point at a local
-        # copy; otherwise the registry's own directory is used.
-        if model_dir == DEFAULT_FACE_MODEL_DIR:
-            model_dir = spec["dir"]
+        model_dir, bundle = face_bundle_for(model, model_dir)
 
-        paths = ensure_face_model(model_dir, bundle=spec.get("bundle", "face"))
+        # Normally a no-op: the parent prefetched these so it could report
+        # progress. Still called, because this class must work when it is the
+        # only thing that runs — a test, or a future in-process caller.
+        paths = ensure_face_model(model_dir, bundle=bundle)
         det_path = paths.get(det_name) or os.path.join(model_dir, det_name)
         rec_path = paths.get(rec_name) or os.path.join(model_dir, rec_name)
 
