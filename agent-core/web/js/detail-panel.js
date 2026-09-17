@@ -25,11 +25,16 @@ let _ws       = null;
 let _status   = null;   // overlay that says why nothing is on screen
 let _staleTimer = null;
 let _frames   = 0;
+let _textLike = false;  // 文本/活动流；其余都是画布
 
 // How long without a frame before the panel stops implying the stream is live.
 // A <canvas> keeps its last painted pixels forever, so a stalled stream is
 // indistinguishable from a running one unless something says so.
 const STALE_MS = 10000;
+
+// 连接中／等待数据这类提示始终居中：那时面板上本来就没有内容可遮。
+const _CENTERED = 'position:absolute;left:0;right:0;top:50%;transform:translateY(-50%);' +
+  'text-align:center;font-size:13px;padding:0 16px;pointer-events:none;z-index:2';
 
 export function initDetailPanel() {
   _panel = document.getElementById('detail-panel');
@@ -55,8 +60,17 @@ function _setStatus(text, tone = 'dim') {
 
 function _armStaleTimer() {
   clearTimeout(_staleTimer);
+  // 文本和活动流不需要这条提示，所以连定时器都不武装。
+  //
+  // 它存在的理由只对画布成立：canvas 会把最后一帧永远留在屏幕上，停掉的流和
+  // 活着的流长得一模一样，不说一声就分不出来。日志不是这样 —— 每一行自带
+  // 时间戳，停没停它自己就说明了。对着一段会自己说话的内容再压一层提示，
+  // 唯一的效果是盖住一行数据。
+  if (_textLike) return;
   _staleTimer = setTimeout(() => {
-    if (_frames > 0) _setStatus(`已暂停 — ${Math.round(STALE_MS / 1000)} 秒没有新数据，画面是最后一帧`, 'warn');
+    if (_frames > 0) {
+      _setStatus(`已暂停 — ${Math.round(STALE_MS / 1000)} 秒没有新数据，画面是最后一帧`, 'warn');
+    }
   }, STALE_MS);
 }
 
@@ -73,6 +87,7 @@ export function showTopicDetail(topicPath, format) {
 
   const hint     = format || 'activity';
   const Renderer = RENDERERS.find(r => r.canRender(hint)) || ActivityRenderer;
+  _textLike = Renderer === TextRenderer || Renderer === ActivityRenderer;
 
   _renderer = Object.assign(Object.create(Object.getPrototypeOf(Renderer)), Renderer);
   _renderer.mount(body, 'detail');
@@ -80,8 +95,7 @@ export function showTopicDetail(topicPath, format) {
   _frames = 0;
   _status = document.createElement('div');
   _status.className = 'detail-status';
-  _status.style.cssText = 'position:absolute;left:0;right:0;top:50%;transform:translateY(-50%);' +
-    'text-align:center;font-size:13px;padding:0 16px;pointer-events:none;z-index:2';
+  _status.style.cssText = _CENTERED;
   body.style.position = body.style.position || 'relative';
   body.appendChild(_status);
   _setStatus('正在连接…');
@@ -199,6 +213,7 @@ function _cleanup() {
   clearTimeout(_staleTimer);
   _staleTimer = null;
   _frames = 0;
+  _textLike = false;
   if (_status) {
     _status.remove();
     _status = null;
