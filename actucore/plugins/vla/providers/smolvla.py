@@ -419,18 +419,34 @@ class SmolVLAProvider:
                 import shutil
                 shutil.copy2(source, target)
 
-        with open(os.path.join(resolved, CONFIG_FILE), "w", encoding="utf-8") as handle:
-            json.dump({**config, "vlm_model_name": self._vlm_dir}, handle)
+        self._write_sidecar(resolved, CONFIG_FILE,
+                            {**config, "vlm_model_name": self._vlm_dir})
 
         if preprocessor:
             for step in preprocessor.get("steps") or []:
                 if step.get("registry_name") != "tokenizer_processor":
                     continue
                 step.setdefault("config", {})["tokenizer_name"] = self._vlm_dir
-            path = os.path.join(resolved, PREPROCESSOR_FILE)
-            with open(path, "w", encoding="utf-8") as handle:
-                json.dump(preprocessor, handle)
+            self._write_sidecar(resolved, PREPROCESSOR_FILE, preprocessor)
         return resolved
+
+    @staticmethod
+    def _write_sidecar(resolved: str, name: str, document: dict):
+        """Write one rewritten file, replacing rather than opening any link.
+
+        **Unlinking first is the whole point.** An earlier version of this file
+        rewrote only `config.json`, so every other file — the preprocessor
+        included — is already a *hard link* to the pinned original in every
+        checkpoint staged before this change. `open(..., "w")` on a hard link
+        truncates the shared inode, which would destroy the very file whose
+        SHA256 proves the download is intact, and it would do so on the first
+        load after an upgrade.
+        """
+        path = os.path.join(resolved, name)
+        if os.path.exists(path):
+            os.unlink(path)
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(document, handle)
 
     def _read_config(self) -> dict:
         path = os.path.join(self._model_dir, CONFIG_FILE)

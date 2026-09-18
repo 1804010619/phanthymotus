@@ -26,6 +26,7 @@ Run: cd actucore && PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python3 -m pytest tests/tes
 from __future__ import annotations
 
 import json
+import os
 import pathlib
 import sys
 import types
@@ -493,6 +494,29 @@ def test_the_rewrite_leaves_the_pinned_originals_alone(checkpoint,
                 if s["registry_name"] == "tokenizer_processor"
                 )["config"]["tokenizer_name"] == HUB_ID
     assert (resolved / "model.safetensors").exists()    # weights still linked
+
+
+def test_upgrading_over_an_old_sidecar_does_not_truncate_the_pinned_original(
+        checkpoint, staged_backbone):
+    """Every checkpoint staged before this change has the preprocessor in
+    `.resolved` as a *hard link* to the original, because the old code rewrote
+    only config.json and linked everything else. Opening that path for writing
+    truncates the shared inode — destroying the file whose SHA256 proves the
+    download is intact, on the first load after an upgrade.
+    """
+    _write_checkpoint(checkpoint, vlm_model_name=HUB_ID, tokenizer_name=HUB_ID)
+    stale = checkpoint / ".resolved"
+    stale.mkdir()
+    os.link(checkpoint / "policy_preprocessor.json",
+            stale / "policy_preprocessor.json")          # what the old code left
+
+    provider = make_provider(checkpoint, vlm_dir=str(staged_backbone))
+
+    original = json.loads((checkpoint / "policy_preprocessor.json").read_text())
+    assert next(s for s in original["steps"]
+                if s["registry_name"] == "tokenizer_processor"
+                )["config"]["tokenizer_name"] == HUB_ID
+    assert _staged_tokenizer(provider._resolve_dir) == str(staged_backbone)
 
 
 def test_a_subdirectory_in_the_checkpoint_does_not_break_the_rewrite(
