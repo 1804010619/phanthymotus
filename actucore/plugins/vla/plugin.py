@@ -512,6 +512,12 @@ class VLAPlugin:
                 "rate_hz": self._rate_hz,
                 "ttl_ms": self._ttl_ms,
                 "published": self._published,
+                # What `resume` will do. `pause` and `interrupt` both leave the
+                # card reporting `state: paused` — the only thing that tells
+                # them apart afterwards is whether the plan survived, and
+                # without this number nothing exposes that. A halted card
+                # showing 0 here will re-infer; one showing 9 will replay.
+                "chunk_pending": max(0, len(self._chunk) - self._chunk_index),
                 "capabilities": dict(self._capabilities),
                 "control_interface": dict(self._descriptor),
                 "error": self._last_error,
