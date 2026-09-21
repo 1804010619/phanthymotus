@@ -1,6 +1,10 @@
 # Perception Stack
 
-Modular ASR/TTS perception plugins running as an MCP HTTP server. Connects to Agent Core via MCP tool calls and exchanges audio/text over ROS2 DDS topics.
+Perception plugins running as one MCP HTTP server: speech (`asr`, `tts`),
+vision (`vop` object detection, `visual_depth` monocular depth, `ocr`,
+`face_recognition`). Connects to Agent Core via MCP tool calls and exchanges
+audio, images and results over ROS2 DDS topics. On Jetson the vision models and
+the local TTS engines run on TensorRT.
 
 ## Audio Requirements for ASR
 
@@ -75,11 +79,117 @@ The VAD parameters can be adjusted per ASR canvas card via the instance config (
 
 ---
 
+## Model downloads: the two rules
+
+Every model in this project is fetched at runtime, never committed. Two things are
+required of any code path that does the fetching. They are not style preferences —
+each one is here because its absence produced a specific bad outcome on a robot.
+
+### 1. Pinned by size and SHA256, and free to choose a source
+
+Every file carries a `size` and a `sha256`, verified before the download is
+accepted (`utils/model_downloader.py`). A `check_file`-exists test is not
+verification: a truncated 780 MB transfer passes it and then fails at session
+creation in a way nobody can diagnose.
+
+Because the pins are what establish trust, `base_url` may be a **list** of hosts
+rather than one, and the machine picks: the sources are probed once with a 512 KB
+ranged read on the largest file and used **fastest-first**, falling through on
+failure. COS is faster from inside the VPC, ModelScope from several of the rigs,
+and no single answer is right everywhere. Choosing by measurement is safe *only*
+because the integrity check does not care which host answered — without the pins,
+"try another mirror" would mean "fetch something unverified from wherever".
+
+A source is a base URL, or a template containing `{file}` for a host that takes
+the path as a query parameter (ModelScope's repo API). An environment override
+(`<X>_MODEL_BASE_URL`) **replaces** the first source rather than being added in
+front of it.
+
+### 2. It must say how far along it is
+
+**A download with no progress is indistinguishable from a hang.** A card shows one
+status line; a cold fetch runs from two seconds (a 4 MB tflite) to minutes (a
+~900 MB SmolVLA checkpoint, and its ~1 GB backbone after it). For a long time only
+ASR reported anything, and every other card sat on a fixed sentence for the whole
+transfer — which is what an operator reads as stuck, and then restarts, and then
+reports as a bug.
+
+So a plugin that downloads weights **must** thread a status sink through to the
+downloader:
+
+```python
+from utils.model_progress import fetch_status
+
+progress_cb, stage_cb = fetch_status(on_status, "sensevoice-small")
+ensure_model(name, model_dir, progress_cb=progress_cb, stage_cb=stage_cb)
+# card shows: 正在下载模型 'sensevoice-small' … 40% (180/449 MB)
+```
+
+Four things follow from that, each learned the hard way:
+
+- **Use `utils/model_progress.fetch_status`, do not format the line yourself.**
+  Seven plugins render this; the wording lives in one place so they cannot drift.
+- **Archives need `stage_cb` too.** A percentage lies at the end of an archive
+  download: a 515 MB Kokoro tarball still has to be decompressed and merged, and
+  `100% (515/515 MB)` frozen on the card for tens of seconds reads as a hang. The
+  helper turns `"extract"` into 正在解压模型 ….
+- **The status line needs somewhere reachable to land.** Adding the callback is
+  half the job — check that the plugin's `info`/`state` can actually be answered
+  while the download is in flight. Two cases found exactly here: the TTS plugin's
+  `_loading` flag had no writer at all, so its "downloading" reply was unreachable
+  code; and the VLA card answered `idle` through a multi-gigabyte fetch because
+  `_running` is only set afterwards.
+- **A download that cannot report progress is a design problem, not an exception.**
+  Face's weights load in the ORT worker child, whose protocol is request/reply with
+  no way to push progress back — so the *parent* fetches them first (pure HTTP and
+  hashing, no ORT session) and the child's own call then finds a verified bundle
+  and returns at once.
+
+Callbacks fire only while work is happening: a verified cache returns without a
+single call, so a warm start never flashes a percentage — which is why the caller
+must still set its own "preparing" line before calling in.
+
+---
+
+## SoundEvent model downloads
+
+SoundEvent loads its YAMNet TFLite model in the background on the first `start`.
+It reuses a verified cache in `/models/soundevent`; otherwise it registers two
+download base URLs as one multi-source bundle:
+
+1. The project COS location, `${COS_BASE}/soundevent` — or whatever
+   `SOUNDEVENT_MODEL_BASE_URL` is set to, which **replaces** it (same convention
+   as `OCR_MODEL_BASE_URL` and `FACE_MODEL_BASE_URL`).
+2. [ModelScope](https://www.modelscope.cn/models/zhangyiqun/yamnet-audio-classification-tflite/resolve/master).
+
+**The order above is only a tiebreak — the machine chooses.** As for every other
+multi-source bundle (`utils/model_downloader.py` § multi-source), the sources
+are probed once with a short ranged read and used **fastest-first**: COS is faster
+from inside the VPC, ModelScope is faster from several of the rigs, and neither
+answer is right everywhere. A source that cannot be reached, or that answers
+quickly with something too short to be the file, measures as unusable and is
+dropped rather than tried; only if *every* probe fails is the declared order used.
+
+The downloader appends `yamnet_classification.tflite` to each base URL (or
+substitutes `{file}`, for a host like ModelScope's repo API that takes the path as
+a query parameter). Each source keeps the three-attempt retry policy; HTTP errors
+(including a missing COS object), connection errors, timeouts, or failed file
+validation fall through to the next source, and the warning names the root cause so
+a down mirror is distinguishable from a corrupt one. If both sources fail, the
+instance reports a model-loading error and a later `start` can retry.
+
+Every source must supply the same 4,126,810-byte file with SHA-256
+`10c95ea3eb9a7bb4cb8bddf6feb023250381008177ac162ce169694d05c317de`.
+Unverified downloads never replace the model cache. Set the environment
+variable before starting Perception to prefer another mirror; it is optional.
+
+---
+
 ## TTS Engines
 
 `tts_engine` (configSchema on the `tts` tool, and `plugins.tts.engine` in
 `config.yaml`) selects the voice. Engines are named **`<model>-<languages>`** —
-the same shape `asr_model` uses (`x-asr-zh-en`, `paraformer-zh-en`, `zipformer-en`),
+the same shape `asr_model` uses (`x-asr-zh-en`, `parakeet-en`, `sensevoice-small`),
 because the dashboard renders the raw enum string, so these two dropdowns sit side
 by side in front of the same operator. Language codes, not country codes: `zh`, not
 `cn`. Naming an engine after its *runtime* was the previous mistake — `matcha-zh-en`
@@ -410,35 +520,244 @@ thing to do here — current misaki targets a newer Kokoro with a larger vocabul
 A test asserts every phoneme the table can emit exists in `tokens.txt`. The absence of
 that assertion is what let the original 12-drop bug ship.
 
-**This session is CPU-only by construction, and that is not a tuning decision.** On
-jp6.1 the standalone onnxruntime (1.18.0) and sherpa's bundled one (1.18.1) share a
-single `libonnxruntime_providers_cuda.so` — the Dockerfile copies sherpa's into
-`onnxruntime/capi/` to get the face plugin onto the GPU, and the soname collides so the
-first `dlopen` wins. Separate graphs coexist fine, but a *second* CUDA session on the
-**Kokoro** graph fails in whichever runtime did not load the provider, symmetrically:
+**This session runs in a process of its own, and that is not a tuning decision.** Two
+ONNX Runtimes live in the perception process — sherpa's bundled one and the standalone
+`onnxruntime` wheel that also serves face recognition — and they cannot both hold a CUDA
+session on the Kokoro graph. The reason is in the dynamic linker, not in either library:
+
+`libonnxruntime_providers_shared.so` is an 8 KB library exporting exactly
+`Provider_GetHost` and `Provider_SetHost` — a process-global slot holding **one** pointer
+to **one** runtime's `ProviderHost`. It carries a SONAME, and `ld.so` deduplicates a
+`dlopen` by matching the requested *basename* against already-loaded objects, so the
+second runtime's copy is never mapped: both get the first one. Each runtime writes its own
+host into that slot as it loads a provider, **last writer wins**, and the next session
+built runs against the other runtime's framework objects:
 
 | order | result |
 |---|---|
-| sherpa's CUDA session first | the standalone one fails, error names `/home/tian/Yxh/…` |
-| the standalone one first | **sherpa** fails, error names `/home/yifanl/…` |
+| sherpa's CUDA session first | the standalone one fails, error names sherpa's build path |
+| the standalone one first | **sherpa** fails, error names the standalone build's path |
 
 both with `Error mapping output names: Could not find OrtValue with name
-'/Squeeze_2_output_0'`. Order does not save it; staying off CUDA does. `KokoroDirect`
-therefore takes **no device argument**, so it cannot be asked.
+'/Squeeze_2_output_0'`. Verified by watching `Provider_GetHost()` change value with only
+ever one bridge mapped. **On jp5.11 the same collision is a SIGSEGV that kills the whole
+perception process**, taking ASR, VOP, OCR and face with it — worse than jp6.1, and it had
+never been exercised there because only Japanese reaches this path.
 
-The cost is confined to Japanese, and it is affordable. Measured on Orin 6, one process,
-Japanese synthesized first so its CPU session is live throughout:
+Order does not save it, and neither does anything short of a process boundary. Four
+narrower fixes were tried and measured: a version-matched 1.18.1 build (still collides),
+renaming the bridge's SONAME (`ld.so` matches the *other* object's SONAME, so changing
+ours does nothing), renaming its symbols (the second file is then never mapped at all),
+and finally renaming both the bridge and the CUDA provider *files* — which does work, but
+only by forking ONNX Runtime's ABI and maintaining a build per JetPack line.
+
+So `plugins/kokoro_worker.py` spawns a child that is the only ONNX Runtime in its address
+space. `spawn`, never `fork`: `fork` copies already-`dlopen`ed libraries, so a forked child
+would inherit sherpa's runtime and the isolation would be worthless.
+
+**What that buys, measured on Orin 6** — one 9.3 s utterance, 121 tokens:
+
+| | first call | steady state |
+|---|---|---|
+| in-process, cpu (the previous shape) | RTF 0.555 | RTF 0.525 |
+| **worker, cuda** | RTF 0.861 (8.03 s, cold kernels) | **RTF 0.063** |
+
+**What it costs**, whole-box `MemAvailable`, measured end to end through the real adapter
+on Orin 6:
+
+| | while resident | after `close()` |
+|---|---|---|
+| in-process cpu session (the previous shape) | 820 MB | **never returned** |
+| worker holding a cuda session | 1585 MB | ~330 MB residual (1191 MB reclaimed) |
+
+So it is more expensive *while speaking Japanese* and cheaper once it is done, which the
+in-process version could never be. A spawned child's own baseline is only 32–40 MB, so the
+extra interpreter is not the expensive part; the CUDA context is. An earlier note here
+quoted "+372 MB net" from a differently-sequenced measurement — the table above is the one
+taken through the adapter and is the one to trust.
+
+The process boundary itself is free enough to ignore. Only a phoneme string goes in and
+the float32 waveform comes out; the parent still does the resample, the 3200-byte framing,
+the pacing and the DDS publish, so it is **one round trip per utterance, not per frame**.
+Measured with a real 0.89 MB payload (9.3 s at 24 kHz): **2.7 ms mean, 335 MB/s** — 0.45%
+of the 590 ms the GPU synthesis itself takes.
+
+Three consequences worth knowing before turning it on:
+
+- **Nothing is spent unless the card's language is `ja`.** `_direct()` is reached only from
+  `_synthesize_japanese`, which is behind `if self._language == "ja"`. A card configured
+  for any of the other eight languages never spawns the child. A card configured *as* `ja`
+  pays at card start, because the construction-time warmup goes through the same branch.
+- **The first CUDA call costs 8.03 s**, so the child is warmed during startup and kept
+  alive. A per-utterance child would be far worse than the CPU path it replaces.
+- **It is reaped after two minutes idle**, which also fixes a leak the in-process version
+  had: `_direct_runtime` was assigned once and never released, so a card that spoke
+  Japanese once kept the session for the adapter's whole life even after switching back to
+  English. Reaping on idle rather than on the language switch is deliberate — the cold path
+  is ~15 s measured end to end and an alternating tour would otherwise pay it on every
+  switch. Card stop and engine switch close it immediately.
+
+Verified through the real adapter on Orin 6: no worker exists until Japanese is used;
+`en-us`/`zh` keep RTF ~0.11 with the worker resident; Japanese alternates with them at
+RTF 0.067–0.070; `kill -9` on the child recovers; `close()` reclaims ~1.2 GB and a later
+Japanese utterance rebuilds.
+
+#### Fixed: every standalone-ORT session lives in one child process
+
+The hazard this section used to describe — face on gpu before Kokoro on gpu, which
+could not build the TTS engine at all — is gone, and so is the whole class it belonged
+to. `plugins/ort_worker.py` spawns **one** child that owns every standalone-ONNX-Runtime
+session, so the perception process holds only sherpa's runtime and the two can no longer
+reach each other.
+
+Not one process per card: one per **runtime**, which is the boundary the bug has. CUDA
+contexts therefore do not increase — the parent used to hold sherpa's *and* the
+standalone one's; now it holds sherpa's and the child holds the standalone one.
+
+`spawn`, never `fork`. `fork` copies the address space including already-`dlopen`ed
+libraries, so a forked child would inherit sherpa's runtime and the isolation would be
+worthless. A test asserts it, because that one word is the entire guarantee.
+
+**Where the boundary is, and why not further in.** The first attempt split at
+`InferenceSession.run` and left decoding, letterboxing, alignment and the quality gate
+in the parent. It worked and it was the wrong cut:
+
+| | in-process | split at `run()` | **whole pipeline in the child** |
+|---|---|---|---|
+| a frame, jp6.1 | ~46 ms | ~78 ms | **48.1 ms** |
+| a frame, jp5.11 | — | — | **26.4 ms** |
+
+because the parent was sending a 2.93 MiB normalised blob and getting **0.96 MiB of
+pre-threshold candidates** back — SCRFD returns 16 800 of them and a frame keeps nought
+to eight — then a 147 kB crop per face for a 2 kB embedding. What the parent actually
+holds is the `CompressedImage` JPEG, ~232 kB, and what it wants is a few boxes and a
+512-float vector each. So the frame crosses **once, compressed**, and
+`plugins/face_service.py` runs decode → detect → decode-head → align → sharpness →
+**the quality gate** → embed inside the child. The gate has to come along: it sits
+between alignment and embedding and decides which faces are worth embedding at all.
+
+What stays in the parent: the FaceDB (`matrix @ embedding` on a 2 kB vector, its lock,
+its files), subject selection, the payload, ROS publishing, the enrolment window. None
+of it touches ONNX.
+
+`FaceAnalyzer` now **refuses to be constructed outside the child** rather than
+documenting that it should not be. A test also walks the plugin tree for
+`ort.InferenceSession` calls and fails on any outside the three files allowed to have
+one, because a new caller adding one would reintroduce a SIGSEGV silently.
+
+**Verified on both lines**, in the order that fails on main: face's sessions up first,
+then sherpa's Kokoro engine builds; Japanese and face share one child and interleave;
+dropping one service leaves the other running.
+
+**Two things that are not settled**, recorded rather than smoothed over:
+
+- **A dropped session does not return memory to the OS.** Measured: unloading Kokoro
+  from the child moved `MemAvailable` by **+0 MB**. The CUDA pool is returned on process
+  exit, not on session destruction, so unloading frees space *inside* the child for
+  reuse and stops the headroom guard mis-reading the box — it does not give memory back.
+  An earlier version of this section claimed it did.
+- **The face path has only been exercised on frames with no faces in them.** The
+  embedding, the aligned-crop return and the registration paths have unit coverage and
+  no on-device run.
+
+#### jp5.11 runs Japanese on the CPU, for two independent reasons
+
+Both were measured on Orin 5, and both had to be guarded, because they fail at different
+moments.
+
+**1. The CUDA path computes durations wrongly.** The graph *is* stochastic — 4
+`RandomNormalLike` and 7 `RandomUniformLike` nodes — so the waveform differs run to run
+and between providers **by design**, and "cpu output must equal cuda output" is not a
+valid check. The **duration** is not stochastic, and that is where the defect shows:
+
+| | cpu | cuda |
+|---|---|---|
+| jp6.1, 8 runs | 8.35 s, stdev 0.000, 1 distinct length | 8.35 s, stdev 0.000, 1 distinct length |
+| **jp5.11**, 8 runs | 8.35 s, stdev 0.000, 1 distinct length | **6.05 s**, stdev 0.053, 3 distinct lengths |
+
+27.5% short is audibly rushed speech. The probe used for warmup gates this: 10 tokens
+give exactly 47400 samples on CPU **on both lines**, jp6.1's CUDA matches exactly, and
+jp5.11's CUDA returns 16800–21000. Gating on the ORT version number would be the wrong
+fix — it would not catch the next line with the same defect — so the gate is the
+measurement, and it is free because the probe already ran.
+
+**2. A CUDA child does not fit.** sherpa's own Kokoro GPU adapter takes **3.2 GB** on
+jp5.11 against ~950 MB on jp6.1, so a CUDA child's allocation OOM-killed the rig —
+`dmesg`: `Out of memory: Killed process … (python3) anon-rss:2420028kB` — **before the
+probe could run**. So the duration gate alone is not enough; a headroom check has to come
+first, because it is the one that can take the process down.
+
+**No silent substitution.** An earlier revision quietly used the CPU when the GPU was
+unavailable, and that produced the worst state available: a card configured for `gpu`,
+running at RTF 0.52 instead of 0.07, with the reason in a log line nobody reads. It
+took a measurement to explain why Japanese "felt slow". The card now goes
+`state: error` and the message names **which** of the two problems it hit, because they
+have different fixes:
+
+| | what it means | what to do |
+|---|---|---|
+| *not enough memory …* | the GPU is fine, the box is full | free memory, or set `japanese_worker_device: cpu` |
+| *… computes the duration path wrongly* | the GPU works and gets the wrong answer | set `japanese_worker_device: cpu`; freeing memory will not help |
+
+The second verdict is **recorded on the machine**, keyed by the ONNX Runtime version,
+because the attempt is not free: one rejected CUDA session took Orin 5's MemAvailable
+from 5754 MB to 1935 MB and **kept it** — unloading does not return it. A crash restarts
+perception, so an in-memory verdict would be lost and the next start would pay again.
+That is how face's later GPU load tipped that box into the OOM killer. Delete
+`.cuda-duration-verdict` in the model directory to force a re-evaluation.
+
+The headroom figure depends on **who else is in the child**, because the first CUDA
+session there pays for the context and the rest do not:
+
+| | measured | threshold |
+|---|---|---|
+| Kokoro alone, bringing its own context | 1585 MB | 2500 MB |
+| Kokoro beside the face service | **967 MB** | 1400 MB |
+
+A single conservative number refused the second case on the first case's evidence: with
+2158 MB free on an otherwise idle jp6.1 box, a 967 MB allocation was declined. With the
+guard asking `ort_worker.has_cuda_session()` first, face and Japanese now **both run on
+the GPU in the same child** on jp6.1 — Japanese at RTF 0.089 while face recognises at
+29.7–37.8 ms. An earlier version of this section said a 7.4 GB box could not fit both;
+that was true of two CUDA *contexts* and not of two sessions.
+
+jp5.11 needs `japanese_worker_device: cpu` set explicitly, and the error says so if it
+is not. Two independent reasons, either one disqualifying:
+
+- **its CUDA renders this graph wrongly** — confirmed by ear, and the cause is not
+  known. Ruled out: the two-runtime collision, the model file, TF32, the ONNX Runtime
+  version, and the CUDA provider binary. The full record, so nobody repeats those five
+  experiments, is **[docs/jp511-cuda-kokoro.md](docs/jp511-cuda-kokoro.md)**;
+- and separately, the box rarely has room.
+
+Worth being precise about what was *not* broken, because "GPU works on jp5.11" is also
+true: sherpa's own engines and face both run on the GPU there and always have.
+`KokoroDirect` is the only thing affected, it exists only for Japanese, and it was
+pinned to the CPU from the day it was written, so this path had never been exercised on
+that line until now.
+**The residual risk is stated rather than hidden**: the thresholds are heuristics, and
+there is a window where CUDA would be attempted on jp5.11 — the duration gate catches it
+if the build survives, and does not if the box OOMs first. `japanese_worker_device: cpu`
+removes the window on that line.
+
+Both CPU configurations remain safe, and are safe for the same reason: a CPU-only session
+loads no CUDA provider, so it never touches the bridge. `japanese_worker_device: cpu` keeps
+the process boundary at RTF 0.525; `japanese_worker: false` goes back to the in-process CPU
+session entirely. That fallback also happens automatically if the child cannot start or
+dies — Japanese losing 8× is acceptable, Japanese breaking is not.
+
+The other eight languages are unaffected either way. Measured in one process with the
+Japanese session live throughout:
 
 | language | runtime | RTF |
 |---|---|---|
 | en-us / en-gb | sherpa, cuda | 0.31 / 0.21 |
 | zh | sherpa, cuda | 0.14 |
 | es / fr / it / pt-br / hi | sherpa, cuda | 0.10 – 0.11 |
-| **ja** | **direct ONNX, cpu** | **0.54** |
+| **ja** | **worker, cuda** | **0.063** |
 
-Real time with margin, and the other eight languages keep the GPU. Threads are the only
-lever left for Japanese and they matter — `intra_op_num_threads` defaults to one per
-core (RTF 0.52); the ORT default of 2 gives 1.17, i.e. slower than real time.
+On the CPU path, threads are the only lever and they matter — `intra_op_num_threads`
+defaults to one per core (RTF 0.52); the ORT default of 2 gives 1.17, slower than real time.
 
 **Pitch accent is not implemented and cannot be with this model.** The pinned misaki has
 no accent code at all (it arrived in 2025-04, alongside the larger vocabulary above),
@@ -692,10 +1011,50 @@ just a different provider string.
 | `asr_model` | `device: cpu` | `device: gpu` | gpu speed-up |
 |-------------|---------------|---------------|--------------|
 | `sensevoice-small` (default) | int8, 228 MB | **fp16, 448 MB** | **3.4x** per utterance ⚠️ |
-| `paraformer-zh-en` (streaming) | int8, 226 MB | **fp32, 825 MB** | **1.77x** |
 | `x-asr-zh-en` | int8 + fp32 | — not offered | 0.80x, i.e. slower |
-| `paraformer-offline` | int8 | — not offered | unmeasured |
-| `zipformer-en` | int8 | — not offered | unmeasured |
+| `parakeet-en` | int8, 104 MB | **fp32, 437 MB** | **4.9x** long / **2.0x** short |
+
+### Removed models
+
+`paraformer-zh-en`, `paraformer-offline` and `zipformer-en` were dropped from the
+registry for accuracy. The two bilingual paraformers were worse than
+`sensevoice-small` on the same audio; `zipformer-en` is LibriSpeech — 960 h of
+clean read audiobook speech — which is the wrong distribution for a robot whose
+microphone always carries cooling-fan noise.
+
+`REMOVED_ASR_MODELS` in `plugins/asr.py` maps each of them onto a replacement
+(the paraformers → `sensevoice-small`, `zipformer-en` → `parakeet-en`) and logs a
+warning. That map is not politeness: a card's `asr_model` lives in agent-core's
+config DB **on each robot**, so an upgrade cannot rewrite it. A removed name that
+resolves to nothing makes `config` return an error and the card comes up
+`state: error` after the next restart, on every deployment that had picked one.
+Do not delete an entry from that map when you remove a model — add one.
+
+**`parakeet-en` is the English model.** NeMo FastConformer CTC 110M, trained on
+~1.7 M h of diverse audio with non-speech material deliberately mixed in to
+suppress hallucination, and it emits punctuation and capitalisation, which
+`zipformer-en` did not. It is also the smallest offline English archive here
+(104 MB int8) and needs no new runtime: `OfflineRecognizer.from_nemo_ctc` has been
+in the pinned sherpa-onnx 1.13.6 all along.
+
+Measured inside the perception image on both JetPack lines, cpu provider,
+`num_threads=2` — RTF 0.039/0.054 on Orin 6 (jp6.1) and 0.040/0.055 on Orin 5
+(jp5.11) for the bundle's 7.4 s and 1.0 s samples. Roughly 25x realtime on either
+line, with punctuation and capitalisation in the transcript. CPU was the point of
+picking this model, and cpu remains the sensible default for it.
+
+A gpu pair is offered as well, and it went through the admission rule below on
+both lines: 6 runs each, first discarded as warmup, against the int8 cpu entry.
+The 7.43 s clip takes 56/57 ms on cuda against 275/271 ms on cpu (~4.9x); the
+0.99 s clip takes 26/29 ms against 52/51 ms (~2.0x). The short clip wins less
+because fixed per-call overhead dominates, and short is the shape most robot
+utterances have — budget for ~2x, not ~5x. Transcripts were read, not just timed:
+all six configurations returned byte-identical text, stable across repeats, with
+none of the silent empty-transcript failure sensevoice fp16 shows on CUDA. The
+weights are fp32 because no fp16 variant is published upstream and int8 on CUDA
+is slower, not faster. Cold start on cuda is ~2.1 s on jp5.11 (466 ms on jp6.1)
+against ~290 ms on cpu, absorbed by the load-time warmup. The ~2 GB of RAM a CUDA
+context costs applies here as much as anywhere — see below.
 
 ⚠️ **`sensevoice-small` on gpu drops some utterances entirely** — fp16 under the
 CUDA provider returns an empty transcript for certain inputs, silently and
@@ -900,8 +1259,9 @@ That rule exists because of one result. Streaming paraformer fp16 on CUDA:
 The same fp16 file on CPU transcribed correctly, so the conversion was fine and the
 CUDA+fp16+streaming *combination* is not. Session creation, speed, and
 self-consistency were all green. Only reading the text caught it. (fp16 is also
-slower than fp32 for that model, so there was nothing to gain by debugging it —
-`paraformer-zh-en`'s gpu entry is fp32.)
+slower than fp32 for that model, so there was nothing to gain by debugging it.
+That model has since been removed from the registry for accuracy; the finding is
+kept because it is the reason every gpu entry has to be listened to, not timed.)
 
 Checklist:
 
@@ -1097,7 +1457,27 @@ place it is again the *only* remaining cause, and the log line
 
 ## asr_kws and espeak
 
-`trigger_mode: asr_kws` transcribes every utterance and gates on a phoneme-level
+`trigger_mode` has two values: `vad` (transcribe and forward everything) and
+`asr_kws` (forward only what follows a wake word). `asr_kws` is the default.
+
+There used to be a third, `kws`, which ran a second sherpa `KeywordSpotter` on
+the raw audio with its own zipformer bundle and its own `waiting_wake` state in
+the VAD worker. It is gone: that is an extra model, an extra download and an
+extra state machine to do a job `asr_kws` already does on a transcript the ASR
+produces anyway.
+
+`REMOVED_TRIGGER_MODES` in `plugins/asr.py` migrates `kws` → `asr_kws` at load.
+Unlike a removed *model* name, leaving this unmapped would not surface as a card
+error — an unrecognised `trigger_mode` falls through to `vad`, so a robot that
+was wake-word gated would silently start answering every utterance in the room.
+The migration also carries the wake word across, taking the display form after
+`@` in the old `keywords` spec (`"x iǎo f àn x iǎo f àn @小范小范"` → `小范小范`),
+because `asr_kws` with no keyword degrades to `vad` — the same silent failure by
+another route. A keyword with no `@` part yields nothing and logs at error
+level: the token side is a spotter lexicon, and de-spacing it would invent a
+wake word nobody can pronounce.
+
+`asr_kws` transcribes every utterance and gates on a phoneme-level
 fuzzy match against the wake word, so it needs IPA for both. That path had two
 faults that together cost **5.2 s per utterance** and quietly degraded wake-word
 accuracy.
@@ -1726,12 +2106,310 @@ transcribed and TTS still speaks with the card running.
 
 ---
 
+## Vision: `vop` (detection) and `visual_depth` (depth)
+
+Both run a **prebuilt TensorRT engine** fetched as a pinned bundle
+(`utils/model_downloader.py` → `ensure_vop_model` / `ensure_depth_model`), the
+same distribution shape OCR uses. Neither loads a `.pt` at runtime, and neither
+falls back to PyTorch if the bundle is missing — it fails loudly instead.
+
+### Why TensorRT *directly*, and not through ultralytics
+
+End-to-end per frame, batch 1 at 640, **Orin 5 with its containers stopped** so
+nothing else was competing — same machine, same conditions, 144 classes:
+
+| Path | ms/frame |
+|------|----------|
+| `yolov8s-worldv2`, PyTorch eager — what this replaced | 31.9 |
+| `yoloe-26s-seg`, TensorRT through `vision_runtime` | **19.8** |
+| `yolo26n-depth`, TensorRT through `vision_runtime` | **12.5** |
+
+1.6x on detection, and a better model with it. The road there is worth
+recording, because two plausible beliefs turned out to be false:
+
+* **Swapping the backend under ultralytics changes nothing.** On one machine,
+  eager measured 35.6 ms and the same network as a TensorRT engine *loaded by
+  ultralytics* measured 37.3 ms. Its Python pre/post-processing costs ~30 ms
+  whichever backend sits underneath. The win only exists if that path is
+  bypassed — hence this module.
+* **It was never going to be 8x.** An early `trtexec --useCudaGraph
+  --noDataTransfers` run measured 4.9 ms and was read as the achievable floor.
+  It is not: that excludes both memory transfers and the Python around them,
+  and it was on jp6.1. Measured properly, GPU compute alone is 12.3 ms
+  (detection) and 8.2 ms (depth) on jp5.11's TensorRT 8.5, CUDA graphs buy ~11%
+  on top, and host↔device copies are genuinely cheap (4.9 MB H2D = 0.8 ms).
+  Most of what remains is the engine, not the wrapper.
+
+Two measurement traps this walked into, both worth avoiding next time:
+
+* **Eager mode measures Python, not the network.** `n` and `s`, 640 and 768,
+  all landed within a few ms, and a plain `yolo26n` detector measured *slower*
+  than a depth model with a dense head. Model comparisons run in eager mode on
+  this hardware are meaningless.
+* **A busy board depresses everything.** The same code measured 33.8 ms on
+  Orin 6 with agent-core and perception running, and 19.8 ms on a quiet Orin 5
+  — despite Orin 6 having the newer, faster TensorRT. Benchmark on an idle
+  machine or the numbers say more about the neighbours than the change.
+
+So `plugins/vision_runtime.py` drives `utils.tensorrt_runtime.TensorRTEngine`
+with its own letterbox and decode, exactly as `plugins/ocr_runtime.py` does.
+ultralytics is a **build-time** dependency now — it exports the engine and
+nothing else.
+
+The decoders assume engines exported with `nms=False`, i.e. YOLO26's NMS-free
+end-to-end head whose output is already final boxes. `yoloe-26s-seg` emits two
+tensors: `(1, 300, 38)` — 4 box + score + class + 32 mask coefficients, the
+last 32 ignored — and `(1, 32, 160, 160)` mask prototypes.
+
+**Both decoders pick their tensor by content, never by index.** TensorRT 10.3
+(jp6.1) lists that pair as `['output0', 'output1']` and TensorRT 8.5 (jp5.11)
+lists it as `['output1', 'output0']`, so `outputs[0]` is the boxes on one
+JetPack line and the mask prototypes on the other. Code written and tested
+against a single line looks completely correct and fails on the other one.
+Orientation is settled the same way — scores confined to [0, 1] beside
+integral class ids — and a layout that matches nothing raises, because every
+wrong reading of those numbers still produces plausible-looking boxes.
+
+### vop's vocabulary is frozen at export time
+
+`YOLOE-26` is open-vocabulary, but ultralytics bakes the class list into the
+weights when it exports; on an exported model `set_classes()` raises. So:
+
+* the `set_classes` action is **gone from the tool schema** and `dispatch`
+  answers it with an error naming the baked vocabulary;
+* a `classes:` key in yaml or on a canvas card makes `config` **fail** rather
+  than apply the rest and drop `classes` on the floor;
+* `info` reports `vocabulary_frozen`, the full class list, and — if something
+  asked for classes this build cannot honour — `ignored_config_classes`.
+
+This is deliberate. A card that silently detects a different set than its
+config states is much worse than one that refuses.
+
+To change what vop detects: edit `ROBOT_EXTRA` in
+`tools/export_vision_engines.py`, rebuild on a host of each JetPack line,
+republish, re-pin.
+
+The plugin never restates the vocabulary. It reads it from the **engine's own
+metadata** — written by the same export that baked the classes into the
+weights, so it cannot drift out of order or out of date — and falls back to the
+`vocab.json` shipped in the bundle only for an engine built without names.
+
+Legacy model names (`yolov8s-worldv2`, `yolov8s-world`, `yoloe-26s`) still
+resolve — a card saved before the switch must not come back as `state: error`.
+
+### visual_depth outputs metres — this file used to say otherwise
+
+Every payload is in **metres**, with `"scale": "metric"` and `"unit": "m"`.
+
+This section previously claimed the opposite: that the numbers were a relative
+scale until someone ran `model.calibrate()`, and the plugin labelled every
+payload `"scale": "relative"` and attached a warning saying the distances were
+not metres. That was wrong. It is also the more dangerous direction of wrong —
+an agent told its distance readings are meaningless will not use them.
+
+The head does predict a relative log-depth field, but the metric transform is
+applied **inside `Depth.forward`**:
+
+```python
+depth = torch.exp(out.clamp(-4.0, 5.0))
+depth = depth.pow(self.cal_a) * self.cal_b.exp()   # ← before the export branch
+if self.export:
+    depth = F.interpolate(depth, scale_factor=4.0, ...)
+```
+
+Because it precedes `if self.export`, it is traced into the ONNX graph and
+therefore into the TensorRT engine. The released `yolo26n-depth.pt` ships with
+that fit already done (`cal_a=1.0`, `cal_b=-0.1938`).
+
+Measured on Orin5, our engine versus the reference `.pt` on the same photos:
+
+| image | our engine (fp16, 640) | reference `.pt` |
+|---|---|---|
+| landscape | 2.36 – 35.7 m | 2.63 – 48.1 m |
+| ultralytics `bus.jpg` | 1.29 – 16.3 m | 2.22 – 17.8 m |
+
+What `model.calibrate()` buys is a refit for **your** camera. Until that is
+done these are metres from a general-purpose fit — fine to compare and to
+reason about, not survey-grade, which is what the `calibration:
+"model-default"` field and its `note` say.
+
+`cal_a` / `cal_b` in the config apply a site refit on top of the engine's own:
+`metres_out = metres_in**cal_a * exp(cal_b)`. That is ultralytics' own
+parameterisation, so a `model.calibrate()` result pastes in unchanged. The old
+`depth_scale` was a plain **linear** multiplier, which is the same thing only
+when `a == 1` — it is still read, mapped onto `cal_b = log(depth_scale)`, so an
+existing card keeps its behaviour.
+
+### Calibrating on the robot: the `calibrate` action
+
+ultralytics' own `model.calibrate()` **cannot run here**. It wants a `.pt`
+checkpoint, torch, ultralytics itself, and a dataloader yielding ground-truth
+depth *maps* (`calibrate_checkpoint`, `models/yolo/depth/calibrate.py`). The
+runtime image carries a TensorRT engine and none of the rest.
+
+What it actually computes, though, is small. `select_calibration` scores two
+candidates and keeps the better one:
+
+| candidate | a | b |
+|---|---|---|
+| identity | 1.0 | 0.0 |
+| scale-only | 1.0 | `mean(log gt − log pred)` |
+
+**`a` is never fitted.** Its docstring records that an affine log-slope
+candidate was evaluated and removed, because the extra parameter overfits
+within-dataset and hurts cross-distribution generalisation. So `cal_a` stays a
+knob for a fit obtained elsewhere, and nothing fits it — here or upstream.
+
+That leaves one number, and the data for it is something a person standing next
+to the robot already has: a tape measure and a wall.
+
+**The procedure.** Drive the robot up to a flat wall, square-on, so the wall
+fills the middle of the frame. Measure lens-to-wall with a tape. Call
+`calibrate` with that distance. Then back off and repeat at 1 m, 2 m, 3 m.
+
+```
+calibrate  distance_m=1.0                  # facing the wall, 1 m away
+calibrate  distance_m=2.0                  # back off, measure again
+calibrate  distance_m=3.0
+reset_calibration                          # back to the engine's own fit
+calibrate  distance_m=2.0 image_path=...   # or fit from a photo
+```
+
+A flat plane is asked for because one number can only stand for a region if the
+region is genuinely all at one distance. Each call therefore also reports
+`flatness` — the interquartile spread of the region over its own median, which
+is scale-free, so a wall at 8 m scores the same as a wall at 1 m. Above 15% the
+reply carries a warning: that region is a corridor, a corner, or has something
+standing in front of the wall, and the reading should be thrown away with
+`reset_calibration`.
+
+Several distances are asked for because two parameters with `a` pinned can only
+express a **constant factor**. Readings spread over 1–3 m are what reveal
+whether that is what this camera has. If near is right and far is wrong, the
+error grows with distance, and no value of `cal_b` fixes it — the reply says so
+rather than leaving a good-looking `cal_b` sitting on a bad assumption.
+
+Each call samples the current frame (median over `region`, default the centre
+20% box; use `full` when the wall fills the frame), appends a
+`(predicted, measured)` pair, and **refits over every sample from scratch** — so
+a bad reading is undone by `reset_calibration`, not compounded. The node keeps
+the most recent **uncalibrated** depth map for exactly this reason: fitting
+against already-corrected depth converges on whatever the first guess was.
+
+A sample whose own post-fit error exceeds 25% is named in `warnings` rather
+than quietly dragging the mean — most often a typo (2 for 20) or a reading
+taken facing something other than the wall.
+
+The result applies immediately, to running nodes too, **in memory only**. The
+reply says so and prints the `cal_a` / `cal_b` to paste into the card config —
+that is the difference between a calibration that survives a restart and one
+that quietly does not.
+
+The reply also carries `residuals` (per-sample `error_pct` after the fit) and
+advice that escalates with the evidence: one sample fixes the average scale and
+nothing else; two samples at *similar* distances still say nothing about range;
+two at clearly different distances are what reveal whether the error is a
+constant factor (fixable) or grows with distance (not fixable with `a` pinned
+at 1.0 — at that point the honest answer is a different model or a real depth
+sensor).
+
+`visual_depth` is **on by default**, but its engine loads lazily on the first
+`start` — an enabled card that nothing has wired up costs nothing. The cost
+arrives with the first subscriber: it is a second resident engine, and on the
+8 GB Orins memory, not GPU time, is what runs out. Set `enabled: false` on a
+machine that does not consume depth.
+
+The tool was called `vdp` for one release. It still answers to `vdp` and
+`vdp_*` (`ALIASES` on the plugin, resolved by `PerceptionBundle._plugin_for`),
+and `main.py` still reads a `vdp:` section from a config.yaml already on a
+machine — but only `visual_depth` is advertised in `tools/list`, so the
+dashboard shows one card, not two.
+
+### Building the engines
+
+```bash
+# INSIDE a container from the target perception image — not on the Jetson host,
+# and never in a live one. Pin numpy to what the image ships, and name a
+# reachable mirror: the Orins reach github.com but not pypi.org.
+docker run --rm --runtime nvidia --network host \
+  -v "$PWD/out:/work/exp" -w /work/exp -e YOLO_CONFIG_DIR=/work/exp \
+  --entrypoint bash <perception-image-with-ultralytics> -lc '
+    source /etc/dla-fallback.env
+    pip3 install -i https://mirrors.tencent.com/pypi/simple/ onnx onnxslim \
+      "numpy==$(python3 -c "import numpy;print(numpy.__version__)")"
+    python3 /work/exp/export_vision_engines.py --out /work/exp/engines --workspace 2
+  '
+```
+
+Three traps, all observed:
+
+* **The image's TensorRT is what counts, not the host's.** An engine plan only
+  loads on the exact TensorRT that built it. Orin 6's *host* carries TensorRT
+  10.3 while the jp6.1 perception *image* carries 10.4, so engines built on
+  that host were rejected by every jp6.1 robot with "engine plan file is not
+  compatible … expecting library version 10.4.0.26". Build in a throwaway
+  container from the target image. `source /etc/dla-fallback.env` first, or
+  `import tensorrt` fails outright on vendor BSPs missing
+  libnvdla_compiler.so — which is why the image's CMD sources it.
+
+* **The ONNX must come from ultralytics, with the classes already set.**
+  `set_classes()` runs on the build host and bakes the vocabulary into the
+  weights; exporting without it produces an engine whose classes are numeric
+  and whose names metadata is useless. The engine *build* itself could be done
+  by trtexec — `utils.tensorrt_runtime.read_engine_file` strips the ultralytics
+  JSON header when present and accepts a plain engine otherwise — but the tool
+  uses ultralytics end to end so the class names travel inside the engine.
+* **Cap the builder workspace.** Jetson memory is shared between CPU and GPU;
+  an unbounded workspace got the jp5.11 build OOM-killed mid-`[GpuLayer]` with
+  no Python traceback — just `Killed`. `--workspace 2` is the default here for
+  that reason. Stopping the host's own containers first helps too, and also
+  makes any timing measured afterwards mean something.
+* **Pin numpy when installing the export dependencies.** onnx raises it
+  otherwise, and the base's cv2 and torch are built against the version the
+  image ships — the next import dies with `numpy.core.multiarray failed to
+  import`. And do not let ultralytics' AutoUpdate install onnx for you: given a
+  route it also drags protobuf from 3.6.1 to 5.x, which onnxruntime and sherpa
+  share. That is how a live perception container got polluted once; `docker
+  restart` does not undo it.
+
+Then upload to COS and pin size + SHA256 in `utils/model_downloader.py` — of
+the copy **downloaded back from COS**, not the local file, for the reason the
+other bundles in that file state.
+
+---
+
 ## Topic Naming
 
 | Direction | Topic pattern | Format |
 |-----------|--------------|--------|
 | Input (mic) | `/{namespace}/mic/audio` or `/{namespace}/ext_mic/{id}/audio` | `audio/pcm-16k` |
 | Output (ASR result) | `{input_topic}/asr` | `data/json` |
+| Output (vop) | `{input_topic}/objects` | `data/json` |
+| Output (visual_depth map) | `{input_topic}/visual_depth` | `image/depth-zlib` |
+| Output (visual_depth summary) | `{input_topic}/visual_depth_summary` | `data/json` |
+
+The depth map is **640x480 uint16 millimetres, zlib level 1**, published as a
+`CompressedImage` with `format="16UC1; compressedDepth zlib"`. The size is not
+negotiable: agent-core's `DepthZlibRenderer`
+(`web/js/renderers/camera.js`) allocates a fixed 640x480 canvas and returns
+early when the decompressed buffer is shorter, so a map published at the
+model's own resolution renders as a blank panel and logs nothing anywhere.
+`plugins/visual_depth.py` resamples before publishing and `encode_depth` refuses any
+other shape.
+
+Depth summary JSON:
+```json
+{
+  "scale": "relative",
+  "unit": "relative",
+  "nearest_by_region": {"left": 1.42, "center": 3.10, "right": null},
+  "range": [0.51, 18.3],
+  "valid_fraction": 0.98,
+  "timestamp": 1234567890.123
+}
+```
+`scale` is `"relative"` unless the camera has been calibrated; `null` for a
+region means it had no valid pixels.
 
 ASR result JSON:
 ```json

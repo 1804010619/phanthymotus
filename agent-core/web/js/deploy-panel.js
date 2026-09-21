@@ -6,7 +6,7 @@
  *   Tab 2 「驱动市场」— 浏览和安装新驱动（flat grid + filter chips）
  */
 
-import { DeployProgressUI } from './deploy-progress.js';
+import { startDeploy } from './deploy-progress.js';
 
 let _overlay  = null;
 let _polling  = null;
@@ -15,7 +15,10 @@ let _catalog  = { core: [], perception: [], actucore: [], driver: [] };
 
 // Fallback descriptions, used when resource-center didn't supply one
 const _CAT_DESC = {
-  perception: '语音感知套件 — ASR 语音识别 + TTS 语音合成 + VAD 静音检测 + 唤醒词检测',
+  // Keep in step with the `description` that deploy/build_perception.sh
+  // registers — this is only the fallback for an image registered before that
+  // field existed, and the two saying different things is worse than either.
+  perception: '感知套件 — 语音：ASR 语音识别 + TTS 语音合成 + VAD 静音检测 + 唤醒词检测；视觉：物体检测 + 单目深度 + OCR 文字识别 + 人脸识别',
   actucore:   '执行模型层 — VLA 策略 / 导航 / 抓取 / locomotion / 全身控制',
 };
 let _statuses = {};   // driver_id → { running, status, running_image, image, last_deploy }
@@ -92,17 +95,17 @@ async function _onChannelChange(e) {
   } catch { /* ignore */ }
 }
 
-// Versions visible per channel. Release also shows ga (a stable fallback);
-// preview is deliberately NOT inclusive of release/ga — mixing in the far
-// more sparsely-published stable tags just buries the preview builds you're
-// there to see. Anything not in this map's active list is hidden, not merely
-// re-labelled — resource-center's own channel param already narrows what it
-// returns, this is the client's independent guarantee that the version list
-// never shows a build outside the selected channel.
+// Versions visible per channel, most-stable last: each channel shows its own
+// tags plus every more-stable channel's tags (preview -> +release -> +ga), so
+// picking a less-stable channel never hides a build you could already see on
+// a more-stable one. Anything not in this map's active list is hidden, not
+// merely re-labelled — resource-center's own channel param already narrows
+// what it returns, this is the client's independent guarantee that the
+// version list never shows a build outside the selected channel's reach.
 const _CHANNEL_TAGS = {
   ga:      ['ga'],
   release: ['release', 'ga'],
-  preview: ['preview'],
+  preview: ['preview', 'release', 'ga'],
 };
 
 function _channelTags(item) {
@@ -181,6 +184,28 @@ async function _loadStatuses() {
   } catch { /* keep existing */ }
   // Update dots if visible
   _updateStatusDots();
+  _rerenderIfServicesChanged();
+}
+
+// 版本号和「升级」按钮是渲染那一刻的快照，而 5 秒一次的轮询以前只更新状态圆点。
+// 升级成功后那一行因此还挂着「升级」，再点一次得到的是后端的「已经在运行相同版本，
+// 跳过部署」—— 看起来像升级没生效。这里在服务集合真的变了时重渲染一次。
+let _lastServiceSig = '';
+
+function _rerenderIfServicesChanged() {
+  const sig = Object.entries(_statuses).sort(([a], [b]) => a < b ? -1 : 1)
+    .map(([id, s]) => `${id}|${s.running ? 1 : 0}|${s.status}|${s.running_image}|${s.image}`)
+    .join('\n');
+  if (sig === _lastServiceSig) return;
+  const first = _lastServiceSig === '';
+  _lastServiceSig = sig;
+  if (first) return;                      // 首次加载由 _load() 自己渲染
+
+  // 重渲染会重建整个列表，正开着的版本下拉和展开的日志会被一起换掉 —— 那比版本号
+  // 晚几秒更新更烦人，所以这两种情况让给用户，下一次轮询再说。
+  if (document.querySelector('.svc-ver-dropdown:not(.hidden)')) return;
+  if (document.querySelector('.deploy-log:not(.hidden)')) return;
+  _render();
 }
 
 // ── Rendering ─────────────────────────────────────────────────────────────
@@ -938,23 +963,19 @@ async function _startDriver(driverId, image, btn) {
   if (!image) return;
   btn.disabled    = true;
   btn.textContent = '启动中…';
-  _showDeployLog(driverId, '正在启动…');
-  try {
-    const res = await fetch(`/api/drivers/${driverId}/deploy`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ image }),
-    });
-    const json = await res.json();
-    if (json.code !== 200) {
-      _appendLog(driverId, `✗ 错误: ${json.message || '未知错误'}`, 'error');
-    } else {
-      _appendLog(driverId, '容器启动中…');
-      _startLogPolling(driverId);
-    }
-  } catch (e) {
-    _appendLog(driverId, `✗ 网络错误: ${e.message}`, 'error');
+  // Starting a stopped service is a deployment of the image it last ran, so it
+  // goes through the same window as every other deployment. It used to be the
+  // one path on the old /deploy endpoint, reporting into a single inline log
+  // line with no preflight checks and no pull progress.
+  _showDeployLogAny(driverId, '启动中…（查看进度窗口）');
+  const name = (_statuses[driverId] || {}).name || driverId;
+  const { ok } = await startDeploy({ driverId, driverName: name, image });
+  if (!ok) {
+    btn.disabled = false;
+    btn.textContent = '启动';
+    return;
   }
+  _startLogPolling(driverId);
 }
 
 async function _removeDriver(driverId, btn) {
@@ -991,53 +1012,25 @@ async function _executeDeploys(entries) {
 
   for (const [driverId, { image }] of entries) {
     const isCoreDriver = (_catalog.core || []).some(item => _driverIdForItem(item, 'core') === driverId);
+    const name = (_statuses[driverId] || {}).name || driverId;
 
-    if (isCoreDriver) {
-      _showDeployLog(driverId, '正在启动升级…');
-      try {
-        const res = await fetch('/api/system/update', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ image }),
-        });
-        const json = await res.json();
-        if (json.code !== 200) {
-          _appendLog(driverId, `✗ 错误: ${json.message || '未知错误'}`, 'error');
-        } else {
-          _appendLog(driverId, '升级任务已启动，拉取镜像中…');
-          _startCoreUpdatePolling(driverId);
-        }
-      } catch (e) {
-        _appendLog(driverId, `✗ 网络错误: ${e.message}`, 'error');
-      }
-    } else {
-      // Try new deploy-v2 with progress, fallback to old API
-      const s = _statuses[driverId] || {};
-      const driverName = s.name || driverId;
-
-      // Show progress UI
-      const progressUI = new DeployProgressUI(driverId, driverName);
-      progressUI.show();
-
-      try {
-        const res = await fetch(`/api/drivers/${driverId}/deploy-v2`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ image }),
-        });
-        const json = await res.json();
-        if (json.code !== 200) {
-          _appendLogAny(driverId, `✗ 错误: ${json.message || '未知错误'}`, 'error');
-          progressUI.close();
-        } else {
-          _appendLogAny(driverId, '部署中…（查看进度窗口）');
-          // Progress UI will auto-close on completion
-        }
-      } catch (e) {
-        _appendLogAny(driverId, `✗ 网络错误: ${e.message}`, 'error');
-        progressUI.close();
-      }
-    }
+    // core and drivers differ only in which endpoint startDeploy posts to —
+    // both render through the same window. The inline row log stays as a
+    // pointer to it, not as a second, differently-worded account of the deploy.
+    _showDeployLogAny(driverId, '部署中…（查看进度窗口）');
+    const { ok, ui } = await startDeploy({
+      driverId,
+      driverName: name,
+      image,
+      kind: isCoreDriver ? 'core' : 'driver',
+    });
+    // 部署完（或窗口被关掉）再回来刷新这一行。否则版本号和「升级」按钮仍是打开面板
+    // 那一刻的快照，用户会对着一个已经升级好的服务再点一次「升级」。
+    if (ok) ui.settled.then(async () => {
+      _getLogEl(driverId)?.classList.add('hidden');
+      await _loadStatuses();
+      _render();
+    });
   }
 
   _pending = {};
@@ -1093,24 +1086,9 @@ async function _toggleLog(driverId) {
   }
 }
 
-function _showDeployLog(driverId, msg) {
-  const el = document.getElementById(`log-${driverId}`);
-  if (!el) return;
-  el.innerHTML = `<div class="deploy-log-line">${msg}</div>`;
-  el.classList.remove('hidden');
-}
-
-function _appendLog(driverId, msg, type = '') {
-  const el = document.getElementById(`log-${driverId}`);
-  if (!el) return;
-  const line = document.createElement('div');
-  line.className = 'deploy-log-line' + (type ? ` ${type}` : '');
-  line.textContent = msg;
-  el.appendChild(line);
-  el.scrollTop = el.scrollHeight;
-}
-
-// Variants that check both marketplace (mp-log-) and my-services (log-) elements
+// _showDeployLog / _appendLog (my-services rows only) are gone: every deploy
+// now reports in the progress window, and the row log is written through the
+// `*Any` variants below, which also find a marketplace card's log element.
 function _getLogEl(driverId) {
   return document.getElementById(`mp-log-${driverId}`) || document.getElementById(`log-${driverId}`);
 }
@@ -1202,41 +1180,4 @@ function _stopLogPolling(driverId) {
     clearInterval(_logPolls[driverId]);
     delete _logPolls[driverId];
   }
-}
-
-// ── Core update polling ───────────────────────────────────────────────────
-
-function _startCoreUpdatePolling(driverId) {
-  if (_logPolls[driverId]) clearInterval(_logPolls[driverId]);
-
-  let attempts = 0;
-  _logPolls[driverId] = setInterval(async () => {
-    attempts++;
-    try {
-      const res  = await fetch('/api/system/update-status');
-      const json = await res.json();
-      const data = json.data || {};
-
-      if (data.error) {
-        _stopLogPolling(driverId);
-        _appendLog(driverId, `✗ 升级失败：${data.error}`, 'error');
-      } else if (data.step) {
-        const el = document.getElementById(`log-${driverId}`);
-        if (el) {
-          el.querySelectorAll('.log-output').forEach(e => e.remove());
-          const pre = document.createElement('div');
-          pre.className = 'log-output';
-          pre.textContent = data.step;
-          el.appendChild(pre);
-        }
-      }
-
-      if (attempts > 90) {
-        _stopLogPolling(driverId);
-        _appendLog(driverId, '✗ 升级超时', 'error');
-      }
-    } catch {
-      // 服务重启中，连接断开是正常的
-    }
-  }, 2000);
 }

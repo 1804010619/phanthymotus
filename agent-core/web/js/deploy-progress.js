@@ -1,14 +1,18 @@
 /**
- * deploy-progress.js — WebSocket client for real-time deployment progress
+ * deploy-progress.js — deployment progress: one window, one code path
  *
- * Usage:
- *   const monitor = new DeployProgressMonitor(driverId);
- *   monitor.onProgress = (event) => { console.log(event); };
- *   monitor.onError = (event) => { console.error(event); };
- *   monitor.onDone = () => { console.log('Deploy complete'); };
- *   monitor.connect();
+ * `startDeploy()` is the only entry point the rest of the UI should use. It
+ * owns the whole sequence — open the window, fire the POST, attach the socket
+ * to the run the POST reports, drive the window to a terminal state — so the
+ * top banner, the deploy panel and the solution loader can no longer drift into
+ * showing different things for the same action. Before this, five call sites
+ * each assembled their own combination of window / inline log / banner text,
+ * and agent-core upgrades had a second, cut-down rendering of their own.
  *
- * Event types:
+ *   await startDeploy({ driverId, driverName, image });            // driver
+ *   await startDeploy({ driverId, driverName, image, kind: 'core' });
+ *
+ * Event types on the wire:
  *   - start: Deployment started
  *   - check: Preflight check result (disk, network, registry)
  *   - progress: Pull/compose/start progress (has percent, speed fields)
@@ -17,11 +21,20 @@
  */
 
 class DeployProgressMonitor {
-    constructor(driverId) {
+    /**
+     * @param {string} driverId
+     * @param {string} [runId] Run to follow, from the deploy POST response.
+     *   The server replays that run from its start, so connecting after the
+     *   deployment began — or after it already finished — still shows the whole
+     *   sequence. Omit to follow whatever the driver is doing now.
+     */
+    constructor(driverId, runId = '') {
         this.driverId = driverId;
+        this.runId = runId;
         this.ws = null;
         this.reconnectAttempts = 0;
         this.maxReconnectAttempts = 3;
+        this._closing = false;
 
         // Callbacks
         this.onProgress = null;
@@ -31,9 +44,11 @@ class DeployProgressMonitor {
     }
 
     connect() {
+        if (this._closing) return;
         const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
         const token = localStorage.getItem('phanthy_access_token') || '';
-        const url = `${protocol}//${window.location.host}/api/ws/deploy/${this.driverId}?token=${token}`;
+        const run = this.runId ? `&run=${encodeURIComponent(this.runId)}` : '';
+        const url = `${protocol}//${window.location.host}/api/ws/deploy/${this.driverId}?token=${token}${run}`;
 
         console.log('[DeployProgress] Connecting to:', url);
         this.ws = new WebSocket(url);
@@ -63,8 +78,11 @@ class DeployProgressMonitor {
         this.ws.onclose = () => {
             console.log(`[DeployProgress] Disconnected for driver ${this.driverId}`);
 
-            // Auto-reconnect on unexpected close
-            if (this.reconnectAttempts < this.maxReconnectAttempts) {
+            // Auto-reconnect on unexpected close. `_closing` keeps a close we
+            // asked for from counting as unexpected — disconnect() used to
+            // trigger the very reconnect loop it was meant to end, so every
+            // finished deploy reopened its socket three more times.
+            if (!this._closing && this.reconnectAttempts < this.maxReconnectAttempts) {
                 this.reconnectAttempts++;
                 console.log(`[DeployProgress] Reconnecting (attempt ${this.reconnectAttempts})...`);
                 setTimeout(() => this.connect(), 2000);
@@ -142,6 +160,7 @@ class DeployProgressMonitor {
     }
 
     disconnect() {
+        this._closing = true;
         if (this.ws) {
             this.ws.close();
             this.ws = null;
@@ -158,12 +177,62 @@ class DeployProgressUI {
     constructor(driverId, driverName) {
         this.driverId = driverId;
         this.driverName = driverName;
-        this.monitor = new DeployProgressMonitor(driverId);
+        this.monitor = null;
         this.container = null;
+        this.finished = false;
         this._lastLoggedPercent = -10; // Initialize to -10 so first log happens at 0%
 
+        // Resolves when the window stops following this deployment — done,
+        // error, or dismissed. Callers refresh what they show about the service
+        // here: `startDeploy` returns as soon as the POST is accepted, which is
+        // far too early to re-read a row (the old container is still running).
+        this.settled = new Promise(resolve => { this._settle = resolve; });
+
         this._createUI();
+    }
+
+    /**
+     * Follow a run over the deploy WebSocket. Call once the deploy POST has
+     * returned its run id; the server replays that run from its first event, so
+     * there is no race between opening the socket and starting the work.
+     * @param {string} [runId]
+     */
+    attach(runId = '') {
+        if (this.monitor) this.monitor.disconnect();
+        this.monitor = new DeployProgressMonitor(this.driverId, runId);
         this._attachCallbacks();
+        this.monitor.connect();
+    }
+
+    // ── Manual drive (no WebSocket) ──────────────────────────────────────
+    // The same three events the monitor delivers, so a locally-observed step
+    // (the core restart watcher below) renders through exactly the same code.
+
+    pushProgress(message, percent, stage = 'update') {
+        this._handleProgress({ type: 'progress', stage, message, percent });
+    }
+
+    pushLog(message, level = 'info') {
+        this._addLog(message, level);
+    }
+
+    pushDone(event) {
+        this._handleDone(event || {});
+    }
+
+    pushError(event) {
+        this._handleError(typeof event === 'string' ? { message: event } : event);
+    }
+
+    static _getMinimizedStack() {
+        let stack = document.getElementById('deploy-progress-minimized-stack');
+        if (!stack) {
+            stack = document.createElement('div');
+            stack.id = 'deploy-progress-minimized-stack';
+            stack.className = 'deploy-progress-minimized-stack';
+            document.body.appendChild(stack);
+        }
+        return stack;
     }
 
     _createUI() {
@@ -205,194 +274,11 @@ class DeployProgressUI {
                 <div class="deploy-progress-minimized-progress"></div>
             </div>
         `;
-        document.body.appendChild(this.minimizedIndicator);
+        DeployProgressUI._getMinimizedStack().appendChild(this.minimizedIndicator);
 
-        // Add styles if not already present
-        if (!document.getElementById('deploy-progress-styles')) {
-            const style = document.createElement('style');
-            style.id = 'deploy-progress-styles';
-            style.textContent = `
-                .deploy-progress-modal {
-                    position: fixed;
-                    top: 0;
-                    left: 0;
-                    right: 0;
-                    bottom: 0;
-                    background: rgba(0, 0, 0, 0.5);
-                    display: flex;
-                    align-items: center;
-                    justify-content: center;
-                    z-index: 10000;
-                }
-                .deploy-progress-content {
-                    background: #1e1e1e;
-                    border-radius: 8px;
-                    padding: 20px;
-                    min-width: 500px;
-                    max-width: 700px;
-                    max-height: 80vh;
-                    overflow: auto;
-                    color: #e0e0e0;
-                }
-                .deploy-progress-header {
-                    display: flex;
-                    justify-content: space-between;
-                    align-items: flex-start;
-                    margin-bottom: 20px;
-                    padding-bottom: 10px;
-                    border-bottom: 1px solid #333;
-                }
-                .deploy-progress-header h3 {
-                    margin: 0;
-                    font-size: 18px;
-                    line-height: 24px;
-                    flex: 1;
-                }
-                .deploy-progress-header-actions {
-                    display: flex;
-                    gap: 4px;
-                    align-items: center;
-                }
-                .deploy-progress-minimize,
-                .deploy-progress-close {
-                    background: none;
-                    border: none;
-                    color: #999;
-                    font-size: 20px;
-                    line-height: 24px;
-                    cursor: pointer;
-                    padding: 0 4px;
-                    height: 24px;
-                    display: inline-flex;
-                    align-items: center;
-                    justify-content: center;
-                    flex-shrink: 0;
-                    margin-left: 0;
-                }
-                .deploy-progress-minimize:hover,
-                .deploy-progress-close:hover {
-                    color: #fff;
-                    background: rgba(255,255,255,0.1);
-                    border-radius: 4px;
-                }
-                .deploy-progress-close {
-                    font-size: 24px;
-                }
-                .deploy-progress-checks {
-                    margin-bottom: 15px;
-                }
-                .deploy-progress-check {
-                    padding: 8px;
-                    margin: 4px 0;
-                    border-radius: 4px;
-                    font-size: 14px;
-                }
-                .deploy-progress-check.pass {
-                    background: rgba(76, 175, 80, 0.2);
-                    color: #4caf50;
-                }
-                .deploy-progress-check.warning {
-                    background: rgba(255, 152, 0, 0.2);
-                    color: #ff9800;
-                }
-                .deploy-progress-check.fail {
-                    background: rgba(244, 67, 54, 0.2);
-                    color: #f44336;
-                }
-                .deploy-progress-stage {
-                    font-size: 16px;
-                    margin-bottom: 10px;
-                    font-weight: 500;
-                }
-                .deploy-progress-bar {
-                    height: 12px;
-                    background: #333;
-                    border-radius: 6px;
-                    overflow: hidden;
-                    margin-bottom: 10px;
-                }
-                .deploy-progress-bar-fill {
-                    height: 100%;
-                    background: #4caf50;
-                    background: -webkit-linear-gradient(left, #4caf50, #8bc34a);
-                    background: linear-gradient(90deg, #4caf50, #8bc34a);
-                    transition: width 0.3s ease;
-                    width: 0%;
-                    min-width: 2px;
-                }
-                .deploy-progress-details {
-                    font-size: 13px;
-                    color: #999;
-                    margin-bottom: 15px;
-                }
-                .deploy-progress-log {
-                    background: #0a0a0a;
-                    border-radius: 4px;
-                    padding: 10px;
-                    max-height: 200px;
-                    overflow-y: auto;
-                    font-family: monospace;
-                    font-size: 12px;
-                }
-                .deploy-progress-log-entry {
-                    margin: 2px 0;
-                    color: #999;
-                }
-                .deploy-progress-log-entry.error {
-                    color: #f44336;
-                }
-                .deploy-progress-log-entry.success {
-                    color: #4caf50;
-                }
-
-                /* Minimized indicator */
-                .deploy-progress-minimized {
-                    position: fixed;
-                    bottom: 20px;
-                    right: 20px;
-                    background: #1e1e1e;
-                    border: 1px solid #333;
-                    border-radius: 8px;
-                    padding: 12px 16px;
-                    min-width: 280px;
-                    box-shadow: 0 4px 12px rgba(0,0,0,0.3);
-                    cursor: pointer;
-                    z-index: 9999;
-                    transition: transform 0.2s, box-shadow 0.2s;
-                }
-                .deploy-progress-minimized:hover {
-                    transform: translateY(-2px);
-                    box-shadow: 0 6px 16px rgba(0,0,0,0.4);
-                }
-                .deploy-progress-minimized.hidden {
-                    display: none;
-                }
-                .deploy-progress-minimized-content {
-                    color: #e0e0e0;
-                }
-                .deploy-progress-minimized-title {
-                    display: flex;
-                    align-items: center;
-                    gap: 8px;
-                    font-size: 14px;
-                    font-weight: 500;
-                    margin-bottom: 8px;
-                }
-                .deploy-progress-minimized-spinner {
-                    animation: spin 1s linear infinite;
-                    font-size: 16px;
-                }
-                @keyframes spin {
-                    from { transform: rotate(0deg); }
-                    to { transform: rotate(360deg); }
-                }
-                .deploy-progress-minimized-progress {
-                    font-size: 12px;
-                    color: #999;
-                }
-            `;
-            document.head.appendChild(style);
-        }
+        // Styles live in css/style.css (§ DEPLOY PROGRESS MODAL). They used to be
+        // injected from here as a hardcoded dark palette, which is why this modal
+        // rendered as a black terminal window inside a light parchment UI.
 
         document.body.appendChild(this.container);
 
@@ -448,26 +334,36 @@ class DeployProgressUI {
 
     _handleError(event) {
         const { message, suggestion } = event;
+        this.finished = true;
+        this._settle({ ok: false, message });
         this._addLog(`错误: ${message}`, 'error');
         if (suggestion) {
             this._addLog(`建议: ${suggestion}`, 'info');
         }
         this._setStage('部署失败', 'error');
+        if (this.monitor) this.monitor.disconnect();
 
         // Update minimized indicator
         const minimizedProgress = this.minimizedIndicator.querySelector('.deploy-progress-minimized-progress');
         if (minimizedProgress) {
             minimizedProgress.textContent = '部署失败';
-            minimizedProgress.style.color = '#f44336';
+            minimizedProgress.classList.add('error');
         }
 
-        // Auto-close after 15 seconds
-        setTimeout(() => this.close(), 15000);
+        // A failed deploy stays on screen until it is dismissed. The failure
+        // and its suggestion are the only place the operator can read what went
+        // wrong; auto-closing this after 15s (and, worse, callers closing the
+        // window themselves on a non-200) was how errors ended up invisible.
     }
 
     _handleDone(event) {
         const { message, elapsed } = event;
-        this._addLog(`${message} (耗时 ${elapsed}s)`, 'success');
+        this.finished = true;
+        this._settle({ ok: true, message });
+        // Only the deploy WebSocket carries `elapsed`; the core upgrade poll has
+        // no equivalent. Unguarded this printed a literal "(耗时 undefineds)".
+        const took = Number.isFinite(elapsed) ? ` (耗时 ${elapsed}s)` : '';
+        this._addLog(`${message}${took}`, 'success');
         this._setStage('部署完成', 'success');
         this._updateProgress('done', '', 100);
 
@@ -485,7 +381,10 @@ class DeployProgressUI {
 
     _updateProgress(stage, message, percent, speed) {
         console.log('[DeployProgress] Updating progress:', { stage, message, percent, speed });
-        this._setStage(message);
+        // An empty message is not a stage — `_handleDone` calls this with '' just
+        // to push the bar to 100%, and overwriting the stage with it wiped the
+        // 部署完成 line the operator had just been shown.
+        if (message) this._setStage(message);
 
         if (percent !== undefined) {
             const bar = this.container.querySelector('.deploy-progress-bar-fill');
@@ -514,8 +413,10 @@ class DeployProgressUI {
                 this._addLog(progressMsg, 'info');
                 this._lastLoggedPercent = percent;
             }
-        } else if (stage !== 'pull') {
-            // Log all non-pull progress updates
+        } else if (stage !== 'pull' && message) {
+            // Log all non-pull progress updates. Guarded on `message` for the
+            // same reason as the stage above: the bar-to-100% call carries none,
+            // and logging it left a bare timestamp as the last line of the log.
             this._addLog(message, 'info');
         }
 
@@ -530,8 +431,8 @@ class DeployProgressUI {
     _setStage(message, status) {
         const stageEl = this.container.querySelector('.deploy-progress-stage');
         stageEl.textContent = message;
-        stageEl.style.color = status === 'error' ? '#f44336' :
-                              status === 'success' ? '#4caf50' : '#e0e0e0';
+        // Class, not an inline colour: the theme owns green/red.
+        stageEl.className = `deploy-progress-stage ${status || ''}`.trim();
     }
 
     _addLog(message, level = 'info') {
@@ -546,7 +447,6 @@ class DeployProgressUI {
     show() {
         this.container.style.display = 'flex';
         this.minimizedIndicator.classList.add('hidden');
-        this.monitor.connect();
     }
 
     minimize() {
@@ -561,7 +461,11 @@ class DeployProgressUI {
     }
 
     close() {
-        this.monitor.disconnect();
+        // Dismissing mid-deploy also settles: the caller's row is left showing
+        // "部署中…" otherwise, and the deployment carries on server-side either
+        // way (it is a background task, not tied to this socket).
+        this._settle({ ok: this.finished, closed: true });
+        if (this.monitor) this.monitor.disconnect();
         if (this.container && this.container.parentNode) {
             this.container.parentNode.removeChild(this.container);
         }
@@ -569,6 +473,105 @@ class DeployProgressUI {
             this.minimizedIndicator.parentNode.removeChild(this.minimizedIndicator);
         }
     }
+}
+
+/**
+ * The single way to start a deployment from the UI.
+ *
+ * Opens the progress window, fires the request, and attaches the window to the
+ * run the server reports. Failures are shown in that window and nowhere else —
+ * callers get a boolean and should not render the error a second time.
+ *
+ * @param {object}  opts
+ * @param {string}  opts.driverId    Service id (also the progress channel).
+ * @param {string}  opts.driverName  Title shown in the window.
+ * @param {string}  [opts.image]     Target image; omit to use the manifest's.
+ * @param {string}  [opts.kind]      'driver' (default) or 'core'.
+ * @returns {Promise<{ok: boolean, ui: DeployProgressUI}>}
+ */
+async function startDeploy({ driverId, driverName, image = '', kind = 'driver' }) {
+    const ui = new DeployProgressUI(driverId, driverName || driverId);
+    ui.show();
+    ui.pushProgress(kind === 'core' ? '正在启动升级…' : '正在提交部署…', 2);
+
+    const url = kind === 'core'
+        ? '/api/system/update'
+        : `/api/drivers/${encodeURIComponent(driverId)}/deploy-v2`;
+    const body = kind === 'core'
+        ? { image, driver_id: driverId }
+        : (image ? { image } : {});
+
+    try {
+        const res = await fetch(url, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(body),
+        });
+        const json = await res.json();
+        if (json.code !== 200) {
+            ui.pushError({ message: json.message || `请求失败（HTTP ${res.status}）` });
+            return { ok: false, ui };
+        }
+        // Attach to the run this POST opened. Everything it has already emitted
+        // is replayed, so a deploy that finished before the socket opened —
+        // routine when the image is already local — still renders in full.
+        ui.attach(json.data?.run_id || '');
+        if (kind === 'core') _watchCoreRestart(driverId, image, ui);
+        return { ok: true, ui };
+    } catch (e) {
+        ui.pushError({
+            message: `网络错误: ${e.message}`,
+            suggestion: '确认与设备的连接正常后重试。',
+        });
+        return { ok: false, ui };
+    }
+}
+
+/**
+ * Tail of an agent-core upgrade. The restart helper replaces this very process,
+ * so the last thing the stream can report is "容器即将切换" — success is only
+ * observable from outside, by reconnecting and finding the new tag. Reporting
+ * it on reconnect alone would call a rolled-back upgrade a success.
+ */
+function _watchCoreRestart(driverId, image, ui) {
+    const targetTag = (image || '').split(':').pop();
+    let attempts = 0;
+    let sawRestart = false;
+
+    const timer = setInterval(async () => {
+        attempts++;
+        if (ui.finished) { clearInterval(timer); return; }
+
+        try {
+            const res = await fetch('/api/drivers');
+            const json = await res.json();
+            const entry = (json.data || []).find(d => d.id === driverId);
+            const runningTag = (entry?.running_image || '').split(':').pop();
+
+            if (sawRestart && runningTag && targetTag && runningTag === targetTag) {
+                clearInterval(timer);
+                ui.pushDone({ message: `升级完成：${runningTag}，页面即将刷新` });
+                setTimeout(() => location.reload(), 2500);
+            }
+        } catch {
+            // The API going away is the expected path to success here, not a
+            // failure: agent-core restarts itself as the last act of the
+            // upgrade. (The TLS cert changes with it, so the first requests
+            // after it returns can fail too.)
+            if (!sawRestart) {
+                sawRestart = true;
+                ui.pushProgress('服务重启中，等待重新连接…', 92, 'restart');
+            }
+        }
+
+        if (attempts > 120) {   // 4 分钟
+            clearInterval(timer);
+            ui.pushError({
+                message: '升级超时',
+                suggestion: '容器可能仍在切换中，刷新页面查看当前版本。',
+            });
+        }
+    }, 2000);
 }
 
 // Auto-restore active deployments on page load
@@ -586,27 +589,31 @@ async function restoreActiveDeployments() {
 
         const data = await response.json();
         const deployments = data.deployments || [];
+        if (!deployments.length) return;
 
         console.log('[DeployProgress] Found active deployments:', deployments);
 
-        // Restore each active deployment
+        // Real service names, from the same list the deploy panel renders. The
+        // hardcoded map this replaced knew three ids and showed every driver
+        // its raw id.
+        let names = {};
+        try {
+            const res = await fetch('/api/drivers', { headers: { 'Authorization': `Bearer ${token}` } });
+            const json = await res.json();
+            for (const d of (json.data || [])) names[d.id] = d.name || d.id;
+        } catch { /* fall back to ids */ }
+
         for (const deployment of deployments) {
-            const driverMap = {
-                'perception': 'Perception Stack',
-                'planning': 'Planning',
-                'control': 'Control',
-            };
-            const driverName = driverMap[deployment.driver_id] || deployment.driver_id;
+            const driverName = names[deployment.driver_id] || deployment.driver_id;
 
             console.log(`[DeployProgress] Restoring ${deployment.driver_id}...`);
 
-            // Create progress window
             const progressWindow = new DeployProgressUI(deployment.driver_id, driverName);
             progressWindow.show();
 
-            // Add a message indicating reconnection
             const elapsed = Math.floor(deployment.elapsed || 0);
             progressWindow._addLog(`重新连接到部署会话 (已运行 ${elapsed}s)`, 'info');
+            progressWindow.attach(deployment.run_id || '');
         }
     } catch (error) {
         console.error('[DeployProgress] Error restoring deployments:', error);
@@ -621,4 +628,4 @@ if (document.readyState === 'loading') {
 }
 
 // ES6 module exports
-export { DeployProgressMonitor, DeployProgressUI };
+export { DeployProgressMonitor, DeployProgressUI, startDeploy };

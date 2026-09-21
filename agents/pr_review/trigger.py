@@ -118,6 +118,7 @@ async def create_job_from_comment(
         source=source,
         skip_build=trigger["skip_build"],
         build_only=trigger["build_only"],
+        skip_tests=trigger["skip_tests"],
         force_targets=trigger["force_targets"],
         perception_variants=trigger["perception_variants"],
     )
@@ -135,6 +136,7 @@ async def create_job_from_comment(
                 head_sha=head_sha,
                 skip_build=job.skip_build,
                 build_only=job.build_only,
+                skip_tests=job.skip_tests,
                 source=source,
             ),
         )

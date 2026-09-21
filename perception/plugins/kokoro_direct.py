@@ -49,42 +49,33 @@ class KokoroDirect:
     held for the lifetime of the object.
     """
 
-    def __init__(self, model_dir: str, weights: str, num_threads: int = 0):
-        """Always CPU. `num_threads=0` means one per core, which is the difference
-        between usable and not.
+    def __init__(self, model_dir: str, weights: str, num_threads: int = 0,
+                 provider: str = "cpu", session_key: str = "tts.kokoro",
+                 in_process: bool = False):
+        """`num_threads=0` means one per core, which is the difference between usable
+        and not on the CPU path.
 
-        **This session must not use CUDA, and it takes no `provider` argument so it
-        cannot be asked to.** Two ONNX Runtime builds live in this process — sherpa's
-        bundled 1.18.1 and the standalone 1.18.0 wheel — and on jp6.1 they share one
-        copy of `libonnxruntime_providers_cuda.so`, because the Dockerfile puts
-        sherpa's into `onnxruntime/capi/` and the soname collides. Whichever runtime
-        dlopens it first owns it, and the *second* CUDA session built on the Kokoro
-        graph then fails in the other runtime's code. Measured on Orin 6, both orders,
-        with the error naming the build it landed in:
+        The session goes into `plugins/ort_worker.py`'s child unless `in_process` is
+        set, because the standalone ONNX Runtime and sherpa-onnx's bundled one corrupt
+        each other's sessions through a shared provider bridge whenever both are in one
+        process. That module's docstring has the mechanism and the measurements; the
+        short version is an exception on jp6.1 and a SIGSEGV that kills all of
+        perception on jp5.11.
 
-            sherpa's CUDA session first  -> this one fails   (/home/tian/Yxh/...)
-            this one first               -> sherpa fails     (/home/yifanl/...)
+        `in_process=True` is the degraded fallback the callers use when the child cannot
+        be reached. It is only safe on CPU — a CPU-only session loads no CUDA provider,
+        so it never touches the bridge — which is why the fallback paths pair it with
+        the default `provider="cpu"`.
 
-            "Error mapping output names: Could not find OrtValue with
-             name '/Squeeze_2_output_0'"
+        Speed, measured on Orin 6 (6 cores) on one 9.35 s Japanese utterance:
 
-        Order does not save it; only staying off CUDA does. A standalone CUDA session
-        on the *face* model is unaffected and keeps its 3x — that graph has none of
-        the fused squeeze outputs this one trips over.
+            cpu, 2 threads  RTF 1.171   <- slower than real time
+            cpu, 4 threads  RTF 0.646
+            cpu, 6 threads  RTF 0.521
+            cpu, 8 threads  RTF 0.644   <- oversubscribed
+            cuda, in the worker          RTF 0.069 warm, 1.65 on the first utterance
 
-        An earlier version of this docstring said the CUDA request was harmless
-        because the standalone wheel was CPU-only. That stopped being true the moment
-        the Dockerfile started installing the GPU wheel, and this is how it failed.
-
-        So threads are the only lever, and they matter. Measured on Orin 6 (6 cores),
-        one 9.35 s Japanese utterance:
-
-            2 threads  RTF 1.171   <- slower than real time
-            4 threads  RTF 0.646
-            6 threads  RTF 0.521
-            8 threads  RTF 0.644   <- oversubscribed
-
-        The default was 2 and made Japanese unusable for streaming.
+        The CPU default was 2 and made Japanese unusable for streaming.
         """
         import onnxruntime as ort
 
@@ -97,12 +88,38 @@ class KokoroDirect:
 
         self._token_to_id = _read_tokens(tokens_path)
 
-        opts = ort.SessionOptions()
+        providers = (["CUDAExecutionProvider", "CPUExecutionProvider"]
+                     if provider in ("cuda", "gpu") else ["CPUExecutionProvider"])
+        # onnxruntime's CUDA EP defaults cudnn_conv_algo_search to EXHAUSTIVE, which
+        # re-benchmarks convolution kernels on every *distinct* input shape — and
+        # this graph's shape is the token count, which is different per sentence.
+        # Measured: a repeated sentence (same shape already benchmarked) answers in
+        # well under a second; a genuinely new one pays several extra seconds on top
+        # of the ~0.07 RTF this graph otherwise runs at. HEURISTIC picks an algorithm
+        # from cuDNN's own heuristics instead of benchmarking every candidate, which
+        # costs a little peak throughput but not a multi-second stall per new shape.
+        # No effect on CPUExecutionProvider, which is why it is CUDA-only below.
+        provider_options = [{"cudnn_conv_algo_search": "HEURISTIC"}
+                             if p == "CUDAExecutionProvider" else {}
+                             for p in providers]
         # 0 lets ORT pick one thread per core, which measured fastest; an explicit
         # value is honoured so a busy robot can be told to use fewer.
-        opts.intra_op_num_threads = int(num_threads or 0)
-        self._session = ort.InferenceSession(
-            model_path, opts, providers=["CPUExecutionProvider"])
+        threads = int(num_threads or 0)
+
+        self._session_key = None
+        if in_process:
+            opts = ort.SessionOptions()
+            opts.intra_op_num_threads = threads
+            self._session = ort.InferenceSession(model_path, opts,
+                                                 providers=providers,
+                                                 provider_options=provider_options)
+        else:
+            from plugins import ort_worker
+            self._session = ort_worker.get_worker().load(
+                session_key, model_path, providers,
+                {"intra_op_num_threads": threads,
+                 "provider_options": provider_options})
+            self._session_key = session_key
         actual = self._session.get_providers()
 
         styles = np.fromfile(voices_path, dtype=np.float32)
@@ -120,6 +137,30 @@ class KokoroDirect:
         log.info("[tts] kokoro_direct ready: %s, %d tokens, %d speakers, providers=%s",
                  os.path.basename(model_path), len(self._token_to_id),
                  self._n_speakers, actual)
+
+    @property
+    def providers(self) -> list:
+        """What the session actually got, e.g. `['CPUExecutionProvider']` after a
+        `gpu` request was silently declined — mirrors `KokoroWorkerProxy.providers`
+        so a caller can treat the two interchangeably (see tts.py's chunk-size
+        decision, which needs to know CPU vs GPU is actually resident, not just
+        which one was originally asked for)."""
+        return list(self._session.get_providers())
+
+    def close(self) -> None:
+        """Release the session.
+
+        Dropping the reference is enough in-process, but not for a session living in
+        the ORT worker: a child does not notice its parent's garbage collector, so it
+        would stay resident — 310 MB of weights plus its share of the GPU pool — for
+        the life of the process. Unload it explicitly and leave the child alive for
+        whatever else it holds, face's sessions included.
+        """
+        key, self._session_key = self._session_key, None
+        self._session = None
+        if key is not None:
+            from plugins import ort_worker
+            ort_worker.get_worker().unload(key)
 
     @property
     def num_speakers(self) -> int:
@@ -152,20 +193,56 @@ class KokoroDirect:
         longer than 510 tokens is synthesized in chunks and concatenated, because
         sherpa's equivalent calls SHERPA_ONNX_EXIT(-1) at that boundary and losing a
         long sentence is worse than a seam in it.
+
+        Callers that can consume audio as it is produced should use
+        `synthesize_stream` instead — this just drains it and concatenates, which is
+        exactly the "wait for the whole utterance" cost that made a long sentence on
+        CPU (RTF ~0.52) sit in silence for as long as it took to compute all of it.
+        """
+        pieces = list(self.synthesize_stream(phonemes, speaker_id, speed))
+        if not pieces:
+            return np.zeros(0, dtype=np.float32)
+        return np.concatenate(pieces) if len(pieces) > 1 else pieces[0]
+
+    def synthesize_stream(self, phonemes: str, speaker_id: int = 0, speed: float = 1.0,
+                          max_chunk_tokens: int | None = None):
+        """Like `synthesize`, but yields each chunk's audio as it is computed.
+
+        Kokoro is not autoregressive, so a single chunk's `_run` cannot itself be
+        streamed — one ONNX call computes that chunk's whole waveform in one shot.
+        The win here is for an utterance `chunk_ids` splits into more than one
+        chunk: the caller can start playing chunk 1 while this generator is still
+        computing chunk 2, instead of waiting for every chunk and the final
+        `np.concatenate` before anything is audible.
+
+        `max_chunk_tokens` defaults to the style table's own ceiling (510), which
+        is a correctness limit, not a latency target — most utterances are well
+        under it and so never actually split, which is why on CPU (RTF ~0.5-1 for
+        a single chunk, since there is no GPU-fast path to hide it behind) a
+        ~400-token sentence measured ~25s of silence before the first frame: one
+        `_run` call, computed in full before this generator could yield anything.
+        A caller chasing time-to-first-sound over CPU can pass a smaller value —
+        `style` is looked up by each chunk's own token count
+        (`self._styles[speaker_id, len(ids)]`), so a chunk of any size is a
+        correct, independent unit; there is no bound below which a smaller value
+        is *wrong*, only smaller ONNX calls with proportionally more per-call
+        fixed overhead and one more potential seam per split.
         """
         ids, unknown = self.encode(phonemes)
         if unknown:
             log.warning("[tts] kokoro_direct: %d phoneme(s) not in the vocabulary "
                         "and skipped: %s", len(unknown), "".join(sorted(set(unknown))))
         if not ids:
-            return np.zeros(0, dtype=np.float32)
+            return
         if not 0 <= speaker_id < self._n_speakers:
             raise ValueError(
                 f"speaker_id must be 0..{self._n_speakers - 1}, got {speaker_id}")
 
-        pieces = [self._run(chunk, speaker_id, speed)
-                  for chunk in chunk_ids(ids, STYLE_LENGTHS - 1, self._break_ids)]
-        return np.concatenate(pieces) if len(pieces) > 1 else pieces[0]
+        limit = STYLE_LENGTHS - 1
+        if max_chunk_tokens is not None:
+            limit = max(1, min(limit, int(max_chunk_tokens)))
+        for chunk in chunk_ids(ids, limit, self._break_ids):
+            yield self._run(chunk, speaker_id, speed)
 
     def _run(self, ids, speaker_id: int, speed: float):
         # A leading and trailing 0, and the style row is chosen by the *inner* count —

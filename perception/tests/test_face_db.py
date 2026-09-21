@@ -268,7 +268,7 @@ def test_update_and_get_missing_person_raise_keyerror(tmp_path):
 def test_unknown_capacity_evicts_least_recently_seen(tmp_path):
     db = FaceDB(db_dir=str(tmp_path), unknown_capacity=3)
     ids = [db.enroll_unknown(_vector(seed))["id"] for seed in range(3)]
-    # unknown-1 is the least recently seen once the others are touched.
+    # The first one is the least recently seen once the others are touched.
     db.touch(ids[1], when=5_000.0)
     db.touch(ids[2], when=6_000.0)
     db.touch(ids[0], when=1_000.0)

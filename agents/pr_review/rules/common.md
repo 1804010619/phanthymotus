@@ -163,6 +163,26 @@ For drivers, `phanthymotus-driver/scripts/check_service_yml.py` encodes this con
 plus its two exemption tables; `read_file` it rather than re-deriving the rules. Full
 rationale: `CLAUDE.md` § "DDS is locked to the local host".
 
+## Tests
+
+`agent-core/tests` and `perception/tests` are run inside the images built from
+this PR, and the results are given to you above. They are advisory, not a gate —
+the review is posted either way.
+
+- A **failing** test is a finding: read the test and the code it covers, and say
+  which of the two is wrong. "Tests fail" on its own is not a review.
+- A **passing** suite is not coverage. For a change to behaviour, say whether a
+  test should have been added or changed, and name the file it belongs in
+  (`agent-core/tests/test_<area>.py`, `perception/tests/test_<area>.py`). Both
+  suites are `unittest`-style and locate their code relative to `__file__`, so a
+  new test needs no fixtures, no ROS and no network — `perception/tests/
+  conftest.py` already stubs rclpy through `vision_stubs`.
+- **Do not ask for tests that need hardware, a model download, or a GPU.**
+  Neither suite has any, deliberately, and asking for them produces work the
+  author has to push back on every time.
+- A suite reported as "could not be run" is an agent-side problem. Say nothing
+  about it; it is not a fact about this PR.
+
 ## Correctness, in priority order
 
 1. **Correctness** — bugs, races, unhandled errors, wrong logic. State the

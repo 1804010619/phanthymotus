@@ -44,6 +44,53 @@ _pending_tools: dict[str, str] = {}               # action_id → tool_name (资
 _pending_resources: dict[str, frozenset | None] = {}  # action_id → 占用的物理通道
 _pending_owner: dict[str, str] = {}               # action_id → 发起它的 agent 上下文
 
+# 动作"有结局了"的订阅者。原本没有单一观察点：完成回调分散在 start.py 的
+# /api/acp/complete 和下面 WS 分支两处，各自直接 .set() 那个 Event；而超时/取消走的是
+# _forget_pending，跟前两者毫无关系。想知道"嘴什么时候空出来"只能去轮询。
+#
+# 沉默计时需要精确的"说完了"时刻（从**开始**播算的话，一段 134 秒的播报刚说完就会立刻
+# 判超时），所以三条路统一在这里发通知：完成走 mark_action_complete，超时/取消走
+# _forget_pending。订阅者自己再判一次资源是否真空了 —— 通知可能早于实际空闲，多个嘴
+# 同时在播时第一个完成也不等于说完了。
+_settle_listeners: list = []
+
+
+def on_action_settled(fn) -> None:
+    """注册"某个动作有结局了"的回调（完成 / 超时 / 取消都会触发）。
+
+    回调签名 fn(action_id, resource)。异常会被吞掉并打日志 —— 一个订阅者出问题不该
+    影响 ACP 本身的解锁。
+    """
+    _settle_listeners.append(fn)
+
+
+def _notify_settled(action_id: str, resource=None) -> None:
+    """`resource` 显式传入，因为 _forget_pending 是先拆表再通知的（见那里的注释），
+    这时候已经查不到这个 action 占用过什么了。"""
+    if resource is None:
+        resource = _pending_resources.get(action_id)
+    for fn in _settle_listeners:
+        try:
+            fn(action_id, resource)
+        except Exception as e:
+            print(f'[acp] settle listener failed: {e}')
+
+
+def mark_action_complete(action_id: str, payload: dict) -> bool:
+    """把一个 pending 标记为完成：记结果、解锁等待者、通知订阅者。
+
+    两处完成入口（HTTP 回调 / WS action_complete 事件）都必须走这里，否则订阅者会漏掉
+    其中一条路上的完成事件。注意**不删** _pending_actions 那一项 —— 晚到的 waiter 还要
+    读 _pending_results，回收是 barrier 的事（见 resource_actually_busy）。
+    """
+    if action_id not in _pending_actions:
+        return False
+    _pending_results[action_id] = payload
+    _pending_actions[action_id].set()
+    _notify_settled(action_id)
+    return True
+
+
 # ── 次序：谁发起的动作 ────────────────────────────────────────────────────────
 #
 # Resource exclusion answers "may these two run at once"; it cannot answer "must
@@ -134,6 +181,28 @@ def conflicting_pending(want: frozenset | None) -> list[str]:
     ]
 
 
+def resource_actually_busy(want: frozenset | None) -> bool:
+    """这些资源**此刻**是不是真被占着 —— 用于「现在能不能说话」这类即时判断。
+
+    与 `conflicting_pending` 的区别很关键：完成回调（/api/acp/complete 或 WS 的
+    action_complete）只做 `_pending_actions[aid].set()`，**故意不删**这一项，好让晚到的
+    waiter 还能读到结果；真正的删除发生在某个 barrier 等到它的时候。所以一个早就播完的
+    action 会一直留在 `_pending_actions` 里，直到下一次 barrier 顺手回收它。
+
+    对 barrier 本身没问题（它 await 一个已经 set 的 Event，瞬间返回并完成回收），但对
+    「嘴现在空不空」就是错的。Orin5 上实测：一句播报 17:03:19 发出、17:03:24 完成回调就
+    到了，可那一项直到 17:05:58 才被回收 —— 中间 2 分 34 秒里嘴明明是空的，却一直被判成
+    忙，期间所有自动播报被静默跳过。
+
+    因此这里要跳过 Event 已经 set 的那些：它们已经完成，只是还没被回收。
+    """
+    for aid in conflicting_pending(want):
+        ev = _pending_actions.get(aid)
+        if ev is not None and not ev.is_set():
+            return True
+    return False
+
+
 def pendings_to_wait_for(want: frozenset | None, *, owner: str,
                          concurrent: bool) -> list[str]:
     """Everything a call must wait for, in registration order.
@@ -183,15 +252,26 @@ def _forget_pending(aids, outcome: str | None = None) -> None:
     completion callback never arrived looks, downstream, like one that played. That
     is what lets a delegation report a line as spoken when nothing was heard.
     """
+    settled = []
     for aid in aids:
         if outcome:
             _record_outcome(aid, outcome)
+        settled.append((aid, _pending_resources.get(aid)))
         _pending_actions.pop(aid, None)
         _pending_results.pop(aid, None)
         _pending_timeouts.pop(aid, None)
         _pending_tools.pop(aid, None)
         _pending_resources.pop(aid, None)
         _pending_owner.pop(aid, None)
+
+    # 超时 / 取消也是"这个动作有结局了" —— 不在这里通知的话，一次超时的播报之后再没有
+    # 任何事件会让沉默计时重新开始，播报就永久静音了。
+    #
+    # **必须在上面那些 pop 之后通知**：订阅者会去判"资源现在真空了吗"，而超时的 Event
+    # 从来没有被 set 过，只要这一项还挂在 _pending_actions 里就仍然算占用 —— 在 pop
+    # 之前通知，订阅者看到的是"还在说话"，于是什么都不做。
+    for aid, res in settled:
+        _notify_settled(aid, res)
 
 
 # Terminal state of recently finished actions, so a caller can still ask "did that
@@ -405,9 +485,8 @@ async def _subscribe_sse(mcp_id: str, url: str) -> None:
                         msg_type = msg.get('type') if isinstance(msg, dict) else None
                         if msg_type == 'action_complete':
                             action_id = msg.get('action_id') or payload.get('action_id')
-                            if action_id and action_id in _pending_actions:
-                                _pending_results[action_id] = msg
-                                _pending_actions[action_id].set()
+                            if action_id:
+                                mark_action_complete(action_id, msg)
 
                         await event_bus.enqueue(
                             source  = f'mcp:{mcp_id}',
@@ -816,29 +895,62 @@ async def call_tool(full_name: str, args: dict) -> str:
 _SYSTEM_ACTIONS = {'start', 'stop', 'info', 'config'}
 
 
+def present_to_llm(schema: dict, meta: dict | None, split_action: str | None = None) -> dict | None:
+    """把一个注册表里的原始 schema 变成可以交给 LLM 的形状。返回 None = 不该暴露。
+
+    两件事：**滤掉 processor 的系统 action**，以及**注入 concurrent 参数**。
+
+    必须是所有"把工具交给模型"的路径共用的唯一入口。这个过滤原本只写在 all_schemas()
+    里，而主 agent loop 走的是 event/llm.py 的 _get_bound_tool_schemas()（直接取
+    info['schemas'][name] 生料），all_schemas() 全仓库只有 peer 那一处调用 —— 于是过滤
+    **从来没有在主链路生效过**。
+
+    后果实测到两个：
+    · Orin5 上用户说"好了别说了"，模型调了 tts(action="stop")。它看到的 enum 就是
+      ["start","stop","speak","info","config","interrupt"]，描述还写着 "start/stop
+      speech synthesis" —— 选 stop 是最自然的读法。但 stop 会 _dispose_node() 把
+      话题订阅节点整个拆掉，而"停住这句话"应该是 interrupt。
+    · concurrent 参数只在 all_schemas() 里注入，所以主链路上**任何工具都没有这个参数**，
+      而 system prompt 花了一整段教模型怎么用它。
+
+    `split_action`：x-action-params 拆出来的子工具，action 编码在 schema 名里而不是
+    参数里，只能靠它判断这个子工具是不是系统 action。
+    """
+    meta = meta or {}
+    tool_type = meta.get('type')
+
+    if tool_type == 'processor':
+        if split_action is not None:
+            if split_action in _SYSTEM_ACTIONS:
+                return None          # 拆分子工具本身就是系统 action，不暴露
+        elif meta.get('action_enum'):
+            user_actions = [a for a in meta['action_enum'] if a not in _SYSTEM_ACTIONS]
+            if not user_actions:
+                return None          # 无用户 action，整个工具不暴露给 LLM
+            props = schema.get('parameters', {}).get('properties', {})
+            if 'action' in props:
+                schema = {**schema, 'parameters': {
+                    **schema['parameters'],
+                    'properties': {**props,
+                                   'action': {**props['action'], 'enum': user_actions}},
+                }}
+    return with_parallel_param(schema, tool_type)
+
+
 def all_schemas() -> list[dict]:
-    """返回所有在线 MCP 工具的 OpenAI function calling schema 列表（过滤 processor 系统 action）。"""
+    """返回所有在线 MCP 工具的 OpenAI function calling schema 列表。"""
     schemas = []
     for info in registry.values():
         if not info.get('online'):
             continue
         tool_meta = info.get('tool_meta', {})
+        split_map = info.get('split_map', {})
         for name, schema in info['schemas'].items():
-            meta = tool_meta.get(name, {})
-            # Processor 类型：过滤系统 action
-            if meta.get('type') == 'processor' and meta.get('action_enum'):
-                user_actions = [a for a in meta['action_enum'] if a not in _SYSTEM_ACTIONS]
-                if not user_actions:
-                    continue  # 无用户 action，不暴露给 LLM
-                # 复制 schema，修改 action enum 只保留用户可调用的
-                schema = {**schema, 'parameters': {
-                    **schema['parameters'],
-                    'properties': {
-                        **schema['parameters']['properties'],
-                        'action': {**schema['parameters']['properties']['action'], 'enum': user_actions}
-                    }
-                }}
-            schemas.append(with_parallel_param(schema, meta.get('type')))
+            presented = present_to_llm(
+                schema, tool_meta.get(name),
+                split_action=split_map.get(name, {}).get('action') if name in split_map else None)
+            if presented is not None:
+                schemas.append(presented)
     return schemas
 
 
@@ -939,11 +1051,19 @@ async def await_pending(cancel_event: asyncio.Event | None = None, timeout: floa
                         want: frozenset | None = None,
                         scoped: bool = False,
                         concurrent: bool = False,
-                        owner: str | None = None) -> dict:
+                        owner: str | None = None,
+                        reconsider_event: asyncio.Event | None = None) -> dict:
     """等待与 `want` 冲突的 pending actions 完成。
 
     `scoped=False`（默认）保持全局语义：等所有 pending。`finish` 走这条 —— 结束 turn
     前不该有任何动作还在飞，跟资源无关。
+
+    `reconsider_event` 是比 `cancel_event` 更窄的信号：`cancel_event` 触发时这次等待
+    在等的 pending 会被当作"不再关心"直接遗忘（`_forget_pending`），因为调用方
+    （interrupt/followup 模式）打算让整个 turn 作废。`reconsider_event` 触发时，正在
+    等的那个动作**仍然合法地在别处跑着**——只是这次调用（还没排到号、还没真的发给
+    设备的那个）放弃继续等，把协程还给主循环去问一次新的 LLM，而不是连带把别人的
+    pending 记账也抹掉。两者互不影响，可以同时传。
 
     `scoped=True` 时只等资源冲突的那些（见 `resources_conflict`），且 `effective_timeout`
     只对冲突项取 max —— 原来对全部 pending 取 max，一个长动作会把不相干的调用一起拖住。
@@ -980,12 +1100,18 @@ async def await_pending(cancel_event: asyncio.Event | None = None, timeout: floa
         await asyncio.gather(*[ev.wait() for ev in events])
 
     try:
-        if cancel_event:
+        if cancel_event or reconsider_event:
             wait_task = asyncio.create_task(_wait_all())
-            cancel_task = asyncio.create_task(cancel_event.wait())
+            tasks = [wait_task]
+            cancel_task = asyncio.create_task(cancel_event.wait()) if cancel_event else None
+            reconsider_task = asyncio.create_task(reconsider_event.wait()) if reconsider_event else None
+            if cancel_task:
+                tasks.append(cancel_task)
+            if reconsider_task:
+                tasks.append(reconsider_task)
             try:
                 done, _unfinished = await asyncio.wait(
-                    [wait_task, cancel_task],
+                    tasks,
                     timeout=effective_timeout,
                     return_when=asyncio.FIRST_COMPLETED,
                 )
@@ -996,11 +1122,16 @@ async def await_pending(cancel_event: asyncio.Event | None = None, timeout: floa
                 # Without the finally, CancelledError propagated straight out and
                 # left _wait_all and its Event.wait() children orphaned — the
                 # "Task was destroyed but it is pending!" pair in the R1 logs.
-                await cancel_and_reap([wait_task, cancel_task])
-            if cancel_task in done:
+                await cancel_and_reap(tasks)
+            if cancel_task and cancel_task in done:
                 # 用户打断：只清本次等待的那些，不连带抹掉不相干的 pending
                 _forget_pending(aids, 'cancelled')
                 return {"status": "cancelled"}
+            if reconsider_task and reconsider_task in done:
+                # 跟上面不一样：这次等的东西仍然合法地在别处跑着（比如还在导航的
+                # navigate），不是"不再关心"，只是这次调用放弃继续排队——所以
+                # 不 _forget_pending，aids 的记账原样留着，该谁的完成通知还是谁的。
+                return {"status": "reconsidering", "actions": aids}
             if wait_task not in done:
                 # Unlike wait_for, asyncio.wait() does not raise on timeout — it
                 # returns with an empty `done`. Falling through from here reported
@@ -1147,6 +1278,89 @@ async def call_tool_direct(mcp_id: str, tool_name: str, args: dict) -> dict:
                 return result
     except Exception as e:
         return {"error": f"call_tool_direct failed: {e}"}
+
+
+def resolve_tool_binding(name: str, args: dict) -> tuple[str, str, str | None] | None:
+    """Resolve an LLM-facing tool_call name back to (mcp_id, tool_name, action).
+
+    A device's real action can reach the LLM two ways: unsplit (tool name is
+    `mcp__{id}__{tool}`, action is an `args["action"]` value) or split via
+    x-action-params (tool name is `mcp__{id}__{tool}__{action}`, no `action`
+    arg). Callers that need to compare an LLM tool_call against an x-hooks
+    binding — which is always declared against the raw device tool+action —
+    must go through this instead of guessing from the name string, or they
+    silently stop matching for whichever convention they didn't hardcode.
+    Returns None if `name` isn't a currently-registered tool of any device.
+    """
+    for mcp_id, info in registry.items():
+        split = info.get('split_map', {}).get(name)
+        if split:
+            return mcp_id, split['tool'], split['action']
+        prefix = f'mcp__{mcp_id}__'
+        if name in info.get('schemas', {}) and name.startswith(prefix):
+            return mcp_id, name[len(prefix):], args.get('action')
+    return None
+
+
+async def call_tool_hook(mcp_id: str, tool_name: str, args: dict, *,
+                          barrier_aware: bool = False) -> dict:
+    """Like `call_tool_direct`, with an opt-in barrier-aware mode for hooks that
+    must not behave like an interrupt.
+
+    True interrupt hooks (on_interrupt_*, e-stop) are supposed to bypass
+    everything immediately — that's the correct semantics for "stop now no
+    matter what". `on_notify` (narrate LLM content so the user isn't left in
+    silence during a long tool-calling turn) is not that: firing it should not
+    cut off whatever the robot is already saying or doing, and once it does
+    speak, the next barrier-respecting tool call shouldn't cut *it* off either.
+    `barrier_aware=True` gets both: skip the call if the tool's declared
+    x-resource is already held by a pending ACP action, and — if the call
+    returns an action_id under a completion spec — register it as pending the
+    same way `call_tool`'s normal ACP dispatch does, so it participates in the
+    barrier like any LLM-issued call would.
+    """
+    entry = registry.get(mcp_id)
+    if not entry:
+        return {"error": f"device {mcp_id} not registered"}
+
+    meta = {}
+    if barrier_aware:
+        action = args.get('action')
+        candidates = [f'mcp__{mcp_id}__{tool_name}__{action}'] if action else []
+        candidates.append(f'mcp__{mcp_id}__{tool_name}')
+        tool_meta = entry.get('tool_meta', {})
+        for candidate in candidates:
+            if candidate in tool_meta:
+                meta = tool_meta[candidate]
+                break
+        resource = meta.get('resource')
+        # resource_actually_busy 而不是 conflicting_pending：已完成但还没被 barrier
+        # 回收的 action 不算占用，否则一句播报会把嘴"锁"到下一次 barrier 为止。
+        if resource and resource_actually_busy(resource):
+            return {"skipped": "resource busy"}
+
+    result = await call_tool_direct(mcp_id, tool_name, args)
+
+    if barrier_aware and isinstance(result, dict):
+        completion_spec = meta.get('completion')
+        action = args.get('action')
+        if completion_spec and _should_await_completion(completion_spec, action):
+            action_id = result.get('action_id')
+            if action_id:
+                resource = meta.get('resource')
+                _pending_actions[action_id] = asyncio.Event()
+                _pending_tools[action_id] = tool_name
+                _pending_resources[action_id] = resource
+                _pending_owner[action_id] = current_agent_context.get()
+                text_arg = args.get('text', '')
+                default_timeout = completion_spec.get('timeout', 120)
+                dynamic_timeout = len(text_arg) / 3 + 10 if text_arg else default_timeout
+                _pending_timeouts[action_id] = dynamic_timeout
+                _res_txt = ','.join(sorted(resource)) if resource else 'undeclared/exclusive'
+                print(f'[acp] registered pending: {action_id} (tool={tool_name}, '
+                      f'timeout={dynamic_timeout:.0f}s, resource={_res_txt}) [via hook]')
+
+    return result
 
 
 def cleanup_stale_actions(max_age_s: float = 300):

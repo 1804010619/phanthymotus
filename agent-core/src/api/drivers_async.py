@@ -32,7 +32,7 @@ def _docker():
     return docker_sdk.from_env()
 
 
-async def _deploy_with_progress(driver: dict) -> dict:
+async def _deploy_with_progress(driver: dict, run_id: str = '') -> dict:
     """Deploy a driver with real-time progress streaming.
 
     This is an async version that integrates preflight checks and progress updates.
@@ -42,7 +42,7 @@ async def _deploy_with_progress(driver: dict) -> dict:
     name = _container_name(driver_id, driver.get('container_name', ''))
     target_image = driver['image']
 
-    async with DeployProgress(driver_id, target_image) as progress:
+    async with DeployProgress(driver_id, target_image, run_id=run_id) as progress:
         # Check if already running with same image
         try:
             client = _docker()

@@ -38,6 +38,21 @@ PCM_FRAME_S = CHUNK_BYTES / (SAMPLE_RATE * 2)  # 0.1s of audio per frame
 # resamples 24000 -> 16000 internally (utils/resample.py) so that the topic stays
 # audio/pcm-16k and nothing downstream has to learn a second rate.
 KOKORO_SAMPLE_RATE = 24000
+# How long a Japanese adapter stays on the in-process CPU fallback before
+# _direct() gives the shared GPU worker another attempt. Not "every call" — a
+# worker that is genuinely down would then pay the ~60s RUN_TIMEOUT_S probe on
+# every single utterance; not "never" either, which is what shipped before and
+# pinned a card to CPU for its whole life over one transient failure.
+KOKORO_WORKER_RETRY_S = 60.0
+# Forces KokoroDirect.synthesize_stream() to split every Japanese utterance
+# into chunks of at most this many tokens, well under the style table's 510
+# ceiling — see _synthesize_japanese. Tuned starting point: on Orin5 CPU,
+# ~400 tokens measured ~60ms/token, so 50 targets first sound in a few
+# seconds rather than tens of seconds; smaller means more ONNX calls (each
+# with its own fixed overhead) and one more potential seam per split, larger
+# means more silence before the first frame. Has no effect on GPU, where a
+# whole utterance is fast enough that this rarely mattered in the first place.
+KOKORO_JA_CHUNK_TOKENS = 250
 
 # Frames held back before pacing starts, then published in one burst, so the
 # consumer begins with a real cushion. 5 frames = 500ms, matching the
@@ -148,7 +163,9 @@ TOOLS = [
         "name": "tts",
         "type": "processor",
         "multiInstance": True,
-        "description": "TTS — start/stop speech synthesis, speak text, or get status",
+        "description": "TTS — 把文本说出来（speak），或立即掐断正在说的话（interrupt）。"
+                       "注意 stop 是停掉整个插件节点、不是停住这句话；"
+                       "要让机器人别说了用 interrupt。",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -177,6 +194,7 @@ TOOLS = [
             "x-resource": "mouth",
             "x-hooks": {
                 "on_interrupt_speak": {"action": "interrupt"},
+                "on_notify": {"action": "speak"},
             }
         },
         "configSchema": {
@@ -323,12 +341,19 @@ class MatchaTTSAdapter(TTSAdapter):
     """On-device TTS using sherpa-onnx Matcha (flow-matching, fast non-autoregressive)."""
 
     def __init__(self, model_dir: str, speaker_id: int = 0, speed: float = 1.0,
-                 device: str = "cpu"):
+                 device: str = "cpu", on_status=None):
         import os
         from utils.model_downloader import ensure_model
+        from utils.model_progress import fetch_status
         from utils.onnx_provider import provider_for_device
-        ensure_model("tts", model_dir)
-        ensure_model("tts_vocoder", model_dir)
+        # Two downloads, so two labels: one shared "matcha" line would jump back
+        # to 0% for the vocoder and read as a restart.
+        acoustic_cb, acoustic_stage = fetch_status(on_status, "matcha")
+        vocoder_cb, vocoder_stage = fetch_status(on_status, "vocos")
+        ensure_model("tts", model_dir, progress_cb=acoustic_cb,
+                     stage_cb=acoustic_stage)
+        ensure_model("tts_vocoder", model_dir, progress_cb=vocoder_cb,
+                     stage_cb=vocoder_stage)
 
         import sherpa_onnx
         # Matcha model files
@@ -418,9 +443,11 @@ class MmsThaiTTSAdapter(TTSAdapter):
     dry_run_text = "ก"
 
     def __init__(self, model_dir: str, speaker_id: int = 0, speed: float = 1.0,
-                 device: str = "cpu", phrase_spacing: bool = False):
+                 device: str = "cpu", phrase_spacing: bool = False,
+                 on_status=None):
         import os
         from utils.model_downloader import ensure_thai_tts_model
+        from utils.model_progress import fetch_status
         from utils.onnx_provider import provider_for_device
 
         if speaker_id != 0:
@@ -447,7 +474,9 @@ class MmsThaiTTSAdapter(TTSAdapter):
                 f"audio rather than spoken: {error}"
             ) from error
 
-        model_dir = ensure_thai_tts_model(model_dir)
+        thai_cb, thai_stage = fetch_status(on_status, "mms-th")
+        model_dir = ensure_thai_tts_model(model_dir, progress_cb=thai_cb,
+                                          stage_cb=thai_stage)
         model_path = os.path.join(model_dir, "model.onnx")
         tokens_path = os.path.join(model_dir, "tokens.txt")
         for path in (model_path, tokens_path):
@@ -724,15 +753,20 @@ class KokoroTTSAdapter(TTSAdapter):
     }
 
     def __init__(self, model_dir: str, speaker_id: int = 0, speed: float = 1.0,
-                 device: str = "gpu", language: str = DEFAULT_LANGUAGE):
+                 device: str = "gpu", language: str = DEFAULT_LANGUAGE,
+                 japanese_worker: bool = True, japanese_worker_device: str = "gpu",
+                 on_status=None):
         import os
         from utils.model_downloader import ensure_kokoro_model
+        from utils.model_progress import fetch_status
         from utils.onnx_provider import normalize_device, pick_weights, provider_for_device
 
         device = normalize_device(device)
         language = self._normalize_language(language)
 
-        model_dir = ensure_kokoro_model(model_dir, device)
+        kokoro_cb, kokoro_stage = fetch_status(on_status, "kokoro-multi")
+        model_dir = ensure_kokoro_model(model_dir, device, progress_cb=kokoro_cb,
+                                        stage_cb=kokoro_stage)
         # gpu directories hold fp32, cpu directories hold int8 — pick_weights'
         # documented behaviour of falling back to the *last* candidate means a
         # missing file produces an error naming the one this device wanted.
@@ -808,9 +842,16 @@ class KokoroTTSAdapter(TTSAdapter):
         # Japanese does not go through sherpa at all — see _synthesize_japanese —
         # so the direct runtime needs to know which weights and provider to reuse.
         self._direct_runtime = None
+        # Set when _direct_runtime is the in-process CPU fallback rather than the
+        # worker proxy, so _direct() knows to give the worker another chance later
+        # instead of being stuck on CPU for the adapter's whole life — see _direct().
+        self._direct_fallback = False
+        self._direct_retry_at = 0.0
         self._model_dir = model_dir
         self._weights_name = os.path.basename(model_path)
         self._provider = provider
+        self._japanese_worker = bool(japanese_worker)
+        self._japanese_worker_device = japanese_worker_device
 
         tts_config = sherpa_onnx.OfflineTtsConfig(
             model=sherpa_onnx.OfflineTtsModelConfig(
@@ -990,22 +1031,84 @@ class KokoroTTSAdapter(TTSAdapter):
         return self._ja_frontend
 
     def _direct(self):
-        """The phoneme-driven ONNX runtime, built on first Japanese utterance.
+        """The phoneme-driven runtime, built on the first Japanese utterance.
 
-        A second session on the same weights, so it is lazy and only Japanese pays
-        for it. Everything else keeps using sherpa, which is correct for those
-        languages and better tested.
+        A second session on the same weights, so it is lazy and only Japanese pays for
+        it. Everything else keeps using sherpa, which is correct for those languages
+        and better tested. A card configured for any of the other eight languages
+        never builds this at all.
 
-        It is deliberately given no device: `KokoroDirect` is CPU-only by
-        construction, because a second *CUDA* session on this graph collides with
-        sherpa's inside the shared CUDA provider library. That is not a tuning
-        choice — see the reasoning and the measurements in `kokoro_direct.py`.
+        **It runs in a separate process.** A CUDA session on this graph cannot coexist
+        with sherpa's in one process — the two ONNX Runtimes share a single provider
+        bridge holding one `ProviderHost` pointer, so the second session built runs
+        against the wrong runtime's objects; on jp5.11 that is a SIGSEGV that kills all
+        of perception. `plugins/kokoro_worker.py` has the full mechanism and the
+        measurements. The boundary also buys the GPU: RTF 0.063 against 0.525
+        in-process on CPU, for ~372 MB.
+
+        Falling back to the in-process CPU session is deliberate and safe — that is
+        exactly what shipped before the worker existed.
+
+        The fallback used to be permanent: once the worker's construction raised
+        anything other than `DeviceUnavailable`, `_direct_runtime` was set to a
+        plain `KokoroDirect` and the `is None` check above never fired again for
+        this adapter's whole life — a single transient failure (the shared worker
+        busy rebuilding after a restart, a one-off timeout) pinned the card to CPU
+        until the card or engine was restarted, even though the worker had long
+        since recovered. `_direct_fallback`/`_direct_retry_at` give it another
+        attempt every `KOKORO_WORKER_RETRY_S`, instead of never.
         """
+        now = time.monotonic()
+        if self._direct_runtime is not None:
+            if not self._direct_fallback or now < self._direct_retry_at:
+                return self._direct_runtime
+
+        if self._japanese_worker:
+            from plugins.kokoro_worker import DeviceUnavailable, KokoroWorkerProxy
+            try:
+                self._direct_runtime = KokoroWorkerProxy(
+                    self._model_dir, self._weights_name,
+                    device=self._japanese_worker_device)
+                self._direct_fallback = False
+                return self._direct_runtime
+            except DeviceUnavailable:
+                # The configured device cannot do the job. Substituting the CPU
+                # here would hide it behind a card that still says `gpu` — the
+                # state that made Japanese "mysteriously slow" and took a
+                # measurement to explain. Let it surface. Deliberately not
+                # retried like the branch below: this is a standing condition
+                # (not enough memory, a wrong-duration CUDA build), not a
+                # transient one, so retrying it would just repeat the same cost
+                # every KOKORO_WORKER_RETRY_S for no chance of a different answer.
+                raise
+            except Exception as exc:                          # noqa: BLE001
+                log.warning("[tts] kokoro worker unavailable (%s); Japanese uses "
+                            "the in-process CPU session, retrying the worker in "
+                            "%.0fs", exc, KOKORO_WORKER_RETRY_S)
+                self._direct_retry_at = now + KOKORO_WORKER_RETRY_S
+
         if self._direct_runtime is None:
             from plugins.kokoro_direct import KokoroDirect
             self._direct_runtime = KokoroDirect(
                 self._model_dir, self._weights_name)
+            self._direct_fallback = True
         return self._direct_runtime
+
+    def close(self) -> None:
+        """Release the Japanese worker, if there is one.
+
+        Called when the card stops or the engine is switched. Without it a card that
+        spoke Japanese once holds the session for the adapter's whole life — true of
+        the in-process runtime too, and a leak this fixes for the worker case, because
+        a process exit is the only thing that returns a CUDA context.
+        """
+        runtime, self._direct_runtime = self._direct_runtime, None
+        closer = getattr(runtime, "close", None)
+        if closer is not None:
+            try:
+                closer()
+            except Exception as exc:                              # noqa: BLE001
+                log.warning("[tts] closing the kokoro worker failed: %s", exc)
 
     def synthesize(self, text: str) -> bytes:
         return b''.join(self.synthesize_stream(text))
@@ -1077,17 +1180,49 @@ class KokoroTTSAdapter(TTSAdapter):
                         "normalisation", text)
             return
 
+        # Chunk-by-chunk, not synthesize()+concatenate. On CPU, also forced to
+        # small chunks rather than the style table's 510-token ceiling: the
+        # ceiling is a correctness limit, not a latency target, and most
+        # utterances never reach it — measured on Orin5 (CPU-only, jp5.11's CUDA
+        # computes this graph's durations wrongly), a single ~400-token sentence
+        # is one `_run` call and sat in 25s of silence before the first frame,
+        # because there was nothing to split. KOKORO_JA_CHUNK_TOKENS forces a
+        # split regardless of length, so chunk 1 (a few seconds of compute) can
+        # start playing while chunk 2 is still being computed.
+        #
+        # GPU does not get this: after fixing the CUDA EP's cudnn_conv_algo_search
+        # default (see kokoro_direct.py), the SAME long sentence measured 3.18s
+        # to first frame on GPU with no chunking at all — RTF is fast enough there
+        # that forcing small chunks would only buy back a couple of seconds while
+        # paying the leading/trailing-silence cost of every extra chunk boundary
+        # (measured: chunking one utterance into ~9 pieces added ~7.5s of audible
+        # mid-utterance pauses). The device actually in use, not the one asked
+        # for, decides this — a session that fell back to the in-process CPU path
+        # after a worker failure is exactly the case this exists for.
+        produced_any = False
         with self._lock:
-            samples = self._direct().synthesize(
-                phonemes, speaker_id=self._sid, speed=self._speed)
+            runtime = self._direct()
+            # The session actually resident, not the device once asked for: a
+            # KokoroWorkerProxy configured for gpu that has silently fallen back
+            # to its in-process CPU session (worker failure, mid-retry-window)
+            # must not be judged "gpu" just because that is what device_used
+            # still says — it would skip exactly the chunking this exists for.
+            providers = getattr(runtime, "providers", None) or []
+            using_gpu = any("CUDA" in p or "Tensorrt" in p for p in providers)
+            chunk_limit = None if using_gpu else KOKORO_JA_CHUNK_TOKENS
+            for samples in runtime.synthesize_stream(
+                    phonemes, speaker_id=self._sid, speed=self._speed,
+                    max_chunk_tokens=chunk_limit):
+                if samples.size == 0:
+                    continue
+                produced_any = True
+                pcm = downsample_24k_to_16k(samples)
+                for i in range(0, len(pcm), CHUNK_BYTES):
+                    yield pcm[i:i + CHUNK_BYTES]
 
-        if samples.size == 0:
+        if not produced_any:
             log.warning("[tts] kokoro_direct produced no audio for %r (%r)",
                         text, phonemes)
-            return
-        pcm = downsample_24k_to_16k(samples)
-        for i in range(0, len(pcm), CHUNK_BYTES):
-            yield pcm[i:i + CHUNK_BYTES]
 
     def set_speed(self, speed: float) -> None:
         # Applied per generate() call, so nothing reloads — same as the other two.
@@ -1172,7 +1307,7 @@ def _validate_kokoro_manifest(model_dir: str) -> dict:
     return manifest
 
 
-def _build_tts_adapter(cfg: dict) -> TTSAdapter:
+def _build_tts_adapter(cfg: dict, on_status=None) -> TTSAdapter:
     import os
     from utils.onnx_provider import normalize_device
     engine = str(cfg.get('engine', '')).lower()
@@ -1191,6 +1326,7 @@ def _build_tts_adapter(cfg: dict) -> TTSAdapter:
         return MmsThaiTTSAdapter(
             model_dir, speaker_id, speed, device,
             phrase_spacing=bool(cfg.get('thai_phrase_spacing', False)),
+            on_status=on_status,
         )
     if engine == 'kokoro-multi':
         return KokoroTTSAdapter(
@@ -1200,8 +1336,16 @@ def _build_tts_adapter(cfg: dict) -> TTSAdapter:
             # same way the facade takes `tts_engine` or `engine`.
             language=(cfg.get('tts_language') or cfg.get('language')
                       or KokoroTTSAdapter.DEFAULT_LANGUAGE),
+            # Japanese runs in its own process — the only way a CUDA session on this
+            # graph can coexist with sherpa's. Not exposed in configSchema: it is a
+            # correctness constraint, not an operator preference. config.yaml can
+            # turn it off to fall back to the in-process CPU session.
+            japanese_worker=bool(cfg.get('japanese_worker', True)),
+            japanese_worker_device=str(cfg.get('japanese_worker_device') or 'gpu'),
+            on_status=on_status,
         )
-    return MatchaTTSAdapter(model_dir, speaker_id, speed, device)
+    return MatchaTTSAdapter(model_dir, speaker_id, speed, device,
+                            on_status=on_status)
 
 
 # ── ROS2 Node ─────────────────────────────────────────────────────────────────
@@ -1650,8 +1794,15 @@ class SherpaOnnxTTSPlugin:
         self._cfg.update(_session_keys(plugin_cfg))
         self._loading  = False
         self._load_error = None
+        # The downloader's progress line while weights are being fetched. Read by
+        # the `info` reply below, which is served on another thread —
+        # ThreadingHTTPServer gives every tools/call its own — so the dashboard's
+        # heartbeat can show it while a rebuild is still blocked here.
+        self._load_status = None
         try:
-            self._adapter  = _build_tts_adapter(plugin_cfg)
+            self._adapter  = _build_tts_adapter(
+                plugin_cfg,
+                on_status=lambda text: setattr(self, "_load_status", text))
         except Exception as e:
             log.error(f"[tts] failed to load model: {e}", exc_info=True)
             self._adapter = None
@@ -1724,7 +1875,7 @@ class SherpaOnnxTTSPlugin:
                 return {
                     "name": "TTS", "manufacture": "Embodied", "model": "tts",
                     "state": "loading",
-                    "desc": "Downloading TTS model...",
+                    "desc": self._load_status or "Downloading TTS model...",
                 }
             if self._load_error:
                 return {
@@ -1777,7 +1928,9 @@ class SherpaOnnxTTSPlugin:
 
         elif action == "start":
             if self._loading:
-                return {"state": "loading", "message": "TTS model is being downloaded, please wait..."}
+                return {"state": "loading",
+                        "message": (self._load_status
+                                    or "TTS model is being downloaded, please wait...")}
             if self._load_error:
                 return {"state": "error", "message": f"TTS model failed to load: {self._load_error}"}
             if not self._adapter:
@@ -1820,7 +1973,9 @@ class SherpaOnnxTTSPlugin:
 
         elif action == "speak":
             if self._loading:
-                return {"state": "loading", "message": "TTS model is being downloaded, please wait..."}
+                return {"state": "loading",
+                        "message": (self._load_status
+                                    or "TTS model is being downloaded, please wait...")}
             if self._load_error or not self._adapter:
                 return {"state": "error", "message": f"TTS model not available: {self._load_error or 'not loaded'}"}
             text = args.get("text", "")
@@ -1908,7 +2063,22 @@ class SherpaOnnxTTSPlugin:
             if needs_rebuild or self._adapter is None:
                 changed = sorted(incoming) if needs_rebuild else ['(no model loaded)']
                 log.info("[tts] rebuilding the adapter: %s changed", ", ".join(changed))
-                self._adapter = _build_tts_adapter(self._cfg)
+                # `_loading` had no writer before this: the flag and the "loading"
+                # reply below both existed, so `info` could never report a rebuild
+                # that was actually in progress. Setting it here is what makes the
+                # progress line reachable — a Kokoro rebuild is a 515 MB download
+                # on a cold /models, and until now the card said nothing at all.
+                self._loading = True
+                self._load_status = None
+                try:
+                    self._adapter = _build_tts_adapter(
+                        self._cfg,
+                        on_status=lambda text: setattr(self, "_load_status", text))
+                finally:
+                    # Cleared on the failure path too, or one failed rebuild would
+                    # leave every later `info` claiming to be loading forever.
+                    self._loading = False
+                    self._load_status = None
                 self._load_error = None
                 # Nodes hold the old adapter, so they have to go — but only when
                 # there really is a new adapter for them to pick up.
@@ -1950,7 +2120,7 @@ class SherpaOnnxTTSPlugin:
 
 DEFAULT_TTS_ENGINE = "vits2-zh-en"
 # `<model>-<languages>`, the shape `asr_model` in plugins/asr.py already uses
-# (x-asr-zh-en, paraformer-zh-en, zipformer-en). Two reasons to match it rather
+# (x-asr-zh-en, parakeet-en, sensevoice-small). Two reasons to match it rather
 # than invent a second convention: the dashboard renders the raw enum string, so
 # this is what an operator reads in the dropdown right next to the ASR one; and
 # naming an engine after its runtime said nothing about what you would hear —
@@ -2277,7 +2447,9 @@ class TTSPlugin:
         if requested:
             engine = self._select_engine(requested)
             with self._lock:
-                switching = engine != self._impl_engine or self._impl is None
+                already_building = self._building == engine
+                switching = not already_building and (
+                    engine != self._impl_engine or self._impl is None)
                 if switching:
                     outgoing, self._impl = self._impl, None
                     self._impl_engine = ""
@@ -2293,6 +2465,18 @@ class TTSPlugin:
                     _dispose_impl(outgoing)
                 self._build_async(engine)
                 log.info("[tts] switching engine to %s", engine)
+            if switching or already_building:
+                if already_building:
+                    # A config for the engine already being built — e.g. a
+                    # dashboard resend after seeing "loading" — must not start
+                    # a second build. Two _build_async() runs for the same
+                    # engine race on self._building/_impl_engine, and whichever
+                    # finishes last wins; if resends keep arriving faster than a
+                    # cold CUDA build the card never settles and just reloads
+                    # the model over and over. Ride the in-flight build instead.
+                    log.info("[tts] config for %s while already building; "
+                              "waiting on the in-flight build instead of "
+                              "starting another", engine)
                 # Wait for it, up to a bound. Only part of a build is open-ended
                 # (downloading a model); constructing the session afterwards took
                 # ~2 s on cpu and ~5 s on gpu, and answering `loading` for that is
@@ -2338,3 +2522,13 @@ def _dispose_impl(impl) -> None:
         impl.dispatch("tts", {"action": "stop"})
     except Exception:
         log.error("[tts] failed to stop the outgoing engine", exc_info=True)
+    # Kokoro's Japanese path may own a worker process. Dropping the impl does not
+    # reap it — a child is not garbage — and on `device: gpu` it is holding a CUDA
+    # context the incoming engine is about to want.
+    adapter = getattr(impl, "_adapter", None)
+    closer = getattr(adapter, "close", None)
+    if closer is not None:
+        try:
+            closer()
+        except Exception:
+            log.error("[tts] failed to close the outgoing adapter", exc_info=True)

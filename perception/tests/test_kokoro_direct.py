@@ -158,25 +158,37 @@ def test_the_japanese_table_encodes_with_no_unknowns():
 
 def test_the_session_is_built_on_cpu_and_cannot_be_asked_for_cuda(tmp_path,
                                                                   monkeypatch):
-    """A CUDA session here collides with sherpa's; the collision is not order-fixable.
+    """CUDA here is safe only in a process with no other ONNX Runtime in it.
 
-    Two ONNX Runtime builds share one `libonnxruntime_providers_cuda.so` on jp6.1,
-    and whichever of them builds the *second* CUDA session on this graph dies with
-    "Could not find OrtValue with name '/Squeeze_2_output_0'". Measured both ways
-    round on Orin 6.
+    Two runtimes share one provider bridge holding a single `ProviderHost` pointer, so
+    whichever builds the *second* CUDA session on this graph dies with "Could not find
+    OrtValue with name '/Squeeze_2_output_0'" — an exception on jp6.1, a SIGSEGV that
+    kills all of perception on jp5.11. Measured both ways round on both rigs.
 
-    This shipped once. The code requested CUDA while a stale docstring asserted the
-    request was inert because the wheel was CPU-only — true until the Dockerfile
-    started installing the GPU wheel, and untested either way. So assert the two
-    things that keep it from coming back: the providers list, and the absence of any
-    argument that could reintroduce a device.
+    This shipped once, because the code requested CUDA while a stale docstring asserted
+    the request was inert. Both arguments exist again now that
+    `plugins/ort_worker.py` provides a process with nothing else in it — so the
+    invariant moved rather than disappeared, and this asserts where it moved to:
+
+      - `provider` defaults to **cpu**, so anything constructing this without thinking
+        gets the safe thing;
+      - `in_process` defaults to **False**, so the session goes to the worker child.
+        `in_process=True` puts it next to sherpa's runtime, which is the configuration
+        that collides, and the callers only use it as an explicitly-degraded fallback.
+
+    A CPU-only session loads no CUDA provider at all, so it never touches the bridge —
+    which is why the in-process fallback paths are safe despite being in the colliding
+    process, as long as they stay on cpu.
     """
     import inspect
 
     signature = inspect.signature(kd.KokoroDirect.__init__)
-    assert "provider" not in signature.parameters, (
-        "KokoroDirect must expose no device argument — see its docstring for why")
-
+    assert signature.parameters["provider"].default == "cpu", (
+        "the default must stay CPU: a caller that does not think about it may be in "
+        "perception's own process, where CUDA here corrupts sherpa's sessions")
+    assert signature.parameters["in_process"].default is False, (
+        "the default must be the worker child. in_process=True puts this session next "
+        "to sherpa's runtime, which is the configuration that collides")
     (tmp_path / "tokens.txt").write_text("a 1\n", encoding="utf-8")
     (tmp_path / "voices.bin").write_bytes(
         b"\0" * (kd.STYLE_LENGTHS * kd.STYLE_DIM * 4))
@@ -185,8 +197,9 @@ def test_the_session_is_built_on_cpu_and_cannot_be_asked_for_cuda(tmp_path,
     seen = {}
 
     class _Session:
-        def __init__(self, path, opts, providers):
+        def __init__(self, path, opts, providers, provider_options=None):
             seen["providers"] = providers
+            seen["provider_options"] = provider_options
 
         def get_providers(self):
             return seen["providers"]
@@ -195,5 +208,11 @@ def test_the_session_is_built_on_cpu_and_cannot_be_asked_for_cuda(tmp_path,
         "o", (), {"intra_op_num_threads": 0})(), "InferenceSession": _Session})
     monkeypatch.setitem(sys.modules, "onnxruntime", fake_ort)
 
-    kd.KokoroDirect(str(tmp_path), "model.onnx")
+    # in_process=True on purpose: this is the path the fake onnxruntime above can be
+    # seen from, and it is the path whose provider list matters — the worker child
+    # gets its providers as a plain list argument, asserted in test_ort_worker.py.
+    kd.KokoroDirect(str(tmp_path), "model.onnx", in_process=True)
     assert seen["providers"] == ["CPUExecutionProvider"], seen
+    assert seen["provider_options"] == [{}], (
+        "cudnn_conv_algo_search is a CUDA-only option; a CPU-only session must not "
+        "carry it")

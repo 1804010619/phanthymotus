@@ -10,6 +10,7 @@ import asyncio
 import fastapi
 
 from api.drivers import _load_manifest, _save_manifest, _deploy_sync, _run_in_executor, _log_deploy
+from api.deploy_stream import begin_run, _runs
 
 router = fastapi.APIRouter(prefix='/drivers', tags=['drivers'])
 
@@ -17,11 +18,11 @@ router = fastapi.APIRouter(prefix='/drivers', tags=['drivers'])
 _background_tasks = {}
 
 
-async def _deploy_background(driver_id: str, driver: dict):
+async def _deploy_background(driver_id: str, driver: dict, run_id: str = ''):
     """Run deployment in background and update manifest when done."""
     try:
         from api.drivers_async import _deploy_with_progress
-        result = await _deploy_with_progress(driver)
+        result = await _deploy_with_progress(driver, run_id=run_id)
 
         # Persist updated image and container_name into manifest
         if not result.get('skipped'):
@@ -60,13 +61,17 @@ async def driver_deploy_v2(driver_id: str, body: dict = fastapi.Body(default={})
     if not driver:
         raise fastapi.HTTPException(status_code=404, detail='Driver not found in manifest')
 
-    # Check if already deploying
+    # Check if already deploying. Hand back the run already in flight so the
+    # caller's window attaches to it instead of watching a run that will never
+    # start — a double click used to leave the second window blank forever.
     if driver_id in _background_tasks:
+        current = _runs.get(driver_id) or {}
         return {
             'code': 200,
             'data': {
-                'status': 'deploying',
+                'status':  'deploying',
                 'message': 'Deployment already in progress',
+                'run_id':  current.get('run_id', ''),
             }
         }
 
@@ -77,8 +82,13 @@ async def driver_deploy_v2(driver_id: str, body: dict = fastapi.Body(default={})
 
     _log_deploy(driver_id, f'[deploy-v2] starting background deployment: {driver["image"]}')
 
+    # Open the run here, not in the background task: the id has to be in this
+    # response for the client to be able to ask for exactly this run, and the
+    # buffer has to exist before the first event is emitted.
+    run_id = begin_run(driver_id, driver['image'])
+
     # Start deployment in background (fire and forget)
-    task = asyncio.create_task(_deploy_background(driver_id, driver))
+    task = asyncio.create_task(_deploy_background(driver_id, driver, run_id))
     _background_tasks[driver_id] = task
 
     # Return immediately - client connects to WebSocket for progress
@@ -88,6 +98,7 @@ async def driver_deploy_v2(driver_id: str, body: dict = fastapi.Body(default={})
             'status': 'started',
             'message': 'Deployment started in background',
             'driver_id': driver_id,
+            'run_id': run_id,
         }
     }
 

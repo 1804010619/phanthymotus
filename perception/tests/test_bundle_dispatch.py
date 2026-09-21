@@ -32,8 +32,11 @@ def bundle_cls():
 
 
 class _StubPlugin:
-    def __init__(self, prefix: str, tools: list[str] | None = None):
+    def __init__(self, prefix: str, tools: list[str] | None = None,
+                 aliases: tuple[str, ...] = ()):
         self.PREFIX = prefix
+        if aliases:
+            self.ALIASES = aliases
         self._tools = tools or [prefix]
         self.calls: list[tuple[str, dict]] = []
 
@@ -122,6 +125,43 @@ def test_owns_and_dispatch_never_disagree(bundle_cls):
         owned = bundle.owns(name)
         dispatched = bundle.dispatch(name, {}) is not None
         assert owned == dispatched, name
+
+
+# ── aliases: a renamed tool keeps answering to its old name ──────────────────
+
+def test_alias_dispatches_to_the_plugin(bundle_cls):
+    """`vdp` was renamed to `visual_depth`; a card saved under the old name
+    must keep working rather than come back `state: error` after a restart."""
+    depth = _StubPlugin("visual_depth", aliases=("vdp",))
+    bundle = _bundle(bundle_cls, depth)
+    assert bundle.owns("vdp") is True
+    assert bundle.dispatch("vdp", {"action": "info"})["plugin"] == "visual_depth"
+
+
+def test_alias_sub_tool_resolves_to_the_bare_action(bundle_cls):
+    depth = _StubPlugin("visual_depth", ["visual_depth", "start"], aliases=("vdp",))
+    bundle = _bundle(bundle_cls, depth)
+    bundle.dispatch("vdp_start", {})
+    assert depth.calls[0][0] == "start"
+
+
+def test_alias_is_not_advertised(bundle_cls):
+    """The old name dispatches but must not appear in tools/list — otherwise
+    the dashboard offers two cards for one plugin."""
+    depth = _StubPlugin("visual_depth", ["visual_depth"], aliases=("vdp",))
+    bundle = _bundle(bundle_cls, depth)
+    assert {t["name"] for t in bundle.get_all_tools()} == {"visual_depth"}
+
+
+def test_a_real_prefix_beats_another_plugins_alias(bundle_cls):
+    """If some plugin ever claims a name another plugin aliases, the plugin
+    that actually owns the name wins — longest match, then real prefix."""
+    depth = _StubPlugin("visual_depth", aliases=("vdp",))
+    legacy = _StubPlugin("vdp")
+    for order in ((depth, legacy), (legacy, depth)):
+        bundle = _bundle(bundle_cls, *order)
+        assert bundle.dispatch("vdp", {})["plugin"] == "vdp"
+        assert bundle.dispatch("visual_depth", {})["plugin"] == "visual_depth"
 
 
 def test_get_all_tools_prefixes_sub_tools_only(bundle_cls):

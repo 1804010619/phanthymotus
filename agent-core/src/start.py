@@ -125,6 +125,8 @@ def _register_core_mcp(silent=False):
                         'trigger_interval_ms': {'type': 'integer', 'description': '采集触发间隔（毫秒）', 'default': 1000},
                         'think_mode': {'type': 'boolean', 'description': 'Think mode (enables deep reasoning, disable for faster response)', 'default': False},
                         'vision_input': {'type': 'boolean', 'description': '模型支持图片输入（关闭时图片只以文件信息形式给模型，不内联图像内容）', 'default': False},
+                        'auto_narration': {'type': 'boolean', 'description': '自动播报：模型长时间不出声时，由系统自动生成一句进展汇报并通过已注册的语音/灯效等输出播报给用户', 'default': True},
+                        'narration_silence_seconds': {'type': 'integer', 'description': '主动播报：距上次对用户说话多少秒后自动汇报一次进展（0 = 关闭）', 'default': 15, 'x-show-when': {'auto_narration': 'true'}},
                         'search_type': {'type': 'string', 'description': '搜索引擎', 'enum': ['none', 'baidu_search'], 'default': 'none'},
                         'search_base_url': {'type': 'string', 'description': '搜索服务 URL (带 /v1)', 'x-show-when': {'search_type': 'baidu_search'}},
                         'search_api_key': {'type': 'string', 'description': '搜索服务 API Key', 'format': 'password', 'x-show-when': {'search_type': 'baidu_search'}},
@@ -422,6 +424,10 @@ async def lifespan(app):
     # 定期刷新 agent-core 自身注册（30s）
     asyncio.create_task(_heartbeat_core_mcp())
 
+    # 画布编辑锁：闲置 60s 自动释放（惰性检查兜不住被浏览器节流的后台标签页）
+    from api import canvas as canvas_api
+    canvas_api.start_editor_sweeper()
+
     # 启动 DDS topic 订阅（依据 config event.subscribe_topics）
     topics = config.main.get('event', {}).get('subscribe_topics', [])
     topic_subscriber.start(topics, asyncio.get_event_loop())
@@ -605,9 +611,7 @@ async def acp_complete(request: fastapi.Request):
         return {'ok': False, 'error': 'action_id required'}
 
     # 通道1: 解锁 sync() 等待
-    if action_id in mcp_client._pending_actions:
-        mcp_client._pending_results[action_id] = body
-        mcp_client._pending_actions[action_id].set()
+    mcp_client.mark_action_complete(action_id, body)
 
     # 通道2: 进 event_bus → steering 注入 LLM
     import event_bus

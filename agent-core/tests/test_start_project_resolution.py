@@ -44,6 +44,17 @@ MIC, ASR, CORE, RM = 'card-mic', 'card-asr', 'card-core', 'card-rm'
 # or one whose output genuinely cannot be inferred. The fallback chain and the
 # unresolved-input check are the only things that can speak for it.
 SILENT = 'card-silent'
+# A card whose driver refuses the start with a bare `{"error": ...}` and no
+# `state` — the shape unitree/{g1,r1,go2}/device.py use for "Missing
+# input_topic". mcp_call_tool returns every ordinary tool result as code 200,
+# so nothing about the transport marks this as a failure.
+REFUSER = 'card-refuser'
+# Two cards that differ only in how much of their input they actually take.
+# GREEDY subscribes to every topic it was handed and reports all of them, the
+# way decision_core does; PICKY takes the first and reports only that, the way
+# every driver and perception's tts/ocr/face do.
+GREEDY = 'card-greedy'
+PICKY = 'card-picky'
 
 # decision_core precedes asr, as it does on R1: cards are listed in the order
 # they were created and asr was added four days later.
@@ -79,17 +90,42 @@ def driver(monkeypatch):
         if action == 'start':
             starts[card_id] = args
             started_input[card_id] = args.get('input_topic') or ''
+            # A Unitree speaker refuses a start it cannot bind, and says so the
+            # way those drivers do: a bare `error` key, no `state`, and the
+            # JSON-RPC call itself succeeds.
+            if card_id == REFUSER:
+                return {'code': 200, 'data': {'error': 'Missing input_topic'}}
             return {'code': 200, 'data': {'state': 'running'}}
         if action == 'info':
-            return {'code': 200, 'data': {'state': 'running',
-                                          'topic_out': _topic_out(card_id, args)}}
+            data = {'state': 'running', 'topic_out': _topic_out(card_id, args, req.tool)}
+            topic_in = _topic_in(card_id)
+            if topic_in is not None:
+                data['topic_in'] = topic_in
+            return {'code': 200, 'data': data}
         return {'code': 200, 'data': {'state': 'idle'}}
 
-    def _topic_out(card_id, args):
-        if card_id == ASR:
-            # Derived. `info` is asked with the input the card was started with;
-            # without one there is nothing to derive from and perception would
-            # answer its fallback, which for ASR is no topic at all.
+    def _topic_in(card_id):
+        """What the card reports having bound, or None to stay silent.
+
+        Silence is the default because most of this file's fakes predate the
+        question — and a tool that does not answer it must not be failed.
+        """
+        args = starts.get(card_id) or {}
+        sent = list(args.get('input_topics') or
+                    ([args['input_topic']] if args.get('input_topic') else []))
+        if card_id == GREEDY:      # binds everything it was handed, as agentcore does
+            return [{'topic': t, 'format': 'data/json'} for t in sent]
+        if card_id == PICKY:       # binds the first and ignores the rest
+            return [{'topic': t, 'format': 'data/json'} for t in sent[:1]]
+        return None
+
+    def _topic_out(card_id, args, tool=''):
+        if tool == 'asr':
+            # Derived from the input, exactly as perception does — and from the
+            # *tool* name, with no trace of the instance, which is why two asr
+            # cards on one source derive the same topic. `info` is asked with
+            # the input the card was started with; without one there is nothing
+            # to derive from and perception would answer no topic at all.
             src = args.get('input_topic') or started_input.get(card_id) or ''
             return [{'topic': f'{src}/asr', 'format': 'data/json'}] if src else []
         static = {
@@ -207,6 +243,130 @@ def test_one_unresolved_input_out_of_two_is_not_silently_dropped(driver):
     }
     assert _start(layout) is False
     assert CORE not in driver.starts
+
+
+# ── a driver that refuses the start without setting `state` ──────────────────
+
+def test_a_bare_error_answer_fails_the_card(driver):
+    """`{"error": ...}` with no `state` is a refusal, not a successful start.
+
+    Only `state` was read, so this answer fell through to the ready branch: the
+    Unitree speaker came up bound to nothing, start-project reported all green,
+    and the robot was silent with nothing in any log.
+    """
+    layout = {
+        'cards': [_card(REFUSER, 'speaker')],
+        'connections': [],
+    }
+    assert _start(layout) is False
+    errors = _errors(driver.events)
+    assert len(errors) == 1
+    assert errors[0]['tool'] == 'speaker'
+    assert 'Missing input_topic' in errors[0]['message']
+
+
+def test_an_error_key_alongside_a_live_state_is_only_a_message(driver):
+    """A running instance that also reports `error` must not be failed.
+
+    Drivers use the key for both refusal and commentary, so letting it condemn
+    a card that has explicitly said `state: running` would turn a dropped-frame
+    warning into a rolled-back project.
+    """
+    state, message = config_api.tool_state_of(
+        {'code': 200, 'data': {'state': 'running', 'error': 'last frame dropped'}})
+    assert state == 'running'
+    assert message == 'last frame dropped'
+
+
+# ── a card handed more inputs than it consumes ───────────────────────────────
+
+def _two_sources_into(card_id, tool):
+    return {
+        'cards': [_card(RM, 'remote_message', [{'topic': '/remote_control/message',
+                                                'format': 'data/json'}]),
+                  _card(MIC, 'mic', [{'topic': '/ubuntu/mic/audio',
+                                      'format': 'audio/pcm-16k'}]),
+                  _card(card_id, tool)],
+        'connections': [_conn(RM, card_id, '/remote_control/message'),
+                        _conn(MIC, card_id, '/ubuntu/mic/audio')],
+    }
+
+
+def test_a_card_that_binds_only_the_first_of_two_inputs_fails(driver):
+    """The second connection did nothing, and the card reported 已就绪.
+
+    No driver reads `input_topics`; perception's tts/ocr/face don't either.
+    Drawing two lines into such a card produced a project that came up green
+    with one of them inert.
+    """
+    assert _start(_two_sources_into(PICKY, 'tts')) is False
+    errors = _errors(driver.events)
+    assert len(errors) == 1
+    assert errors[0]['tool'] == 'tts'
+    # Names both halves: which input survived, and which one was ignored.
+    assert '/remote_control/message' in errors[0]['message']
+    assert '/ubuntu/mic/audio' in errors[0]['message']
+
+
+def test_a_card_that_binds_both_inputs_succeeds(driver):
+    """decision_core really does subscribe to all of them — no exemption needed."""
+    assert _start(_two_sources_into(GREEDY, 'decision_core')) is True
+    assert not _errors(driver.events)
+
+
+def test_a_card_that_reports_no_bound_input_is_not_failed(driver):
+    """Reticence is not evidence of dropping.
+
+    Most tools report nothing useful under `topic_in`. Failing them on that
+    would roll back projects that work.
+    """
+    assert _start(_two_sources_into(CORE, 'decision_core')) is True
+    assert not _errors(driver.events)
+
+
+def test_a_multi_input_card_is_also_given_the_singular_argument(driver):
+    """The plural-only argument reached every driver as no input at all."""
+    _start(_two_sources_into(GREEDY, 'decision_core'))
+    assert driver.starts[GREEDY]['input_topic'] == \
+        driver.starts[GREEDY]['input_topics'][0]
+
+
+# ── two cards deriving the same output topic ─────────────────────────────────
+
+def test_two_cards_of_one_tool_on_one_source_clash(driver):
+    """`{input}/asr` carries no trace of the instance, so both cards claim it.
+
+    The canvas allows the second card (the duplicate guard is skipped for
+    multiInstance tools) and perception gives each its own node, so both publish
+    to the one topic and every utterance arrives twice.
+    """
+    asr2 = 'card-asr-2'
+    layout = {
+        'cards': [_card(MIC, 'mic', [{'topic': '/ubuntu/mic/audio',
+                                      'format': 'audio/pcm-16k'}]),
+                  _card(ASR, 'asr', []), _card(asr2, 'asr', [])],
+        'connections': [_conn(MIC, ASR, '/ubuntu/mic/audio'),
+                        _conn(MIC, asr2, '/ubuntu/mic/audio')],
+    }
+    assert _start(layout) is False
+    errors = _errors(driver.events)
+    assert len(errors) == 1, 'reported once, on the second card'
+    assert '/ubuntu/mic/audio/asr' in errors[0]['message']
+
+
+def test_two_cards_of_one_tool_on_different_sources_are_fine(driver):
+    """Different inputs derive different topics — the supported arrangement."""
+    layout = {
+        'cards': [_card(MIC, 'mic', [{'topic': '/ubuntu/mic/audio',
+                                      'format': 'audio/pcm-16k'}]),
+                  _card(RM, 'remote_message', [{'topic': '/remote_control/message',
+                                                'format': 'data/json'}]),
+                  _card(ASR, 'asr', []), _card('card-asr-2', 'asr', [])],
+        'connections': [_conn(MIC, ASR, '/ubuntu/mic/audio'),
+                        _conn(RM, 'card-asr-2', '/remote_control/message')],
+    }
+    assert _start(layout) is True
+    assert not _errors(driver.events)
 
 
 # ── fallbacks, for a source that cannot answer ───────────────────────────────

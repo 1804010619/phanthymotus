@@ -1,22 +1,38 @@
 # ── Jetson GPU variant ──────────────────────────────────────────────
-# Base: jetson-base:jp511-torch (torch 2.0 + torchvision 0.15 with CUDA)
-#
-# ActuCore ships no cards yet, so this variant is deliberately thin — it
-# exists so the first GPU-bound execution model (VLA policy, grasp net) has a
-# base to land on without also needing a new base image. It keeps the CUDA
-# torch from the base plus the ROS2 plumbing, and nothing else.
+# One Dockerfile for both JetPack lines; the base comes in as BASE_IMAGE (see
+# below). The application layers are byte-identical on both — what differs is
+# only what the base already carries.
 #
 # Build context: repo root (phanthymotus/) so we can access both
 # actucore/ and deploy/ros-base/audio_msgs/
 #
 # Usage:
-#   ./deploy/build_actucore.sh --variant jetson --mirror tuna
+#   ./deploy/build_actucore.sh --mirror tuna                  # jp5.11 (default)
+#   ./deploy/build_actucore.sh --jp-version 6.1 --mirror tuna
 # ────────────────────────────────────────────────────────────────────
 
 ARG PYPI_MIRROR=https://pypi.tuna.tsinghua.edu.cn/simple/
 ARG APT_MIRROR=mirrors.tuna.tsinghua.edu.cn
+# Defaults match deploy/build_actucore.sh, which matches build_perception.sh.
+# The script always passes both explicitly; these only apply to a bare
+# `docker build`, and having them disagree with the script would mean the same
+# command producing a different image depending on how it was invoked.
 ARG JP_VERSION=511
-FROM bj-warehouse.tencentcloudcr.com/phanthy-motus/jetson-base:jp${JP_VERSION}-torch
+# One Dockerfile, two bases. Everything above and below this line is identical
+# on both JetPack lines — only what the base carries differs, and the card sorts
+# itself out at runtime:
+#
+#   jp5.11  jetson-base            remote providers only. Thin. (default)
+#   jp6.1   jetson-base-actucore   CUDA torch 2.9 + lerobot → local *and* remote
+#                                  providers. ~18.6 GB.
+#
+# That split is forced, not chosen. JetPack 5.11 is CUDA 11.4 and lerobot needs
+# torch >= 2.2.1, and no torch >= 2.2 supports CUDA 11.4 (PyTorch's own matrix
+# floors at 11.8) — so local inference cannot exist there whatever we build.
+# The `smolvla` provider refuses at start on that line with that reason; `mock`
+# and `vla_cloud` are unaffected. See deploy/prepare_actucore_base.sh.
+ARG BASE_IMAGE=bj-warehouse.tencentcloudcr.com/phanthy-motus/jetson-base:jp511-torch
+FROM ${BASE_IMAGE}
 ARG PYPI_MIRROR APT_MIRROR
 
 # ── APT mirror (conditional) ─────────────────────────────────────
@@ -54,6 +70,18 @@ COPY actucore/config.yaml /work/config.yaml
 # perception's copy instead of adding a fourth one to keep in sync — see the
 # DUPLICATION note in perception/utils/logsafe.py.
 COPY perception/utils/logsafe.py /work/logsafe.py
+# COS downloader with size/SHA256 pinning, for cards that fetch weights at
+# runtime (plugins/vla's smolvla provider). Same reasoning as logsafe above:
+# reuse perception's copy rather than keeping a second one in sync. It carries
+# the parts that are easy to get wrong — a check file that must not appear
+# until the model behind it is complete, a lock so concurrent starts fetch one
+# copy, archives staged before they are merged.
+COPY perception/utils/model_downloader.py /work/model_downloader.py
+# The status-line helper that turns that downloader's callbacks into the one
+# string a card shows. Same reuse rule again — and it must travel with the
+# downloader: smolvla imports both, so shipping one without the other fails at
+# card start, on a robot, with an ImportError nothing here would have caught.
+COPY perception/utils/model_progress.py /work/model_progress.py
 # Agent Core reads /deploy/service.yml out of the image to merge the compose
 # fragment — dropping this COPY silently falls back to the legacy docker-run path.
 COPY actucore/deploy/     /deploy/
