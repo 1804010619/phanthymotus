@@ -64,10 +64,10 @@ plugins:
       asr_kws_threshold: 0.3
 
   tts:
-    enabled: false
-    engine: vits2-zh-en
+    enabled: true
+    engine: kokoro-multi
     backend: trt
-    model_dir: /models/vits2
+    model_dir: /models/kokoro-multi
     # vits2-zh-en and mms-th support 0 only. For kokoro-multi this is an index
     # *within* the selected language — 0 is that language's first voice — so the
     # voice moves with `language` and cannot end up mismatched with it. The global
@@ -109,7 +109,7 @@ plugins:
     # CUDA provider falls back per node on quantised ops), so it carries its own
     # default in ENGINE_DEVICE_DEFAULTS — gpu. An explicit `cpu` here would apply
     # to every engine and quietly override that.
-    device: cpu
+    device: gpu
     # kokoro-multi only: pronunciation language. One of en-us, en-gb, zh, ja, es,
     # fr, it, pt-br, hi — every language Kokoro v1.0 has voices for. Read per
     # generate() call, so changing it costs nothing.
@@ -124,7 +124,7 @@ plugins:
     #
     # Only en-us / en-gb / zh have been listened to — sherpa-onnx documents English
     # and Chinese as this model's supported pair, so the rest are best-effort.
-    language: en-us
+    language: ja
 
   vop:
     enabled: false
@@ -151,7 +151,7 @@ plugins:
     # loaded lazily on the first `start`, so an enabled-but-unwired card costs
     # nothing; the cost appears once something actually subscribes. On a tight
     # machine that does not consume depth, set this to false.
-    enabled: true
+    enabled: false
     namespace: ""       # auto-detect from hostname if empty
     fps: 2
     # Output is METRES. ultralytics bakes its metric fit into the exported
@@ -194,7 +194,7 @@ plugins:
   soundevent:
     enabled: true
   face_recognition:
-    enabled: true
+    enabled: false
     # InsightFace buffalo_sc: SCRFD-500M detector + ArcFace MobileFaceNet.
     # Plain ONNX, so one bundle serves both JetPack lines and x86 dev hosts.
     model_dir: /models/face/buffalo_sc
