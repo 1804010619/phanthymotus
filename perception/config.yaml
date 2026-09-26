@@ -124,7 +124,7 @@ plugins:
     #
     # Only en-us / en-gb / zh have been listened to — sherpa-onnx documents English
     # and Chinese as this model's supported pair, so the rest are best-effort.
-    language: en-us
+    language: es
 
   vop:
     enabled: false
