@@ -1088,6 +1088,49 @@ async def mcp_call_tool(mcp_id: str, req: MCPCallRequest,
                                                'ws_connected': _start_mod._mic_ws_connected,
                                                'chunks_received': _start_mod._mic_chunk_count}}
             return {'code': 200, 'data': None}
+        if req.tool == 'remote_camera':
+            action = req.arguments.get('action', 'start')
+            if action == 'start':
+                # Same self-check shape as remote_mic: the browser is started in
+                # parallel by the frontend, so wait for real frames rather than
+                # declaring success on a publisher that nothing is feeding. A
+                # card that says `running` while no image is flowing is how a
+                # vision pipeline gets debugged from the wrong end.
+                from start import _ensure_camera_pub
+                import start as _start_mod
+                if _ensure_camera_pub() is None:
+                    return {'code': 200, 'data': {
+                        'state': 'error',
+                        'message': 'ROS2 camera publisher not available'}}
+                import asyncio
+                initial = _start_mod._camera_frame_count
+                for _ in range(20):            # 20 x 0.5s = 10s
+                    if _start_mod._camera_frame_count > initial:
+                        return {'code': 200, 'data': {
+                            'state': 'running', 'ws_path': '/ws/camera',
+                            'frames_received': _start_mod._camera_frame_count}}
+                    await asyncio.sleep(0.5)
+                if not _start_mod._camera_ws_connected:
+                    return {'code': 200, 'data': {
+                        'state': 'error',
+                        'message': '等待浏览器摄像头连接超时（10s）— 请在 dashboard 允许摄像头权限'}}
+                return {'code': 200, 'data': {
+                    'state': 'error',
+                    'message': '浏览器已连接但未收到画面 — 请检查摄像头是否被其他程序占用'}}
+            elif action == 'stop':
+                return {'code': 200, 'data': {'state': 'idle'}}
+            elif action == 'info':
+                import ros2_bridge, start as _start_mod
+                visible = '/remote_control/camera' in ros2_bridge.get_dds_topics()
+                return {'code': 200, 'data': {
+                    'state': 'running' if _start_mod._camera_frame_count > 0 else 'idle',
+                    'ws_path': '/ws/camera',
+                    'topic_out': [{'topic': '/remote_control/camera',
+                                   'format': 'image/jpeg'}],
+                    'topic_visible': visible,
+                    'ws_connected': _start_mod._camera_ws_connected,
+                    'frames_received': _start_mod._camera_frame_count}}
+            return {'code': 200, 'data': None}
         if req.tool == 'remote_message':
             action = req.arguments.get('action', 'start')
             if action == 'start':

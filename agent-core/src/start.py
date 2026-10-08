@@ -192,9 +192,51 @@ def _register_core_mcp(silent=False):
                     'image_file': {'type': 'string', 'format': 'file', 'accept': 'image/*', 'description': '图片文件'},
                 }, 'required': ['action', 'image_file']},
                 'topic_out': [{'topic': '/remote_control/image', 'format': 'image/jpeg'}],
+            },
+            {
+                'name': 'remote_camera',
+                'type': 'sensor',
+                'description': (
+                    '远程摄像头 — 把浏览器的摄像头作为一路实时图像源推到 DDS。'
+                    'remote_image 一次只能上传一张图，所以挥手、走动、跌倒这类'
+                    '需要连续画面的东西根本测不了；没有摄像头的机器（测试机）'
+                    '更是完全没有图像源。这张卡片发的是 image/jpeg，和真实相机'
+                    '卡片同一个格式，所以 vop / pose / face / ocr 可以直接连上，'
+                    '无需任何特殊处理。'
+                ),
+                'inputSchema': {'type': 'object', 'properties': {
+                    'action': {'type': 'string', 'enum': ['start', 'stop', 'info'],
+                               'description': 'Action to perform'},
+                }, 'required': ['action']},
+                'configSchema': {
+                    'type': 'object',
+                    'properties': {
+                        'device_id': {
+                            'type': 'string',
+                            'description': '浏览器视频输入设备',
+                            'format': 'video-input-device',
+                            'scope': 'instance',
+                        },
+                        'fps': {
+                            'type': 'integer', 'minimum': 1, 'maximum': 30,
+                            'default': 12, 'scope': 'instance',
+                            'description': (
+                                '每秒推送几帧。12 是 pose 卡片的默认值：骨架动作'
+                                '模型判的是一段视频，再低就只剩插值了。浏览器要在'
+                                '主线程上逐帧 JPEG 编码，所以上限 30。'),
+                        },
+                        'width': {
+                            'type': 'integer', 'minimum': 160, 'maximum': 1920,
+                            'default': 640, 'scope': 'instance',
+                            'description': '长边像素。按摄像头真实宽高比缩放，不拉伸',
+                        },
+                    },
+                },
+                'topic_out': [{'topic': '/remote_control/camera',
+                               'format': 'image/jpeg'}],
             }
         ],
-        'topic_out': [{'topic': '/decision_core', 'format': 'data/json'}, {'topic': '/remote_control/mic', 'format': 'audio/pcm-16k'}, {'topic': '/remote_control/message', 'format': 'data/json'}, {'topic': '/remote_control/audio', 'format': 'audio/pcm-16k'}, {'topic': '/remote_control/image', 'format': 'image/jpeg'}],
+        'topic_out': [{'topic': '/decision_core', 'format': 'data/json'}, {'topic': '/remote_control/mic', 'format': 'audio/pcm-16k'}, {'topic': '/remote_control/message', 'format': 'data/json'}, {'topic': '/remote_control/audio', 'format': 'audio/pcm-16k'}, {'topic': '/remote_control/image', 'format': 'image/jpeg'}, {'topic': '/remote_control/camera', 'format': 'image/jpeg'}],
         'topic_in': [{'format': 'data/json'}],
     })
 
@@ -898,6 +940,72 @@ async def _ws_mic(ws: fastapi.WebSocket):
                     _mic_chunk_count += 1
     except Exception:
         pass
+
+# ── Camera WebSocket endpoint (receive browser JPEG frames, publish to ROS2) ──
+#
+# The visual twin of /ws/mic, and it exists for the same reason: a card that
+# consumes a live sensor cannot be tested from a file. `remote_image` publishes
+# one picture, which exercises a detector and says nothing about anything
+# temporal — waving is motion that comes back, a fall is a transition. And a
+# machine with no camera, which is every Orin test rig, had no image source at
+# all.
+_camera_pub = None
+_camera_frame_count = 0
+_camera_ws_connected = False
+
+
+def _ensure_camera_pub():
+    """Lazily create the ROS2 publisher for /remote_control/camera."""
+    global _camera_pub
+    if _camera_pub is not None:
+        return _camera_pub
+    try:
+        from sensor_msgs.msg import CompressedImage
+        import ros2_bridge
+        node = ros2_bridge._node_main
+        if node:
+            from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
+            # BEST_EFFORT with a shallow queue, like every other image topic in
+            # this project: a late frame is worse than a dropped one, because
+            # the action rules measure velocity between frames and a backlog
+            # delivered in a burst reads as motion that did not happen.
+            qos = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT,
+                             history=HistoryPolicy.KEEP_LAST, depth=2,
+                             durability=DurabilityPolicy.VOLATILE)
+            _camera_pub = node.create_publisher(
+                CompressedImage, "/remote_control/camera", qos)
+    except Exception:
+        pass
+    return _camera_pub
+
+
+@app.websocket('/ws/camera')
+async def _ws_camera(ws: fastapi.WebSocket):
+    """Receive JPEG frames from the browser and republish them on DDS."""
+    global _camera_frame_count, _camera_ws_connected
+    await ws.accept()
+    _camera_ws_connected = True
+    try:
+        _ensure_camera_pub()
+        while True:
+            data = await ws.receive_bytes()
+            if not data or _camera_pub is None:
+                continue
+            from sensor_msgs.msg import CompressedImage
+            msg = CompressedImage()
+            try:
+                msg.header.stamp = ros2_bridge._node_main.get_clock().now().to_msg()
+            except Exception:
+                pass
+            msg.format = "jpeg"
+            msg.data = data
+            _camera_pub.publish(msg)
+            _camera_frame_count += 1
+    except Exception:
+        pass
+    finally:
+        _camera_ws_connected = False
+
 
 class _HTTPOnlyStaticFiles(fastapi.staticfiles.StaticFiles):
     async def __call__(self, scope, receive, send):

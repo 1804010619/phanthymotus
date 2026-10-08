@@ -16,6 +16,7 @@ import { showToast } from './toast.js';
 import { showTopicDetail } from './detail-panel.js';
 import { showToolDetail, isToolConfigured, isInstanceConfigured, openInstanceConfigModal, hasSharedRequired } from './sidebar.js';
 import { toggleMicStream, isMicActive } from './mic-stream.js';
+import { toggleCameraStream, isCameraActive } from './camera-stream.js';
 import { sessionId } from './session.js';
 import { getToken } from './auth.js';
 // Shared with the monitor dashboard so both sides shape the `info` call the
@@ -1982,6 +1983,18 @@ async function _startProject() {
     }).catch(err => _logActivity('warn', `麦克风启动失败: ${err.message}`));
   }
 
+  // Same trick as the mic: start the browser camera in parallel with the API
+  // call, because the card's self-check waits for real frames and the browser
+  // cannot be started from the server side.
+  const remoteCameraCard = _cards.find(c => c.toolName === 'remote_camera');
+  if (remoteCameraCard && !isCameraActive()) {
+    const wsProto = location.protocol === 'https:' ? 'wss' : 'ws';
+    const cfg = remoteCameraCard.config || {};
+    toggleCameraStream(`${wsProto}://${location.host}/ws/camera`, () => {}, {
+      fps: cfg.fps, width: cfg.width, deviceId: cfg.device_id,
+    }).catch(err => _logActivity('warn', `摄像头启动失败: ${err.message}`));
+  }
+
   // Call unified backend start-project
   try {
     const res = await fetch('/api/config/start-project', { method: 'POST' });
@@ -2044,6 +2057,9 @@ async function _stopProject() {
 
   try {
     for (const card of _cards) {
+      if (card.toolName === 'remote_camera' && isCameraActive()) {
+        toggleCameraStream('', () => {}).catch(() => {});
+      }
       if (card.toolName === 'remote_mic' && isMicActive()) {
         toggleMicStream('', () => {}).catch(() => {});
         const micBtn = card.el?.querySelector('.canvas-mic-btn');
