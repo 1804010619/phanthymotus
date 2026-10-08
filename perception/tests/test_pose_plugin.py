@@ -27,10 +27,40 @@ from vision_stubs import (  # noqa: F401
 )
 
 import plugins.pose as pose_plugin  # noqa: E402
-from plugins.pose_action import ACTION_LABELS_ZH, DEFAULT_THRESHOLDS  # noqa: E402
+from plugins.pose_action import (  # noqa: E402
+    ACTION_LABELS_ZH, DEFAULT_THRESHOLDS, POSTURE_LABELS_ZH)
 from plugins.vision_runtime import COCO_INDEX, LetterboxMeta, N_KEYPOINTS  # noqa: E402
 
 FRAME_W, FRAME_H = 640, 480
+
+# -- reading the two-channel result ------------------------------------------
+# posture and activity are separate channels; these express the old flattened
+# view for assertions that only care about "in one word".
+
+from plugins.pose_action import RULE_TO_ACTIVITY        # noqa: E402
+
+ACTIVITY_TO_RULE = {v: k for k, v in RULE_TO_ACTIVITY.items()}
+
+
+def _action(result):
+    activity = result.get("activity")
+    if isinstance(activity, dict):
+        return ACTIVITY_TO_RULE.get(activity["name"], activity["name"])
+    if isinstance(activity, str):
+        return ACTIVITY_TO_RULE.get(activity, activity)
+    return result.get("posture") or "unknown"
+
+
+def _labels(result):
+    out = set()
+    if result.get("posture"):
+        out.add(result["posture"])
+    name = _action(result)
+    if name != "unknown":
+        out.add(name)
+    return out
+
+
 
 
 def _standing_row(cx=320.0, top=40.0, h=400.0, score=0.9) -> list:
@@ -195,7 +225,7 @@ def test_a_started_card_publishes_lean_json_and_a_skeleton():
     assert lean["count"] == 1
     assert "latency_ms" in lean
     person = lean["persons"][0]
-    assert person["action"] == "standing"
+    assert person["posture"] == "standing"
     assert person["id"] == 1
     assert "bbox" in person
 
@@ -203,7 +233,7 @@ def test_a_started_card_publishes_lean_json_and_a_skeleton():
     assert skeleton["image_size"] == [FRAME_W, FRAME_H]
     assert len(skeleton["keypoint_names"]) == N_KEYPOINTS
     assert len(skeleton["persons"][0]["keypoints"]) == N_KEYPOINTS
-    assert skeleton["persons"][0]["action"] == "standing"
+    assert skeleton["persons"][0]["posture"] == "standing"
 
 
 def test_the_lean_stream_carries_no_keypoints_by_default():
@@ -263,7 +293,7 @@ def test_max_persons_keeps_the_most_confident_detections():
     node = _feed(plugin, "/cam/rgb")
     lean = json.loads(_publisher(node, "/cam/rgb/poses").messages[-1])
     assert lean["count"] == 2
-    assert sorted(p["action_confidence"] for p in lean["persons"])
+    assert sorted(p["posture_confidence"] for p in lean["persons"])
     assert {round(p["position"][0], 2) for p in lean["persons"]} == {0.0, 0.69}
 
 
@@ -416,7 +446,7 @@ def test_info_on_an_idle_card_reports_the_label_set():
     info = plugin.dispatch("pose", {"action": "info"})
     assert info["state"] == "idle"
     assert info["keypoints"] == N_KEYPOINTS
-    assert set(info["actions"]) == set(ACTION_LABELS_ZH)
+    assert set(info["postures"]) == set(POSTURE_LABELS_ZH)
     assert info["action_backend"] == "hybrid"       # the default
 
 
@@ -553,7 +583,7 @@ def test_a_photo_answers_with_keypoints_and_says_what_it_cannot_judge(photo):
     assert result["image_size"] == [FRAME_W, FRAME_H]
     assert result["count"] == 1
     assert len(result["persons"][0]["keypoints"]) == N_KEYPOINTS
-    assert result["persons"][0]["action"] == "standing"
+    assert result["persons"][0]["posture"] == "standing"
 
 
 def test_a_photo_says_which_actions_it_cannot_judge(photo):
@@ -563,8 +593,8 @@ def test_a_photo_says_which_actions_it_cannot_judge(photo):
     result = plugin.dispatch("pose", {"action": "recognize_by_photo",
                                       "image_path": photo})
     assert result["temporal"] is False
-    assert "waving" in result["unavailable_actions"]
-    assert "fall" in result["unavailable_actions"]
+    assert "hand waving" in result["unavailable_activities"]
+    assert "falling down" in result["unavailable_activities"]
 
 
 def test_a_photo_echoes_onto_a_running_topicless_card(photo):
@@ -601,9 +631,9 @@ def test_list_actions_separates_events_from_poses_and_states_its_limits():
     plugin, _ = _plugin()
     result = plugin.dispatch("pose", {"action": "list_actions"})
     assert result["ok"] is True
-    catalogue = {entry["action"]: entry for entry in result["actions"]}
-    assert catalogue["fall"]["kind"] == "event"
-    assert "fall" in result["limitations"]["needs_stream"]
+    names = {entry["name"] for entry in result["activities"]}
+    assert "falling down" in names
+    assert "falling down" in result["limitations"]["needs_stream"]
     assert "face_recognition" in result["limitations"]["identity"]
 
 
@@ -699,7 +729,7 @@ def test_list_actions_reports_two_vocabularies():
     single frame; `activities` is NTU-60 in its own words, from the model."""
     plugin, _ = _plugin({"action_backend": "hybrid"})
     result = plugin.dispatch("pose", {"action": "list_actions"})
-    assert set(result["postures"]) == set(ACTION_LABELS_ZH)
+    assert set(result["postures"]) == set(POSTURE_LABELS_ZH)
     assert len(result["activities"]) == 49, "A50-A60 are two-person classes"
     names = {a["name"] for a in result["activities"]}
     assert "falling down" in names and "staggering" in names
@@ -712,7 +742,7 @@ def test_rules_only_offers_no_activities():
     plugin, _ = _plugin({"action_backend": "rules"})
     result = plugin.dispatch("pose", {"action": "list_actions"})
     assert result["activities"] == []
-    assert set(result["postures"]) == set(ACTION_LABELS_ZH)
+    assert set(result["postures"]) == set(POSTURE_LABELS_ZH)
 
 
 

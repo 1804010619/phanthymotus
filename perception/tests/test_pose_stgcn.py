@@ -22,6 +22,7 @@ import pytest
 import vision_stubs  # noqa: F401
 
 from plugins.pose_action import (  # noqa: E402
+    RULE_TO_ACTIVITY,
     ACTION_PRIORITY,
     PoseActionClassifier,
     PoseFrame,
@@ -55,6 +56,33 @@ from test_pose_action import (  # noqa: E402
 )
 
 FRAME = (1280, 720)
+
+# -- reading the two-channel result ------------------------------------------
+# posture and activity are separate channels; these express the old flattened
+# view for assertions that only care about "in one word".
+
+ACTIVITY_TO_RULE = {v: k for k, v in RULE_TO_ACTIVITY.items()}
+
+
+def _action(result):
+    activity = result.get("activity")
+    if isinstance(activity, dict):
+        return ACTIVITY_TO_RULE.get(activity["name"], activity["name"])
+    if isinstance(activity, str):
+        return ACTIVITY_TO_RULE.get(activity, activity)
+    return result.get("posture") or "unknown"
+
+
+def _labels(result):
+    out = set()
+    if result.get("posture"):
+        out.add(result["posture"])
+    name = _action(result)
+    if name != "unknown":
+        out.add(name)
+    return out
+
+
 N_CLASSES = 60
 
 
@@ -288,15 +316,15 @@ def test_a_softmaxed_output_is_detected_and_not_softmaxed_again():
     assert looks_like_probabilities(probabilities)
     engine = _FakeEngine(outputs=[probabilities[None]])
     result = SkeletonActionBackend(engine=engine).classify(_frames(_standing))
-    assert result["action"] == "fall"
-    assert result["action_confidence"] == pytest.approx(0.9, abs=0.01)
+    assert _action(result) == "fall"
+    assert result["activity"]["score"] == pytest.approx(0.9, abs=0.01)
 
 
 def test_raw_logits_are_softmaxed():
     engine = _FakeEngine({42: 12.0})
     result = SkeletonActionBackend(engine=engine).classify(_frames(_standing))
-    assert result["action"] == "fall"
-    assert 0.9 < result["action_confidence"] <= 1.0
+    assert _action(result) == "fall"
+    assert 0.9 < result["activity"]["score"] <= 1.0
 
 
 def test_logits_are_not_mistaken_for_probabilities():
@@ -320,7 +348,7 @@ def test_the_model_reports_its_own_class_not_one_of_ours():
     value in it: the health group and the interaction gestures."""
     engine = _FakeEngine({10: 9.0})           # A11 reading
     result = SkeletonActionBackend(engine=engine).classify(_frames(_standing))
-    assert result["action"] == "reading"
+    assert _action(result) == "reading"
     assert result["activity"]["ntu_class"] == 11
     assert result["activity"]["name_zh"] == "看书"
 
@@ -332,7 +360,7 @@ def test_classes_the_geometry_also_names_use_the_shared_name():
         engine = _FakeEngine({index: 12.0})
         backend = SkeletonActionBackend(
             engine=engine, fall_min_score=0.1, min_score=0.1)
-        assert backend.classify(_frames(_standing))["action"] == label
+        assert _action(backend.classify(_frames(_standing))) == label
 
 
 def test_the_vocabulary_is_the_full_ntu60_table():
@@ -354,7 +382,7 @@ def test_two_person_classes_are_excluded():
     engine = _FakeEngine({54: 20.0})
     result = SkeletonActionBackend(engine=engine, min_score=0.01).classify(
         _frames(_standing))
-    assert result["action"] == "unknown"
+    assert _action(result) == "unknown"
 
 
 def test_the_catalogue_covers_every_usable_class_with_both_names():
@@ -370,7 +398,7 @@ def test_the_health_group_is_reachable():
                             (47, "nausea / vomiting"), (40, "sneeze / cough")):
         engine = _FakeEngine({index: 9.0})
         result = SkeletonActionBackend(engine=engine).classify(_frames(_standing))
-        assert result["action"] == expected, index
+        assert _action(result) == expected, index
 
 
 # ── failure paths must not become labels ────────────────────────────────────
@@ -414,7 +442,7 @@ def test_the_backend_also_guards_the_keypoint_count_itself():
 
 def test_no_frames_is_unknown_without_touching_the_engine():
     engine = _FakeEngine({42: 9.0})
-    assert SkeletonActionBackend(engine=engine).classify([])["action"] == "unknown"
+    assert _action(SkeletonActionBackend(engine=engine).classify([])) == "unknown"
     assert engine.calls == []
 
 
@@ -424,7 +452,7 @@ def test_a_single_frame_is_declined_rather_than_padded():
     engine = _FakeEngine({42: 9.0})
     result = SkeletonActionBackend(engine=engine).classify_frame(
         _frames(_standing, n=1)[0])
-    assert result["action"] == "unknown"
+    assert _action(result) == "unknown"
     assert result["temporal"] is False
     assert result["activity_available"] is False
     assert engine.calls == []
@@ -437,17 +465,17 @@ def test_hybrid_takes_postures_from_geometry():
     action — so the geometry is the only thing that can answer it."""
     engine = _FakeEngine(outputs=[np.zeros((1, N_CLASSES), dtype=np.float32)])
     result = HybridActionBackend(engine=engine).classify(_frames(_standing, n=20))
-    assert result["action"] == "standing"
+    assert _action(result) == "standing"
     assert result["posture"] == "standing"
-    assert result["evidence"]["source"] == "rules"
+    assert result["activity"] is None or result["activity"]["source"] == "rules"
 
 
 def test_hybrid_lets_the_model_name_the_activity():
     """The model answers "what is this person doing" in its own words."""
     engine = _FakeEngine({10: 9.0})          # A11 reading
     result = HybridActionBackend(engine=engine).classify(_frames(_standing, n=20))
-    assert result["action"] == "reading"
-    assert result["evidence"]["source"] == "stgcn"
+    assert _action(result) == "reading"
+    assert result["activity"]["source"] == "stgcn"
     assert result["activity"]["name_zh"] == "看书"
 
 
@@ -456,7 +484,7 @@ def test_hybrid_reports_posture_and_activity_separately():
     "standing" says what shape their body is in. Neither replaces the other."""
     engine = _FakeEngine({10: 9.0})
     result = HybridActionBackend(engine=engine).classify(_frames(_standing, n=20))
-    assert result["action"] == "reading"
+    assert _action(result) == "reading"
     assert result["posture"] == "standing"
     assert result["activity"]["name"] == "reading"
 
@@ -473,7 +501,7 @@ def test_hybrid_keeps_the_geometrys_point_direction():
     engine = _FakeEngine({30: 9.0})
     result = HybridActionBackend(engine=engine).classify(
         _frames(lambda _t: joints, n=20, box=box))
-    assert result["action"] == "pointing"
+    assert _action(result) == "pointing"
     assert result["point_direction"][0] == pytest.approx(-1.0, abs=0.05)
 
 
@@ -482,7 +510,7 @@ def test_hybrid_still_answers_when_the_model_is_broken():
     leave a trace rather than looking like a quiet frame."""
     engine = _FakeEngine(raise_on_infer=RuntimeError("no engine"))
     result = HybridActionBackend(engine=engine).classify(_frames(_standing, n=20))
-    assert result["action"] == "standing"
+    assert _action(result) == "standing"
     assert "no engine" in result["evidence"]["stgcn_error"]
 
 
@@ -507,7 +535,7 @@ def test_a_single_frame_through_hybrid_falls_to_the_geometry():
     engine = _FakeEngine({42: 9.0})
     result = HybridActionBackend(engine=engine).classify_frame(
         _frames(_standing, n=1)[0])
-    assert result["action"] == "standing"
+    assert _action(result) == "standing"
 
 
 # ── backend selection ───────────────────────────────────────────────────────
@@ -557,7 +585,7 @@ def test_a_noise_level_fall_score_does_not_become_a_fall():
     probabilities[0] = 0.38
     engine = _FakeEngine(outputs=[probabilities[None]])
     result = SkeletonActionBackend(engine=engine).classify(_frames(_standing))
-    assert result["action"] != "fall"
+    assert _action(result) != "fall"
 
 
 def test_a_confident_fall_still_passes():
@@ -565,8 +593,8 @@ def test_a_confident_fall_still_passes():
     probabilities[42] = 0.90
     probabilities[0] = 0.10
     engine = _FakeEngine(outputs=[probabilities[None]])
-    assert SkeletonActionBackend(engine=engine).classify(
-        _frames(_standing))["action"] == "fall"
+    assert _action(SkeletonActionBackend(engine=engine).classify(
+        _frames(_standing))) == "fall"
 
 
 def test_hybrid_withholds_a_fall_the_geometry_contradicts():
@@ -574,7 +602,7 @@ def test_hybrid_withholds_a_fall_the_geometry_contradicts():
     with the person on the ground, which the geometry can see."""
     engine = _FakeEngine({42: 20.0})          # model is certain
     result = HybridActionBackend(engine=engine).classify(_frames(_standing, n=20))
-    assert result["action"] != "fall", "a standing body cannot have just fallen"
+    assert _action(result) != "fall", "a standing body cannot have just fallen"
     assert "fall_withheld" in str(result["evidence"])
 
 
@@ -588,8 +616,8 @@ def test_hybrid_accepts_a_fall_the_geometry_corroborates():
         frames.append(PoseFrame(i / 12, _lying_box(), _kp(**joints), 0.3,
                                 image_size=FRAME))
     result = HybridActionBackend(engine=engine).classify(frames)
-    assert result["action"] == "fall"
-    assert result["evidence"]["source"] == "stgcn"
+    assert _action(result) == "fall"
+    assert result["activity"]["source"] == "stgcn"
 
 
 # ── resampling: the step that quietly ate most of a fall's confidence ───────
@@ -669,7 +697,7 @@ def test_a_motionless_clip_is_not_sent_to_the_model():
     engine = _FakeEngine({42: 20.0})
     result = SkeletonActionBackend(engine=engine).classify(
         _frames(_standing, n=40, static=True))
-    assert result["action"] == "unknown"
+    assert _action(result) == "unknown"
     assert "no motion" in result["evidence"]["reason"]
     assert engine.calls == [], "the engine must not have been consulted"
 
@@ -684,7 +712,7 @@ def test_a_moving_clip_still_reaches_the_model():
                         image_size=FRAME) for i in range(30)]
     result = SkeletonActionBackend(engine=engine, fall_min_score=0.1).classify(frames)
     assert engine.calls, "a clip with motion must be classified"
-    assert result["action"] == "fall"
+    assert _action(result) == "fall"
 
 
 def test_the_motion_figure_is_reported_either_way():

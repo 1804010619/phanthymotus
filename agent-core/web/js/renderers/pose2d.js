@@ -48,10 +48,10 @@ export const ALERT_COLOUR = '#d77757';
 // Actions that mean a person is on the ground. Drawn in the alert colour —
 // `lying` as well as `fall`, because a person lying down is worth looking at
 // even when the rules declined to call it a fall.
-export const ALERT_ACTIONS = new Set(['fall', 'lying']);
+export const ALERT_LABELS = new Set(['falling down', 'lying']);
 
-export function trackColour(id, action) {
-  if (ALERT_ACTIONS.has(action)) return ALERT_COLOUR;
+export function trackColour(id, label) {
+  if (ALERT_LABELS.has(label)) return ALERT_COLOUR;
   const index = Number.isFinite(id) ? Math.abs(Math.trunc(id)) : 0;
   return TRACK_COLOURS[index % TRACK_COLOURS.length];
 }
@@ -94,8 +94,13 @@ function normalisePerson(raw) {
   ));
   return {
     id: Number.isFinite(raw.id) ? raw.id : 0,
-    action: typeof raw.action === 'string' ? raw.action : 'unknown',
-    confidence: Number.isFinite(raw.action_confidence) ? raw.action_confidence : null,
+    // Two channels. `posture` is the shape the body is in and everybody has
+    // one; `activity` is what they are doing and may legitimately be absent.
+    // The label drawn prefers the activity — "falling down" says more than
+    // "lying" — and falls back to the posture.
+    posture: typeof raw.posture === 'string' ? raw.posture : null,
+    activity: typeof raw.activity === 'string' ? raw.activity : null,
+    confidence: Number.isFinite(raw.posture_confidence) ? raw.posture_confidence : null,
     bbox: Array.isArray(raw.bbox) && raw.bbox.length === 4 ? raw.bbox.map(Number) : null,
     keypoints,
   };
@@ -180,11 +185,22 @@ export function visibleJoints(person, minConfidence, transform) {
     .map(point => transform.project(point.x, point.y));
 }
 
-/** The one-line summary drawn over each person. */
+/** The one-line summary drawn over each person.
+
+    Activity first when there is one, because it says more: a fallen person is
+    better described by "falling down" than by "lying". */
 export function personLabel(person) {
-  const confidence = person.confidence === null
+  const label = person.activity || person.posture || 'unknown';
+  const confidence = person.confidence === null || person.activity
     ? '' : ` ${Math.round(person.confidence * 100)}%`;
-  return `#${person.id} ${person.action}${confidence}`;
+  return `#${person.id} ${label}${confidence}`;
+}
+
+/** Which label decides the colour — the alerting one wins. */
+export function personLabelForColour(person) {
+  if (ALERT_LABELS.has(person.activity)) return person.activity;
+  if (ALERT_LABELS.has(person.posture)) return person.posture;
+  return person.activity || person.posture || 'unknown';
 }
 
 const MIN_CONFIDENCE = 0.3;
@@ -265,7 +281,7 @@ export const Pose2dRenderer = {
     c.strokeRect(originX, originY, cornerX - originX, cornerY - originY);
 
     for (const person of frame.persons) {
-      const colour = trackColour(person.id, person.action);
+      const colour = trackColour(person.id, personLabelForColour(person));
       c.strokeStyle = colour;
       c.lineWidth = 2;
       c.lineCap = 'round';

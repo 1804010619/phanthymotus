@@ -615,22 +615,18 @@ class SkeletonActionBackend:
                 },
             }
 
-        # The model answers in its own words. `action` is the NTU name unless
-        # the class coincides with a label the geometry also produces, in which
-        # case the shared name is used so the two halves do not report the same
-        # thing twice under different spellings.
-        label = best["pose_label"] or best["name"]
+        # The model answers in its own words. It has no posture to offer — a
+        # body's shape is not an action and NTU-60 has no class for one.
         return {
-            "action": label,
-            "actions": [label],
-            "action_confidence": round(best["score"], 2),
+            "posture": None,
+            "posture_confidence": 0.0,
             "activity": {
                 "name": best["name"], "name_zh": best["name_zh"],
                 "ntu_class": best["ntu_class"], "score": best["score"],
+                "source": "stgcn",
             },
             "evidence": {
                 "backend": "stgcn",
-                "ntu_class": best["ntu_class"],
                 "motion": prediction["motion"],
                 "frames_used": prediction["frames_used"],
                 "runners_up": prediction["scores"][1:3],
@@ -684,13 +680,6 @@ class HybridActionBackend:
     clap, salute, cross hands to say stop).
     """
 
-    #: Posture labels the geometry owns outright. The model has no class for any
-    #: of them — a body's shape is not an action.
-    POSTURES = ("standing", "sitting", "crouching", "bending", "lying")
-
-    #: Labels that outrank any activity: the person is on the ground.
-    OVERRIDING = ("fall", "lying")
-
     def __init__(self, *, rules: Optional[PoseActionClassifier] = None,
                  learned: Optional["SkeletonActionBackend"] = None, **kwargs):
         self.rules = rules or PoseActionClassifier(
@@ -714,81 +703,35 @@ class HybridActionBackend:
         geometry = self.rules.classify(frames)
         model = self.learned.classify(frames)
 
-        posture = next((a for a in geometry.get("actions", [])
-                        if a in self.POSTURES), None)
+        result = dict(geometry)                 # posture always comes from here
         activity = model.get("activity")
-        model_spoke = activity is not None and not model.get("backend_error")
 
-        # `fall` needs the geometry to agree the body is not upright. The model
-        # returns A43 at 0.62 on pure noise, so a score bar alone is one guard on
-        # the single label the robot acts on; this is the second, and the noise
-        # case cannot satisfy it.
+        # `falling down` needs the geometry to agree the body is not upright.
+        # The model returns A43 at 0.62 on pure noise, so a score bar alone is
+        # one guard on the single activity a robot acts on; this is the second,
+        # and the noise case cannot satisfy it.
         withheld = None
-        if model_spoke and model.get("action") == "fall":
-            if not any(a in ("lying", "fall", "crouching", "bending")
-                       for a in geometry.get("actions", [])):
+        if activity and activity["name"] == "falling down":
+            if geometry.get("posture") not in ("lying", "crouching", "bending"):
                 withheld = ("the model called it a fall; the geometry still "
                             "reads the body as upright")
-                model_spoke, activity = False, None
+                activity = None
 
-        # Everything the geometry saw that the model does not speak about:
-        # postures, plus the gestures it can read on its own when the model is
-        # silent. Dropping those when the model has nothing to say made the card
-        # worse than the geometry alone — a clear wave came back `raising_hand`.
-        geometry_labels = [a for a in geometry.get("actions", [])
-                           if model_spoke is False or a not in ("waving", "pointing")]
-
-        candidates = list(geometry_labels)
-        if model_spoke:
-            candidates.append(model["action"])
-
-        # Order: on the ground first, then what they are doing, then what shape
-        # they are in. An activity says more than a posture — "reading" beats
-        # "sitting" — for the same reason `walking` beats `standing`.
-        overriding = [a for a in self.OVERRIDING if a in candidates]
-        if overriding:
-            primary = overriding[0]
-            # Credited to whoever actually said it. `fall` normally comes from
-            # the model (gated, and corroborated by the geometry); `lying` only
-            # the geometry can see. Attributing both to the rules made the one
-            # label a robot acts on look like it came from the half that did not
-            # produce it.
-            source = ("stgcn" if model_spoke and model.get("action") == primary
-                      else "rules")
-        elif model_spoke:
-            primary, source = model["action"], "stgcn"
-        else:
-            ordered = [a for a in ACTION_PRIORITY if a in candidates]
-            if not ordered:
-                base = geometry if not model.get("backend_error") else model
-                result = dict(base)
-                if withheld:
-                    result["evidence"] = {**(result.get("evidence") or {}),
-                                          "fall_withheld": withheld}
-                return result
-            primary, source = ordered[0], "rules"
-
-        donor = model if source == "stgcn" else geometry
-        actions = [a for a in ACTION_PRIORITY if a in candidates]
-        if primary not in actions:
-            actions = [primary] + actions
-        result = {
-            "action": primary,
-            "actions": actions,
-            "action_confidence": donor.get("action_confidence", 0.0),
-            "evidence": {**(donor.get("evidence") or {}), "source": source},
-        }
-        if posture:
-            result["posture"] = posture
-        if activity:
+        if activity is not None:
             result["activity"] = activity
-        if geometry.get("point_direction"):
-            # The model names the act; only the geometry measures where.
-            result["point_direction"] = geometry["point_direction"]
+            result["evidence"] = {**(result.get("evidence") or {}),
+                                  **(model.get("evidence") or {})}
+        # else: the geometry's own activity, already in `result`, stands. It is
+        # the best evidence available when the model abstained, scored under the
+        # bar, or could not run — dropping it made the card worse than the
+        # geometry alone.
+
         if model.get("backend_error"):
-            result["evidence"]["stgcn_error"] = model["evidence"].get("reason")
+            result["evidence"] = {**(result.get("evidence") or {}),
+                                  "stgcn_error": model["evidence"].get("reason")}
         if withheld:
-            result["evidence"]["fall_withheld"] = withheld
+            result["evidence"] = {**(result.get("evidence") or {}),
+                                  "fall_withheld": withheld}
         return result
 
     def classify_frame(self, frame) -> dict:
@@ -798,9 +741,9 @@ class HybridActionBackend:
 
 def _nothing(reason: str, *, backend_error: bool = False) -> dict:
     result = {
-        "action": "unknown",
-        "actions": [],
-        "action_confidence": 0.0,
+        "posture": None,
+        "posture_confidence": 0.0,
+        "activity": None,
         "evidence": {"reason": reason},
     }
     if backend_error:

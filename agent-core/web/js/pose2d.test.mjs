@@ -13,7 +13,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
 import {
-  ALERT_ACTIONS,
+  ALERT_LABELS,
   ALERT_COLOUR,
   COCO_SKELETON,
   Pose2dRenderer,
@@ -43,8 +43,8 @@ function payload(overrides = {}) {
     skeleton: COCO_SKELETON,
     persons: [{
       id: 1,
-      action: 'standing',
-      action_confidence: 0.82,
+      posture: 'standing',
+      posture_confidence: 0.82,
       bbox: [100, 50, 300, 450],
       keypoints: keypoints({ 5: [200, 200, 0.9], 6: [300, 200, 0.9] }),
     }],
@@ -81,7 +81,7 @@ test('a pose payload is normalised into persons with keypoint objects', () => {
   assert.equal(frame.count, 1);
   assert.deepEqual(frame.imageSize, { width: 640, height: 480 });
   const person = frame.persons[0];
-  assert.equal(person.action, 'standing');
+  assert.equal(person.posture, 'standing');
   assert.equal(person.confidence, 0.82);
   assert.deepEqual(person.keypoints[5], { x: 200, y: 200, v: 0.9 });
 });
@@ -105,7 +105,7 @@ test('a compact payload without visibilities counts as fully visible', () => {
   // publish_keypoints: compact sends [x, y]. The producer choosing not to send
   // confidences cannot mean "every joint is invisible".
   const frame = parsePosePayload(payload({
-    persons: [{ id: 1, action: 'standing', keypoints: [[10, 20], [30, 40]] }],
+    persons: [{ id: 1, posture: 'standing', keypoints: [[10, 20], [30, 40]] }],
   }));
   assert.deepEqual(frame.persons[0].keypoints[0], { x: 10, y: 20, v: 1 });
 });
@@ -180,7 +180,7 @@ test('invisible joints are skipped rather than drawn at the origin', () => {
 
 test('raising the threshold drops joints the model was unsure about', () => {
   const frame = parsePosePayload(payload({
-    persons: [{ id: 1, action: 'standing',
+    persons: [{ id: 1, posture: 'standing',
                 keypoints: keypoints({ 5: [200, 200, 0.9], 6: [300, 200, 0.4] }) }],
   }));
   const t = fitTransform({ width: 640, height: 480 }, 640, 480);
@@ -196,7 +196,7 @@ test('a bone index outside the keypoint list is skipped, not fatal', () => {
 
 test('non-finite coordinates are skipped', () => {
   const frame = parsePosePayload(payload({
-    persons: [{ id: 1, action: 'standing',
+    persons: [{ id: 1, posture: 'standing',
                 keypoints: keypoints({ 5: [NaN, 200, 0.9], 6: [300, 200, 0.9] }) }],
   }));
   const t = fitTransform(frame.imageSize, 640, 480);
@@ -213,12 +213,12 @@ test('two tracks get two colours and keep them', () => {
 });
 
 test('a person on the ground is drawn in the alert colour whatever their id', () => {
-  for (const action of ALERT_ACTIONS) {
-    assert.equal(trackColour(3, action), ALERT_COLOUR, action);
+  for (const label of ALERT_LABELS) {
+    assert.equal(trackColour(3, label), ALERT_COLOUR, label);
   }
-  // `lying` as well as `fall`: someone lying down is worth looking at even when
-  // the rules declined to call it a fall.
-  assert.ok(ALERT_ACTIONS.has('lying') && ALERT_ACTIONS.has('fall'));
+  // `lying` as well as `falling down`: someone on the floor is worth looking at
+  // even when nothing called it a fall.
+  assert.ok(ALERT_LABELS.has('lying') && ALERT_LABELS.has('falling down'));
 });
 
 test('an id that is not a number still picks a colour', () => {
@@ -226,12 +226,17 @@ test('an id that is not a number still picks a colour', () => {
   assert.ok(TRACK_COLOURS.includes(trackColour(-3, 'standing')));
 });
 
-test('the label carries the id, the action and the confidence', () => {
-  assert.equal(personLabel({ id: 2, action: 'waving', confidence: 0.82 }),
-               '#2 waving 82%');
+test('the label prefers the activity, which says more than the posture', () => {
+  assert.equal(personLabel({ id: 2, posture: 'lying', activity: 'falling down',
+                             confidence: 0.82 }), '#2 falling down');
 });
 
-test('a label with no confidence does not show a stray percentage', () => {
-  assert.equal(personLabel({ id: 2, action: 'waving', confidence: null }),
-               '#2 waving');
+test('with no activity the posture is drawn, with its confidence', () => {
+  assert.equal(personLabel({ id: 2, posture: 'standing', activity: null,
+                             confidence: 0.82 }), '#2 standing 82%');
+});
+
+test('a person with neither is labelled unknown rather than blank', () => {
+  assert.equal(personLabel({ id: 2, posture: null, activity: null,
+                             confidence: null }), '#2 unknown');
 });

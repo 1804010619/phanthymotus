@@ -22,6 +22,7 @@ import pytest
 import vision_stubs  # noqa: F401  (installs the cv2 / ROS stubs)
 
 from plugins.pose_action import (  # noqa: E402
+    RULE_TO_ACTIVITY,
     LabelStabiliser,
     ACTION_LABELS_ZH,
     ACTION_PRIORITY,
@@ -100,6 +101,35 @@ def _sequence(joints_at, box_at, times) -> list:
     return [_frame(joints_at(t), box_at(t), t) for t in times]
 
 
+# -- reading the two-channel result ------------------------------------------
+#
+# The card used to flatten posture and activity into one `action` field. These
+# helpers express that old view over the new contract, so assertions that only
+# care about "what is this person doing, in one word" stay readable. Tests that
+# care about the split assert on `posture` and `activity` directly.
+
+ACTIVITY_TO_RULE = {v: k for k, v in RULE_TO_ACTIVITY.items()}
+
+
+def _action(result):
+    """Most specific label: the activity if there is one, else the posture."""
+    activity = result.get("activity")
+    if activity:
+        return ACTIVITY_TO_RULE.get(activity["name"], activity["name"])
+    return result.get("posture") or "unknown"
+
+
+def _labels(result):
+    """Everything the result asserts, in the rules' own spellings."""
+    out = set()
+    if result.get("posture"):
+        out.add(result["posture"])
+    activity = result.get("activity")
+    if activity:
+        out.add(ACTIVITY_TO_RULE.get(activity["name"], activity["name"]))
+    return out
+
+
 def _classify(frames, **config) -> dict:
     return PoseActionClassifier(**config).classify(frames)
 
@@ -113,16 +143,18 @@ def _steady(joints: dict, box, *, duration=1.5, fps=10.0) -> list:
 
 def test_a_standing_body_is_standing():
     result = _classify(_steady(_body(), _standing_box()))
-    assert result["action"] == "standing"
-    assert "standing" in result["actions"]
-    assert result["action_confidence"] >= DEFAULT_THRESHOLDS["min_confidence"]
+    assert _action(result) == "standing"
+    assert "standing" in _labels(result)
+    assert result["posture_confidence"] >= DEFAULT_THRESHOLDS["min_confidence"]
 
 
-def test_standing_also_reports_still_but_standing_wins():
-    """`still` says less than `standing` does, so it must not be primary."""
+def test_a_motionless_person_simply_has_no_activity():
+    """`still` used to be a label. With posture and activity as separate
+    channels it is redundant: the absence of an activity *is* stillness, and a
+    field saying "not doing anything" beside an empty activity is noise."""
     result = _classify(_steady(_body(), _standing_box()))
-    assert result["action"] == "standing"
-    assert "still" in result["actions"]
+    assert result["posture"] == "standing"
+    assert result["activity"] is None
 
 
 def _sitting_body(cx=CX, top=TOP, h=H) -> dict:
@@ -142,8 +174,8 @@ def _sitting_body(cx=CX, top=TOP, h=H) -> dict:
 def test_a_seated_body_is_sitting_not_standing():
     box = (CX - 0.22 * H, TOP, CX + 0.30 * H, TOP + 0.80 * H)
     result = _classify(_steady(_sitting_body(), box))
-    assert result["action"] == "sitting"
-    assert "standing" not in result["actions"]
+    assert _action(result) == "sitting"
+    assert "standing" not in _labels(result)
 
 
 def _crouching_body(cx=CX, top=TOP, h=H) -> dict:
@@ -162,8 +194,8 @@ def test_a_crouching_body_is_crouching_not_sitting():
     """Folded knees past the sitting range, hips down near the ankles."""
     box = (CX - 0.20 * H, TOP, CX + 0.22 * H, TOP + 0.78 * H)
     result = _classify(_steady(_crouching_body(), box))
-    assert result["action"] == "crouching"
-    assert "sitting" not in result["actions"]
+    assert _action(result) == "crouching"
+    assert "sitting" not in _labels(result)
 
 
 def _bending_body(cx=CX, top=TOP, h=H) -> dict:
@@ -186,9 +218,9 @@ def test_bending_over_is_not_crouching():
     floor, only one folds the knees."""
     box = (CX - 0.15 * H, TOP + 0.18 * H, CX + 0.40 * H, TOP + H)
     result = _classify(_steady(_bending_body(), box))
-    assert result["action"] == "bending"
-    assert "crouching" not in result["actions"]
-    assert "lying" not in result["actions"]
+    assert _action(result) == "bending"
+    assert "crouching" not in _labels(result)
+    assert "lying" not in _labels(result)
 
 
 def _lying_body(cx=CX, floor=TOP + 0.90 * H, h=H) -> dict:
@@ -210,8 +242,7 @@ def _lying_box(cx=CX, floor=TOP + 0.90 * H, h=H):
 
 def test_a_horizontal_body_is_lying():
     result = _classify(_steady(_lying_body(), _lying_box(), duration=0.5))
-    assert "lying" in result["actions"]
-    assert result["action"] == "lying"
+    assert result["posture"] == "lying"
 
 
 # ── occlusion ───────────────────────────────────────────────────────────────
@@ -227,20 +258,20 @@ def test_a_body_with_no_visible_hips_refuses_to_guess_a_posture():
              "left_shoulder": (CX - 0.10 * H, TOP + 0.18 * H),
              "right_shoulder": (CX + 0.10 * H, TOP + 0.18 * H)}
     result = _classify(_steady(upper, _standing_box()))
-    assert result["action"] == "unknown"
-    assert result["actions"] == []
+    assert _action(result) == "unknown"
+    assert _labels(result) == set()
     assert result["evidence"]["reason"] == "occluded"
     assert result["evidence"]["has_torso"] is False
 
 
 def test_a_nearly_invisible_body_is_unknown():
     result = _classify(_steady({"nose": (CX, TOP)}, _standing_box()))
-    assert result["action"] == "unknown"
+    assert _action(result) == "unknown"
     assert result["evidence"]["visible_keypoints"] == 1
 
 
 def test_an_empty_history_is_unknown_rather_than_an_error():
-    assert PoseActionClassifier().classify([])["action"] == "unknown"
+    assert _action(PoseActionClassifier().classify([])) == "unknown"
 
 
 # ── arms ────────────────────────────────────────────────────────────────────
@@ -259,7 +290,7 @@ def _raised_arm(joints: dict, *, side="left", wrist_dx=0.0, cx=CX, top=TOP,
 def test_a_held_raised_hand_is_raising_hand():
     frames = _steady(_raised_arm(_body()), _standing_box(), duration=1.0)
     result = _classify(frames)
-    assert result["action"] == "raising_hand"
+    assert _action(result) == "raising_hand"
     assert result["evidence"]["side"] == "left"
     assert result["evidence"]["held_s"] >= DEFAULT_THRESHOLDS["raise_hold_s"]
 
@@ -270,7 +301,7 @@ def test_a_glimpsed_raised_hand_is_not_raising_hand():
     frames = [_frame(plain, _standing_box(), 0.0),
               _frame(plain, _standing_box(), 0.1),
               _frame(raised, _standing_box(), 0.2)]
-    assert "raising_hand" not in _classify(frames)["actions"]
+    assert "raising_hand" not in _labels(_classify(frames))
 
 
 def test_a_hand_that_oscillates_while_raised_is_waving():
@@ -280,8 +311,11 @@ def test_a_hand_that_oscillates_while_raised_is_waving():
     frames = _sequence(joints_at, lambda _t: _standing_box(),
                        [i / 10.0 for i in range(11)])
     result = _classify(frames)
-    assert result["action"] == "waving"
-    assert "raising_hand" in result["actions"]      # both hold; waving is primary
+    assert _action(result) == "waving"
+    # Only the most specific activity is reported. `raising hand` is implied by
+    # a wave and listing both would be noise — the single-activity channel is
+    # what replaced the old multi-label list.
+    assert result["activity"]["name"] == "hand waving"
     evidence = result["evidence"]
     assert evidence["reversals"] >= DEFAULT_THRESHOLDS["wave_reversals"]
     assert (DEFAULT_THRESHOLDS["wave_freq_min_hz"] <= evidence["frequency_hz"]
@@ -290,7 +324,7 @@ def test_a_hand_that_oscillates_while_raised_is_waving():
 
 def test_a_still_raised_hand_is_not_waving():
     frames = _steady(_raised_arm(_body()), _standing_box(), duration=1.0)
-    assert "waving" not in _classify(frames)["actions"]
+    assert "waving" not in _labels(_classify(frames))
 
 
 def test_an_arm_swinging_below_the_shoulder_is_not_waving():
@@ -305,7 +339,7 @@ def test_an_arm_swinging_below_the_shoulder_is_not_waving():
         return joints
     frames = _sequence(joints_at, lambda _t: _standing_box(),
                        [i / 10.0 for i in range(11)])
-    actions = _classify(frames)["actions"]
+    actions = _labels(_classify(frames))
     assert "waving" not in actions and "raising_hand" not in actions
 
 
@@ -317,7 +351,7 @@ def test_a_straight_horizontal_arm_is_pointing_and_reports_a_direction():
                    "left_elbow": _mid(shoulder, wrist)})
     box = (CX - 0.45 * H, TOP, CX + 0.15 * H, TOP + H)
     result = _classify(_steady(joints, box))
-    assert result["action"] == "pointing"
+    assert _action(result) == "pointing"
     direction = result["point_direction"]
     assert direction[0] == pytest.approx(-1.0, abs=0.05)
     assert abs(direction[1]) < 0.2
@@ -333,8 +367,8 @@ def test_two_wrists_across_the_midline_at_chest_height_are_arms_crossed():
         "right_elbow": (CX + 0.18 * H, TOP + 0.35 * H),
     })
     result = _classify(_steady(joints, _standing_box(half_w=0.20)))
-    assert result["action"] == "arms_crossed"
-    assert "pointing" not in result["actions"]
+    assert _action(result) == "arms_crossed"
+    assert "pointing" not in _labels(result)
 
 
 # ── motion ──────────────────────────────────────────────────────────────────
@@ -346,8 +380,8 @@ def test_alternating_ankles_under_an_upright_torso_is_walking():
     frames = _sequence(joints_at, lambda _t: _standing_box(half_w=0.20),
                        [i / 10.0 for i in range(16)])
     result = _classify(frames)
-    assert "walking" in result["actions"]
-    assert result["action"] == "walking"      # above standing: more informative
+    assert "walking" in _labels(result)
+    assert _action(result) == "walking"      # above standing: more informative
     cadence = result["evidence"]["cadence_hz"]
     assert (DEFAULT_THRESHOLDS["walk_cadence_min_hz"] <= cadence
             <= DEFAULT_THRESHOLDS["walk_cadence_max_hz"])
@@ -365,7 +399,7 @@ def test_a_seated_body_shuffling_its_feet_is_not_walking():
         return joints
     box = (CX - 0.30 * H, TOP, CX + 0.40 * H, TOP + 0.80 * H)
     frames = _sequence(joints_at, lambda _t: box, [i / 10.0 for i in range(16)])
-    assert "walking" not in _classify(frames)["actions"]
+    assert "walking" not in _labels(_classify(frames))
 
 
 def test_a_narrowing_shoulder_width_is_turning():
@@ -375,7 +409,7 @@ def test_a_narrowing_shoulder_width_is_turning():
     frames = _sequence(joints_at, lambda _t: _standing_box(),
                        [i / 10.0 for i in range(16)])
     result = _classify(frames)
-    assert "turning" in result["actions"]
+    assert "turning" in _labels(result)
 
 
 # ── fall ────────────────────────────────────────────────────────────────────
@@ -402,8 +436,8 @@ def _fall_sequence(*, sit_before_landing=False, fps=10.0,
 
 def test_a_fast_drop_into_a_sustained_horizontal_pose_is_a_fall():
     result = _classify(_fall_sequence())
-    assert result["action"] == "fall"
-    assert result["actions"][0] == "fall"
+    assert _action(result) == "fall"
+    assert result["activity"]["name"] == "falling down"
     evidence = result["evidence"]
     assert evidence["is_fall"] is True
     assert evidence["drop_ratio"] >= DEFAULT_THRESHOLDS["fall_drop_ratio"]
@@ -415,8 +449,8 @@ def test_a_fast_drop_into_a_sustained_horizontal_pose_is_a_fall():
 def test_sitting_down_then_lying_down_is_lying_not_a_fall():
     """Sitting on the way down is the signature of a deliberate descent."""
     result = _classify(_fall_sequence(sit_before_landing=True))
-    assert result["action"] == "lying"
-    assert "fall" not in result["actions"]
+    assert result["posture"] == "lying"
+    assert "fall" not in _labels(result)
     assert result["evidence"]["had_sitting_phase"] is True
     assert result["evidence"]["is_fall"] is False
 
@@ -425,8 +459,8 @@ def test_someone_already_lying_down_is_not_a_fall():
     """Lying on the floor and lying on a sofa are the same terminal state —
     without the drop there is no fall to report."""
     result = _classify(_steady(_lying_body(), _lying_box(), duration=2.0))
-    assert result["action"] == "lying"
-    assert "fall" not in result["actions"]
+    assert result["posture"] == "lying"
+    assert "fall" not in _labels(result)
     assert result["evidence"]["is_fall"] is False
     assert result["evidence"]["reason"] == "no fast drop into the horizontal pose"
 
@@ -434,8 +468,8 @@ def test_someone_already_lying_down_is_not_a_fall():
 def test_a_fall_is_not_declared_before_the_body_has_settled():
     """Bending down to pick something up is horizontal too, briefly."""
     result = _classify(_fall_sequence(settle_s=0.4))
-    assert "fall" not in result["actions"]
-    assert result["action"] == "lying"
+    assert "fall" not in _labels(result)
+    assert result["posture"] == "lying"
     assert "is_fall" not in result["evidence"]
 
 
@@ -454,9 +488,9 @@ def test_a_raised_fall_threshold_suppresses_the_same_fall():
     """The fall thresholds are instance config, not constants: the same fall
     measures differently depending on where the camera is."""
     frames = _fall_sequence()
-    assert _classify(frames)["action"] == "fall"
+    assert _action(_classify(frames)) == "fall"
     strict = _classify(frames, thresholds={"fall_drop_ratio": 0.95})
-    assert strict["action"] == "lying"
+    assert strict["posture"] == "lying"
     assert strict["evidence"]["is_fall"] is False
 
 
@@ -487,7 +521,7 @@ def test_the_action_window_bounds_what_the_arm_rules_see():
     frames = _steady(_raised_arm(_body()), _standing_box(), duration=1.0)
     frames += [_frame(_body(), _standing_box(), 1.0 + i / 10.0)
                for i in range(1, 12)]
-    assert "raising_hand" not in _classify(frames, action_window_s=0.5)["actions"]
+    assert "raising_hand" not in _labels(_classify(frames, action_window_s=0.5))
 
 
 def test_every_priority_entry_has_a_chinese_label():
@@ -581,7 +615,7 @@ def test_still_is_not_reported_for_a_body_too_occluded_to_place():
              "left_shoulder": (CX - 0.10 * H, TOP + 0.18 * H),
              "right_shoulder": (CX + 0.10 * H, TOP + 0.18 * H)}
     result = _classify(_steady(upper, _standing_box()))
-    assert "still" not in result["actions"]
+
 
 
 def test_an_occluded_body_can_still_report_its_arms():
@@ -591,7 +625,7 @@ def test_an_occluded_body_can_still_report_its_arms():
                          "left_shoulder": (CX - 0.10 * H, TOP + 0.18 * H),
                          "right_shoulder": (CX + 0.10 * H, TOP + 0.18 * H)})
     result = _classify(_steady(upper, _standing_box(), duration=1.0))
-    assert result["action"] == "raising_hand"
+    assert _action(result) == "raising_hand"
 
 
 # ── single-image classification ─────────────────────────────────────────────
@@ -601,7 +635,7 @@ def test_a_single_frame_drops_the_hold_requirement_on_a_raised_hand():
     through shoulder height, and a photo has no "swinging through"."""
     frame = _frame(_raised_arm(_body()), _standing_box(), 0.0)
     result = PoseActionClassifier().classify_frame(frame)
-    assert result["action"] == "raising_hand"
+    assert _action(result) == "raising_hand"
     assert result["temporal"] is False
 
 
@@ -614,11 +648,10 @@ def test_a_single_frame_says_which_actions_it_cannot_answer():
     """
     frame = _frame(_body(), _standing_box(), 0.0)
     result = PoseActionClassifier().classify_frame(frame)
-    assert result["action"] == "standing"
-    assert "waving" in result["unavailable_actions"]
-    assert "fall" in result["unavailable_actions"]
-    assert "standing" not in result["unavailable_actions"]
-    assert "still" not in result["actions"]
+    assert _action(result) == "standing"
+    assert "hand waving" in result["unavailable_activities"]
+    assert "falling down" in result["unavailable_activities"]
+
 
 
 def test_a_single_frame_still_refuses_an_occluded_posture():
@@ -627,7 +660,7 @@ def test_a_single_frame_still_refuses_an_occluded_posture():
              "right_shoulder": (CX + 0.10 * H, TOP + 0.18 * H)}
     result = PoseActionClassifier().classify_frame(
         _frame(upper, _standing_box(), 0.0))
-    assert result["action"] == "unknown"
+    assert _action(result) == "unknown"
 
 
 # ── track continuity through a fall ─────────────────────────────────────────
@@ -673,7 +706,7 @@ def test_a_fall_is_detected_through_the_real_tracker(fps):
         track = tracker.update([_lying_box()], [_kp(**_lying_body())], t)[0]
         t += step
     result = classifier.classify(list(track.history))
-    assert result["action"] == "fall", result
+    assert _action(result) == "fall", result
     assert result["evidence"]["is_fall"] is True
 
 
@@ -749,7 +782,7 @@ def test_standing_survives_any_leg_foreshortening(k):
     """
     joints, box = _standing_with_foreshortened_legs(k)
     result = _classify(_steady(joints, box))
-    assert result["action"] == "standing", f"k={k}: {result}"
+    assert _action(result) == "standing", f"k={k}: {result}"
 
 
 @pytest.mark.parametrize("k", [1.0, 0.6, 0.35, 0.15])
@@ -765,8 +798,8 @@ def test_sitting_survives_any_leg_foreshortening(k):
     })
     box = (CX - 0.22 * H, TOP, CX + 0.34 * H, hip_y + 0.23 * H * k + 10)
     result = _classify(_steady(joints, box))
-    assert result["action"] == "sitting", f"k={k}: {result}"
-    assert "standing" not in result["actions"]
+    assert _action(result) == "sitting", f"k={k}: {result}"
+    assert "standing" not in _labels(result)
 
 
 def test_a_cropped_view_with_knees_but_no_feet_still_reads_as_standing():
@@ -776,7 +809,7 @@ def test_a_cropped_view_with_knees_but_no_feet_still_reads_as_standing():
               if k not in ("left_ankle", "right_ankle")}
     box = (CX - 0.15 * H, TOP, CX + 0.15 * H, TOP + 0.80 * H)
     result = _classify(_steady(joints, box))
-    assert result["action"] == "standing"
+    assert _action(result) == "standing"
 
 
 def test_a_torso_only_view_still_refuses_to_pick_a_posture():
@@ -785,7 +818,7 @@ def test_a_torso_only_view_still_refuses_to_pick_a_posture():
     joints = {k: v for k, v in _body().items()
               if "knee" not in k and "ankle" not in k and "hip" not in k}
     box = (CX - 0.15 * H, TOP, CX + 0.15 * H, TOP + 0.55 * H)
-    assert _classify(_steady(joints, box))["action"] == "unknown"
+    assert _action(_classify(_steady(joints, box))) == "unknown"
 
 
 def test_the_posture_rules_use_no_image_space_length_ratios():
@@ -802,8 +835,8 @@ def test_a_squat_is_crouching_only_and_not_also_sitting():
     """Both fired at first. Priority hid it, but `actions` still carried it."""
     box = (CX - 0.20 * H, TOP, CX + 0.22 * H, TOP + 0.78 * H)
     result = _classify(_steady(_crouching_body(), box))
-    assert result["action"] == "crouching"
-    assert "sitting" not in result["actions"]
+    assert _action(result) == "crouching"
+    assert "sitting" not in _labels(result)
 
 
 def test_a_foreshortened_knee_angle_cannot_veto_an_open_hip():
@@ -831,7 +864,7 @@ def test_a_foreshortened_knee_angle_cannot_veto_an_open_hip():
     frame = _frame(joints, box)
     assert frame.hip_deg is not None and frame.hip_deg >= 145
     assert frame.knee_deg < 150, "the premise: the knee angle has bent"
-    assert _classify(_steady(joints, box))["action"] == "standing"
+    assert _action(_classify(_steady(joints, box))) == "standing"
 
 
 def test_a_squat_can_still_veto_standing():
@@ -839,8 +872,8 @@ def test_a_squat_can_still_veto_standing():
     the loosened rule would call a squat standing."""
     box = (CX - 0.20 * H, TOP, CX + 0.22 * H, TOP + 0.78 * H)
     result = _classify(_steady(_crouching_body(), box))
-    assert result["action"] == "crouching"
-    assert "standing" not in result["actions"]
+    assert _action(result) == "crouching"
+    assert "standing" not in _labels(result)
 
 
 def test_a_straight_knee_alone_is_enough_when_the_hip_is_unreadable():
@@ -849,7 +882,7 @@ def test_a_straight_knee_alone_is_enough_when_the_hip_is_unreadable():
     joints.update({"left_shoulder": (CX - 0.10 * H, TOP + 0.18 * H)})
     frame = _frame(joints, _standing_box())
     assert frame.knee_deg >= 150
-    assert _classify(_steady(joints, _standing_box()))["action"] == "standing"
+    assert _action(_classify(_steady(joints, _standing_box()))) == "standing"
 
 
 # ── a person on the ground is not gesturing ─────────────────────────────────
@@ -886,9 +919,9 @@ def test_a_fallen_person_with_an_arm_along_their_body_is_not_pointing():
     straight arm resting alongside them scored as pointing every time."""
     joints, box = _lying_with_arm(+0.15 * H, +0.02 * H)
     result = _classify(_steady(joints, box, duration=1.5, fps=12))
-    assert result["action"] == "lying"
-    assert "pointing" not in result["actions"]
-    assert "raising_hand" not in result["actions"]
+    assert result["posture"] == "lying"
+    assert "pointing" not in _labels(result)
+    assert "raising_hand" not in _labels(result)
 
 
 def test_a_fallen_person_is_reported_as_lying_even_with_the_hips_occluded():
@@ -902,8 +935,8 @@ def test_a_fallen_person_is_reported_as_lying_even_with_the_hips_occluded():
     assert frame.torso_deg is None, "the premise: no hips, so no torso angle"
     assert frame.body_down is not None, "the head-to-shoulder fallback"
     result = _classify(_steady(joints, box, duration=1.5, fps=12))
-    assert result["action"] == "lying"
-    assert "pointing" not in result["actions"]
+    assert result["posture"] == "lying"
+    assert "pointing" not in _labels(result)
 
 
 def test_a_fallen_person_can_still_be_seen_raising_an_arm():
@@ -912,8 +945,8 @@ def test_a_fallen_person_can_still_be_seen_raising_an_arm():
     the gesture survives in `actions`."""
     joints, box = _lying_with_arm(-0.20 * H, +0.01 * H)   # past the head
     result = _classify(_steady(joints, box, duration=1.5, fps=12))
-    assert result["action"] == "lying"
-    assert "raising_hand" in result["actions"]
+    assert result["posture"] == "lying"
+    assert "raising_hand" in _labels(result)
 
 
 def test_an_arm_perpendicular_to_a_fallen_body_is_pointing():
@@ -922,8 +955,8 @@ def test_an_arm_perpendicular_to_a_fallen_body_is_pointing():
     it is."""
     joints, box = _lying_with_arm(+0.02 * H, -0.18 * H)
     result = _classify(_steady(joints, box, duration=1.5, fps=12))
-    assert result["action"] == "lying"
-    assert "pointing" in result["actions"]
+    assert result["posture"] == "lying"
+    assert "pointing" in _labels(result)
 
 
 def test_arm_thresholds_do_not_scale_with_the_bounding_box():
@@ -993,9 +1026,9 @@ def test_an_inverted_body_is_lying_not_gesturing():
     frames = [_photo_frame(_INVERTED, _INVERTED_BOX, (300, 400), i / 12)
               for i in range(20)]
     result = PoseActionClassifier().classify(frames)
-    assert result["action"] == "lying", result
-    assert "pointing" not in result["actions"]
-    assert "standing" not in result["actions"]
+    assert result["posture"] == "lying", result
+    assert "pointing" not in _labels(result)
+    assert "standing" not in _labels(result)
 
 
 def test_a_body_seen_along_its_own_axis_is_not_separable_from_a_standing_one():
@@ -1027,7 +1060,7 @@ def test_a_body_seen_along_its_own_axis_is_not_separable_from_a_standing_one():
     # threshold that would misfire on ordinary standing people.
     frames = [_photo_frame(_ALONG_AXIS, _ALONG_AXIS_BOX, (427, 583), i / 12)
               for i in range(20)]
-    assert "lying" not in PoseActionClassifier().classify(frames)["actions"]
+    assert PoseActionClassifier().classify(frames)["posture"] != "lying"
 
 
 def test_the_aspect_ratio_no_longer_vetoes_lying():
@@ -1038,7 +1071,7 @@ def test_the_aspect_ratio_no_longer_vetoes_lying():
     assert inverted.aspect < DEFAULT_THRESHOLDS["lying_aspect"]
     frames = [_photo_frame(_INVERTED, _INVERTED_BOX, (300, 400), i / 12)
               for i in range(20)]
-    assert "lying" in PoseActionClassifier().classify(frames)["actions"]
+    assert PoseActionClassifier().classify(frames)["posture"] == "lying"
 
 
 # ── label stability ─────────────────────────────────────────────────────────
@@ -1108,6 +1141,7 @@ def test_each_person_is_stabilised_separately():
     left, right = (0, 0, 100, 300), (400, 0, 500, 300)
     kps = [_kp(**_body(cx=50, top=0, h=300)), _kp(**_body(cx=450, top=0, h=300))]
     a, b = tracker.update([left, right], kps, 0.0)
-    assert a.stabiliser is not b.stabiliser
-    a.stabiliser.update("waving")
-    assert b.stabiliser.current is None
+    assert a.posture_stabiliser is not b.posture_stabiliser
+    assert a.activity_stabiliser is not b.activity_stabiliser
+    a.posture_stabiliser.update("standing")
+    assert b.posture_stabiliser.current is None

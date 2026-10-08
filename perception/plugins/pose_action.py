@@ -44,43 +44,84 @@ log = logging.getLogger(__name__)
 
 # ── label set ────────────────────────────────────────────────────────────────
 
-# Priority for picking the single primary label out of everything that holds.
+# Two vocabularies, because two different questions are being answered and
+# neither answer substitutes for the other.
 #
-# It is NOT "posture before motion". A walking person is also standing, and
-# `action: "standing"` for someone crossing the room in front of the robot is
-# the less useful of two true answers — so `walking` sits above `standing`
-# while staying below the postures that contradict it. `still` is last for the
-# same reason in reverse: it says less than `standing` does.
+# A **posture** is the shape a body is in. It is a state, readable from one
+# frame, and a person always has one.
+#
+# An **activity** is what somebody is doing. It is a process, needs motion to be
+# visible at all, and a person may not be doing anything nameable.
+#
+# They used to be flattened into one `action` field picked by priority across
+# both, which meant `standing` and `reading` — different kinds of fact — shared
+# a field, and the field's vocabulary was the union of everything. A consumer
+# could not rely on it coming from a known set.
+
+#: What the geometry can say about a body's shape. Closed.
+POSTURES = ("lying", "crouching", "sitting", "bending", "standing")
+
+#: Activities the geometry can read without a model. Open to the model's own
+#: vocabulary on top — see plugins/pose_stgcn.py.
+GEOMETRY_ACTIVITIES = ("falling down", "hand waving", "point to something",
+                       "raising hand", "arms crossed", "walking", "turning")
+
+#: Order within each vocabulary, most informative first. `standing` is last
+#: among postures for the reason `walking` beat it before: it says the least.
+POSTURE_PRIORITY = POSTURES
+
+#: Within activities: the one a robot acts on first, then gestures aimed at it,
+#: then what somebody is doing on their own.
+ACTIVITY_PRIORITY = ("falling down", "hand waving", "point to something",
+                     "raising hand", "arms crossed", "turning", "walking")
+
+#: Kept for the geometry's internal rule names, which are shorter than the NTU
+#: spellings they map onto.
+RULE_TO_ACTIVITY = {
+    "fall": "falling down",
+    "waving": "hand waving",
+    "pointing": "point to something",
+    "raising_hand": "raising hand",
+    "arms_crossed": "arms crossed",
+    "walking": "walking",
+    "turning": "turning",
+}
+
 ACTION_PRIORITY = (
-    "fall",
-    "lying",
-    "waving",
-    "raising_hand",
-    "pointing",
-    "arms_crossed",
-    "crouching",
-    "sitting",
-    "bending",
-    "walking",
-    "turning",
-    "standing",
-    "still",
-    "unknown",
+    "fall", "lying", "waving", "raising_hand", "pointing", "arms_crossed",
+    "crouching", "sitting", "bending", "walking", "turning", "standing",
+    "still", "unknown",
 )
 
 ACTIONS = tuple(a for a in ACTION_PRIORITY if a != "unknown")
 
-# Labels whose meaning is "something happened", not "this is the current pose".
 EVENT_ACTIONS = ("fall",)
 
-# Labels that cannot exist in a single image, however good it is. Waving is
-# motion that comes back, walking is a cadence, a fall is a transition — one
-# frame carries none of them. The one-shot photo actions report this list
-# rather than quietly answering a narrower question than they were asked.
-TEMPORAL_ACTIONS = ("waving", "walking", "turning", "still", "fall")
+#: Activities that cannot exist in a single image, however good it is. Waving is
+#: motion that comes back, walking is a cadence, a fall is a transition — one
+#: frame carries none of them.
+TEMPORAL_ACTIVITIES = ("falling down", "hand waving", "walking", "turning")
+TEMPORAL_ACTIONS = TEMPORAL_ACTIVITIES
 
-# Chinese names, for the `list_actions` reply and the card. Kept beside the
-# labels so the two cannot drift.
+#: Chinese names for the activities the geometry can read. The model's own
+#: classes carry theirs in plugins/pose_stgcn.py NTU60.
+ACTIVITY_LABELS_ZH = {
+    "falling down": "跌倒",
+    "hand waving": "挥手",
+    "point to something": "指向某处",
+    "raising hand": "举手",
+    "arms crossed": "抱臂",
+    "walking": "走动",
+    "turning": "转身",
+}
+
+#: Chinese names for the postures.
+POSTURE_LABELS_ZH = {
+    "standing": "站立", "sitting": "坐", "crouching": "蹲",
+    "bending": "弯腰", "lying": "躺",
+}
+
+# Kept while callers migrate off the flattened vocabulary.
 ACTION_LABELS_ZH = {
     "standing": "站立",
     "sitting": "坐",
@@ -807,10 +848,10 @@ def _motion_labels(frames: list, th: dict, postures: list) -> list:
     # than as unreadable, which is the failure this plugin is supposed to avoid.
     # walking and turning carry their own structural requirements (two ankles,
     # two shoulders), so only this one needs the gate.
-    speed = _body_speed(frames)
-    if (frames[-1].has_torso and speed is not None
-            and speed <= th["still_speed"]):
-        out.append(("still", _confidence(speed, th["still_speed"]), {}))
+    # No `still` label. With posture and activity as separate channels the
+    # absence of an activity *is* stillness, and a label saying "not doing
+    # anything" beside an empty activity field is noise. `still_speed` is still
+    # used, by the rules that need a limb to be stationary.
 
     separations, widths = [], []
     for frame in frames:
@@ -975,9 +1016,9 @@ class PoseActionClassifier:
         The hold requirement on a raised hand is dropped here, because it only
         exists to tell a held gesture from an arm passing through shoulder
         height, and a photo has no "passing through". Everything in
-        TEMPORAL_ACTIONS stays unreachable and is named in the reply, so a
-        caller who asked "is this person waving" is told the question needs a
-        stream rather than being handed `raising_hand` as if it answered.
+        TEMPORAL_ACTIVITIES stays unreachable and is named in the reply, so a
+        caller who asked "is she waving" is told the question needs a stream
+        rather than being handed `raising hand` as if it answered.
         """
         single = PoseActionClassifier(
             thresholds={**self.thresholds, "raise_hold_s": 0.0},
@@ -985,14 +1026,20 @@ class PoseActionClassifier:
         )
         result = single.classify([frame])
         result["temporal"] = False
-        result["unavailable_actions"] = list(TEMPORAL_ACTIONS)
+        result["unavailable_activities"] = list(TEMPORAL_ACTIVITIES)
         return result
 
     def classify(self, frames: list) -> dict:
+        """Two channels: what shape the body is in, and what it is doing.
+
+        Neither is derived from the other and neither is a fallback for the
+        other. A person always has a posture; they may well not have an
+        activity, and saying so is the honest answer rather than picking the
+        least-wrong verb.
+        """
         th = self.thresholds
         if not frames:
-            return {"action": "unknown", "actions": [], "action_confidence": 0.0,
-                    "evidence": {"reason": "no frames"}}
+            return _nothing("no frames")
 
         current = frames[-1]
         window = [f for f in frames
@@ -1019,41 +1066,54 @@ class PoseActionClassifier:
             if fall.get("is_fall"):
                 _offer("fall", fall.get("confidence", 0.5), fall)
             else:
-                # Attach the rejected evidence to `lying`, so the reason the
-                # robot did not raise an alarm is readable.
                 extras.setdefault("lying", {}).update(fall)
 
-        # Events bypass min_confidence — they have their own, stricter gates.
         held = {label: conf for label, conf in scored.items()
                 if conf >= th["min_confidence"] or label in EVENT_ACTIONS}
 
-        actions = [label for label in ACTION_PRIORITY if label in held]
-        if not actions:
-            reason = ("occluded" if not current.has_torso
-                      else "no rule matched with enough confidence")
-            return {
-                "action": "unknown",
-                "actions": [],
-                "action_confidence": 0.0,
-                "evidence": {"reason": reason,
-                             "visible_keypoints": current.visible_count(),
-                             "has_torso": current.has_torso,
-                             "has_legs": current.has_legs},
+        result: dict = {"posture": None, "posture_confidence": 0.0,
+                        "activity": None}
+
+        posture = next((p for p in POSTURE_PRIORITY if p in held), None)
+        if posture is not None:
+            result["posture"] = posture
+            result["posture_confidence"] = round(held[posture], 2)
+            result["evidence"] = extras.get(posture, {})
+        else:
+            result["evidence"] = {
+                "reason": ("occluded" if not current.has_torso
+                           else "no posture rule matched with enough confidence"),
+                "visible_keypoints": current.visible_count(),
+                "has_torso": current.has_torso,
+                "has_legs": current.has_legs,
             }
 
-        primary = actions[0]
-        result = {
-            "action": primary,
-            "actions": actions,
-            "action_confidence": round(held[primary], 2),
-            "evidence": extras.get(primary, {}),
-        }
-        # Promoted out of `evidence` because it is the actionable number:
-        # "someone is pointing" is far less useful than where they point.
-        direction = extras.get("pointing", {}).get("point_direction")
-        if direction is not None:
-            result["point_direction"] = direction
+        # The geometry's own activities, named the way the model names them so
+        # the two sources cannot report one thing under two spellings.
+        activities = [(RULE_TO_ACTIVITY[label], held[label], extras.get(label, {}))
+                      for label in held if label in RULE_TO_ACTIVITY]
+        if activities:
+            activities.sort(key=lambda item: ACTIVITY_PRIORITY.index(item[0])
+                            if item[0] in ACTIVITY_PRIORITY else 99)
+            name, confidence, extra = activities[0]
+            result["activity"] = {
+                "name": name, "name_zh": ACTIVITY_LABELS_ZH.get(name, name),
+                "score": round(confidence, 2), "source": "rules",
+            }
+            if extra:
+                result["evidence"] = {**result["evidence"], **extra}
+            direction = extras.get("pointing", {}).get("point_direction")
+            if direction is not None:
+                result["point_direction"] = direction
         return result
+
+    def _nothing_compat(self):          # pragma: no cover - kept for clarity
+        return _nothing("no frames")
+
+
+def _nothing(reason: str) -> dict:
+    return {"posture": None, "posture_confidence": 0.0, "activity": None,
+            "evidence": {"reason": reason}}
 
 
 # ── tracking ────────────────────────────────────────────────────────────────
@@ -1088,16 +1148,19 @@ def _iou(a, b) -> float:
 class PoseTrack:
     """One person's timeline. `history` is what the classifier reads."""
 
-    __slots__ = ("id", "history", "last_seen", "stabiliser")
+    __slots__ = ("id", "history", "last_seen",
+                 "posture_stabiliser", "activity_stabiliser")
 
     def __init__(self, track_id: int, label_hold: int = 3):
         self.id = track_id
         self.history: deque = deque()
         self.last_seen = 0.0
-        # Per person, because two people in frame change labels independently
-        # and a shared stabiliser would let one person's gesture suppress the
-        # other's.
-        self.stabiliser = LabelStabiliser(label_hold)
+        # Per person, because two people in frame change independently and a
+        # shared stabiliser would let one person's gesture suppress the other's.
+        # Per channel, because a posture settling must not hold back an
+        # activity, or vice versa — they change on different timescales.
+        self.posture_stabiliser = LabelStabiliser(label_hold)
+        self.activity_stabiliser = LabelStabiliser(label_hold)
 
     @property
     def current(self) -> Optional[PoseFrame]:

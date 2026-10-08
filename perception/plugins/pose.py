@@ -57,6 +57,8 @@ from plugins.image_input import BadInput, load_image_bytes
 from plugins.pose_action import (
     ACTION_LABELS_ZH,
     DEFAULT_THRESHOLDS,
+    POSTURE_LABELS_ZH,
+    TEMPORAL_ACTIVITIES,
     PoseFrame,
     PoseTracker,
     action_catalogue,
@@ -442,20 +444,35 @@ class _PoseNode(Node):
         for track, box, score, kpts in zip(tracks, boxes, kept_scores,
                                            kept_keypoints):
             verdict = dict(self._classifier.classify(list(track.history)))
-            # Hysteresis, per person. Every threshold here is a cliff, and at
-            # the boundaries the raw answer flips on every frame — a label that
-            # alternates twelve times a second is worse than one that is simply
-            # wrong, because nothing downstream can act on it. See
-            # pose_action.LabelStabiliser.
-            stable, pending = track.stabiliser.update(verdict["action"])
-            if stable != verdict["action"]:
+            # Hysteresis, per person, per channel. Every threshold here is a
+            # cliff and at the boundaries the raw answer flips on every frame —
+            # a label alternating twelve times a second is worse than a stable
+            # wrong one, because nothing downstream can act on it. The two
+            # channels are stabilised independently: a posture settling must not
+            # hold back an activity, or vice versa.
+            posture, pending = track.posture_stabiliser.update(
+                verdict.get("posture") or "unknown")
+            if posture != (verdict.get("posture") or "unknown"):
                 verdict["evidence"] = {**(verdict.get("evidence") or {}),
-                                       "raw_action": verdict["action"]}
-                verdict["action"] = stable
-                verdict["action_confidence"] = 0.0
+                                       "raw_posture": verdict.get("posture")}
+                verdict["posture"] = None if posture == "unknown" else posture
+                verdict["posture_confidence"] = 0.0
             if pending:
                 verdict["evidence"] = {**(verdict.get("evidence") or {}),
-                                       "pending_action": pending}
+                                       "pending_posture": pending}
+
+            activity = verdict.get("activity")
+            name, _ = track.activity_stabiliser.update(
+                activity["name"] if activity else "none")
+            if activity and name != activity["name"]:
+                verdict["evidence"] = {**(verdict.get("evidence") or {}),
+                                       "raw_activity": activity["name"]}
+                verdict["activity"] = None
+            elif not activity and name != "none":
+                # The stabiliser is still holding the previous activity; do not
+                # resurrect it with a stale score, just say nothing this frame.
+                pass
+
             cx = (float(box[0]) + float(box[2])) / 2.0
             cy = (float(box[1]) + float(box[3])) / 2.0
             persons.append({
@@ -468,28 +485,43 @@ class _PoseNode(Node):
                              round((cy - half_h) / half_h, 3)],
                 "verdict": verdict,
             })
-        self._last_actions = {p["id"]: p["verdict"]["action"] for p in persons}
+        self._last_actions = {
+            p["id"]: (p["verdict"].get("activity") or {}).get("name")
+                     or p["verdict"].get("posture") or "unknown"
+            for p in persons
+        }
         return persons
 
     def _lean_record(self, person: dict) -> dict:
+        """Two channels, because two different questions are answered.
+
+        `posture` is the shape the body is in — a state, readable from one
+        frame, and everybody has one. `activity` is what they are doing — a
+        process, needs motion, and may legitimately be absent. Neither is
+        derived from the other and there is no third field flattening them: a
+        single `action` picked by priority across both put `standing` and
+        `reading` in one slot whose vocabulary was the union of everything, and
+        a consumer could not rely on it coming from a known set.
+        """
         verdict = person["verdict"]
         record = {
             "id": person["id"],
             "position": person["position"],
-            "action": verdict["action"],
-            "action_confidence": verdict["action_confidence"],
+            "posture": verdict.get("posture"),
+            "posture_confidence": verdict.get("posture_confidence", 0.0),
         }
-        # Only when it says something the primary label does not, so the common
-        # case stays at one short string. Every byte here is LLM context.
-        if len(verdict["actions"]) > 1:
-            record["actions"] = verdict["actions"]
+        activity = verdict.get("activity")
+        if activity:
+            record["activity"] = activity["name"]
+            record["activity_zh"] = activity["name_zh"]
+            record["activity_score"] = activity["score"]
         if verdict.get("point_direction"):
             record["point_direction"] = verdict["point_direction"]
-        # Evidence rides along only for events: "it fell" without the numbers
-        # behind it is not something an operator can check, and this is the one
-        # label a robot is expected to act on.
-        if verdict["action"] in ("fall",):
-            record["evidence"] = verdict["evidence"]
+        # Evidence rides along only for the one activity a robot acts on:
+        # "they fell" without the numbers behind it is not something an operator
+        # can check.
+        if activity and activity["name"] == "falling down":
+            record["evidence"] = verdict.get("evidence", {})
         if self._publish_bbox:
             record["bbox"] = [round(v, 1) for v in person["box"]]
         if self._publish_keypoints == "compact":
@@ -504,8 +536,9 @@ class _PoseNode(Node):
             "id": person["id"],
             "score": person["score"],
             "bbox": [round(v, 1) for v in person["box"]],
-            "action": verdict["action"],
-            "action_confidence": verdict["action_confidence"],
+            "posture": verdict.get("posture"),
+            "activity": (verdict["activity"]["name"]
+                         if verdict.get("activity") else None),
             "keypoints": _full_keypoints(person["keypoints"]),
         }
 
@@ -899,9 +932,8 @@ class PosePerceptionPlugin:
             # answering "raising_hand" to "is she waving" would be answering a
             # narrower question than was asked.
             "temporal": False,
-            "unavailable_actions": list(
-                persons[0]["verdict"]["unavailable_actions"]) if persons else [],
-            "note": ("单张图片只能判姿态和手臂动作；挥手、走动、转身、跌倒需要"
+            "unavailable_activities": list(TEMPORAL_ACTIVITIES),
+            "note": ("单张图片只能判姿势和手臂动作；挥手、走动、转身、跌倒需要"
                      "连续画面，请把卡片连上摄像头后看 {topic}/poses"),
             "persons": [
                 {
@@ -909,10 +941,14 @@ class PosePerceptionPlugin:
                     "score": person["score"],
                     "bbox": [round(v, 1) for v in person["box"]],
                     "position": person["position"],
-                    "action": person["verdict"]["action"],
-                    "actions": person["verdict"]["actions"],
-                    "action_confidence": person["verdict"]["action_confidence"],
-                    "evidence": person["verdict"]["evidence"],
+                    "posture": person["verdict"].get("posture"),
+                    "posture_confidence": person["verdict"].get(
+                        "posture_confidence", 0.0),
+                    **({"activity": person["verdict"]["activity"]["name"],
+                        "activity_zh": person["verdict"]["activity"]["name_zh"],
+                        "activity_score": person["verdict"]["activity"]["score"]}
+                       if person["verdict"].get("activity") else {}),
+                    "evidence": person["verdict"].get("evidence", {}),
                     **({"point_direction": person["verdict"]["point_direction"]}
                        if person["verdict"].get("point_direction") else {}),
                     "keypoints": _full_keypoints(person["keypoints"]),
@@ -1046,7 +1082,7 @@ class PosePerceptionPlugin:
                 "ok": True,
                 "backend": effective,
                 # Two vocabularies, because two questions are being answered.
-                "postures": sorted(ACTION_LABELS_ZH),
+                "postures": sorted(POSTURE_LABELS_ZH),
                 "activities": (action_vocabulary() if effective != "rules" else []),
                 "backend_note": (
                     "hybrid：posture（身体是什么姿势）来自关键点几何，单帧可判；"
@@ -1064,7 +1100,7 @@ class PosePerceptionPlugin:
                          "单目正面视角下「跌倒」和「蹲下再趴下」几乎不可分，"
                          "侧视角可靠得多。"),
                 "limitations": {
-                    "needs_stream": ["waving", "walking", "turning", "still", "fall"],
+                    "needs_stream": list(TEMPORAL_ACTIVITIES),
                     "occluded_lower_body": ("看不到髋/膝时姿态一律报 unknown —— "
                                             "坐在桌子后面和站在桌子后面的躯干轴"
                                             "完全一样，猜一个比不猜更糟"),
@@ -1147,7 +1183,7 @@ class PosePerceptionPlugin:
             "keypoint_names": list(COCO_KEYPOINTS),
             "action_backend": self._action_backend,
             "action_backend_effective": self._effective_backend(),
-            "actions": sorted(ACTION_LABELS_ZH),
+            "postures": sorted(POSTURE_LABELS_ZH),
             "instances": instances,
             "topic_in": topics_in,
             "topic_out": topics_out,
