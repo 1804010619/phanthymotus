@@ -940,3 +940,101 @@ def test_the_body_frame_reduces_to_the_image_frame_when_standing():
     frame = _frame(_body(), _standing_box())
     assert frame.body_down is not None
     assert frame.body_down[1] > 0.99, "down is down for someone standing"
+
+
+# ── two real photographs of fallen people ───────────────────────────────────
+#
+# Keypoints as the engine actually produced them on a rig, pinned here. They are
+# the only cases in this file that are not synthetic, and between them they mark
+# where the geometry works and where it stops.
+
+def _photo_frame(joints_px, box, image_size, t=0.0):
+    """A frame from literal engine output. Unlisted joints are invisible."""
+    keypoints = np.zeros((N_KEYPOINTS, 3), dtype=np.float32)
+    for name, (x, y, v) in joints_px.items():
+        keypoints[COCO_INDEX[name]] = (x, y, v)
+    return PoseFrame(t, box, keypoints, 0.3, image_size=image_size)
+
+
+# Trampoline: on their back, head down, legs in the air. Reported as `pointing`.
+_INVERTED = {
+    "nose": (140, 211, 0.92),
+    "left_shoulder": (107, 218, 1.0), "right_shoulder": (197, 212, 1.0),
+    "left_hip": (86, 155, 1.0), "right_hip": (144, 148, 1.0),
+    "left_knee": (53, 118, 1.0), "right_knee": (162, 103, 1.0),
+    "left_ankle": (27, 41, 1.0), "right_ankle": (131, 15, 0.99),
+}
+_INVERTED_BOX = (15, 0, 274, 250)
+
+# Elderly person fallen on pavement, camera above and looking along the body.
+# Reported as `raising_hand`.
+_ALONG_AXIS = {
+    "nose": (168, 200, 0.98),
+    "left_shoulder": (252, 175, 0.99), "right_shoulder": (187, 243, 1.0),
+    "left_hip": (343, 320, 1.0), "right_hip": (291, 352, 1.0),
+    "left_knee": (316, 442, 1.0), "right_knee": (232, 438, 1.0),
+    "left_ankle": (409, 560, 0.66), "right_ankle": (346, 533, 0.97),
+}
+_ALONG_AXIS_BOX = (6, 132, 427, 577)
+
+
+def test_an_inverted_body_is_lying_not_gesturing():
+    """Head down, legs in the air. Came back as `pointing`.
+
+    Torso tilt read 30.2 deg — "upright" — because `_tilt_from_vertical_deg`
+    takes the absolute value of the vertical component, so an inverted body and
+    an upright one are the same number to it. Aspect was 1.04, under the 1.2
+    gate. Both halves of the old `lying` test failed on a person who was plainly
+    on their back.
+    """
+    frame = _photo_frame(_INVERTED, _INVERTED_BOX, (300, 400))
+    assert frame.extent is not None and frame.extent < -2.0, frame.extent
+    frames = [_photo_frame(_INVERTED, _INVERTED_BOX, (300, 400), i / 12)
+              for i in range(20)]
+    result = PoseActionClassifier().classify(frames)
+    assert result["action"] == "lying", result
+    assert "pointing" not in result["actions"]
+    assert "standing" not in result["actions"]
+
+
+def test_a_body_seen_along_its_own_axis_is_not_separable_from_a_standing_one():
+    """The limit, pinned so nobody tries to close it with a threshold.
+
+    A person lying on pavement, photographed from above and along their body.
+    The projection puts head above hips above feet exactly as it does for
+    someone standing: the measured head-to-foot span is **+2.17** body scales
+    against **+2.68** for an upright reference — a 19% gap.
+
+    A threshold could separate *these two samples*. What makes it unusable is
+    what else lives in the 1.0-2.4 band: a standing person with their feet
+    cropped, or knees slightly bent, or a child's proportions. Catching this
+    fall means calling those people fallen, and a false "someone has collapsed"
+    makes the robot drop what it is doing to ask whether a standing person is
+    hurt.
+
+    So this case is left to the cues that do carry the information: the ground
+    plane (depth), the camera pose, or the *transition* that put them there —
+    which is why `fall` keys on the drop rather than on the terminal pose.
+    """
+    frame = _photo_frame(_ALONG_AXIS, _ALONG_AXIS_BOX, (427, 583))
+    assert frame.extent == pytest.approx(2.17, abs=0.1)
+    standing = _frame(_body(), _standing_box())
+    assert standing.extent == pytest.approx(2.68, abs=0.1)
+    gap = (standing.extent - frame.extent) / standing.extent
+    assert gap < 0.20, f"the two are {gap:.0%} apart, not separable in practice"
+    # And it is correctly NOT claimed as lying, rather than forced with a
+    # threshold that would misfire on ordinary standing people.
+    frames = [_photo_frame(_ALONG_AXIS, _ALONG_AXIS_BOX, (427, 583), i / 12)
+              for i in range(20)]
+    assert "lying" not in PoseActionClassifier().classify(frames)["actions"]
+
+
+def test_the_aspect_ratio_no_longer_vetoes_lying():
+    """Both photographs had a *taller-than-wide* box — 1.04 and 0.95 — because a
+    fallen body photographed end-on is tall in the image. Aspect only separates
+    anything for a camera level with the body and perpendicular to it."""
+    inverted = _photo_frame(_INVERTED, _INVERTED_BOX, (300, 400))
+    assert inverted.aspect < DEFAULT_THRESHOLDS["lying_aspect"]
+    frames = [_photo_frame(_INVERTED, _INVERTED_BOX, (300, 400), i / 12)
+              for i in range(20)]
+    assert "lying" in PoseActionClassifier().classify(frames)["actions"]

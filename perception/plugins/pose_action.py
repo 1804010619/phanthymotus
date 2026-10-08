@@ -109,7 +109,13 @@ DEFAULT_THRESHOLDS = {
     "upright_deg": 25.0,          # torso within this of vertical = upright
     "bend_deg": 35.0,             # torso past this = leaning
     "lying_deg": 60.0,            # torso past this = horizontal
-    "lying_aspect": 1.2,          # bbox w/h past this = lying down
+    "lying_aspect": 1.2,          # bbox w/h past this corroborates lying
+    # Head-to-foot image-vertical span, in body scales. Standing measures
+    # +2.5..+3.0 on real photographs; a body on the floor seen side-on about 0;
+    # an inverted one negative. See _head_to_foot_extent for the case this
+    # cannot see.
+    "upright_extent": 2.0,
+    "lying_extent": 1.0,
     "leg_straight_deg": 150.0,    # knee angle past this = straight leg
     "knee_bent_max_deg": 140.0,   # sitting: knee not straighter than this
     "knee_bent_min_deg": 70.0,    # crouching: knee folded past this
@@ -246,6 +252,47 @@ def _body_down(frame) -> Optional[np.ndarray]:
     return (vector / norm).astype(np.float32)
 
 
+def _head_to_foot_extent(frame) -> Optional[float]:
+    """Image-vertical distance from the head to the feet, in body scales.
+
+    Measured on real photographs through the real engine:
+
+        standing (reference)                     +2.5 to +3.0
+        fallen, camera side-on                    about 0
+        inverted (head down, legs up)             -2.50
+        fallen, camera looking ALONG the body     +2.17   <- indistinguishable
+
+    The first three are what makes this a better `lying` cue than the torso's
+    image-space angle: it keys on the fact that a body on the floor has its head
+    and its feet at the same *height*, which is a statement about the world and
+    survives the camera tilting down. Torso angle and bbox aspect do not — a
+    fallen person photographed from above measured 37.4 deg of tilt and an aspect
+    of 0.95, failing both gates.
+
+    The fourth line is the limit, and it is a real one: when the camera looks
+    down the length of a fallen body, the projection puts the head above the
+    feet exactly as it does for someone standing. That information is not in the
+    skeleton. No threshold recovers it — it needs the ground plane (depth), the
+    camera pose, or the *transition* that got them there.
+    """
+    nose = frame.joint("nose")
+    if nose is None:
+        nose = _mid_of([p for p in (frame.joint("left_ear"),
+                                    frame.joint("right_ear")) if p is not None])
+    feet = _mid_of([p for p in (frame.joint("left_ankle"),
+                                frame.joint("right_ankle")) if p is not None])
+    if feet is None:
+        # Hips are a usable stand-in at roughly a third of the span; a person
+        # whose legs are out of frame still has a head and hips.
+        feet = frame.hip
+        if feet is None or nose is None or frame.body_scale is None:
+            return None
+        return float(feet[1] - nose[1]) / frame.body_scale * 2.9
+    if nose is None or frame.body_scale is None:
+        return None
+    return float(feet[1] - nose[1]) / frame.body_scale
+
+
 def _body_scale(frame) -> Optional[float]:
     """Pixel length the arm thresholds are fractions of.
 
@@ -292,7 +339,7 @@ class PoseFrame:
     __slots__ = ("t", "box", "keypoints", "height", "min_conf", "image_size",
                  "shoulder", "hip", "torso_deg", "knee_deg", "hip_deg",
                  "hip_knee_dy", "hip_ankle_dy", "aspect", "torso_px",
-                 "body_down", "body_scale", "has_torso", "has_legs")
+                 "body_down", "body_scale", "extent", "has_torso", "has_legs")
 
     def __init__(self, t: float, box, keypoints: np.ndarray, min_conf: float,
                  image_size=None):
@@ -391,6 +438,7 @@ class PoseFrame:
 
         self.body_down = _body_down(self)
         self.body_scale = _body_scale(self)
+        self.extent = _head_to_foot_extent(self)
 
     def joint(self, name: str) -> Optional[np.ndarray]:
         return _point(self.keypoints, name, self.min_conf)
@@ -503,9 +551,27 @@ def _posture_labels(frame: PoseFrame, th: dict) -> list:
     # `body_down` falls back to the head-to-shoulder vector, so the axis
     # survives the occlusion that matters.
     axis_deg = _tilt_from_vertical_deg(frame.body_down)
-    if (axis_deg is not None and axis_deg >= th["lying_deg"]
-            and frame.aspect >= th["lying_aspect"]):
-        out.append(("lying", _confidence(axis_deg, th["lying_deg"], below=False)))
+    extent = frame.extent
+
+    # Three independent signs of a body that is not upright, ORed. They were a
+    # single conjunction (tilt >= 60 AND aspect >= 1.2) and that pair is only
+    # valid for a camera looking at the body side-on, level with it. Two real
+    # photographs of fallen people failed both halves: 37.4 deg / 0.95 aspect,
+    # and 30.2 deg / 1.04.
+    inverted = extent is not None and extent <= -th["upright_extent"] * 0.4
+    flattened = extent is not None and abs(extent) < th["lying_extent"]
+    side_on = axis_deg is not None and axis_deg >= th["lying_deg"]
+    if inverted or flattened or side_on:
+        score = max(
+            _confidence(axis_deg, th["lying_deg"], below=False) if side_on else 0.0,
+            _confidence(abs(extent), th["lying_extent"]) if flattened else 0.0,
+            0.8 if inverted else 0.0,
+        )
+        # Aspect corroborates rather than gates: a wide box makes this more
+        # certain, a tall one no longer vetoes it.
+        if frame.aspect >= th["lying_aspect"]:
+            score = min(1.0, score + 0.1)
+        out.append(("lying", score))
 
     if frame.torso_deg is None:
         return out
@@ -547,7 +613,12 @@ def _posture_labels(frame: PoseFrame, th: dict) -> list:
     # Standing: upright torso, and the legs not folded. Stated as the absence
     # of folding rather than the presence of a vertical gap, which is the whole
     # point of this rewrite.
-    if upright:
+    # A body whose feet are above its head is not standing, whatever the torso
+    # angle says. The trampoline photograph read 30.2 deg of torso tilt — which
+    # is "upright" — because `_tilt_from_vertical_deg` takes the absolute value
+    # of the vertical component, so an inverted body and an upright one are the
+    # same number to it. That choice is right for `bending` and wrong here.
+    if upright and not inverted:
         # The hip angle carries this, and the knee may only veto a *clearly*
         # folded leg. Making a straight knee a requirement repeated the mistake
         # this rewrite was supposed to remove, one level down.
