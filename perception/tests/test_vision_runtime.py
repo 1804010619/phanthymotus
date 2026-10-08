@@ -480,3 +480,38 @@ def test_keypoint_index_matches_the_name_order():
     assert COCO_INDEX["left_hip"] == 11 and COCO_INDEX["right_hip"] == 12
     assert COCO_INDEX["left_ankle"] == 15 and COCO_INDEX["right_ankle"] == 16
     assert all(COCO_INDEX[name] == i for i, name in enumerate(COCO_KEYPOINTS))
+
+
+def test_the_real_pose_engine_geometry_decodes():
+    """The shape the shipped engine actually declares.
+
+    Measured, not assumed: exporting yolo26s-pose inside the jp6.1 perception
+    image (TensorRT 10.4) reported
+
+        input  "images"  shape(1, 3, 640, 640)  FLOAT
+        output "output0" shape(1, 300, 57)      FLOAT
+
+    57 = 6 + 3x17, so the engine carries the class column and the keypoints
+    start at index 6; 300 rows is the NMS-free end-to-end head, the same fixed
+    row count yoloe-26s-seg's (1, 300, 38) has. One output tensor, so the
+    per-JetPack output *ordering* problem does not arise for pose — but the
+    decode still picks by content, because that was also true of vop's engine
+    on one of the two lines and not the other.
+
+    Pinning it here means a future re-export that changes the layout fails in a
+    test rather than on a robot.
+    """
+    rows = np.zeros((1, 300, 57), dtype=np.float32)
+    rows[0, 0, :4] = (10, 20, 110, 420)
+    rows[0, 0, 4] = 0.91
+    rows[0, 0, 5] = 0.0                       # the class column
+    rows[0, 0, 6:] = np.tile([55.0, 66.0, 0.8], 17)
+    meta = LetterboxMeta(1.0, 0, 0, 640, 640)
+
+    boxes, scores, keypoints = decode_poses(rows, meta, conf=0.5)
+    assert boxes.shape == (1, 4) and keypoints.shape == (1, 17, 3)
+    assert scores[0] == pytest.approx(0.91)
+    assert keypoints[0, 0].tolist() == pytest.approx([55.0, 66.0, 0.8])
+    # The other 299 rows are all-zero: score 0 is below any usable threshold,
+    # so a fixed-row head does not report 299 phantom people.
+    assert len(boxes) == 1

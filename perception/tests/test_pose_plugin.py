@@ -36,6 +36,9 @@ FRAME_W, FRAME_H = 640, 480
 def _standing_row(cx=320.0, top=40.0, h=400.0, score=0.9) -> list:
     """One 57-column pose row: [x1,y1,x2,y2,score,class, kx,ky,kv × 17].
 
+    57 columns because that is what the shipped engine declares — exporting
+    yolo26s-pose in the jp6.1 image reports `output0` with shape (1, 300, 57).
+
     The body is the same fraction-of-height skeleton the action tests use, so
     this row classifies as `standing` through the real rules.
     """
