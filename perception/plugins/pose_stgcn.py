@@ -66,13 +66,31 @@ from plugins.vision_runtime import COCO_INDEX, N_KEYPOINTS
 
 log = logging.getLogger(__name__)
 
-# Frames the network is fed. PYSKL's NTU configs uniform-sample 100; 48 is used
-# here because the card's history is bounded by what the rules need (a few
-# seconds) and because sampling 48 slots out of ~30 real frames interpolates
-# less than stretching them over 100. It must match whatever the engine was
-# exported with — `_build_input` reads the engine's own input shape and uses
-# that, so this is only the fallback when the engine does not declare one.
-DEFAULT_WINDOW_FRAMES = 48
+# Frames the network is fed. **100**, because that is what the published
+# checkpoint was trained with (`UniformSample(clip_len=100)` in
+# configs/stgcn++/stgcn++_ntu60_xsub_hrnet/j.py) — not a number we get to pick.
+# `_build_input` still reads the engine's own declaration and prefers it; this
+# is the fallback when the engine does not state one.
+DEFAULT_WINDOW_FRAMES = 100
+
+# Person slots the network expects. **2**, from `FormatGCNInput(num_person=2)`
+# in the same config: the model was trained on a tensor with room for two
+# skeletons, and a single person is zero-padded into the second slot. Feeding
+# M=1 is not "the same thing with less data" — it is a different tensor shape,
+# and the batch-norm the backbone applies over N*M would see a different
+# population.
+NUM_PERSON_SLOTS = 2
+
+# Channels per joint: x, y **and the detector's confidence**. Confirmed against
+# the checkpoint rather than assumed — `backbone.data_bn.weight` has 51 entries,
+# which is 3 x 17, and the first conv takes 3 input channels. PreNormalize2D
+# concatenates `keypoint_score` as that third channel.
+NUM_CHANNELS = 3
+
+# PreNormalize2D zeroes the x and y of any joint at or below this score, keeping
+# the score itself. Not a visibility threshold of ours — it is part of the
+# transform the weights were trained under.
+PRENORM_SCORE_THRESHOLD = 0.01
 
 # How much video the window should span. ST-GCN needs an action to be *in* the
 # clip: NTU samples are 1-5 s. At the card's default 5 fps a 2 s window is 10
@@ -148,15 +166,27 @@ def uniform_sample_indices(available: int, wanted: int) -> np.ndarray:
 
 
 def pre_normalize_2d(keypoints: np.ndarray, image_size) -> np.ndarray:
-    """PYSKL `PreNormalize2D`: pixels → [-1, 1] about the frame centre.
+    """PYSKL `PreNormalize2D` in its default `fix` mode, transcribed.
 
-    (T, V, 2) in, same shape out. This is the step whose details decide whether
-    the network sees what it was trained on, and getting it wrong raises nothing
-    — hence the explicit arithmetic and the tests on it.
+    (T, V, 3) in — x, y, score — same shape out. This is the step whose details
+    decide whether the network sees what it was trained on, and getting it wrong
+    raises nothing, so the arithmetic is written out and tested rather than
+    paraphrased. Upstream:
 
-    PYSKL normalises by the *frame*, not by the person's box. That matters: the
-    person's position and apparent size within the frame are information the
-    network was trained with, and re-centring on the body would throw them away.
+        h, w = img_shape
+        keypoint[..., 0] = (keypoint[..., 0] - w / 2) / (w / 2)
+        keypoint[..., 1] = (keypoint[..., 1] - h / 2) / (h / 2)
+        keypoint[..., :2][score <= threshold] = 0
+
+    Two things that are easy to get wrong and were:
+
+    * Normalisation is by the **frame**, not the person's box. Where someone is
+      and how large they appear within the frame is information the network
+      trained with; re-centring on the body throws it away.
+    * A joint the detector is unsure of has its **x and y zeroed while its score
+      is kept**. That is not our visibility gate — it is part of the transform
+      the weights were trained under, and skipping it feeds the network
+      coordinates it was taught to read as absent.
     """
     width, height = image_size
     if not (width > 0 and height > 0):
@@ -165,8 +195,12 @@ def pre_normalize_2d(keypoints: np.ndarray, image_size) -> np.ndarray:
             "pixels, so there is nothing to normalise against"
         )
     out = keypoints.astype(np.float32, copy=True)
-    out[..., 0] = out[..., 0] / (width / 2.0) - 1.0
-    out[..., 1] = out[..., 1] / (height / 2.0) - 1.0
+    out[..., 0] = (out[..., 0] - width / 2.0) / (width / 2.0)
+    out[..., 1] = (out[..., 1] - height / 2.0) / (height / 2.0)
+    if out.shape[-1] >= 3:
+        absent = out[..., 2] <= PRENORM_SCORE_THRESHOLD
+        out[..., 0][absent] = 0.0
+        out[..., 1][absent] = 0.0
     return out
 
 
@@ -241,7 +275,7 @@ class SkeletonActionBackend:
         engine = self._engine
         shape = getattr(engine, "input_shape", None) or getattr(
             engine, "optimization_shape", None)
-        # (N, M, T, V, C) is PYSKL's FormatGCNInput order.
+        # (N, M, T, V, C) is PYSKL's FormatGCNInput order, so T is index 2.
         if shape is not None and len(shape) == 5 and int(shape[2]) > 0:
             return int(shape[2])
         return DEFAULT_WINDOW_FRAMES
@@ -249,11 +283,18 @@ class SkeletonActionBackend:
     # ── input construction ───────────────────────────────────────────────
 
     def _build_input(self, frames: list, window_frames: int) -> np.ndarray:
-        """PoseFrames → (1, 1, T, 17, 2) float32, PYSKL's FormatGCNInput order.
+        """PoseFrames → (1, 2, T, 17, 3) float32, PYSKL's FormatGCNInput order.
 
         One of the two version-sensitive calls in this class. Steps, in PYSKL's
-        order: take the joint stream, normalise by the frame, uniform-sample to
-        T. `M=1` because the card classifies one tracked person at a time.
+        order: joint stream with the score channel, normalise by the frame,
+        uniform-sample to T, then pad to two person slots.
+
+        The shape is taken from the published config, not chosen:
+        `FormatGCNInput(num_person=2)` means the network was trained on a tensor
+        with room for two skeletons and a single person zero-padded into the
+        second slot. An earlier version of this method built (1, 1, T, 17, 2) —
+        wrong in two dimensions, which is precisely the kind of mistake that
+        loads without complaint and returns confident nonsense.
         """
         if not frames:
             raise ActionBackendError("no frames to classify")
@@ -263,15 +304,21 @@ class SkeletonActionBackend:
         # with "all input arrays must have the same shape", which says nothing
         # about joints and sends the reader to numpy rather than to the caller
         # who supplied the wrong skeleton.
-        bad = {a.shape for a in arrays if a.ndim != 2 or a.shape[0] != N_KEYPOINTS}
+        bad = {a.shape for a in arrays
+               if a.ndim != 2 or a.shape[0] != N_KEYPOINTS or a.shape[1] < 3}
         if bad:
             raise ActionBackendError(
-                f"every frame needs {N_KEYPOINTS} keypoints; got {sorted(bad)}")
-        raw = np.stack([a[:, :2] for a in arrays])    # (T0, V, 2)
+                f"every frame needs {N_KEYPOINTS} keypoints with x, y and a "
+                f"score; got {sorted(bad)}")
+        raw = np.stack([a[:, :NUM_CHANNELS] for a in arrays])   # (T0, V, 3)
         normalised = pre_normalize_2d(raw, image_size)
         indices = uniform_sample_indices(len(frames), window_frames)
-        sampled = normalised[indices]                # (T, V, 2)
-        return sampled[None, None].astype(np.float32)   # (1, 1, T, V, 2)
+        sampled = normalised[indices]                           # (T, V, 3)
+
+        # (M, T, V, C) with the unused person slot zeroed, then the clip axis.
+        people = np.zeros((NUM_PERSON_SLOTS,) + sampled.shape, dtype=np.float32)
+        people[0] = sampled
+        return people[None]                                     # (1, M, T, V, C)
 
     def _run(self, blob: np.ndarray) -> np.ndarray:
         """Engine call → per-class scores. The other version-sensitive call."""

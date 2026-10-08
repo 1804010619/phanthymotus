@@ -28,6 +28,9 @@ from plugins.pose_action import (  # noqa: E402
 )
 from plugins.pose_stgcn import (  # noqa: E402
     DEFAULT_WINDOW_FRAMES,
+    NUM_CHANNELS,
+    NUM_PERSON_SLOTS,
+    PRENORM_SCORE_THRESHOLD,
     NTU60_TO_ACTION,
     NTU60_TRANSITIONS,
     ActionBackendError,
@@ -53,7 +56,8 @@ class _FakeEngine:
 
     def __init__(self, scores=None, *, window_frames=DEFAULT_WINDOW_FRAMES,
                  outputs=None, raise_on_infer=None):
-        self.input_shape = (1, 1, window_frames, N_KEYPOINTS, 2)
+        self.input_shape = (1, NUM_PERSON_SLOTS, window_frames,
+                            N_KEYPOINTS, NUM_CHANNELS)
         self.calls = []
         self._raise = raise_on_infer
         if outputs is not None:
@@ -94,17 +98,17 @@ def test_normalisation_maps_the_frame_onto_minus_one_to_one():
     it. Pinned on exact corners because a wrong scale raises nothing — it just
     feeds the model a skeleton from a distribution it never saw.
     """
-    corners = np.array([[[0.0, 0.0], [1280.0, 720.0], [640.0, 360.0]]],
-                       dtype=np.float32)
+    corners = np.array([[[0.0, 0.0, 0.9], [1280.0, 720.0, 0.9],
+                         [640.0, 360.0, 0.9]]], dtype=np.float32)
     out = pre_normalize_2d(corners, FRAME)
-    assert out[0, 0].tolist() == pytest.approx([-1.0, -1.0])
-    assert out[0, 1].tolist() == pytest.approx([1.0, 1.0])
-    assert out[0, 2].tolist() == pytest.approx([0.0, 0.0])
+    assert out[0, 0, :2].tolist() == pytest.approx([-1.0, -1.0])
+    assert out[0, 1, :2].tolist() == pytest.approx([1.0, 1.0])
+    assert out[0, 2, :2].tolist() == pytest.approx([0.0, 0.0])
 
 
 def test_normalisation_refuses_a_zero_frame_size():
     with pytest.raises(ActionBackendError, match="unusable"):
-        pre_normalize_2d(np.zeros((1, 17, 2), dtype=np.float32), (0, 720))
+        pre_normalize_2d(np.zeros((1, 17, 3), dtype=np.float32), (0, 720))
 
 
 def test_uniform_sampling_covers_the_clip_evenly():
@@ -129,15 +133,52 @@ def test_sampling_an_empty_sequence_raises_rather_than_returning_nothing():
         uniform_sample_indices(0, 48)
 
 
-def test_the_input_tensor_has_pyskls_layout_and_the_engines_window():
-    """(N, M, T, V, C) — FormatGCNInput's order. A transposed tensor is a shape
-    error at best and a silent reinterpretation at worst."""
+def test_the_input_tensor_matches_the_published_config():
+    """(N, M, T, V, C) — FormatGCNInput's order, with M and C taken from the
+    config the checkpoint was trained under, not chosen.
+
+    `FormatGCNInput(num_person=2)` means two person slots with a single person
+    zero-padded into the second; `backbone.data_bn.weight` has 51 = 3 x 17
+    entries, so C is x, y **and score**. An earlier version built
+    (1, 1, T, 17, 2) — wrong in two dimensions, which is exactly the kind of
+    mistake that loads without complaint and returns confident nonsense.
+    """
     engine = _FakeEngine({42: 9.0}, window_frames=48)
     backend = SkeletonActionBackend(engine=engine)
     backend.classify(_frames(_standing, n=30))
     assert engine.calls, "the engine was never called"
-    assert engine.calls[0].shape == (1, 1, 48, N_KEYPOINTS, 2)
+    assert engine.calls[0].shape == (1, 2, 48, N_KEYPOINTS, 3)
     assert engine.calls[0].dtype == np.float32
+    assert NUM_PERSON_SLOTS == 2 and NUM_CHANNELS == 3
+
+
+def test_the_unused_person_slot_is_zero():
+    """`mode='zero'`, not `'loop'`: the second slot is padding, not a copy."""
+    engine = _FakeEngine({42: 9.0})
+    SkeletonActionBackend(engine=engine).classify(_frames(_standing, n=30))
+    blob = engine.calls[0]
+    assert np.any(blob[0, 0] != 0), "the real person must not be empty"
+    assert np.all(blob[0, 1] == 0), "the padded slot must be all zeros"
+
+
+def test_the_default_window_is_the_one_the_checkpoint_was_trained_with():
+    """UniformSample(clip_len=100) in the published config. Not ours to pick."""
+    assert DEFAULT_WINDOW_FRAMES == 100
+
+
+def test_a_joint_below_the_prenorm_threshold_has_its_position_zeroed():
+    """Part of the transform the weights were trained under, not our visibility
+    gate: PreNormalize2D zeroes x and y while keeping the score, and skipping it
+    feeds the network coordinates it was taught to read as absent."""
+    keypoints = np.zeros((1, N_KEYPOINTS, 3), dtype=np.float32)
+    keypoints[0, :, 0] = 640.0
+    keypoints[0, :, 1] = 360.0
+    keypoints[0, 0, 2] = 0.9                      # visible
+    keypoints[0, 1, 2] = PRENORM_SCORE_THRESHOLD  # at the threshold -> absent
+    out = pre_normalize_2d(keypoints, FRAME)
+    assert out[0, 0, :2].tolist() == pytest.approx([0.0, 0.0])   # frame centre
+    assert out[0, 1, :2].tolist() == [0.0, 0.0]                  # zeroed
+    assert out[0, 1, 2] == pytest.approx(PRENORM_SCORE_THRESHOLD)  # score kept
 
 
 def test_the_window_comes_from_the_engine_not_from_our_constant():
