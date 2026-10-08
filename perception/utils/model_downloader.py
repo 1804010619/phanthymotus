@@ -1248,17 +1248,16 @@ POSE_MODEL_BUNDLES = {
             },
         },
     },
-    # Not built yet, deliberately: the jp5.11 engine has to come from Orin 5, and
-    # jp6.1 is being validated first. The zero pins make ensure_pose_model raise
-    # with the build instructions on a jp5.11 machine rather than fetch something
-    # unverified, so the pose card there reports `state: error` and the rest of
-    # perception is untouched.
+    # Built on Orin 5 in a container off the jp5.11 image (TensorRT 8.5.2.2),
+    # 634 s. Not interchangeable with the jp61 plan above and not a rebuild of
+    # the same bytes: a different TensorRT produces a different engine, which is
+    # the whole reason this table is keyed by JetPack family.
     "jp511": {
         "base_url": f"{VISION_MODEL_BASE}/yolo26s-pose/tensorrt-jp511-trt8.5-orin-640",
         "files": {
             "yolo26s-pose.engine": {
-                "size": 0,
-                "sha256": "",
+                "size": 23916308,
+                "sha256": "80473d875d6cbfec829a0572e51bdde7785b42b7542f3ae21a55c8f163ab376c",
             },
         },
     },
@@ -1317,10 +1316,20 @@ ACTION_MODEL_BUNDLES = {
             },
         },
     },
+    # Same checkpoint and the same ONNX graph as jp61 — only the TensorRT that
+    # built the plan differs (8.5.2.2), which is why the bytes and the size do.
+    # Measurably slower on the older line: 8.62 ms GPU latency against jp61's
+    # 4.66 ms for an identical (1, 2, 100, 17, 3) input, so a jp5.11 robot has
+    # roughly half the action-inference headroom. The ~3 Hz per-track throttle
+    # in plugins/pose.py was sized with margin and still holds, but anything
+    # that raises activity_interval_s should be checked here first.
     "jp511": {
         "base_url": f"{VISION_MODEL_BASE}/stgcnpp-ntu60-2d/tensorrt-jp511-trt8.5-orin-t100",
         "files": {
-            "stgcnpp-ntu60-2d.engine": {"size": 0, "sha256": ""},
+            "stgcnpp-ntu60-2d.engine": {
+                "size": 3842709,
+                "sha256": "8a627bf92d372ba87eaf81062051ff1da7e2e759543161eb8a5d66c84a871268",
+            },
         },
     },
 }
