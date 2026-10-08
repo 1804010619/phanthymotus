@@ -33,8 +33,13 @@ from plugins.pose_stgcn import (  # noqa: E402
     NUM_CHANNELS,
     NUM_PERSON_SLOTS,
     PRENORM_SCORE_THRESHOLD,
-    NTU60_TO_ACTION,
-    NTU60_TRANSITIONS,
+    FALL_CLASS,
+    MUTUAL_CLASSES,
+    NTU60,
+    NTU_TO_POSE_LABEL,
+    USABLE_CLASSES,
+    action_vocabulary,
+    ntu_name,
     ActionBackendError,
     HybridActionBackend,
     SkeletonActionBackend,
@@ -305,67 +310,67 @@ def test_softmax_is_stable_on_large_logits():
     assert out.sum() == pytest.approx(1.0)
 
 
-# ── label mapping ───────────────────────────────────────────────────────────
+# ── the model's own vocabulary ──────────────────────────────────────────────
 
-@pytest.mark.parametrize("ntu_index,expected", sorted(NTU60_TO_ACTION.items()))
-def test_each_mapped_ntu_class_produces_its_label(ntu_index, expected):
-    engine = _FakeEngine({ntu_index: 9.0})
+def test_the_model_reports_its_own_class_not_one_of_ours():
+    """An earlier version clipped sixty classes down to the five that coincided
+    with labels the geometry happened to produce and discarded the rest. That
+    inverted the relationship — the rules were written by hand in an afternoon,
+    the model was trained on 56,000 clips — and threw away the half with the
+    value in it: the health group and the interaction gestures."""
+    engine = _FakeEngine({10: 9.0})           # A11 reading
     result = SkeletonActionBackend(engine=engine).classify(_frames(_standing))
-    assert result["action"] == expected
-    assert result["evidence"]["ntu_class"] == ntu_index + 1
+    assert result["action"] == "reading"
+    assert result["activity"]["ntu_class"] == 11
+    assert result["activity"]["name_zh"] == "看书"
 
 
-def test_every_mapped_label_exists_in_the_shared_priority_order():
-    """A label the priority order does not know would crash the merge."""
-    for label in NTU60_TO_ACTION.values():
-        assert label in ACTION_PRIORITY
+def test_classes_the_geometry_also_names_use_the_shared_name():
+    """So the two halves do not report the same thing twice under different
+    spellings."""
+    for index, label in NTU_TO_POSE_LABEL.items():
+        engine = _FakeEngine({index: 12.0})
+        backend = SkeletonActionBackend(
+            engine=engine, fall_min_score=0.1, min_score=0.1)
+        assert backend.classify(_frames(_standing))["action"] == label
 
 
-def test_mutual_two_person_classes_are_not_mapped():
-    """A59/A60 walking-towards/apart are defined on a *pair* of skeletons, and
-    this backend is fed one person at a time — a confident prediction there
-    would be meaningless. Which is why `walking` stays with the geometry."""
-    assert max(NTU60_TO_ACTION) < 49
-    assert "walking" not in NTU60_TO_ACTION.values()
+def test_the_vocabulary_is_the_full_ntu60_table():
+    assert len(NTU60) == 60
+    assert all(len(entry) == 2 and all(entry) for entry in NTU60)
+    assert ntu_name(FALL_CLASS) == "falling down"
+    assert ntu_name(22) == "hand waving"
 
 
-def test_an_unmapped_class_winning_means_the_model_has_nothing_to_say():
-    """Not `unknown` by way of a wrong label: class 5 is "drop something", for
-    which this project has no label at all."""
-    engine = _FakeEngine({5: 20.0})
-    result = SkeletonActionBackend(engine=engine).classify(_frames(_standing))
-    assert result["action"] == "unknown"
-    assert result["actions"] == []
-
-
-def test_transitions_are_flagged_as_transitions():
-    """NTU's `sit down` is a transition; our `sitting` is a state. The reply
-    says which it was, so a consumer is not told a state was observed."""
-    engine = _FakeEngine({7: 9.0})
-    result = SkeletonActionBackend(engine=engine).classify(_frames(_standing))
-    assert result["action"] == "sitting"
-    assert result["evidence"]["transition"] is True
-    assert 7 in NTU60_TRANSITIONS
-
-
-def test_a_score_below_min_score_reports_what_it_nearly_said():
-    """So "the model is wrong" can be told from "the threshold is wrong" on a
-    robot, which is the only way to tune this without a rebuild."""
-    engine = _FakeEngine(outputs=[np.full(N_CLASSES, 1.0 / N_CLASSES,
-                                          dtype=np.float32)[None]])
-    result = SkeletonActionBackend(engine=engine, min_score=0.4).classify(
+def test_two_person_classes_are_excluded():
+    """A50-A60 are defined on a **pair** of skeletons. This backend is fed one
+    tracked person with the second slot zero-padded, so the evidence for those
+    classes is structurally absent from the input — the model would answer, and
+    the answer would be about a person who is not in the tensor."""
+    assert MUTUAL_CLASSES == frozenset(range(49, 60))
+    assert len(USABLE_CLASSES) == 49
+    assert all(i not in USABLE_CLASSES for i in MUTUAL_CLASSES)
+    # "hugging" must be unreachable however confident the model is about it.
+    engine = _FakeEngine({54: 20.0})
+    result = SkeletonActionBackend(engine=engine, min_score=0.01).classify(
         _frames(_standing))
     assert result["action"] == "unknown"
-    assert result["evidence"]["min_score"] == 0.4
-    assert result["evidence"]["best"]["score"] < 0.4
 
 
-def test_predict_exposes_the_full_ranking_for_info():
-    engine = _FakeEngine({42: 5.0, 22: 4.0})
-    prediction = SkeletonActionBackend(engine=engine).predict(_frames(_standing))
-    labels = [entry["action"] for entry in prediction["scores"]]
-    assert labels[0] == "fall" and labels[1] == "waving"
-    assert prediction["frames_used"] > 0
+def test_the_catalogue_covers_every_usable_class_with_both_names():
+    catalogue = action_vocabulary()
+    assert len(catalogue) == 49
+    assert all(entry["name"] and entry["name_zh"] for entry in catalogue)
+    assert {e["ntu_class"] for e in catalogue} == {i + 1 for i in USABLE_CLASSES}
+
+
+def test_the_health_group_is_reachable():
+    """The half that was being discarded, and the reason this changed."""
+    for index, expected in ((41, "staggering"), (43, "touch head"),
+                            (47, "nausea / vomiting"), (40, "sneeze / cough")):
+        engine = _FakeEngine({index: 9.0})
+        result = SkeletonActionBackend(engine=engine).classify(_frames(_standing))
+        assert result["action"] == expected, index
 
 
 # ── failure paths must not become labels ────────────────────────────────────
@@ -421,38 +426,39 @@ def test_a_single_frame_is_declined_rather_than_padded():
         _frames(_standing, n=1)[0])
     assert result["action"] == "unknown"
     assert result["temporal"] is False
-    assert "fall" in result["unavailable_actions"]
+    assert result["activity_available"] is False
     assert engine.calls == []
 
 
 # ── hybrid ──────────────────────────────────────────────────────────────────
 
 def test_hybrid_takes_postures_from_geometry():
-    """NTU-60 has no `standing` class, so a pure swap would lose the postures."""
+    """NTU-60 has no class for a motionless person — standing still is not an
+    action — so the geometry is the only thing that can answer it."""
     engine = _FakeEngine(outputs=[np.zeros((1, N_CLASSES), dtype=np.float32)])
-    backend = HybridActionBackend(engine=engine)
-    result = backend.classify(_frames(_standing, n=20))
+    result = HybridActionBackend(engine=engine).classify(_frames(_standing, n=20))
     assert result["action"] == "standing"
+    assert result["posture"] == "standing"
     assert result["evidence"]["source"] == "rules"
 
 
-def test_hybrid_lets_the_model_win_on_its_own_classes():
-    """`waving`, not `fall`: fall carries an extra corroboration requirement of
-    its own (see the noise-bias tests), so it is the wrong example of the
-    general rule."""
-    engine = _FakeEngine({22: 9.0})
-    backend = HybridActionBackend(engine=engine)
-    result = backend.classify(_frames(_standing, n=20))
-    assert result["action"] == "waving"
-    assert result["evidence"]["source"] == "stgcn"
-
-
-def test_hybrid_merges_a_posture_and_a_learned_action():
-    """"Standing while waving" has to survive, as it does in the rules."""
-    engine = _FakeEngine({22: 9.0})
+def test_hybrid_lets_the_model_name_the_activity():
+    """The model answers "what is this person doing" in its own words."""
+    engine = _FakeEngine({10: 9.0})          # A11 reading
     result = HybridActionBackend(engine=engine).classify(_frames(_standing, n=20))
-    assert result["action"] == "waving"
-    assert "standing" in result["actions"]
+    assert result["action"] == "reading"
+    assert result["evidence"]["source"] == "stgcn"
+    assert result["activity"]["name_zh"] == "看书"
+
+
+def test_hybrid_reports_posture_and_activity_separately():
+    """Two questions, two answers. "Reading" says what they are doing;
+    "standing" says what shape their body is in. Neither replaces the other."""
+    engine = _FakeEngine({10: 9.0})
+    result = HybridActionBackend(engine=engine).classify(_frames(_standing, n=20))
+    assert result["action"] == "reading"
+    assert result["posture"] == "standing"
+    assert result["activity"]["name"] == "reading"
 
 
 def test_hybrid_keeps_the_geometrys_point_direction():
@@ -487,13 +493,14 @@ def test_hybrid_history_covers_both_backends():
     assert backend.history_s >= backend.rules.history_s
 
 
-def test_hybrid_defers_to_geometry_on_ntu_transitions():
-    """`sit down` is a transition; the geometry observes the state directly."""
+def test_an_ntu_transition_is_reported_as_itself_beside_the_posture():
+    """`sit down` is NTU's name for the *act* of sitting down. It no longer gets
+    bent into our `sitting` state — the posture channel already carries that,
+    observed directly, and the two are different facts."""
     engine = _FakeEngine({7: 9.0})
     result = HybridActionBackend(engine=engine).classify(_frames(_standing, n=20))
-    # The model said "sit down"; the body is plainly standing.
-    assert result["action"] == "standing"
-    assert result["evidence"]["source"] == "rules"
+    assert result["activity"]["name"] == "sit down"
+    assert result["posture"] == "standing"
 
 
 def test_a_single_frame_through_hybrid_falls_to_the_geometry():
@@ -539,8 +546,8 @@ def test_fall_is_held_to_a_higher_score_than_the_rest():
     from plugins.pose_stgcn import FALL_MIN_SCORE
     assert FALL_MIN_SCORE > DEFAULT_MIN_SCORE
     backend = SkeletonActionBackend(engine=_FakeEngine({42: 9.0}))
-    assert backend._threshold_for("fall") == FALL_MIN_SCORE
-    assert backend._threshold_for("waving") == backend.min_score
+    assert backend._threshold_for({"ntu_class": FALL_CLASS + 1}) == FALL_MIN_SCORE
+    assert backend._threshold_for({"ntu_class": 23}) == backend.min_score
 
 
 def test_a_noise_level_fall_score_does_not_become_a_fall():
@@ -675,7 +682,7 @@ def test_a_moving_clip_still_reaches_the_model():
     engine = _FakeEngine({42: 20.0})
     frames = [PoseFrame(i / 12.0, _standing_box(), _kp(**drifting(i / 29)), 0.3,
                         image_size=FRAME) for i in range(30)]
-    result = SkeletonActionBackend(engine=engine).classify(frames)
+    result = SkeletonActionBackend(engine=engine, fall_min_score=0.1).classify(frames)
     assert engine.calls, "a clip with motion must be classified"
     assert result["action"] == "fall"
 

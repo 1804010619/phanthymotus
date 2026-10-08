@@ -65,7 +65,7 @@ from plugins.pose_stgcn import (
     BACKENDS,
     DEFAULT_MIN_SCORE,
     DEFAULT_WINDOW_S,
-    NTU60_TO_ACTION,
+    action_vocabulary,
     build_backend,
 )
 from plugins.vision_runtime import COCO_KEYPOINTS, COCO_SKELETON, N_KEYPOINTS
@@ -1042,35 +1042,21 @@ class PosePerceptionPlugin:
 
         elif action == "list_actions":
             effective = self._effective_backend()
-            available = (sorted(set(NTU60_TO_ACTION.values()))
-                         if effective == "stgcn" else sorted(ACTION_LABELS_ZH))
-            # Which of those are inferred from a *transition* rather than
-            # observed as a state. `standing` from NTU's "stand up" only fires
-            # while someone is getting up — a person who has been standing
-            # still for a minute produces no event and reads as unknown. That
-            # distinction is the whole reason `hybrid` exists, so it has to be
-            # legible here and not just in a docstring.
-            from plugins.pose_stgcn import NTU60_TRANSITIONS
-            transition_labels = sorted({
-                label for index, label in NTU60_TO_ACTION.items()
-                if index in NTU60_TRANSITIONS
-            }) if effective == "stgcn" else []
             return {
                 "ok": True,
                 "backend": effective,
-                "available_actions": available,
-                "transition_derived_actions": transition_labels,
+                # Two vocabularies, because two questions are being answered.
+                "postures": sorted(ACTION_LABELS_ZH),
+                "activities": (action_vocabulary() if effective != "rules" else []),
                 "backend_note": (
-                    "stgcn 单独使用时只能产出 NTU-60 里有的那几类。注意 NTU 里"
-                    "没有「站立」「坐」这两个**状态**类，只有 stand up / sit down "
-                    "这种**转换** —— 所以这里的 standing/sitting 只在人起身/坐下"
-                    "的那几秒出现（回复里的 transition_derived_actions 列的就是"
-                    "这些），一个已经站着不动一分钟的人不产生任何事件，会报 "
-                    "unknown。hybrid 就是为此存在的：姿态走几何、事件走模型"
-                    if effective == "stgcn" else
-                    "hybrid：姿态标签来自关键点几何，跌倒/挥手/指向来自 ST-GCN++"
+                    "hybrid：posture（身体是什么姿势）来自关键点几何，单帧可判；"
+                    "activity（人在做什么）来自 ST-GCN++，用它自己的 NTU-60 词表，"
+                    "需要画面里有运动。两者答的不是同一个问题 —— NTU-60 的 60 个类"
+                    "全是「某人正在做某事」，没有「静止」这个答案，所以站着不动的人"
+                    "只有 posture；而几何没有「挥手长什么样」的先验。"
+                    "跌倒是唯一的告警类，要模型得分过 0.75 且几何同意身体不直立"
                     if effective == "hybrid" else
-                    "rules：全部标签来自关键点几何，不需要第二个 engine"),
+                    "rules：只用关键点几何，不加载动作模型。没有 activity 这一路"),
                 "actions": action_catalogue(),
                 "note": ("姿态标签来自关键点几何，事件标签（跌倒）判的是「转换」"
                          "而不是终态 —— 躺在地上和躺在沙发上是同一个终态。"

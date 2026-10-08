@@ -694,21 +694,28 @@ def test_the_migration_also_covers_a_runtime_config_call():
     assert plugin._action_backend == "hybrid"
 
 
-def test_list_actions_on_the_offered_backends_covers_the_whole_label_set():
-    """Neither offered backend drops a label: `rules` produces them all from
-    geometry, `hybrid` adds the model on top of that."""
-    for name in ("rules", "hybrid"):
-        plugin, _ = _plugin({"action_backend": name})
-        result = plugin.dispatch("pose", {"action": "list_actions"})
-        assert set(result["available_actions"]) == set(ACTION_LABELS_ZH), name
-        assert result["transition_derived_actions"] == []
-
-
-def test_list_actions_on_hybrid_offers_the_whole_label_set():
+def test_list_actions_reports_two_vocabularies():
+    """Two questions, two answers. `postures` is what the geometry can see on a
+    single frame; `activities` is NTU-60 in its own words, from the model."""
     plugin, _ = _plugin({"action_backend": "hybrid"})
     result = plugin.dispatch("pose", {"action": "list_actions"})
-    assert set(result["available_actions"]) == set(ACTION_LABELS_ZH)
-    assert result["transition_derived_actions"] == []
+    assert set(result["postures"]) == set(ACTION_LABELS_ZH)
+    assert len(result["activities"]) == 49, "A50-A60 are two-person classes"
+    names = {a["name"] for a in result["activities"]}
+    assert "falling down" in names and "staggering" in names
+    assert "handshake" not in names, "a two-person class must not be offered"
+
+
+def test_rules_only_offers_no_activities():
+    """No model, no activity channel — and the reply says so rather than
+    listing a vocabulary nothing can produce."""
+    plugin, _ = _plugin({"action_backend": "rules"})
+    result = plugin.dispatch("pose", {"action": "list_actions"})
+    assert result["activities"] == []
+    assert set(result["postures"]) == set(ACTION_LABELS_ZH)
+
+
+
 
 
 def test_the_frame_size_reaches_the_tracker():

@@ -97,27 +97,93 @@ PRENORM_SCORE_THRESHOLD = 0.01
 # real frames, which is thin — hence the fps coupling the plugin warns about.
 DEFAULT_WINDOW_S = 2.5
 
-# NTU-60 class index → our label. Only the classes this project has a label for
-# and that a single-person skeleton can support; everything else maps to None and
-# is treated as "this model has nothing to say", not as `unknown`.
+# ── the model's own vocabulary ───────────────────────────────────────────────
 #
-# Indices are 0-based, i.e. NTU's A01 is 0. Mutual (two-person) classes A50-A60
-# are deliberately absent: they are defined on a *pair* of skeletons and this
-# backend is fed one person at a time, so a confident prediction there would be
-# meaningless. That includes A59/A60 walking-towards/apart, which is why
-# `walking` is not available from this backend and stays with the geometry.
-NTU60_TO_ACTION = {
-    7:  "sitting",        # A08 sit down      (transition → resulting state)
-    8:  "standing",       # A09 stand up
-    22: "waving",         # A23 hand waving
-    30: "pointing",       # A31 pointing to something with finger
-    42: "fall",           # A43 falling down
+# NTU-60, in its own words. The first version of this file mapped five of these
+# sixty classes onto the labels my geometry rules happened to produce and threw
+# the other fifty-five away as "the model has nothing to say" — which inverted
+# the relationship. The rules were written by hand in an afternoon; the model was
+# trained on 56,000 clips. Clipping its vocabulary to mine wasted most of it, and
+# the discarded half is where the value for a robot actually is:
+#
+#   health      A41 sneeze/cough  A42 staggering  A44-A47 touching head/chest/
+#               back/neck (pain)  A48 nausea
+#   gestures    A10 clapping  A22 cheer  A23 wave  A31 point  A35 nod/bow
+#               A36 shake head  A38 salute  A40 cross hands (stop)
+#   occupied    A1 drink  A2 eat  A11 read  A12 write  A28 phone call
+#               A29 play with phone  A30 type  A33 check time
+#
+# So the model now reports its class and the geometry reports posture, each
+# answering the question it can: "what is this person doing" needs motion and a
+# learned prior, "what shape is this body in" needs neither.
+NTU60 = (
+    ("drink water", "喝水"), ("eat meal", "吃东西"), ("brush teeth", "刷牙"),
+    ("brush hair", "梳头"), ("drop", "东西掉了"), ("pickup", "捡东西"),
+    ("throw", "扔东西"), ("sit down", "坐下"), ("stand up", "起身"),
+    ("clapping", "鼓掌"), ("reading", "看书"), ("writing", "写字"),
+    ("tear up paper", "撕纸"), ("wear jacket", "穿外套"),
+    ("take off jacket", "脱外套"), ("wear a shoe", "穿鞋"),
+    ("take off a shoe", "脱鞋"), ("wear on glasses", "戴眼镜"),
+    ("take off glasses", "摘眼镜"), ("put on a hat", "戴帽子"),
+    ("take off a hat", "摘帽子"), ("cheer up", "欢呼"), ("hand waving", "挥手"),
+    ("kicking something", "踢东西"), ("reach into pocket", "掏口袋"),
+    ("hopping", "单脚跳"), ("jump up", "跳起"), ("phone call", "打电话"),
+    ("play with phone", "玩手机"), ("type on keyboard", "打字"),
+    ("point to something", "指向某处"), ("taking a selfie", "自拍"),
+    ("check time", "看表"), ("rub two hands", "搓手"),
+    ("nod head / bow", "点头/鞠躬"), ("shake head", "摇头"),
+    ("wipe face", "擦脸"), ("salute", "敬礼"), ("put palms together", "合掌"),
+    ("cross hands in front", "双手交叉(制止)"), ("sneeze / cough", "打喷嚏/咳嗽"),
+    ("staggering", "踉跄"), ("falling down", "跌倒"), ("touch head", "捂头(头痛)"),
+    ("touch chest", "捂胸(胸痛)"), ("touch back", "捂背(背痛)"),
+    ("touch neck", "捂脖子"), ("nausea / vomiting", "恶心/呕吐"),
+    ("fan self", "扇风(热)"),
+    # A50-A60 below. Defined on a **pair** of skeletons; this backend is fed one
+    # person at a time, so a confident prediction here would be meaningless.
+    ("punch other person", "打人"), ("kick other person", "踢人"),
+    ("push other person", "推人"), ("pat on back", "拍背"),
+    ("point at other person", "指着别人"), ("hug", "拥抱"),
+    ("give something", "递东西"), ("touch other's pocket", "掏别人口袋"),
+    ("handshake", "握手"), ("walking towards", "相向走"),
+    ("walking apart", "分开走"),
+)
+
+#: Two-person classes, excluded from everything this backend reports.
+MUTUAL_CLASSES = frozenset(range(49, 60))
+
+#: Classes this backend will report. 49 of 60.
+USABLE_CLASSES = tuple(i for i in range(len(NTU60)) if i not in MUTUAL_CLASSES)
+
+#: The one class that is an alarm rather than an observation, and is gated
+#: accordingly — see FALL_MIN_SCORE and HybridActionBackend.
+FALL_CLASS = 42
+
+#: NTU classes that coincide with a label the geometry also produces, so the two
+#: do not report the same thing under two names. Everything else is reported by
+#: its NTU name.
+NTU_TO_POSE_LABEL = {
+    42: "fall",
+    22: "waving",
+    30: "pointing",
 }
 
-# Classes that are *transitions* in NTU but states for us. Reporting `sitting`
-# because the model saw "sit down" is an inference beyond what it was asked, so
-# in `hybrid` these defer to the geometry, which observes the state directly.
-NTU60_TRANSITIONS = {7, 8}
+
+def ntu_name(index: int) -> str:
+    return NTU60[index][0] if 0 <= index < len(NTU60) else f"A{index + 1}"
+
+
+def ntu_name_zh(index: int) -> str:
+    return NTU60[index][1] if 0 <= index < len(NTU60) else f"A{index + 1}"
+
+
+def action_vocabulary() -> list:
+    """What `list_actions` reports for the learned half."""
+    return [
+        {"ntu_class": i + 1, "name": NTU60[i][0], "name_zh": NTU60[i][1],
+         "pose_label": NTU_TO_POSE_LABEL.get(i)}
+        for i in USABLE_CLASSES
+    ]
+
 
 PRENORM_MODE = "auto"
 
@@ -128,11 +194,6 @@ PRENORM_MODE = "auto"
 # somebody is doing — so a motionless clip does not make this network unsure, it
 # makes it confidently wrong. Measured on 100 identical frames of a real person
 # lying on pavement: NTU's "play with phone/tablet" at **0.997**, entropy 0.03.
-# A standing person gave "taking a selfie" at 0.289.
-#
-# The hybrid mapping happened to discard both of those (neither class is mapped
-# to one of our labels), but that is luck, not a guard: the same mechanism
-# landing on A43 or A23 would be a false fall or a false wave straight through.
 MIN_MOTION = 0.02
 
 DEFAULT_MIN_SCORE = 0.40
@@ -442,10 +503,10 @@ class SkeletonActionBackend:
                             else [outputs])]
         for array in arrays:
             flat = array.reshape(-1)
-            if flat.size >= max(NTU60_TO_ACTION) + 1:
+            if flat.size >= len(NTU60):
                 return flat
         raise ActionBackendError(
-            f"no engine output has at least {max(NTU60_TO_ACTION) + 1} classes; "
+            f"no engine output has {len(NTU60)} classes; "
             f"got shapes {[a.shape for a in arrays]} — is this an NTU-60 head?"
         )
 
@@ -490,23 +551,26 @@ class SkeletonActionBackend:
         if not looks_like_probabilities(scores):
             scores = softmax(scores)
         ranked = sorted(
-            ((label, float(scores[index]), index)
-             for index, label in NTU60_TO_ACTION.items() if index < scores.size),
+            ((index, float(scores[index])) for index in USABLE_CLASSES
+             if index < scores.size),
             key=lambda item: item[1], reverse=True,
         )
         return {
             "frames_used": len(window),
             "window_frames": self._window_frames(),
             "motion": round(motion, 4),
-            "scores": [{"action": label, "score": round(score, 3),
-                        "ntu_class": index + 1,
-                        "transition": index in NTU60_TRANSITIONS}
-                       for label, score, index in ranked],
+            "scores": [
+                {"ntu_class": index + 1,
+                 "name": ntu_name(index), "name_zh": ntu_name_zh(index),
+                 "pose_label": NTU_TO_POSE_LABEL.get(index),
+                 "score": round(score, 3)}
+                for index, score in ranked[:8]
+            ],
         }
 
-    def _threshold_for(self, action: str) -> float:
-        """Per-class score bar. `fall` is held higher — see FALL_MIN_SCORE."""
-        if action == "fall":
+    def _threshold_for(self, entry: dict) -> float:
+        """Per-class score bar. Falling is held higher — see FALL_MIN_SCORE."""
+        if entry["ntu_class"] - 1 == FALL_CLASS:
             return max(self.min_score, self.fall_min_score)
         return self.min_score
 
@@ -538,10 +602,8 @@ class SkeletonActionBackend:
                 },
             }
 
-        held = [entry for entry in prediction["scores"]
-                if entry["score"] >= self._threshold_for(entry["action"])]
-        if not held:
-            best = prediction["scores"][0] if prediction["scores"] else None
+        best = prediction["scores"][0] if prediction["scores"] else None
+        if best is None or best["score"] < self._threshold_for(best):
             return {
                 **_nothing("no class above min_score"),
                 "evidence": {
@@ -553,20 +615,25 @@ class SkeletonActionBackend:
                 },
             }
 
-        actions = [entry["action"] for entry in
-                   sorted(held, key=lambda e: ACTION_PRIORITY.index(e["action"]))]
-        primary = actions[0]
-        best = next(e for e in held if e["action"] == primary)
+        # The model answers in its own words. `action` is the NTU name unless
+        # the class coincides with a label the geometry also produces, in which
+        # case the shared name is used so the two halves do not report the same
+        # thing twice under different spellings.
+        label = best["pose_label"] or best["name"]
         return {
-            "action": primary,
-            "actions": actions,
+            "action": label,
+            "actions": [label],
             "action_confidence": round(best["score"], 2),
+            "activity": {
+                "name": best["name"], "name_zh": best["name_zh"],
+                "ntu_class": best["ntu_class"], "score": best["score"],
+            },
             "evidence": {
                 "backend": "stgcn",
                 "ntu_class": best["ntu_class"],
-                "transition": best["transition"],
+                "motion": prediction["motion"],
                 "frames_used": prediction["frames_used"],
-                "scores": prediction["scores"][:3],
+                "runners_up": prediction["scores"][1:3],
             },
         }
 
@@ -581,29 +648,51 @@ class SkeletonActionBackend:
         return {
             **_nothing("a skeleton-action model needs a sequence, not one frame"),
             "temporal": False,
-            "unavailable_actions": sorted(set(NTU60_TO_ACTION.values())),
+            # Not the whole 49-name list — a reply nobody reads is worse than a
+            # sentence somebody does. The caller needs to know the activity
+            # channel is unavailable, not to be handed the vocabulary.
+            "activity_available": False,
         }
 
 
 class HybridActionBackend:
-    """Geometry for the postures, ST-GCN++ for the events. The default.
+    """The model says what the person is **doing**; the geometry says what shape
+    their body is **in**. The default, and not a hedge.
 
-    Not a hedge. NTU-60 has no `standing` and no `sitting` class — a motionless
-    person is not an action — so the learned model cannot supply the postures at
-    all, while the geometry cannot see a fall as anything but its terminal pose
-    without the hand-built transition rules this replaces.
+    They answer different questions and neither can answer the other's. NTU-60
+    is 60 things somebody is doing, with no class for a motionless person —
+    standing still is not an action, so the model has nothing to say about it
+    and says something wrong instead when forced (a real person lying on
+    pavement, held still, came back "play with phone/tablet" at 0.997). The
+    geometry has no learned prior for what a wave looks like, and hand-written
+    thresholds over 2D keypoints proved a poor substitute.
 
-    Where both have an opinion, the learned one wins on its own classes
-    (`waving`, `pointing`, `fall`) and defers on NTU's *transitions*
-    (`sit down`, `stand up`): inferring a state from a transition is beyond what
-    the model was asked, and the geometry observes the state directly.
+    So the output carries both, separately:
+
+        posture    standing / sitting / crouching / bending / lying / unknown
+                   from the geometry, available on a single frame
+        activity   the NTU class, in its own words, from the model
+                   available when the clip has motion and the model is confident
+        action     the primary, for a caller that wants one string
+
+    An earlier version clipped the model's sixty classes down to the five that
+    coincided with labels my rules happened to produce, and discarded the rest.
+    That inverted the relationship — the rules were written by hand in an
+    afternoon, the model was trained on 56,000 clips — and threw away the half
+    with the value in it: the health group (staggering, touching head/chest/
+    back/neck, nausea, coughing) and the interaction gestures (nod, shake head,
+    clap, salute, cross hands to say stop).
     """
 
-    #: Labels the learned backend owns outright.
-    LEARNED = ("fall", "waving", "pointing")
+    #: Posture labels the geometry owns outright. The model has no class for any
+    #: of them — a body's shape is not an action.
+    POSTURES = ("standing", "sitting", "crouching", "bending", "lying")
+
+    #: Labels that outrank any activity: the person is on the ground.
+    OVERRIDING = ("fall", "lying")
 
     def __init__(self, *, rules: Optional[PoseActionClassifier] = None,
-                 learned: Optional[SkeletonActionBackend] = None, **kwargs):
+                 learned: Optional["SkeletonActionBackend"] = None, **kwargs):
         self.rules = rules or PoseActionClassifier(
             thresholds=kwargs.get("thresholds"),
             action_window_s=kwargs.get("action_window_s", 1.5))
@@ -611,8 +700,6 @@ class HybridActionBackend:
 
     @property
     def thresholds(self) -> dict:
-        """The geometry's thresholds. The learned half has no thresholds to
-        tune — it has `min_score`, which is a different kind of knob."""
         return self.rules.thresholds
 
     @property
@@ -627,63 +714,80 @@ class HybridActionBackend:
         geometry = self.rules.classify(frames)
         model = self.learned.classify(frames)
 
-        # The model owns these classes **when it has an opinion**. When it
-        # abstained (a motionless clip), scored under the bar, or could not run
-        # at all, the geometry's own reading of them is the best evidence
-        # available and dropping it makes the card worse than `rules` alone —
-        # measured: a clear wave came back `raising_hand` from hybrid and
-        # `waving` from the geometry on its own, because hybrid discarded the
-        # geometry's `waving` and the model had nothing to put in its place.
-        model_spoke = bool(model.get("actions")) and not model.get("backend_error")
-        learned_labels = [a for a in model.get("actions", []) if a in self.LEARNED]
-        if not model_spoke:
-            learned_labels = [a for a in geometry.get("actions", [])
-                              if a in self.LEARNED]
-        # `fall` additionally needs the geometry to agree the body is not
-        # upright. The model returns A43 at 0.62 on pure noise, so a score bar
-        # alone is one guard against the single label the robot acts on; this is
-        # the second, and it is one the noise case cannot satisfy. A real fall
-        # ends with the person on the ground, which the geometry can see — and
-        # where it cannot (camera looking along the body) the drop detector in
-        # the rules is the third path to the same label.
-        if "fall" in learned_labels:
-            geometry_agrees = any(a in ("lying", "fall", "crouching", "bending")
-                                  for a in geometry.get("actions", []))
-            withheld = None
-            if not geometry_agrees:
-                learned_labels = [a for a in learned_labels if a != "fall"]
+        posture = next((a for a in geometry.get("actions", [])
+                        if a in self.POSTURES), None)
+        activity = model.get("activity")
+        model_spoke = activity is not None and not model.get("backend_error")
+
+        # `fall` needs the geometry to agree the body is not upright. The model
+        # returns A43 at 0.62 on pure noise, so a score bar alone is one guard on
+        # the single label the robot acts on; this is the second, and the noise
+        # case cannot satisfy it.
+        withheld = None
+        if model_spoke and model.get("action") == "fall":
+            if not any(a in ("lying", "fall", "crouching", "bending")
+                       for a in geometry.get("actions", [])):
                 withheld = ("the model called it a fall; the geometry still "
                             "reads the body as upright")
-        else:
-            withheld = None
-        geometry_labels = [a for a in geometry.get("actions", [])
-                           if a not in self.LEARNED]
-        merged = [a for a in ACTION_PRIORITY
-                  if a in set(learned_labels) | set(geometry_labels)]
-        if not merged:
-            # Neither had anything. Keep the geometry's reason — it is the one
-            # that explains occlusion, which is the common case.
-            return geometry if not model.get("backend_error") else model
+                model_spoke, activity = False, None
 
-        primary = merged[0]
-        source = ("stgcn" if (primary in learned_labels and model_spoke)
-                  else "rules")
+        # Everything the geometry saw that the model does not speak about:
+        # postures, plus the gestures it can read on its own when the model is
+        # silent. Dropping those when the model has nothing to say made the card
+        # worse than the geometry alone — a clear wave came back `raising_hand`.
+        geometry_labels = [a for a in geometry.get("actions", [])
+                           if model_spoke is False or a not in ("waving", "pointing")]
+
+        candidates = list(geometry_labels)
+        if model_spoke:
+            candidates.append(model["action"])
+
+        # Order: on the ground first, then what they are doing, then what shape
+        # they are in. An activity says more than a posture — "reading" beats
+        # "sitting" — for the same reason `walking` beats `standing`.
+        overriding = [a for a in self.OVERRIDING if a in candidates]
+        if overriding:
+            primary = overriding[0]
+            # Credited to whoever actually said it. `fall` normally comes from
+            # the model (gated, and corroborated by the geometry); `lying` only
+            # the geometry can see. Attributing both to the rules made the one
+            # label a robot acts on look like it came from the half that did not
+            # produce it.
+            source = ("stgcn" if model_spoke and model.get("action") == primary
+                      else "rules")
+        elif model_spoke:
+            primary, source = model["action"], "stgcn"
+        else:
+            ordered = [a for a in ACTION_PRIORITY if a in candidates]
+            if not ordered:
+                base = geometry if not model.get("backend_error") else model
+                result = dict(base)
+                if withheld:
+                    result["evidence"] = {**(result.get("evidence") or {}),
+                                          "fall_withheld": withheld}
+                return result
+            primary, source = ordered[0], "rules"
+
         donor = model if source == "stgcn" else geometry
+        actions = [a for a in ACTION_PRIORITY if a in candidates]
+        if primary not in actions:
+            actions = [primary] + actions
         result = {
             "action": primary,
-            "actions": merged,
+            "actions": actions,
             "action_confidence": donor.get("action_confidence", 0.0),
             "evidence": {**(donor.get("evidence") or {}), "source": source},
         }
+        if posture:
+            result["posture"] = posture
+        if activity:
+            result["activity"] = activity
         if geometry.get("point_direction"):
-            # The geometry measures the direction; the model only names the act.
+            # The model names the act; only the geometry measures where.
             result["point_direction"] = geometry["point_direction"]
         if model.get("backend_error"):
             result["evidence"]["stgcn_error"] = model["evidence"].get("reason")
         if withheld:
-            # Recorded whichever backend won the primary label: "the model
-            # thought this was a fall and was overruled" is the thing somebody
-            # needs when asking why the robot stayed quiet.
             result["evidence"]["fall_withheld"] = withheld
         return result
 
