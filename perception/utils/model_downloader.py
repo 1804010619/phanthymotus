@@ -1277,6 +1277,32 @@ POSE_MODEL_BUNDLES = {
 # image. ensure_action_model therefore raises with the build instructions rather
 # than fetching anything unverified, and the pose card falls back to the `rules`
 # backend with that message in `info` instead of failing.
+# The ST-GCN++ *checkpoint*, mirrored onto COS so the engine build is
+# reproducible and does not depend on download.openmmlab.com being reachable
+# from wherever it runs. Not a runtime download — no robot ever fetches this; it
+# is an input to tools/export_vision_engines.py --model action.
+#
+# Upstream:
+#   http://download.openmmlab.com/mmaction/pyskl/ckpt/stgcnpp/
+#       stgcnpp_ntu60_xsub_hrnet/j.pth
+#   PYSKL's stgcn++_ntu60_xsub_hrnet joint config, 89.3 top-1.
+#
+# PYSKL's code is Apache-2.0. The weights are trained on NTU RGB+D, whose
+# dataset terms are academic-research; a model trained on it inherits that
+# question for a commercial deployment. Recorded here as a fact to check, not
+# settled by this file.
+ACTION_CHECKPOINT_BASE = os.environ.get(
+    "ACTION_CHECKPOINT_BASE_URL",
+    f"{VISION_MODEL_BASE}/stgcnpp-ntu60-2d/checkpoint")
+
+ACTION_CHECKPOINT = {
+    "stgcnpp_ntu60_xsub_hrnet_j.pth": {
+        "size": 5854105,
+        "sha256": "b274888dd5b7bd8552ce4e3c3073973af84fa0fd18fd94363eac25457f225992",
+    },
+}
+
+
 ACTION_MODEL_BUNDLES = {
     "jp61": {
         "base_url": f"{VISION_MODEL_BASE}/stgcnpp-ntu60-2d/tensorrt-jp61-trt10.4-orin-t48",
@@ -1340,6 +1366,19 @@ def ensure_depth_model(model_dir: str, family: str | None = None,
     """Ensure the monocular depth engine matching the runtime TensorRT is present."""
     return _ensure_vision_bundle("depth", DEPTH_MODEL_BUNDLES, model_dir, family,
                                  progress_cb=progress_cb)
+
+
+def ensure_action_checkpoint(model_dir: str, progress_cb=None) -> dict[str, str]:
+    """Fetch the pinned ST-GCN++ checkpoint for the engine build.
+
+    Build-time only; nothing on a robot calls this. Pinned by size+SHA256 like
+    every other artefact here, and the pin is the hash of the copy downloaded
+    back from COS — which for this one also matches the upstream openmmlab
+    download byte for byte, so the mirror is verifiably the same weights.
+    """
+    return ensure_verified_bundle("action/checkpoint", model_dir,
+                                  ACTION_CHECKPOINT_BASE, ACTION_CHECKPOINT,
+                                  progress_cb=progress_cb)
 
 
 def ensure_action_model(model_dir: str, family: str | None = None,

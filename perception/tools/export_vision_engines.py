@@ -241,16 +241,18 @@ def export_action(out_dir: str, window: int, workspace: float | None,
     except ImportError as exc:                           # pragma: no cover
         raise RuntimeError("torch is required to export the action engine") from exc
 
-    if not checkpoint or not os.path.isfile(checkpoint):
-        raise RuntimeError(
-            "--action-checkpoint must point at a PYSKL ST-GCN++ NTU60-XSub-2D "
-            "joint checkpoint (.pth). Nothing is auto-downloaded here: these "
-            "weights carry a licence and a provenance, and a URL guessed by a "
-            "build script is the wrong way to acquire either."
-        )
-
-    from pyskl.models import build_model          # noqa: F401 — presence check
-    from mmcv import Config
+    if not checkpoint:
+        # Fetched from the project's own mirror, pinned by size+SHA256 like
+        # every other artefact. No URL is guessed: the upstream openmmlab path
+        # is recorded in utils/model_downloader.py beside the pins, and the
+        # mirrored copy was verified byte-identical to it.
+        from utils.model_downloader import ensure_action_checkpoint
+        paths = ensure_action_checkpoint(os.environ.get("ACTION_MODEL_DIR",
+                                                        "/models/action"))
+        checkpoint = next(iter(paths.values()))
+        print(f"[export] action checkpoint: {checkpoint}", flush=True)
+    if not os.path.isfile(checkpoint):
+        raise RuntimeError(f"action checkpoint not found: {checkpoint!r}")
 
     raise RuntimeError(
         "the ONNX export path for ST-GCN++ is not implemented here yet.\n"
@@ -263,11 +265,18 @@ def export_action(out_dir: str, window: int, workspace: float | None,
         f"(1, 1, {window}, 17, 2) input, and that wiring depends on the pyskl "
         "version in the container.\n"
         "\n"
-        "Until that is written, build the ONNX by hand with the same input "
-        "layout and put it through `trtexec --fp16`, then record the size and "
-        "SHA256 of the copy downloaded back from COS in "
-        "ACTION_MODEL_BUNDLES. The pose card runs `action_backend: rules` "
-        "meanwhile and says so in `info`."
+        "The checkpoint itself is in hand and pinned, and its state_dict says "
+        "what has to be traced: `backbone.data_bn`, ten `backbone.gcn.N` "
+        "blocks each with a `.gcn` (adjacency `A` stored in the checkpoint, so "
+        "the graph does not have to be rebuilt) and a six-branch `.tcn`, then "
+        "`cls_head.fc_cls`. Reimplementing that by hand in plain torch is "
+        "possible and is NOT the path taken here: a mis-wired branch loads "
+        "fine and returns wrong numbers, and there is no reference output to "
+        "check against without pyskl. Install pyskl in the container and trace "
+        "its own modules.\n"
+        "\n"
+        "Until then the pose card runs `action_backend: rules` and says so in "
+        "`info` (action_backend_effective / action_backend_note)."
     )
 
 

@@ -2712,14 +2712,33 @@ today and says so — `action_backend_effective`, `action_backend_note` and
 geometry while its config names a model is how the model gets blamed for the
 geometry's mistakes.
 
-`tools/export_vision_engines.py --model action` needs a checkpoint you supply
-(`--action-checkpoint`, a PYSKL ST-GCN++ NTU60-XSub-2D joint `.pth`). Nothing is
-auto-downloaded: those weights carry a licence and a provenance, and a URL
-guessed by a build script is the wrong way to acquire either. The ONNX export
-itself is **not implemented yet** and says so when run, rather than producing a
-graph whose input is not the tensor the robot has — PYSKL's recogniser wraps the
-backbone in a test-time pipeline that averages over clips and people, so the
-backbone and head have to be traced directly on a `(1, 1, T, 17, 2)` input.
+**The checkpoint is in hand and pinned.** PYSKL's
+`stgcn++_ntu60_xsub_hrnet` joint `j.pth` (89.3 top-1), 5,854,105 bytes,
+`sha256 b274888d…`, mirrored to COS under
+`public/vision/stgcnpp-ntu60-2d/checkpoint/` and verified **byte-identical to the
+upstream openmmlab download**. `tools/export_vision_engines.py --model action`
+fetches it with no arguments; `--action-checkpoint` overrides. Mirroring is not
+about trust — the size+SHA256 pins are what establish that — it is so the engine
+build does not depend on `download.openmmlab.com` being reachable from wherever
+it runs.
+
+One fact to settle outside this file: PYSKL's **code** is Apache-2.0, but the
+weights are trained on **NTU RGB+D**, whose dataset terms are academic-research.
+A model trained on it inherits that question for a commercial deployment.
+
+**The ONNX export is still not implemented** and says so when run, rather than
+emitting a graph whose input is not the tensor the robot has: PYSKL's recogniser
+wraps the backbone in a test-time pipeline that averages over clips and people,
+so the backbone and head must be traced directly on `(1, 1, T, 17, 2)`.
+
+The checkpoint's `state_dict` says exactly what has to be traced —
+`backbone.data_bn`, ten `backbone.gcn.N` blocks each carrying a `.gcn` (with the
+adjacency `A` *stored in the checkpoint*, so the graph does not have to be
+rebuilt) and a six-branch `.tcn`, then `cls_head.fc_cls`. Reimplementing that by
+hand in plain torch is possible and is deliberately **not** the path: a mis-wired
+branch loads without complaint and returns wrong numbers, and there is no
+reference output to check against without pyskl itself. Install pyskl in the
+throwaway container and trace its own modules.
 
 **None of the learned path has run against real weights.** The tests cover the
 tensor layout, the normalisation arithmetic, the sampling, the logit/probability
