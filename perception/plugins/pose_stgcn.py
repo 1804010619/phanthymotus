@@ -121,6 +121,20 @@ NTU60_TRANSITIONS = {7, 8}
 
 PRENORM_MODE = "auto"
 
+# Minimum motion, in body scales, before the clip is worth asking the model
+# about. Below it the backend abstains instead of inferring.
+#
+# "No action" is not an answer NTU-60 contains — all 60 classes are things
+# somebody is doing — so a motionless clip does not make this network unsure, it
+# makes it confidently wrong. Measured on 100 identical frames of a real person
+# lying on pavement: NTU's "play with phone/tablet" at **0.997**, entropy 0.03.
+# A standing person gave "taking a selfie" at 0.289.
+#
+# The hybrid mapping happened to discard both of those (neither class is mapped
+# to one of our labels), but that is luck, not a guard: the same mechanism
+# landing on A43 or A23 would be a false fall or a false wave straight through.
+MIN_MOTION = 0.02
+
 DEFAULT_MIN_SCORE = 0.40
 
 # `fall` is held to a higher bar than the rest, and measured evidence says it
@@ -306,6 +320,7 @@ class SkeletonActionBackend:
                  min_score: float = DEFAULT_MIN_SCORE,
                  fall_min_score: float = FALL_MIN_SCORE,
                  prenorm_mode: str = PRENORM_MODE,
+                 min_motion: float = MIN_MOTION,
                  model_dir: Optional[str] = None,
                  engine=None, thresholds: Optional[dict] = None,
                  action_window_s: Optional[float] = None):
@@ -313,6 +328,7 @@ class SkeletonActionBackend:
         self.min_score = float(min_score)
         self.fall_min_score = float(fall_min_score)
         self.prenorm_mode = str(prenorm_mode)
+        self.min_motion = float(min_motion)
         self.thresholds = dict(DEFAULT_THRESHOLDS)
         self.thresholds.update({k: v for k, v in (thresholds or {}).items()
                                 if k in DEFAULT_THRESHOLDS and v is not None})
@@ -435,6 +451,19 @@ class SkeletonActionBackend:
 
     # ── classification ───────────────────────────────────────────────────
 
+    @staticmethod
+    def clip_motion(blob: np.ndarray) -> float:
+        """Largest per-joint displacement across the clip, in normalised units.
+
+        Computed on the tensor that is about to be sent, so it measures what the
+        network would actually see — after normalisation and resampling, not
+        before.
+        """
+        track = blob[0, 0, :, :, :2]
+        if len(track) < 2:
+            return 0.0
+        return float(np.abs(track.max(axis=0) - track.min(axis=0)).max())
+
     def predict(self, frames: list) -> dict:
         """Raw model view: every mappable label with its score, best first.
 
@@ -446,6 +475,17 @@ class SkeletonActionBackend:
         window = [f for f in frames if current.t - f.t <= self.window_s] or [current]
         self._ensure_engine()
         blob = self._build_input(window, self._window_frames())
+        motion = self.clip_motion(blob)
+        if motion < self.min_motion:
+            # Abstaining rather than inferring. See MIN_MOTION: a frozen clip
+            # does not make this model unsure, it makes it confidently wrong.
+            return {
+                "frames_used": len(window),
+                "window_frames": self._window_frames(),
+                "motion": round(motion, 4),
+                "abstained": "clip holds no motion",
+                "scores": [],
+            }
         scores = self._run(blob)
         if not looks_like_probabilities(scores):
             scores = softmax(scores)
@@ -457,6 +497,7 @@ class SkeletonActionBackend:
         return {
             "frames_used": len(window),
             "window_frames": self._window_frames(),
+            "motion": round(motion, 4),
             "scores": [{"action": label, "score": round(score, 3),
                         "ntu_class": index + 1,
                         "transition": index in NTU60_TRANSITIONS}
@@ -486,6 +527,17 @@ class SkeletonActionBackend:
             log.error("[pose/stgcn] engine failure: %s", error, exc_info=True)
             return _nothing(f"engine failure: {error}", backend_error=True)
 
+        if prediction.get("abstained"):
+            return {
+                **_nothing(prediction["abstained"]),
+                "evidence": {
+                    "reason": prediction["abstained"],
+                    "motion": prediction["motion"],
+                    "min_motion": self.min_motion,
+                    "frames_used": prediction["frames_used"],
+                },
+            }
+
         held = [entry for entry in prediction["scores"]
                 if entry["score"] >= self._threshold_for(entry["action"])]
         if not held:
@@ -496,6 +548,7 @@ class SkeletonActionBackend:
                     "reason": "no class above min_score",
                     "min_score": self.min_score,
                     "best": best,
+                    "motion": prediction["motion"],
                     "frames_used": prediction["frames_used"],
                 },
             }

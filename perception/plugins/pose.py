@@ -103,7 +103,26 @@ DEFAULT_MODEL = "yolo26s-pose"
 
 KEYPOINT_LEVELS = ("off", "compact", "full")
 
-ACTION_BACKENDS = tuple(BACKENDS)
+# What the card offers. `stgcn` is deliberately NOT here, although
+# `build_backend` can still construct it for tests and deliberate experiments.
+#
+# Offering it would be offering a foot-gun: alone it has no `standing` and no
+# `sitting` class, because NTU-60 is built from actions and a motionless person
+# is not one — so every stationary person comes back `unknown`. Worse, a static
+# clip does not make it abstain: fed 100 identical frames of a real person lying
+# on pavement it returns NTU's "play with phone/tablet" at **0.997** with an
+# entropy of 0.03. It is not unsure, it is confidently wrong, because "no action"
+# is not an answer the label space contains.
+#
+# Same call as vop's `classes` config, which was removed rather than left
+# available-but-broken.
+ACTION_BACKENDS = ("hybrid", "rules")
+
+# Cards saved before `stgcn` was withdrawn. Migrated rather than refused, the
+# way plugins/asr.py migrates the removed `kws` trigger mode: a deployed card
+# must keep working after an upgrade, and `hybrid` is what its owner wanted
+# anyway — the learned labels, plus the postures that backend cannot produce.
+WITHDRAWN_BACKENDS = {"stgcn": "hybrid"}
 
 # Below this, a temporal backend is being starved. ST-GCN++ classifies a clip,
 # and at 5 fps a 2.5 s window is 13 real frames resampled up to the engine's 48
@@ -214,7 +233,7 @@ TOOLS = [
                 "publish_bbox": {"type": "boolean", "description": "lean 流里带上像素框 [x1,y1,x2,y2]", "default": True, "scope": "instance"},
                 "publish_overlay": {"type": "boolean", "description": "另发一条把骨架画在原始画面上的 JPEG（{topic}/poses/overlay_img）。每帧多一次绘制+编码，外加一条跑 JPEG 的话题，所以默认关闭；要录给人看时再开", "default": False, "scope": "instance"},
                 "action_window_s": {"type": "number", "minimum": 0.2, "description": "动作判定回看多少秒。挥手频率和步频都是在这个窗口里数出来的", "default": 1.5, "scope": "instance"},
-                "action_backend": {"type": "string", "enum": list(ACTION_BACKENDS), "description": "动作分类后端。hybrid（默认）= 姿态走几何规则、跌倒/挥手/指向走 ST-GCN++ 骨架动作模型；rules = 只用几何规则，不需要第二个 engine；stgcn = 只用模型（注意 NTU-60 里没有「站立」「坐」这两个状态类，所以站/坐会变成 unknown）。模型是 1.39M 参数/1.95 GFLOPs，约为 pose engine 的 8% 算力", "default": "hybrid", "scope": "instance"},
+                "action_backend": {"type": "string", "enum": list(ACTION_BACKENDS), "description": "动作分类后端。hybrid（默认）= 姿态走几何规则、跌倒/挥手/指向走 ST-GCN++ 骨架动作模型，两者各做擅长的；rules = 只用几何规则，不加载第二个 engine —— 这也是取不到 engine 时自动退到的模式，手动选它主要用于在真机上区分「模型判错」和「几何判错」。只用模型的 stgcn 模式已撤下：NTU-60 里没有「站立」「坐」这两个状态类，静止的人不但报不出来，还会拿到一个自信的错答案", "default": "hybrid", "scope": "instance"},
                 "action_min_score": {"type": "number", "minimum": 0.0, "maximum": 1.0, "description": "骨架动作模型的得分阈值，低于它不报。跌倒单独用更高的 0.75 —— 实测该 engine 对纯噪声会给出 A43「跌倒」0.62，而误报跌倒的代价是机器人丢下手上的事去问人有没有受伤。调之前先看 info 里的实际得分，那是区分「模型判错」和「阈值定错」的唯一办法", "default": DEFAULT_MIN_SCORE, "scope": "instance"},
                 # Exposed because they are NOT constants: the same fall measures
                 # differently depending on where the camera is mounted.
@@ -605,7 +624,9 @@ class PosePerceptionPlugin:
         self._publish_bbox = bool(plugin_cfg.get("publish_bbox", True))
         self._publish_overlay = bool(plugin_cfg.get("publish_overlay", False))
         self._action_window_s = float(plugin_cfg.get("action_window_s", 1.5))
-        self._action_backend = str(plugin_cfg.get("action_backend", "hybrid"))
+        self._backend_migrated: Optional[str] = None
+        self._action_backend = self._migrate_backend(
+            str(plugin_cfg.get("action_backend", "hybrid")))
         self._action_min_score = float(
             plugin_cfg.get("action_min_score", DEFAULT_MIN_SCORE))
         # Why a temporal backend may be unavailable, kept so `info` can say it
@@ -652,8 +673,8 @@ class PosePerceptionPlugin:
             "publish_overlay": bool(icfg.get("publish_overlay", self._publish_overlay)),
             "action_window_s": float(icfg.get("action_window_s",
                                               self._action_window_s)),
-            "action_backend": str(icfg.get("action_backend",
-                                           self._action_backend)),
+            "action_backend": self._migrate_backend(
+                str(icfg.get("action_backend", self._action_backend))),
             "action_min_score": float(icfg.get("action_min_score",
                                                self._action_min_score)),
         }
@@ -1133,6 +1154,8 @@ class PosePerceptionPlugin:
         # case. Without this the card looks like it chose the geometry.
         if self._backend_fallback:
             info["action_backend_note"] = self._backend_fallback
+        if self._backend_migrated:
+            info["action_backend_migrated"] = self._backend_migrated
 
         # A backend can construct fine and then fail on every inference — the
         # engine is fetched lazily, and there is no published action engine yet.
@@ -1187,6 +1210,26 @@ class PosePerceptionPlugin:
                     "横向偏移，下游拿不到视场角就没法换算成角度。相机卡片补上声明"
                     "即可，见 phanthymotus-driver/README_dev.md 的 Camera Parameters")
         return info
+
+    def _migrate_backend(self, name: str) -> str:
+        """Carry a withdrawn backend name onto its replacement, loudly.
+
+        A card saved while `stgcn` was offered keeps working — refusing it would
+        turn an upgrade into a broken card — and `hybrid` is what its owner
+        wanted anyway: the learned labels, plus the postures that backend cannot
+        produce at all.
+        """
+        replacement = WITHDRAWN_BACKENDS.get(name)
+        if replacement is None:
+            return name
+        self._backend_migrated = (
+            f"action_backend={name!r} has been withdrawn and this card now runs "
+            f"{replacement!r}. Alone it has no `standing` or `sitting` class — "
+            f"NTU-60 is built from actions and a motionless person is not one — "
+            f"and a static clip does not make it abstain: a real person lying on "
+            f"pavement came back as \"play with phone/tablet\" at 0.997.")
+        log.warning("[pose] %s", self._backend_migrated)
+        return replacement
 
     def _effective_backend(self) -> str:
         """The backend actually running, which is not always the configured one."""
@@ -1284,7 +1327,7 @@ class PosePerceptionPlugin:
         if "action_window_s" in cfg:
             self._action_window_s = float(cfg["action_window_s"])
         if "action_backend" in cfg:
-            self._action_backend = str(cfg["action_backend"])
+            self._action_backend = self._migrate_backend(str(cfg["action_backend"]))
         if "action_min_score" in cfg:
             self._action_min_score = float(cfg["action_min_score"])
         for key in _THRESHOLD_KEYS:

@@ -77,11 +77,29 @@ class _FakeEngine:
         return self._outputs
 
 
-def _frames(joints_fn, *, n=30, fps=10.0, box=None, image_size=FRAME):
+def _frames(joints_fn, *, n=30, fps=10.0, box=None, image_size=FRAME,
+            static=False):
+    """A clip. **Moving by default**, because a static one is now refused.
+
+    The backend abstains below `MIN_MOTION` rather than asking the model, since
+    "no action" is not a class NTU-60 has and a frozen clip gets a confident
+    wrong answer instead of an unsure one. Tests that want the model consulted
+    therefore need a clip with motion in it; `static=True` is for the tests of
+    the abstention itself.
+    """
     out = []
     for i in range(n):
         t = i / fps
-        out.append(PoseFrame(t, box or _standing_box(), _kp(**joints_fn(t)),
+        joints = joints_fn(t)
+        if not static and n > 1:
+            # A plain drift: enough to clear MIN_MOTION on the normalised
+            # tensor, but under the geometry's `still_speed`, so it neither
+            # colours what the fake engine is asked nor trips the rules that
+            # require a limb to be stationary (pointing needs the other arm
+            # still).
+            shift = (i / (n - 1)) * 0.05 * H
+            joints = {k: (v[0], v[1] - shift) for k, v in joints.items()}
+        out.append(PoseFrame(t, box or _standing_box(), _kp(**joints),
                              0.3, image_size=image_size))
     return out
 
@@ -557,7 +575,10 @@ def test_hybrid_accepts_a_fall_the_geometry_corroborates():
     engine = _FakeEngine({42: 20.0})
     frames = []
     for i in range(20):
-        frames.append(PoseFrame(i / 12, _lying_box(), _kp(**_lying_body()), 0.3,
+        # Drifting, so the clip has motion and the model is actually consulted.
+        joints = {k: (v[0], v[1] - (i / 19) * 0.05 * H)
+                  for k, v in _lying_body().items()}
+        frames.append(PoseFrame(i / 12, _lying_box(), _kp(**joints), 0.3,
                                 image_size=FRAME))
     result = HybridActionBackend(engine=engine).classify(frames)
     assert result["action"] == "fall"
@@ -623,3 +644,56 @@ def test_resampling_a_single_frame_fills_the_window():
 def test_resampling_an_empty_clip_raises():
     with pytest.raises(ActionBackendError):
         resample_clip(np.zeros((0, N_KEYPOINTS, 3), dtype=np.float32), 100)
+
+
+# ── a frozen clip must not reach the model ──────────────────────────────────
+
+def test_a_motionless_clip_is_not_sent_to_the_model():
+    """"No action" is not an answer NTU-60 contains — all 60 classes are things
+    somebody is doing — so a frozen clip does not make this network unsure, it
+    makes it confidently wrong.
+
+    Measured on 100 identical frames of a real person lying on pavement: NTU's
+    "play with phone/tablet" at **0.997**, entropy 0.03. The hybrid mapping
+    happened to discard that (the class is not mapped to one of our labels) but
+    that is luck, not a guard — the same mechanism landing on A43 would be a
+    false fall straight through.
+    """
+    engine = _FakeEngine({42: 20.0})
+    result = SkeletonActionBackend(engine=engine).classify(
+        _frames(_standing, n=40, static=True))
+    assert result["action"] == "unknown"
+    assert "no motion" in result["evidence"]["reason"]
+    assert engine.calls == [], "the engine must not have been consulted"
+
+
+def test_a_moving_clip_still_reaches_the_model():
+    def drifting(t):
+        joints = dict(_body())
+        shift = t * 0.8 * H
+        return {k: (v[0], v[1] - shift) for k, v in joints.items()}
+    engine = _FakeEngine({42: 20.0})
+    frames = [PoseFrame(i / 12.0, _standing_box(), _kp(**drifting(i / 29)), 0.3,
+                        image_size=FRAME) for i in range(30)]
+    result = SkeletonActionBackend(engine=engine).classify(frames)
+    assert engine.calls, "a clip with motion must be classified"
+    assert result["action"] == "fall"
+
+
+def test_the_motion_figure_is_reported_either_way():
+    """So "the model is wrong" can be told from "it was never asked"."""
+    engine = _FakeEngine({42: 20.0})
+    backend = SkeletonActionBackend(engine=engine)
+    prediction = backend.predict(_frames(_standing, n=40, static=True))
+    assert prediction["motion"] < backend.min_motion
+    assert prediction["abstained"]
+
+
+def test_motion_is_measured_on_the_tensor_that_would_be_sent():
+    """After normalisation and resampling, so it reflects what the network sees
+    rather than raw pixels — which scale with how close the person is."""
+    still = np.zeros((1, 2, 10, N_KEYPOINTS, 3), dtype=np.float32)
+    assert SkeletonActionBackend.clip_motion(still) == 0.0
+    moving = still.copy()
+    moving[0, 0, :, 0, 0] = np.linspace(0.0, 0.5, 10)
+    assert SkeletonActionBackend.clip_motion(moving) == pytest.approx(0.5)

@@ -621,7 +621,8 @@ def test_the_default_backend_is_hybrid():
     assert plugin._action_backend == "hybrid"
     schema = pose_plugin.TOOLS[0]["configSchema"]["properties"]["action_backend"]
     assert schema["default"] == "hybrid"
-    assert set(schema["enum"]) == {"rules", "stgcn", "hybrid"}
+    # `stgcn` is deliberately absent — see WITHDRAWN_BACKENDS.
+    assert set(schema["enum"]) == {"rules", "hybrid"}
 
 
 def test_choosing_rules_needs_no_action_engine_at_all():
@@ -668,27 +669,39 @@ def test_the_rules_backend_gets_no_fps_note():
     assert "action_fps_note" not in plugin.dispatch("pose", {"action": "info"})
 
 
-def test_list_actions_names_what_the_running_backend_can_produce():
+def test_a_card_saved_with_the_withdrawn_backend_is_migrated_not_refused():
+    """`stgcn` was offered and is not any more. A deployed card must keep
+    working after an upgrade, and `hybrid` is what its owner wanted anyway: the
+    learned labels plus the postures that backend cannot produce at all.
+
+    Withdrawn because alone it is a foot-gun. It has no `standing` and no
+    `sitting` class — NTU-60 is built from actions and a motionless person is
+    not one — and a static clip does not make it abstain: fed 100 identical
+    frames of a real person lying on pavement it returned NTU's "play with
+    phone/tablet" at 0.997, entropy 0.03. Confidently wrong, not unsure.
+    """
     plugin, _ = _plugin({"action_backend": "stgcn"})
-    result = plugin.dispatch("pose", {"action": "list_actions"})
-    assert result["backend"] == "stgcn"
-    # Only the mapped NTU-60 classes, and every one is a label this project has.
-    assert set(result["available_actions"]) <= set(ACTION_LABELS_ZH)
-    assert "fall" in result["available_actions"]
-    # `walking` comes from NTU's *mutual* classes (A59/A60), which are defined
-    # on a pair of skeletons; this backend sees one person at a time.
-    assert "walking" not in result["available_actions"]
-    assert "NTU-60" in result["backend_note"]
+    assert plugin._action_backend == "hybrid"
+    plugin.dispatch("pose", {"action": "start", "input_topic": "/cam/rgb"})
+    info = plugin.dispatch("pose", {"action": "info"})
+    assert "action_backend_migrated" in info
+    assert "0.997" in info["action_backend_migrated"]
 
 
-def test_list_actions_flags_the_labels_that_are_only_transitions():
-    """`standing` from NTU's "stand up" fires while someone gets up. A person
-    who has been standing still for a minute produces no event at all, which is
-    why a bare stgcn backend is not a replacement for the geometry."""
-    plugin, _ = _plugin({"action_backend": "stgcn"})
-    result = plugin.dispatch("pose", {"action": "list_actions"})
-    assert set(result["transition_derived_actions"]) == {"standing", "sitting"}
-    assert "unknown" in result["backend_note"]
+def test_the_migration_also_covers_a_runtime_config_call():
+    plugin, _ = _plugin()
+    plugin.dispatch("pose", {"action": "config", "action_backend": "stgcn"})
+    assert plugin._action_backend == "hybrid"
+
+
+def test_list_actions_on_the_offered_backends_covers_the_whole_label_set():
+    """Neither offered backend drops a label: `rules` produces them all from
+    geometry, `hybrid` adds the model on top of that."""
+    for name in ("rules", "hybrid"):
+        plugin, _ = _plugin({"action_backend": name})
+        result = plugin.dispatch("pose", {"action": "list_actions"})
+        assert set(result["available_actions"]) == set(ACTION_LABELS_ZH), name
+        assert result["transition_derived_actions"] == []
 
 
 def test_list_actions_on_hybrid_offers_the_whole_label_set():
