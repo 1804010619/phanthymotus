@@ -1243,11 +1243,16 @@ POSE_MODEL_BUNDLES = {
         "base_url": f"{VISION_MODEL_BASE}/yolo26s-pose/tensorrt-jp61-trt10.4-orin-640",
         "files": {
             "yolo26s-pose.engine": {
-                "size": 0,
-                "sha256": "",
+                "size": 24704612,
+                "sha256": "ec90f471e4b3fa793e567b14859ea23aa5ea36602e8a99d9632b05baa9681338",
             },
         },
     },
+    # Not built yet, deliberately: the jp5.11 engine has to come from Orin 5, and
+    # jp6.1 is being validated first. The zero pins make ensure_pose_model raise
+    # with the build instructions on a jp5.11 machine rather than fetch something
+    # unverified, so the pose card there reports `state: error` and the rest of
+    # perception is untouched.
     "jp511": {
         "base_url": f"{VISION_MODEL_BASE}/yolo26s-pose/tensorrt-jp511-trt8.5-orin-640",
         "files": {
