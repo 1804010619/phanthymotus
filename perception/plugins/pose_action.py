@@ -1088,12 +1088,16 @@ def _iou(a, b) -> float:
 class PoseTrack:
     """One person's timeline. `history` is what the classifier reads."""
 
-    __slots__ = ("id", "history", "last_seen")
+    __slots__ = ("id", "history", "last_seen", "stabiliser")
 
-    def __init__(self, track_id: int):
+    def __init__(self, track_id: int, label_hold: int = 3):
         self.id = track_id
         self.history: deque = deque()
         self.last_seen = 0.0
+        # Per person, because two people in frame change labels independently
+        # and a shared stabiliser would let one person's gesture suppress the
+        # other's.
+        self.stabiliser = LabelStabiliser(label_hold)
 
     @property
     def current(self) -> Optional[PoseFrame]:
@@ -1111,7 +1115,8 @@ class PoseTracker:
 
     def __init__(self, history_s: float = 3.0, iou_min: float = 0.2,
                  timeout_s: float = 1.0, min_conf: float = 0.3,
-                 centroid_max_travel: float = 1.0):
+                 centroid_max_travel: float = 1.0,
+                 label_hold: int = 3):
         self.history_s = float(history_s)
         self.iou_min = float(iou_min)
         self.timeout_s = float(timeout_s)
@@ -1136,6 +1141,7 @@ class PoseTracker:
         # every temporal label undetectable. This tracker is explicitly not
         # re-identification, so it has no identity to protect.
         self.centroid_max_travel = float(centroid_max_travel)
+        self.label_hold = max(1, int(label_hold))
         self._tracks: list = []
         self._next_id = 1
 
@@ -1218,7 +1224,7 @@ class PoseTracker:
         for d_index, box in enumerate(boxes):
             track = assigned.get(d_index)
             if track is None:
-                track = PoseTrack(self._next_id)
+                track = PoseTrack(self._next_id, self.label_hold)
                 self._next_id += 1
                 self._tracks.append(track)
             frame = PoseFrame(now, box, np.asarray(keypoints[d_index],
@@ -1249,3 +1255,52 @@ def action_catalogue() -> list:
         }
         for name in ACTION_PRIORITY
     ]
+
+
+class LabelStabiliser:
+    """Hysteresis on the primary label, per tracked person.
+
+    Every threshold in this file and in the learned backend is a cliff: a score
+    hovering at `min_score`, a clip whose motion sits at `MIN_MOTION`, a torso
+    at exactly `upright_deg`. Measured at those boundaries the card flipped its
+    answer on **every single frame** — 9 changes in 9 comparisons with the
+    model's score oscillating around 0.40, and 6 in 6 with the motion oscillating
+    around the gate.
+
+    A label that alternates twelve times a second is worse than a label that is
+    simply wrong: nothing downstream can act on it, an operator cannot read it,
+    and an agent asked to react gets a different world each turn. So a challenger
+    has to win `hold` consecutive classifications before it takes over, and the
+    previous answer stands until it does.
+
+    The cost is latency — `hold` frames, 250 ms at 12 fps — paid on every real
+    change too. That is the trade being made deliberately, and `pending` is
+    reported so the raw instantaneous answer stays visible.
+    """
+
+    __slots__ = ("hold", "current", "_candidate", "_count")
+
+    def __init__(self, hold: int = 3):
+        self.hold = max(1, int(hold))
+        self.current: Optional[str] = None
+        self._candidate: Optional[str] = None
+        self._count = 0
+
+    def update(self, label: str) -> tuple:
+        """Feed this frame's label; returns (stable label, pending or None)."""
+        if self.current is None:
+            self.current = label
+            self._candidate, self._count = None, 0
+            return self.current, None
+        if label == self.current:
+            self._candidate, self._count = None, 0
+            return self.current, None
+        if label == self._candidate:
+            self._count += 1
+        else:
+            self._candidate, self._count = label, 1
+        if self._count >= self.hold:
+            self.current = label
+            self._candidate, self._count = None, 0
+            return self.current, None
+        return self.current, self._candidate

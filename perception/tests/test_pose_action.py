@@ -22,6 +22,7 @@ import pytest
 import vision_stubs  # noqa: F401  (installs the cv2 / ROS stubs)
 
 from plugins.pose_action import (  # noqa: E402
+    LabelStabiliser,
     ACTION_LABELS_ZH,
     ACTION_PRIORITY,
     DEFAULT_THRESHOLDS,
@@ -1038,3 +1039,75 @@ def test_the_aspect_ratio_no_longer_vetoes_lying():
     frames = [_photo_frame(_INVERTED, _INVERTED_BOX, (300, 400), i / 12)
               for i in range(20)]
     assert "lying" in PoseActionClassifier().classify(frames)["actions"]
+
+
+# ── label stability ─────────────────────────────────────────────────────────
+
+def test_a_label_does_not_flip_on_a_threshold_crossing():
+    """Every threshold here is a cliff, and at the boundaries the raw answer
+    flipped on **every frame**: 9 changes in 9 comparisons with the model's
+    score oscillating around 0.40, 6 in 6 with motion oscillating around its
+    gate. A label that alternates twelve times a second is worse than one that
+    is simply wrong — nothing downstream can act on it, an operator cannot read
+    it, and an agent asked to react gets a different world each turn.
+    """
+    noisy = ["standing", "waving", "standing", "waving", "standing", "waving"]
+    stabiliser = LabelStabiliser(hold=3)
+    out = [stabiliser.update(label)[0] for label in noisy]
+    assert out == ["standing"] * 6
+    assert len(set(out)) == 1
+
+
+def test_a_sustained_change_does_get_through():
+    stabiliser = LabelStabiliser(hold=3)
+    for label in ["standing"] * 3:
+        stabiliser.update(label)
+    out = [stabiliser.update("waving")[0] for _ in range(5)]
+    assert out == ["standing", "standing", "waving", "waving", "waving"]
+
+
+def test_the_latency_of_the_hold_is_exactly_hold_frames():
+    """The cost, paid on every real change. Measured rather than asserted
+    loosely, because it is the half of this trade that hurts: at 12 fps a hold
+    of 3 is 167 ms before a genuine new action is reported."""
+    for hold in (1, 2, 3, 5):
+        stabiliser = LabelStabiliser(hold=hold)
+        sequence = ["standing"] * 5 + ["waving"] * 10
+        out = [stabiliser.update(label)[0] for label in sequence]
+        assert out.index("waving") - 5 == hold - 1
+
+
+def test_the_first_label_is_adopted_immediately():
+    """Nothing to be stable about yet, and making a new person wait would mean
+    somebody walking into frame is `unknown` for a quarter of a second."""
+    assert LabelStabiliser(hold=5).update("standing") == ("standing", None)
+
+
+def test_the_challenger_is_reported_while_it_is_being_held():
+    """So the raw instantaneous answer stays visible — otherwise hysteresis is
+    indistinguishable from the classifier being stuck."""
+    stabiliser = LabelStabiliser(hold=3)
+    stabiliser.update("standing")
+    assert stabiliser.update("waving") == ("standing", "waving")
+
+
+def test_an_interrupted_challenge_starts_over():
+    """Two frames of `waving`, one of something else, two more of `waving` is
+    not three consecutive — that is the flapping this exists to absorb."""
+    stabiliser = LabelStabiliser(hold=3)
+    stabiliser.update("standing")
+    stabiliser.update("waving")
+    stabiliser.update("waving")
+    stabiliser.update("sitting")
+    assert stabiliser.update("waving")[0] == "standing"
+
+
+def test_each_person_is_stabilised_separately():
+    """A shared stabiliser would let one person's gesture suppress another's."""
+    tracker = PoseTracker(label_hold=3)
+    left, right = (0, 0, 100, 300), (400, 0, 500, 300)
+    kps = [_kp(**_body(cx=50, top=0, h=300)), _kp(**_body(cx=450, top=0, h=300))]
+    a, b = tracker.update([left, right], kps, 0.0)
+    assert a.stabiliser is not b.stabiliser
+    a.stabiliser.update("waving")
+    assert b.stabiliser.current is None

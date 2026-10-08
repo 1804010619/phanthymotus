@@ -627,7 +627,18 @@ class HybridActionBackend:
         geometry = self.rules.classify(frames)
         model = self.learned.classify(frames)
 
+        # The model owns these classes **when it has an opinion**. When it
+        # abstained (a motionless clip), scored under the bar, or could not run
+        # at all, the geometry's own reading of them is the best evidence
+        # available and dropping it makes the card worse than `rules` alone —
+        # measured: a clear wave came back `raising_hand` from hybrid and
+        # `waving` from the geometry on its own, because hybrid discarded the
+        # geometry's `waving` and the model had nothing to put in its place.
+        model_spoke = bool(model.get("actions")) and not model.get("backend_error")
         learned_labels = [a for a in model.get("actions", []) if a in self.LEARNED]
+        if not model_spoke:
+            learned_labels = [a for a in geometry.get("actions", [])
+                              if a in self.LEARNED]
         # `fall` additionally needs the geometry to agree the body is not
         # upright. The model returns A43 at 0.62 on pure noise, so a score bar
         # alone is one guard against the single label the robot acts on; this is
@@ -655,7 +666,8 @@ class HybridActionBackend:
             return geometry if not model.get("backend_error") else model
 
         primary = merged[0]
-        source = "stgcn" if primary in learned_labels else "rules"
+        source = ("stgcn" if (primary in learned_labels and model_spoke)
+                  else "rules")
         donor = model if source == "stgcn" else geometry
         result = {
             "action": primary,

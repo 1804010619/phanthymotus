@@ -234,6 +234,7 @@ TOOLS = [
                 "publish_overlay": {"type": "boolean", "description": "另发一条把骨架画在原始画面上的 JPEG（{topic}/poses/overlay_img）。每帧多一次绘制+编码，外加一条跑 JPEG 的话题，所以默认关闭；要录给人看时再开", "default": False, "scope": "instance"},
                 "action_window_s": {"type": "number", "minimum": 0.2, "description": "动作判定回看多少秒。挥手频率和步频都是在这个窗口里数出来的", "default": 1.5, "scope": "instance"},
                 "action_backend": {"type": "string", "enum": list(ACTION_BACKENDS), "description": "动作分类后端。hybrid（默认）= 姿态走几何规则、跌倒/挥手/指向走 ST-GCN++ 骨架动作模型，两者各做擅长的；rules = 只用几何规则，不加载第二个 engine —— 这也是取不到 engine 时自动退到的模式，手动选它主要用于在真机上区分「模型判错」和「几何判错」。只用模型的 stgcn 模式已撤下：NTU-60 里没有「站立」「坐」这两个状态类，静止的人不但报不出来，还会拿到一个自信的错答案", "default": "hybrid", "scope": "instance"},
+                "label_hold": {"type": "integer", "minimum": 1, "description": "标签迟滞：新动作要连续赢多少帧才换。每个阈值都是悬崖，实测在边界上原始答案会逐帧翻（模型得分在 0.40 附近摆动时 9 次比较全翻）。一个每秒跳十几次的标签比一个稳定的错标签更糟 —— 下游没法用、人读不了。代价是每次真实变化也要晚这么多帧（12 fps 下 3 帧 = 250 ms）。原始答案在 evidence.raw_action 里", "default": 3, "scope": "instance"},
                 "action_min_score": {"type": "number", "minimum": 0.0, "maximum": 1.0, "description": "骨架动作模型的得分阈值，低于它不报。跌倒单独用更高的 0.75 —— 实测该 engine 对纯噪声会给出 A43「跌倒」0.62，而误报跌倒的代价是机器人丢下手上的事去问人有没有受伤。调之前先看 info 里的实际得分，那是区分「模型判错」和「阈值定错」的唯一办法", "default": DEFAULT_MIN_SCORE, "scope": "instance"},
                 # Exposed because they are NOT constants: the same fall measures
                 # differently depending on where the camera is mounted.
@@ -261,7 +262,7 @@ class _PoseNode(Node):
                  fps: float, node_suffix: str, *, classifier: PoseActionClassifier,
                  kpt_confidence: float = 0.3, max_persons: int = 5,
                  publish_keypoints: str = "off", publish_bbox: bool = True,
-                 publish_overlay: bool = False):
+                 publish_overlay: bool = False, label_hold: int = 3):
         super().__init__(f"pose_{node_suffix}" if node_suffix else "pose")
         # Topic-less is a supported mode, as in vop and tts: a card driven only
         # by recognize_by_photo has no camera, but still wants somewhere to
@@ -282,7 +283,8 @@ class _PoseNode(Node):
         self._frame_interval = 1.0 / max(fps, 0.1)
 
         self._tracker = PoseTracker(history_s=classifier.history_s,
-                                   min_conf=kpt_confidence)
+                                   min_conf=kpt_confidence,
+                                   label_hold=label_hold)
 
         self._pub = self.create_publisher(String, self._output_topic, _PUB_QOS)
         self._pub_skeleton = self.create_publisher(String, self._skeleton_topic,
@@ -439,7 +441,21 @@ class _PoseNode(Node):
         persons = []
         for track, box, score, kpts in zip(tracks, boxes, kept_scores,
                                            kept_keypoints):
-            verdict = self._classifier.classify(list(track.history))
+            verdict = dict(self._classifier.classify(list(track.history)))
+            # Hysteresis, per person. Every threshold here is a cliff, and at
+            # the boundaries the raw answer flips on every frame — a label that
+            # alternates twelve times a second is worse than one that is simply
+            # wrong, because nothing downstream can act on it. See
+            # pose_action.LabelStabiliser.
+            stable, pending = track.stabiliser.update(verdict["action"])
+            if stable != verdict["action"]:
+                verdict["evidence"] = {**(verdict.get("evidence") or {}),
+                                       "raw_action": verdict["action"]}
+                verdict["action"] = stable
+                verdict["action_confidence"] = 0.0
+            if pending:
+                verdict["evidence"] = {**(verdict.get("evidence") or {}),
+                                       "pending_action": pending}
             cx = (float(box[0]) + float(box[2])) / 2.0
             cy = (float(box[1]) + float(box[3])) / 2.0
             persons.append({
@@ -629,6 +645,7 @@ class PosePerceptionPlugin:
             str(plugin_cfg.get("action_backend", "hybrid")))
         self._action_min_score = float(
             plugin_cfg.get("action_min_score", DEFAULT_MIN_SCORE))
+        self._label_hold = int(plugin_cfg.get("label_hold", 3))
         # Why a temporal backend may be unavailable, kept so `info` can say it
         # instead of the card looking like it chose the geometry on purpose.
         self._backend_fallback: Optional[str] = None
@@ -677,6 +694,7 @@ class PosePerceptionPlugin:
                 str(icfg.get("action_backend", self._action_backend))),
             "action_min_score": float(icfg.get("action_min_score",
                                                self._action_min_score)),
+            "label_hold": int(icfg.get("label_hold", self._label_hold)),
         }
         for key in _THRESHOLD_KEYS:
             if key in icfg and icfg[key] is not None:
@@ -944,6 +962,7 @@ class PosePerceptionPlugin:
                 publish_keypoints=merged["publish_keypoints"],
                 publish_bbox=merged["publish_bbox"],
                 publish_overlay=merged["publish_overlay"],
+                label_hold=merged["label_hold"],
             )
             self._executor.add_node(node)
             self._nodes[node_key] = node
@@ -1330,6 +1349,8 @@ class PosePerceptionPlugin:
             self._action_backend = self._migrate_backend(str(cfg["action_backend"]))
         if "action_min_score" in cfg:
             self._action_min_score = float(cfg["action_min_score"])
+        if "label_hold" in cfg:
+            self._label_hold = int(cfg["label_hold"])
         for key in _THRESHOLD_KEYS:
             if key in cfg:
                 self._plugin_cfg[key] = cfg[key]
