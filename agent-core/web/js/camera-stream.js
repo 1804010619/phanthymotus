@@ -16,6 +16,9 @@ let _timer = null;
 let _active = false;
 let _video = null;
 let _canvas = null;
+let _rvfcArmed = false;
+let _sent = 0;
+let _startedAt = 0;
 
 export const DEFAULTS = { width: 640, height: 480, fps: 12, quality: 0.7 };
 
@@ -52,6 +55,18 @@ export function fitCapture(videoWidth, videoHeight, target = DEFAULTS.width) {
 
 export function isCameraActive() {
   return _active;
+}
+
+/** Frames actually sent per second since the stream started.
+ *
+ * Reported because the configured rate and the achieved rate can differ by an
+ * order of magnitude — a backgrounded tab clamps timers to 1 Hz — and a stream
+ * running at a twelfth of its setting is otherwise indistinguishable from a
+ * slow robot. */
+export function achievedFps() {
+  if (!_active || !_startedAt) return 0;
+  const seconds = (performance.now() - _startedAt) / 1000;
+  return seconds > 0.5 ? _sent / seconds : 0;
 }
 
 /** List the browser's video inputs, for the card's device picker. */
@@ -112,13 +127,20 @@ export async function toggleCameraStream(wsUrl, onStateChange, opts = {}) {
     });
 
     let sending = false;
-    _timer = setInterval(() => {
+    const interval = 1000 / fps;
+    let lastSent = 0;
+
+    const sendFrame = () => {
       if (!_ws || _ws.readyState !== WebSocket.OPEN || !_video) return;
-      // Skip rather than queue. A frame that arrives late is worse than a frame
-      // that never arrives: the action rules measure velocity between frames, so
-      // a backlog delivered in a burst reads as motion that did not happen.
+      // Skip rather than queue. A frame that arrives late is worse than one
+      // that never arrives: the action rules measure velocity between frames,
+      // so a backlog delivered in a burst reads as motion that did not happen.
       if (sending || _ws.bufferedAmount > 1 << 20) return;
+      const now = performance.now();
+      if (now - lastSent < interval * 0.9) return;
+      lastSent = now;
       sending = true;
+      _sent++;
       ctx.drawImage(_video, 0, 0, _canvas.width, _canvas.height);
       _canvas.toBlob(async (blob) => {
         try {
@@ -129,9 +151,36 @@ export async function toggleCameraStream(wsUrl, onStateChange, opts = {}) {
           sending = false;
         }
       }, 'image/jpeg', quality);
-    }, 1000 / fps);
+    };
+
+    // Driven by the video's own decoded frames where the browser offers it.
+    //
+    // setInterval alone is not enough: browsers clamp timers in a hidden or
+    // background tab to **once per second**, so the stream silently collapses
+    // to 1 fps the moment the dashboard is not the foreground tab. Measured on
+    // a live session: frames arriving 1003 ms apart, p95 1052 — not jitter, a
+    // 1 Hz timer. At that rate tracks expire between frames and the action
+    // model never accumulates the seconds of history it needs, so the activity
+    // channel can never fire.
+    //
+    // requestVideoFrameCallback fires per decoded frame and is throttled far
+    // less aggressively. The interval stays as a fallback for browsers without
+    // it, and `sendFrame` rate-limits either way.
+    if (typeof _video.requestVideoFrameCallback === 'function') {
+      const onFrame = () => {
+        if (!_active && _rvfcArmed) return;
+        sendFrame();
+        if (_video) _video.requestVideoFrameCallback(onFrame);
+      };
+      _rvfcArmed = true;
+      _video.requestVideoFrameCallback(onFrame);
+    } else {
+      _timer = setInterval(sendFrame, interval);
+    }
 
     _active = true;
+    _sent = 0;
+    _startedAt = performance.now();
     onStateChange(true);
   } catch (err) {
     _stopCamera();
@@ -146,5 +195,6 @@ function _stopCamera() {
   if (_stream) { _stream.getTracks().forEach(t => t.stop()); _stream = null; }
   if (_video) { _video.srcObject = null; _video = null; }
   _canvas = null;
+  _rvfcArmed = false;
   _active = false;
 }

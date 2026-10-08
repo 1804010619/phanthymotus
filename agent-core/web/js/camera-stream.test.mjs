@@ -9,7 +9,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { DEFAULTS, clampFps, fitCapture } from './camera-stream.js';
+import { DEFAULTS, achievedFps, clampFps, fitCapture } from './camera-stream.js';
 
 test('the default frame rate matches what the pose card expects', () => {
   // 12, because a skeleton-action model classifies a clip and a 2.5 s window at
@@ -69,4 +69,13 @@ test('a camera that reports no dimensions yet gets the defaults', () => {
 test('the long edge is what gets scaled, whichever it is', () => {
   assert.equal(Math.max(...Object.values(fitCapture(1920, 1080, 320))), 320);
   assert.equal(Math.max(...Object.values(fitCapture(1080, 1920, 320))), 320);
+});
+
+
+test('the achieved rate is zero while nothing is streaming', () => {
+  // It exists because a configured 12 fps and an achieved 1 fps are
+  // indistinguishable from a frame counter alone, and the difference decides
+  // whether anything temporal can work: at 1 fps a tracked person expires
+  // between frames and the action model never accumulates a window.
+  assert.equal(achievedFps(), 0);
 });

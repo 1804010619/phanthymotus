@@ -1125,9 +1125,22 @@ async def mcp_call_tool(mcp_id: str, req: MCPCallRequest,
             elif action == 'info':
                 import ros2_bridge, start as _start_mod
                 visible = '/remote_control/camera' in ros2_bridge.get_dds_topics()
+                recent = list(_start_mod._camera_recent)
+                achieved = 0.0
+                if len(recent) >= 2 and recent[-1] > recent[0]:
+                    achieved = (len(recent) - 1) / (recent[-1] - recent[0])
+                note = None
+                if achieved and achieved < 4:
+                    note = (f'Only {achieved:.1f} frames/s are arriving. A browser '
+                            f'clamps timers in a background tab to 1 Hz, which '
+                            f'collapses the stream — keep the dashboard tab '
+                            f'visible. Below about 4 fps a tracked person expires '
+                            f'between frames and no activity can be recognised.')
                 return {'code': 200, 'data': {
                     'state': 'running' if _start_mod._camera_frame_count > 0 else 'idle',
                     'ws_path': '/ws/camera',
+                    'achieved_fps': round(achieved, 1),
+                    **({'warning': note} if note else {}),
                     'topic_out': [{'topic': '/remote_control/camera',
                                    'format': 'image/jpeg'}],
                     'topic_visible': visible,

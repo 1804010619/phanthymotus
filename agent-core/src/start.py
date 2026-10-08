@@ -950,6 +950,12 @@ async def _ws_mic(ws: fastapi.WebSocket):
 _camera_pub = None
 _camera_frame_count = 0
 _camera_ws_connected = False
+# Arrival times of the last few frames, for the achieved-rate figure in `info`.
+# A configured 12 fps and an achieved 1 fps are indistinguishable from a frame
+# counter alone, and the difference decides whether anything temporal can work
+# at all: at 1 fps a track expires between frames and the action model never
+# accumulates the seconds of history it needs.
+_camera_recent: "collections.deque" = __import__("collections").deque(maxlen=30)
 
 
 def _ensure_camera_pub():
@@ -999,6 +1005,7 @@ async def _ws_camera(ws: fastapi.WebSocket):
             msg.data = data
             _camera_pub.publish(msg)
             _camera_frame_count += 1
+            _camera_recent.append(time.time())
     except Exception:
         pass
     finally:
