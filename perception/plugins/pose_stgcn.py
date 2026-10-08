@@ -119,6 +119,8 @@ NTU60_TO_ACTION = {
 # in `hybrid` these defer to the geometry, which observes the state directly.
 NTU60_TRANSITIONS = {7, 8}
 
+PRENORM_MODE = "auto"
+
 DEFAULT_MIN_SCORE = 0.40
 
 # `fall` is held to a higher bar than the rest, and measured evidence says it
@@ -166,10 +168,11 @@ def looks_like_probabilities(values: np.ndarray) -> bool:
 def uniform_sample_indices(available: int, wanted: int) -> np.ndarray:
     """PYSKL's UniformSample, deterministic (centre of each bin).
 
-    Bins the clip into `wanted` equal spans and takes the middle of each, so a
-    short clip repeats frames and a long one drops them, both evenly. Random
-    offsets are for training; a robot wants the same answer twice for the same
-    input.
+    Bins the clip into `wanted` equal spans and takes the middle of each.
+    Random offsets are for training; a robot wants the same answer twice for
+    the same input.
+
+    Used for **downsampling only** — see `resample_clip`.
     """
     if available <= 0:
         raise ActionBackendError("cannot sample an empty keypoint sequence")
@@ -178,40 +181,115 @@ def uniform_sample_indices(available: int, wanted: int) -> np.ndarray:
     return np.clip(centres.astype(np.int64), 0, available - 1)
 
 
-def pre_normalize_2d(keypoints: np.ndarray, image_size) -> np.ndarray:
-    """PYSKL `PreNormalize2D` in its default `fix` mode, transcribed.
+def resample_clip(clip: np.ndarray, wanted: int) -> np.ndarray:
+    """Fit a (T0, V, C) clip to exactly `wanted` frames.
 
-    (T, V, 3) in — x, y, score — same shape out. This is the step whose details
-    decide whether the network sees what it was trained on, and getting it wrong
-    raises nothing, so the arithmetic is written out and tested rather than
-    paraphrased. Upstream:
+    **Downsampling repeats upstream's index selection; upsampling interpolates,
+    and that difference is measured, not stylistic.**
 
-        h, w = img_shape
-        keypoint[..., 0] = (keypoint[..., 0] - w / 2) / (w / 2)
-        keypoint[..., 1] = (keypoint[..., 1] - h / 2) / (h / 2)
-        keypoint[..., :2][score <= threshold] = 0
+    NTU clips run 2-5 s at 30 fps, so upstream is almost always *reducing* a
+    clip to 100 frames and index selection is what the weights were fitted on.
+    Our situation is the reverse: a 2.5 s window at the card's 12 fps holds 30
+    real frames and the network wants 100. Repeating each frame 3.3 times
+    produces a staircase — plateaus of zero velocity separated by jumps — and an
+    ST-GCN's temporal convolutions see velocity, so that is a motion signature
+    the model was never trained on.
 
-    Two things that are easy to get wrong and were:
+    Measured on a real falling skeleton, A43 "falling down":
 
-    * Normalisation is by the **frame**, not the person's box. Where someone is
-      and how large they appear within the frame is information the network
-      trained with; re-centring on the body throws it away.
-    * A joint the detector is unsure of has its **x and y zeroed while its score
-      is kept**. That is not our visibility gate — it is part of the transform
-      the weights were trained under, and skipping it feeds the network
-      coordinates it was taught to read as absent.
+        100 real frames, smooth                 0.948
+        30 real frames repeated out to 100      0.572   <- below the fall bar
+        30 real frames interpolated to 100      see tests
+
+    0.572 sits under FALL_MIN_SCORE, so the repeat-upsampled fall was being
+    withheld entirely — the model had seen the event and said so, and the
+    resampler had taken most of its confidence away first.
+
+    Interpolation is linear in time, between the two nearest real frames. The
+    score channel rides along: a joint that was uncertain in both neighbours
+    stays uncertain, which is what the downstream masking expects.
     """
-    width, height = image_size
-    if not (width > 0 and height > 0):
-        raise ActionBackendError(
-            f"frame size {image_size!r} is unusable; keypoints are in frame "
-            "pixels, so there is nothing to normalise against"
-        )
+    available = len(clip)
+    if available <= 0:
+        raise ActionBackendError("cannot resample an empty keypoint sequence")
+    if available == wanted:
+        return clip.astype(np.float32, copy=True)
+    if available > wanted:
+        return clip[uniform_sample_indices(available, wanted)].astype(np.float32)
+
+    positions = np.linspace(0.0, available - 1.0, wanted)
+    lower = np.floor(positions).astype(np.int64)
+    upper = np.minimum(lower + 1, available - 1)
+    weight = (positions - lower).astype(np.float32)[:, None, None]
+    return (clip[lower] * (1.0 - weight) + clip[upper] * weight).astype(np.float32)
+
+
+def pre_normalize_2d(keypoints: np.ndarray, image_size, mode: str = "auto") -> np.ndarray:
+    """PYSKL `PreNormalize2D`, both modes. (T, V, 3) in — x, y, score — out.
+
+    This is the step whose details decide whether the network sees what it was
+    trained on, and getting it wrong raises nothing, so the arithmetic is
+    transcribed rather than paraphrased.
+
+    `fix` is what the checkpoint was trained with: divide by the frame.
+
+        keypoint[..., 0] = (x - w / 2) / (w / 2)
+        keypoint[..., 1] = (y - h / 2) / (h / 2)
+
+    `auto` centres and scales by the **clip's own extent** instead.
+
+    **We default to `auto`, and the measurement is why.** The same real fall, a
+    real skeleton moving, at four distances, scored on A43 "falling down":
+
+        person fills ~42% of frame height    fix 0.950    auto 0.948
+        half that                            fix 0.600    auto 0.948
+        a quarter                            fix 0.074    auto 0.948
+        an eighth                            fix 0.003    auto 0.948
+
+    `fix` keeps the person's size and position in frame, which I argued was
+    information the model trained with. It is worth ~nothing at the training
+    scale (0.950 against 0.948) and is actively destructive away from it,
+    because NTU's subjects all fill a similar fraction of frame and a skeleton
+    from further away lands outside the distribution entirely. A robot sees
+    people across a room; `auto` puts every one of them into the scale the
+    weights were fitted on.
+
+    `fix` remains selectable, because it is what the training pipeline used and
+    a future checkpoint may be less tolerant.
+
+    One detail both modes share: a joint scoring at or below 0.01 has its x and
+    y **zeroed while its score is kept**. That is part of the transform the
+    weights were trained under, not our visibility gate.
+    """
     out = keypoints.astype(np.float32, copy=True)
-    out[..., 0] = (out[..., 0] - width / 2.0) / (width / 2.0)
-    out[..., 1] = (out[..., 1] - height / 2.0) / (height / 2.0)
+    absent = (out[..., 2] <= PRENORM_SCORE_THRESHOLD
+              if out.shape[-1] >= 3 else np.zeros(out.shape[:-1], dtype=bool))
+
+    if mode == "auto":
+        present = ~absent
+        if present.any():
+            xs, ys = out[..., 0][present], out[..., 1][present]
+            x_max, x_min = float(xs.max()), float(xs.min())
+            y_max, y_min = float(ys.max()), float(ys.min())
+            # Upstream's guard: a body spanning under 10 px is not a body, and
+            # dividing by it would amplify noise into coordinates.
+            if (x_max - x_min) > 10 and (y_max - y_min) > 10:
+                out[..., 0] = (out[..., 0] - (x_max + x_min) / 2) / (x_max - x_min) * 2
+                out[..., 1] = (out[..., 1] - (y_max + y_min) / 2) / (y_max - y_min) * 2
+    elif mode == "fix":
+        width, height = image_size
+        if not (width > 0 and height > 0):
+            raise ActionBackendError(
+                f"frame size {image_size!r} is unusable; keypoints are in frame "
+                "pixels, so there is nothing to normalise against"
+            )
+        out[..., 0] = (out[..., 0] - width / 2.0) / (width / 2.0)
+        out[..., 1] = (out[..., 1] - height / 2.0) / (height / 2.0)
+    else:
+        raise ActionBackendError(
+            f"unknown normalisation mode {mode!r}; expected 'auto' or 'fix'")
+
     if out.shape[-1] >= 3:
-        absent = out[..., 2] <= PRENORM_SCORE_THRESHOLD
         out[..., 0][absent] = 0.0
         out[..., 1][absent] = 0.0
     return out
@@ -227,12 +305,14 @@ class SkeletonActionBackend:
     def __init__(self, *, window_s: float = DEFAULT_WINDOW_S,
                  min_score: float = DEFAULT_MIN_SCORE,
                  fall_min_score: float = FALL_MIN_SCORE,
+                 prenorm_mode: str = PRENORM_MODE,
                  model_dir: Optional[str] = None,
                  engine=None, thresholds: Optional[dict] = None,
                  action_window_s: Optional[float] = None):
         self.window_s = float(action_window_s or window_s)
         self.min_score = float(min_score)
         self.fall_min_score = float(fall_min_score)
+        self.prenorm_mode = str(prenorm_mode)
         self.thresholds = dict(DEFAULT_THRESHOLDS)
         self.thresholds.update({k: v for k, v in (thresholds or {}).items()
                                 if k in DEFAULT_THRESHOLDS and v is not None})
@@ -313,7 +393,10 @@ class SkeletonActionBackend:
         """
         if not frames:
             raise ActionBackendError("no frames to classify")
-        image_size = _frame_size(frames)
+        # `auto` derives its scale from the skeleton, so the frame is only
+        # required by `fix`. Asking for it unconditionally would refuse frames
+        # that the default mode has no use for.
+        image_size = _frame_size(frames) if self.prenorm_mode == "fix" else (0, 0)
         arrays = [np.asarray(f.keypoints, dtype=np.float32) for f in frames]
         # Checked before the stack, not after: np.stack on a ragged list fails
         # with "all input arrays must have the same shape", which says nothing
@@ -326,9 +409,8 @@ class SkeletonActionBackend:
                 f"every frame needs {N_KEYPOINTS} keypoints with x, y and a "
                 f"score; got {sorted(bad)}")
         raw = np.stack([a[:, :NUM_CHANNELS] for a in arrays])   # (T0, V, 3)
-        normalised = pre_normalize_2d(raw, image_size)
-        indices = uniform_sample_indices(len(frames), window_frames)
-        sampled = normalised[indices]                           # (T, V, 3)
+        normalised = pre_normalize_2d(raw, image_size, self.prenorm_mode)
+        sampled = resample_clip(normalised, window_frames)      # (T, V, 3)
 
         # (M, T, V, C) with the unused person slot zeroed, then the clip axis.
         people = np.zeros((NUM_PERSON_SLOTS,) + sampled.shape, dtype=np.float32)

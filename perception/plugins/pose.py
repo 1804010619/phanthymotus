@@ -215,7 +215,7 @@ TOOLS = [
                 "publish_overlay": {"type": "boolean", "description": "另发一条把骨架画在原始画面上的 JPEG（{topic}/poses/overlay_img）。每帧多一次绘制+编码，外加一条跑 JPEG 的话题，所以默认关闭；要录给人看时再开", "default": False, "scope": "instance"},
                 "action_window_s": {"type": "number", "minimum": 0.2, "description": "动作判定回看多少秒。挥手频率和步频都是在这个窗口里数出来的", "default": 1.5, "scope": "instance"},
                 "action_backend": {"type": "string", "enum": list(ACTION_BACKENDS), "description": "动作分类后端。hybrid（默认）= 姿态走几何规则、跌倒/挥手/指向走 ST-GCN++ 骨架动作模型；rules = 只用几何规则，不需要第二个 engine；stgcn = 只用模型（注意 NTU-60 里没有「站立」「坐」这两个状态类，所以站/坐会变成 unknown）。模型是 1.39M 参数/1.95 GFLOPs，约为 pose engine 的 8% 算力", "default": "hybrid", "scope": "instance"},
-                "action_min_score": {"type": "number", "minimum": 0.0, "maximum": 1.0, "description": "骨架动作模型的得分阈值，低于它不报。调之前先看 info 里 last_prediction 的实际得分 —— 那是区分「模型判错」和「阈值定错」的唯一办法", "default": DEFAULT_MIN_SCORE, "scope": "instance"},
+                "action_min_score": {"type": "number", "minimum": 0.0, "maximum": 1.0, "description": "骨架动作模型的得分阈值，低于它不报。跌倒单独用更高的 0.75 —— 实测该 engine 对纯噪声会给出 A43「跌倒」0.62，而误报跌倒的代价是机器人丢下手上的事去问人有没有受伤。调之前先看 info 里的实际得分，那是区分「模型判错」和「阈值定错」的唯一办法", "default": DEFAULT_MIN_SCORE, "scope": "instance"},
                 # Exposed because they are NOT constants: the same fall measures
                 # differently depending on where the camera is mounted.
                 "fall_drop_ratio": {"type": "number", "minimum": 0.05, "maximum": 1.0, "description": "判定跌倒所需的髋部下降幅度，按站立身高的比例。和机位强相关 —— 相机离地 0.4 m 和 1.2 m 量同一次跌倒得到的数不一样，务必在真机上调", "default": DEFAULT_THRESHOLDS["fall_drop_ratio"], "scope": "instance"},

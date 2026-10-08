@@ -28,6 +28,7 @@ from plugins.pose_action import (  # noqa: E402
 )
 from plugins.pose_stgcn import (  # noqa: E402
     DEFAULT_MIN_SCORE,
+    resample_clip,
     DEFAULT_WINDOW_FRAMES,
     NUM_CHANNELS,
     NUM_PERSON_SLOTS,
@@ -91,8 +92,8 @@ def _standing(_t):
 
 # ── preprocessing: the part that fails silently ─────────────────────────────
 
-def test_normalisation_maps_the_frame_onto_minus_one_to_one():
-    """PYSKL normalises by the FRAME, not by the person's box.
+def test_fix_mode_maps_the_frame_onto_minus_one_to_one():
+    """`fix` is what the checkpoint was trained with: normalise by the FRAME.
 
     Where someone stands and how large they appear within the frame is
     information the network trained with; re-centring on the body would discard
@@ -101,15 +102,57 @@ def test_normalisation_maps_the_frame_onto_minus_one_to_one():
     """
     corners = np.array([[[0.0, 0.0, 0.9], [1280.0, 720.0, 0.9],
                          [640.0, 360.0, 0.9]]], dtype=np.float32)
-    out = pre_normalize_2d(corners, FRAME)
+    out = pre_normalize_2d(corners, FRAME, "fix")
     assert out[0, 0, :2].tolist() == pytest.approx([-1.0, -1.0])
     assert out[0, 1, :2].tolist() == pytest.approx([1.0, 1.0])
     assert out[0, 2, :2].tolist() == pytest.approx([0.0, 0.0])
 
 
-def test_normalisation_refuses_a_zero_frame_size():
+def test_fix_mode_refuses_a_zero_frame_size():
     with pytest.raises(ActionBackendError, match="unusable"):
-        pre_normalize_2d(np.zeros((1, 17, 3), dtype=np.float32), (0, 720))
+        pre_normalize_2d(np.zeros((1, 17, 3), dtype=np.float32), (0, 720), "fix")
+
+
+def test_an_unknown_normalisation_mode_is_refused():
+    with pytest.raises(ActionBackendError, match="unknown normalisation"):
+        pre_normalize_2d(np.zeros((1, 17, 3), dtype=np.float32), FRAME, "centred")
+
+
+def test_auto_mode_is_scale_invariant():
+    """The reason it is the default. Measured on a real falling skeleton at four
+    distances, scoring A43 "falling down":
+
+        fills ~42% of frame   fix 0.950   auto 0.948
+        half that             fix 0.600   auto 0.948
+        a quarter             fix 0.074   auto 0.948
+        an eighth             fix 0.003   auto 0.948
+
+    NTU's subjects all fill a similar fraction of frame, so a skeleton from
+    further away lands outside the distribution under `fix`. A robot sees people
+    across a room.
+    """
+    body = np.zeros((4, N_KEYPOINTS, 3), dtype=np.float32)
+    body[:, :, 2] = 0.9
+    body[:, :, 0] = np.linspace(400, 600, N_KEYPOINTS)
+    body[:, :, 1] = np.linspace(200, 700, N_KEYPOINTS)
+    near = pre_normalize_2d(body, FRAME, "auto")
+    far = body.copy()
+    far[:, :, :2] = (far[:, :, :2] - 500.0) * 0.2 + 500.0     # same pose, 5x away
+    assert np.allclose(near[..., :2], pre_normalize_2d(far, FRAME, "auto")[..., :2],
+                       atol=1e-4)
+    # fix, by contrast, shrinks with the person.
+    assert not np.allclose(pre_normalize_2d(body, FRAME, "fix")[..., :2],
+                           pre_normalize_2d(far, FRAME, "fix")[..., :2], atol=1e-2)
+
+
+def test_auto_mode_needs_no_frame_size():
+    """It derives its scale from the skeleton, so a frame it has no use for
+    must not be a reason to refuse the clip."""
+    engine = _FakeEngine({42: 9.0})
+    frames = _frames(_standing, n=20, image_size=None)
+    result = SkeletonActionBackend(engine=engine).classify(frames)
+    assert result.get("backend_error") is None
+    assert engine.calls, "auto mode should have reached the engine"
 
 
 def test_uniform_sampling_covers_the_clip_evenly():
@@ -176,7 +219,7 @@ def test_a_joint_below_the_prenorm_threshold_has_its_position_zeroed():
     keypoints[0, :, 1] = 360.0
     keypoints[0, 0, 2] = 0.9                      # visible
     keypoints[0, 1, 2] = PRENORM_SCORE_THRESHOLD  # at the threshold -> absent
-    out = pre_normalize_2d(keypoints, FRAME)
+    out = pre_normalize_2d(keypoints, FRAME, "fix")
     assert out[0, 0, :2].tolist() == pytest.approx([0.0, 0.0])   # frame centre
     assert out[0, 1, :2].tolist() == [0.0, 0.0]                  # zeroed
     assert out[0, 1, 2] == pytest.approx(PRENORM_SCORE_THRESHOLD)  # score kept
@@ -189,13 +232,14 @@ def test_the_window_comes_from_the_engine_not_from_our_constant():
     assert engine.calls[0].shape[2] == 100
 
 
-def test_the_backend_refuses_frames_with_no_declared_image_size():
+def test_fix_mode_refuses_frames_with_no_declared_image_size():
     """Guessing the frame from the bounding box would silently misnormalise
     every input, and this model answers a misnormalised skeleton with confident
-    nonsense rather than an error."""
+    nonsense rather than an error. Only `fix` needs the frame at all."""
     engine = _FakeEngine({42: 9.0})
     frames = _frames(_standing, n=20, image_size=None)
-    result = SkeletonActionBackend(engine=engine).classify(frames)
+    result = SkeletonActionBackend(engine=engine,
+                                   prenorm_mode="fix").classify(frames)
     assert result["backend_error"] is True
     assert "image_size" in result["evidence"]["reason"]
     assert engine.calls == []
@@ -518,3 +562,64 @@ def test_hybrid_accepts_a_fall_the_geometry_corroborates():
     result = HybridActionBackend(engine=engine).classify(frames)
     assert result["action"] == "fall"
     assert result["evidence"]["source"] == "stgcn"
+
+
+# ── resampling: the step that quietly ate most of a fall's confidence ───────
+
+def test_downsampling_keeps_upstreams_index_selection():
+    """NTU clips are longer than 100 frames, so reducing is what the weights
+    were fitted on. That path stays exactly as upstream wrote it."""
+    clip = np.arange(200, dtype=np.float32)[:, None, None] * np.ones((1, 17, 3))
+    out = resample_clip(clip.astype(np.float32), 100)
+    assert len(out) == 100
+    expected = clip[uniform_sample_indices(200, 100)]
+    assert np.allclose(out, expected)
+
+
+def test_upsampling_interpolates_rather_than_repeating():
+    """Our situation is the reverse of NTU's: a 2.5 s window at 12 fps holds 30
+    real frames and the network wants 100.
+
+    Repeating each frame 3.3 times makes a staircase — plateaus of zero velocity
+    separated by jumps — and an ST-GCN's temporal convolutions see velocity, so
+    that is a motion signature the model was never trained on. Measured on a
+    real falling skeleton, A43 "falling down":
+
+        100 real frames, smooth              0.948
+        30 frames repeated out to 100        0.572   <- under FALL_MIN_SCORE
+        30 frames interpolated to 100        0.950
+
+    The repeat version was being withheld as a fall entirely: the model had seen
+    the event and said so, and the resampler had taken most of its confidence
+    away first.
+    """
+    clip = np.linspace(0.0, 29.0, 30, dtype=np.float32)[:, None, None]
+    clip = clip * np.ones((1, N_KEYPOINTS, 3), dtype=np.float32)
+    out = resample_clip(clip, 100)
+    assert out.shape == (100, N_KEYPOINTS, 3)
+    # A linear ramp in must come back a linear ramp: no plateaus, no jumps.
+    steps = np.diff(out[:, 0, 0])
+    assert steps.min() > 0, "a repeated frame would give a zero step"
+    assert np.allclose(steps, steps[0], atol=1e-4), "and a jump would give a spike"
+    assert out[0, 0, 0] == pytest.approx(0.0)
+    assert out[-1, 0, 0] == pytest.approx(29.0)
+
+
+def test_resampling_an_exact_length_clip_is_a_copy():
+    clip = np.random.default_rng(0).standard_normal(
+        (100, N_KEYPOINTS, 3)).astype(np.float32)
+    out = resample_clip(clip, 100)
+    assert np.allclose(out, clip)
+    assert out is not clip, "must not alias the caller's array"
+
+
+def test_resampling_a_single_frame_fills_the_window():
+    clip = np.ones((1, N_KEYPOINTS, 3), dtype=np.float32)
+    out = resample_clip(clip, 100)
+    assert out.shape == (100, N_KEYPOINTS, 3)
+    assert np.allclose(out, 1.0)
+
+
+def test_resampling_an_empty_clip_raises():
+    with pytest.raises(ActionBackendError):
+        resample_clip(np.zeros((0, N_KEYPOINTS, 3), dtype=np.float32), 100)
