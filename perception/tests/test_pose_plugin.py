@@ -346,7 +346,7 @@ def test_draw_skeleton_marks_the_canvas_and_skips_invisible_joints():
     # top-left corner of every frame.
     pose_plugin.draw_skeleton(
         canvas, [{"keypoints": keypoints, "id": 1, "box": [180, 180, 320, 400],
-                  "verdict": {"action": "standing"}}], 0.3)
+                  "verdict": {"posture": "standing", "activity": None}}], 0.3)
     assert canvas[200, 250].any()        # the shoulder-to-shoulder bone
     assert not canvas[0, 0].any()        # no phantom limb at the origin
 
@@ -357,7 +357,8 @@ def test_a_fallen_person_is_drawn_in_the_alert_colour():
     keypoints[COCO_INDEX["left_shoulder"]] = (200, 200, 0.9)
     keypoints[COCO_INDEX["right_shoulder"]] = (300, 200, 0.9)
     person = {"keypoints": keypoints, "id": 1, "box": [180, 180, 320, 400],
-              "verdict": {"action": "fall"}}
+              "verdict": {"posture": "lying",
+                          "activity": {"name": "falling down"}}}
     pose_plugin.draw_skeleton(canvas, [person], 0.3)
     assert tuple(int(v) for v in canvas[200, 250]) == pose_plugin._ALERT_COLOUR
 
@@ -763,3 +764,29 @@ def test_action_min_score_is_configurable_per_instance():
     plugin.dispatch("pose", {"action": "config", "instance_id": "i1",
                              "action_min_score": 0.7})
     assert plugin._merged_config("i1")["action_min_score"] == 0.7
+
+
+# ── the overlay label ────────────────────────────────────────────────────────
+
+def test_the_overlay_label_reads_the_two_channel_verdict():
+    """It read `verdict["action"]` until that field was removed, and then
+    labelled everybody `unknown` — silently, because the drawing tests fed a
+    hand-built verdict that still carried the old key. That is exactly how a
+    renderer keeps drawing after its data has moved underneath it."""
+    assert pose_plugin.overlay_label(
+        {"posture": "lying", "activity": {"name": "falling down"}}) == "falling down"
+    assert pose_plugin.overlay_label(
+        {"posture": "standing", "activity": None}) == "standing"
+    assert pose_plugin.overlay_label({"posture": None, "activity": None}) == "unknown"
+    # A published record carries the activity as a plain string, not a dict.
+    assert pose_plugin.overlay_label(
+        {"posture": "sitting", "activity": "reading"}) == "reading"
+
+
+def test_the_overlay_label_never_comes_back_unknown_for_a_known_person():
+    """The regression itself: anybody the card has an opinion about must get
+    that opinion drawn."""
+    for verdict in ({"posture": "standing", "activity": None},
+                    {"posture": None, "activity": {"name": "hand waving"}},
+                    {"posture": "lying", "activity": {"name": "falling down"}}):
+        assert pose_plugin.overlay_label(verdict) != "unknown", verdict

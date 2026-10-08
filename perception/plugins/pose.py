@@ -613,6 +613,29 @@ _TRACK_COLOURS = (
 )
 _ALERT_COLOUR = (87, 119, 215)      # var(--orange) in BGR
 
+#: Labels drawn in the alert colour. Same set the web renderer uses, and the
+#: same reason: somebody on the floor is worth looking at whether or not
+#: anything called it a fall.
+_ALERT_LABELS = ("falling down", "lying")
+
+
+def overlay_label(verdict: dict) -> str:
+    """The one line drawn over a person, from the two-channel verdict.
+
+    Activity first, because it says more — "falling down" beats "lying" — and
+    the posture when there is no activity. This read `verdict["action"]` until
+    that field was removed, and then silently labelled everybody `unknown`: the
+    existing drawing tests passed because they fed a hand-built verdict that
+    still had the old key, which is exactly how a renderer keeps drawing after
+    its data has moved.
+    """
+    activity = verdict.get("activity")
+    if isinstance(activity, dict) and activity.get("name"):
+        return activity["name"]
+    if isinstance(activity, str) and activity:
+        return activity
+    return verdict.get("posture") or "unknown"
+
 
 def draw_skeleton(canvas, persons: list, kpt_confidence: float) -> None:
     """Draw bones, joints and the action label onto a BGR frame, in place.
@@ -626,8 +649,8 @@ def draw_skeleton(canvas, persons: list, kpt_confidence: float) -> None:
     for person in persons:
         keypoints = np.asarray(person["keypoints"], dtype=np.float32)
         verdict = person.get("verdict") or {}
-        action = verdict.get("action", "unknown")
-        colour = (_ALERT_COLOUR if action in ("fall", "lying")
+        label = overlay_label(verdict)
+        colour = (_ALERT_COLOUR if label in _ALERT_LABELS
                   else _TRACK_COLOURS[int(person.get("id", 0)) % len(_TRACK_COLOURS)])
         visible = keypoints[:, 2] >= kpt_confidence
         for a, b in COCO_SKELETON:
@@ -643,8 +666,8 @@ def draw_skeleton(canvas, persons: list, kpt_confidence: float) -> None:
                            cv2.LINE_AA)
         box = person.get("box") or person.get("bbox")
         if box:
-            label = f"#{person.get('id', '?')} {action}"
-            cv2.putText(canvas, label, (int(box[0]), max(int(box[1]) - 6, 12)),
+            cv2.putText(canvas, f"#{person.get('id', '?')} {label}",
+                        (int(box[0]), max(int(box[1]) - 6, 12)),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, colour, 1, cv2.LINE_AA)
 
 
