@@ -1240,18 +1240,18 @@ DEPTH_MODEL_BUNDLES = {
 
 POSE_MODEL_BUNDLES = {
     "jp61": {
-        "base_url": f"{VISION_MODEL_BASE}/yolo26n-pose/tensorrt-jp61-trt10.4-orin-640",
+        "base_url": f"{VISION_MODEL_BASE}/yolo26s-pose/tensorrt-jp61-trt10.4-orin-640",
         "files": {
-            "yolo26n-pose.engine": {
+            "yolo26s-pose.engine": {
                 "size": 0,
                 "sha256": "",
             },
         },
     },
     "jp511": {
-        "base_url": f"{VISION_MODEL_BASE}/yolo26n-pose/tensorrt-jp511-trt8.5-orin-640",
+        "base_url": f"{VISION_MODEL_BASE}/yolo26s-pose/tensorrt-jp511-trt8.5-orin-640",
         "files": {
-            "yolo26n-pose.engine": {
+            "yolo26s-pose.engine": {
                 "size": 0,
                 "sha256": "",
             },

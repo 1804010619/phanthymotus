@@ -54,8 +54,8 @@ deserializes fine and is then rejected on load.
 Outputs, per model:
     yoloe-26s-seg.engine + vocab.json     (vop)
     yolo26n-depth.engine                  (visual_depth)
-    yolo26n-pose.engine                   (pose; yolo11n-pose if the image's
-                                           ultralytics has no yolo26 pose weights)
+    yolo26s-pose.engine                   (pose; --pose-weights to pick another
+                                           size, and update the bundle table)
 
 Then upload to COS and record size + SHA256 of the *uploaded* copy (re-download
 it and hash that) in utils/model_downloader.py. See that file's bundle tables.
@@ -160,21 +160,36 @@ def export_depth(out_dir: str, imgsz: int, workspace: float | None) -> list[str]
     return [target]
 
 
-def export_pose(out_dir: str, imgsz: int, workspace: float | None) -> list[str]:
+# Which pose weights to export. `s` rather than `n` on purpose: the keypoints
+# feed geometric action rules, so precision here shows up as fewer misjudged
+# actions rather than as a nicer picture (57.2 → 63.0 mAP(pose) for ~12 MB more
+# resident and ~8 ms more per frame). Overridable with --pose-weights, so
+# re-exporting another size needs no code change — but then also update
+# POSE_MODEL_BUNDLES, whose paths name the model.
+DEFAULT_POSE_WEIGHTS = "yolo26s-pose.pt"
+
+
+def export_pose(out_dir: str, imgsz: int, workspace: float | None,
+                weights: str = DEFAULT_POSE_WEIGHTS) -> list[str]:
     """Build the human-keypoint engine for plugins/pose.py.
 
-    COCO-17, single class. `yolo26n-pose` is preferred for consistency with
-    yolo26n-depth and because the YOLO26 head is NMS-free, but whether the
-    installed ultralytics ships those weights is a property of the image, not
-    something to assume — so fall back to yolo11n-pose and say which was used.
-    Both decode through plugins/vision_runtime.decode_poses, which picks the
+    COCO-17, single class. The YOLO11 equivalent is tried as a fallback because
+    which weights the image's ultralytics can fetch is a property of the image
+    rather than something to assume; it should not fire, since ultralytics
+    publishes yolo26{n,s,m,l,x}-pose and this repo already runs YOLO26 elsewhere.
+    Either decodes through plugins/vision_runtime.decode_poses, which picks the
     layout by content.
     """
     from ultralytics import YOLO
 
-    weights, model = None, None
+    candidates = [weights]
+    fallback = weights.replace("yolo26", "yolo11")
+    if fallback != weights:
+        candidates.append(fallback)
+
+    model = None
     errors = []
-    for candidate in ("yolo26n-pose.pt", "yolo11n-pose.pt"):
+    for candidate in candidates:
         try:
             model = YOLO(candidate)
             weights = candidate
@@ -206,6 +221,10 @@ def main() -> int:
     # builder workspace is not a soft preference — on an 8 GB Orin already
     # running the perception stack it gets the build OOM-killed outright
     # (observed on jp5.11: "Killed" mid-[GpuLayer], no Python traceback). Cap it.
+    parser.add_argument("--pose-weights", default=DEFAULT_POSE_WEIGHTS,
+                        help="pose weights to export (default %(default)s). "
+                             "Changing this also means updating "
+                             "POSE_MODEL_BUNDLES, whose COS paths name the model")
     parser.add_argument("--workspace", type=float, default=2.0,
                         help="TensorRT builder workspace in GB (0 = unbounded)")
     args = parser.parse_args()
@@ -227,7 +246,8 @@ def main() -> int:
     if args.model in ("both", "depth"):
         produced += export_depth(args.out, args.imgsz, workspace)
     if args.model in ("both", "pose"):
-        produced += export_pose(args.out, args.imgsz, workspace)
+        produced += export_pose(args.out, args.imgsz, workspace,
+                                weights=args.pose_weights)
 
     print("\n[export] record these in utils/model_downloader.py — but re-hash "
           "the COPY DOWNLOADED BACK FROM COS, not these local files: a pin that "

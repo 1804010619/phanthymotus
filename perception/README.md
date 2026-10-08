@@ -2624,17 +2624,51 @@ shoulder height, and a photo has no "passing through". But `waving`, `walking`,
 reply says so (`temporal: false`, `unavailable_actions`) rather than handing back
 `raising_hand` as though it settled "is she waving".
 
+### Which model, and why `s`
+
+`yolo26s-pose` — COCO-17, single class. The ladder, from ultralytics' own table
+(`params`, `mAP`, `FLOPs`) with engine sizes extrapolated from the two engines
+this repo already ships (`yolo26n-depth` 14.0 MB, `yoloe-26s-seg` 24.8 MB, both
+fp16/640):
+
+| | mAP(pose) 50-95 | params | FLOPs | `.pt` | engine (est.) |
+|---|---|---|---|---|---|
+| `yolo26n-pose` | 57.2 | 2.9 M | 7.6 B | 7 MB | ~13 MB |
+| **`yolo26s-pose`** | **63.0** | 10.4 M | 24.1 B | 23 MB | ~25 MB |
+| `yolo26m-pose` | 68.8 | 21.5 M | 73.3 B | 46 MB | ~48 MB |
+| `yolo26l-pose` | 70.4 | 25.9 M | 91.7 B | 55 MB | ~58 MB |
+
+`s` rather than `n`, which is what every other nano-class model here uses,
+because **keypoint precision is the input to the action rules, not a cosmetic
+property**. A noisy wrist breaks the reversal count that separates `waving` from
+reaching; a noisy hip breaks the drop ratio that separates `fall` from `lying`.
+So the 57.2 → 63.0 step buys fewer misjudged actions rather than prettier
+skeletons, which is worth ~12 MB resident and (extrapolating from the 19.8 ms
+measured for the same-class `yoloe-26s-seg`) ~8 ms per frame over `n`. On an
+8 GB Orin that is a real cost — if memory gets tight on a robot that does not
+need pose, `enabled: false` is the lever, not a smaller model whose keypoints
+the rules cannot rely on.
+
+`--pose-weights` picks another size without a code change. Changing it also
+means updating `POSE_MODEL_BUNDLES`, whose COS paths name the model.
+
 ### Building the engine
 
 `tools/export_vision_engines.py --model pose`, **inside a container built from
-the target perception image** — not on the Jetson host, for the reason that file
-opens with (the jp6.1 image ships TensorRT 10.4 while its hosts carry 10.3, and
-an engine plan only loads on the TensorRT that built it). It prefers
-`yolo26n-pose` and falls back to `yolo11n-pose`, because which pose weights the
-image's ultralytics can fetch is a property of the image rather than something to
-assume; the engine is named after whichever was used, so the bundle table and the
-file cannot disagree about what a robot is running. Both decode through
-`decode_poses`, which picks the layout by content.
+the target perception image, on an Orin** — two separate requirements, each of
+which has cost a failed build:
+
+* **Not on the Jetson host.** The jp6.1 image ships TensorRT 10.4 while its hosts
+  carry 10.3, and an engine plan only loads on the TensorRT that built it.
+* **Not on the x86 build host either.** `172.18.66.241` has no GPU, and exporting
+  an engine means actually running the TensorRT builder. That host's role in this
+  is the COS upload, because it holds the keys — so the path is: export on the
+  Orin, `scp` to the build host, upload to COS, download the copy back, hash
+  *that*, and pin it.
+
+One bundle per JetPack line, from the Orin on that line: Orin 6 (jp6.1) for
+`jp61`, Orin 5 (jp5.11) for `jp511`. A line with no published bundle reports
+`state: error` on that machine and affects nothing else.
 
 `POSE_MODEL_BUNDLES` ships with **zero pins**, so `ensure_pose_model` raises with
 the build instructions instead of fetching anything unverified — the standing

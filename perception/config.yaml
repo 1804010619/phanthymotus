@@ -217,6 +217,12 @@ plugins:
   pose:
     enabled: true
     namespace: ""       # auto-detect from hostname if empty
+    # `s` 而不是 `n`：关键点精度在这里不是观感问题，它是动作规则的输入 ——
+    # 手腕抖一点，区分「挥手」和「伸手」的方向反转计数就不准；髋部抖一点，
+    # 区分「跌倒」和「躺下」的 drop_ratio 就不准。57.2 → 63.0 mAP(pose) 买到的是
+    # 更少的误判动作，不是更好看的骨架。代价约 12 MB 常驻 + 约 8 ms/帧（外推）。
+    # 机器内存紧张又不需要 pose，该关的是 enabled，不是换个规则信不过的小模型。
+    model: "yolo26s-pose"
     confidence: 0.4     # 人体检测阈值
     fps: 5
     kpt_confidence: 0.3 # 单个关键点的可见性阈值，低于此值的关节不参与判定也不绘制

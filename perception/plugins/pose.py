@@ -87,7 +87,13 @@ DEFAULT_OUTPUT_TOPIC = "/perception/pose"
 # Instance key for the topic-less card, mirroring vop's and tts's.
 _DEFAULT_INSTANCE = "_default"
 
-DEFAULT_MODEL = "yolo26n-pose"
+# `s` rather than `n`, chosen deliberately: keypoint precision is not a cosmetic
+# property here, it is the input to the action rules. A noisy wrist breaks the
+# reversal count that distinguishes waving from reaching, and a noisy hip breaks
+# the drop ratio that distinguishes a fall from lying down — so the 57.2 → 63.0
+# mAP(pose) step buys fewer misjudged actions, not prettier skeletons. Costs
+# ~12 MB more resident and ~8 ms more per frame than `n` (see README).
+DEFAULT_MODEL = "yolo26s-pose"
 
 KEYPOINT_LEVELS = ("off", "compact", "full")
 
