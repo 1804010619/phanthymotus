@@ -417,7 +417,7 @@ def test_info_on_an_idle_card_reports_the_label_set():
     assert info["state"] == "idle"
     assert info["keypoints"] == N_KEYPOINTS
     assert set(info["actions"]) == set(ACTION_LABELS_ZH)
-    assert info["action_backend"] == "rules"
+    assert info["action_backend"] == "hybrid"       # the default
 
 
 def test_info_on_a_running_card_lists_both_output_topics():
@@ -610,3 +610,106 @@ def test_list_actions_separates_events_from_poses_and_states_its_limits():
 def test_an_unknown_action_returns_none_rather_than_a_fake_success():
     plugin, _ = _plugin()
     assert plugin.dispatch("pose", {"action": "teleport"}) is None
+
+
+# ── action backend selection ─────────────────────────────────────────────────
+
+def test_the_default_backend_is_hybrid():
+    """Geometry for the postures, ST-GCN++ for the events. Not a hedge: NTU-60
+    has no `standing`/`sitting` state class, so a pure swap loses the postures."""
+    plugin, _ = _plugin()
+    assert plugin._action_backend == "hybrid"
+    schema = pose_plugin.TOOLS[0]["configSchema"]["properties"]["action_backend"]
+    assert schema["default"] == "hybrid"
+    assert set(schema["enum"]) == {"rules", "stgcn", "hybrid"}
+
+
+def test_choosing_rules_needs_no_action_engine_at_all():
+    plugin, _ = _plugin({"action_backend": "rules"})
+    backend = plugin._classifier_for(plugin._merged_config("i1"))
+    assert backend.last_error is None
+    assert plugin._backend_fallback is None
+    assert plugin._effective_backend() == "rules"
+
+
+def test_an_unknown_backend_name_falls_back_to_rules_and_says_so():
+    """A card silently running geometry while its config names something else
+    is the failure this whole feature set exists to stop."""
+    plugin, _ = _plugin({"action_backend": "stgcnpp"})
+    backend = plugin._classifier_for(plugin._merged_config("i1"))
+    assert plugin._backend_fallback is not None
+    assert "stgcnpp" in plugin._backend_fallback
+    assert plugin._effective_backend() == "rules"
+    plugin.dispatch("pose", {"action": "start", "input_topic": "/cam/rgb"})
+    info = plugin.dispatch("pose", {"action": "info"})
+    assert "action_backend_note" in info
+    assert info["action_backend_effective"] == "rules"
+
+
+def test_a_low_fps_with_a_temporal_backend_is_called_out():
+    """A temporal backend classifies a clip, so a low fps starves it in a way
+    the geometry is not — and a starved model looks like a wrong model."""
+    plugin, _ = _plugin({"action_backend": "hybrid", "fps": 5})
+    plugin.dispatch("pose", {"action": "start", "input_topic": "/cam/rgb"})
+    info = plugin.dispatch("pose", {"action": "info"})
+    assert "action_fps_note" in info
+    assert "fps >= 12" in info["action_fps_note"]
+
+
+def test_a_sufficient_fps_raises_no_note():
+    plugin, _ = _plugin({"action_backend": "hybrid", "fps": 15})
+    plugin.dispatch("pose", {"action": "start", "input_topic": "/cam/rgb"})
+    assert "action_fps_note" not in plugin.dispatch("pose", {"action": "info"})
+
+
+def test_the_rules_backend_gets_no_fps_note():
+    plugin, _ = _plugin({"action_backend": "rules", "fps": 5})
+    plugin.dispatch("pose", {"action": "start", "input_topic": "/cam/rgb"})
+    assert "action_fps_note" not in plugin.dispatch("pose", {"action": "info"})
+
+
+def test_list_actions_names_what_the_running_backend_can_produce():
+    plugin, _ = _plugin({"action_backend": "stgcn"})
+    result = plugin.dispatch("pose", {"action": "list_actions"})
+    assert result["backend"] == "stgcn"
+    # Only the mapped NTU-60 classes, and every one is a label this project has.
+    assert set(result["available_actions"]) <= set(ACTION_LABELS_ZH)
+    assert "fall" in result["available_actions"]
+    # `walking` comes from NTU's *mutual* classes (A59/A60), which are defined
+    # on a pair of skeletons; this backend sees one person at a time.
+    assert "walking" not in result["available_actions"]
+    assert "NTU-60" in result["backend_note"]
+
+
+def test_list_actions_flags_the_labels_that_are_only_transitions():
+    """`standing` from NTU's "stand up" fires while someone gets up. A person
+    who has been standing still for a minute produces no event at all, which is
+    why a bare stgcn backend is not a replacement for the geometry."""
+    plugin, _ = _plugin({"action_backend": "stgcn"})
+    result = plugin.dispatch("pose", {"action": "list_actions"})
+    assert set(result["transition_derived_actions"]) == {"standing", "sitting"}
+    assert "unknown" in result["backend_note"]
+
+
+def test_list_actions_on_hybrid_offers_the_whole_label_set():
+    plugin, _ = _plugin({"action_backend": "hybrid"})
+    result = plugin.dispatch("pose", {"action": "list_actions"})
+    assert set(result["available_actions"]) == set(ACTION_LABELS_ZH)
+    assert result["transition_derived_actions"] == []
+
+
+def test_the_frame_size_reaches_the_tracker():
+    """A learned backend normalises the skeleton by the frame and cannot derive
+    that from the keypoints; a wrong frame size is a silent misnormalisation."""
+    plugin, _ = _plugin()
+    plugin.dispatch("pose", {"action": "start", "input_topic": "/cam/rgb"})
+    node = _feed(plugin, "/cam/rgb")
+    frame = node._tracker.tracks[0].history[-1]
+    assert frame.image_size == (FRAME_W, FRAME_H)
+
+
+def test_action_min_score_is_configurable_per_instance():
+    plugin, _ = _plugin()
+    plugin.dispatch("pose", {"action": "config", "instance_id": "i1",
+                             "action_min_score": 0.7})
+    assert plugin._merged_config("i1")["action_min_score"] == 0.7

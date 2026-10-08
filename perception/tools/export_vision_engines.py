@@ -211,9 +211,70 @@ def export_pose(out_dir: str, imgsz: int, workspace: float | None,
     return [target]
 
 
+# ── skeleton-action engine ───────────────────────────────────────────────────
+
+DEFAULT_ACTION_WINDOW = 48
+
+
+def export_action(out_dir: str, window: int, workspace: float | None,
+                  checkpoint: str | None) -> list[str]:
+    """Build the ST-GCN++ skeleton-action engine for plugins/pose_stgcn.py.
+
+    Unlike the three above, this one needs a **checkpoint you supply**: pass
+    `--action-checkpoint` pointing at a PYSKL ST-GCN++ NTU60-XSub *2D* joint
+    weight file (the `j.pth` from the stgcn++_ntu60_xsub_hrnet config). There is
+    no ultralytics-style auto-download, and guessing a URL for weights whose
+    licence and provenance matter is not something this script should do.
+
+    It also needs `pyskl`/`mmaction2` + torch importable, which the perception
+    image does not carry — so this step runs in a throwaway container like the
+    others, with those installed alongside onnx/onnxslim.
+
+    Input is (N, M, T, V, C) = (1, 1, window, 17, 2), PYSKL's FormatGCNInput
+    order, matching `SkeletonActionBackend._build_input`. The temporal size is
+    baked into the engine, and the backend reads it back off the engine rather
+    than trusting its own constant — but the two still have to agree about the
+    *layout*, which is why both name it in the same order.
+    """
+    try:
+        import torch
+    except ImportError as exc:                           # pragma: no cover
+        raise RuntimeError("torch is required to export the action engine") from exc
+
+    if not checkpoint or not os.path.isfile(checkpoint):
+        raise RuntimeError(
+            "--action-checkpoint must point at a PYSKL ST-GCN++ NTU60-XSub-2D "
+            "joint checkpoint (.pth). Nothing is auto-downloaded here: these "
+            "weights carry a licence and a provenance, and a URL guessed by a "
+            "build script is the wrong way to acquire either."
+        )
+
+    from pyskl.models import build_model          # noqa: F401 — presence check
+    from mmcv import Config
+
+    raise RuntimeError(
+        "the ONNX export path for ST-GCN++ is not implemented here yet.\n"
+        "\n"
+        "What is missing is only the graph export, and it is deliberately not "
+        "guessed: PYSKL's recogniser wraps the backbone in a test-time pipeline "
+        "(`forward_test` averages over clips and people), so exporting the "
+        "recogniser gives a graph whose input is not the tensor the robot has. "
+        "The backbone + head have to be traced directly on a "
+        f"(1, 1, {window}, 17, 2) input, and that wiring depends on the pyskl "
+        "version in the container.\n"
+        "\n"
+        "Until that is written, build the ONNX by hand with the same input "
+        "layout and put it through `trtexec --fp16`, then record the size and "
+        "SHA256 of the copy downloaded back from COS in "
+        "ACTION_MODEL_BUNDLES. The pose card runs `action_backend: rules` "
+        "meanwhile and says so in `info`."
+    )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--model", choices=("vop", "depth", "pose", "both"),
+    parser.add_argument("--model",
+                        choices=("vop", "depth", "pose", "action", "both"),
                         default="both")
     parser.add_argument("--imgsz", type=int, default=640)
     parser.add_argument("--out", default="./engines")
@@ -221,6 +282,11 @@ def main() -> int:
     # builder workspace is not a soft preference — on an 8 GB Orin already
     # running the perception stack it gets the build OOM-killed outright
     # (observed on jp5.11: "Killed" mid-[GpuLayer], no Python traceback). Cap it.
+    parser.add_argument("--action-checkpoint", default=None,
+                        help="PYSKL ST-GCN++ NTU60-XSub-2D joint checkpoint "
+                             "(.pth) for --model action")
+    parser.add_argument("--action-window", type=int, default=DEFAULT_ACTION_WINDOW,
+                        help="frames the action engine takes (default %(default)s)")
     parser.add_argument("--pose-weights", default=DEFAULT_POSE_WEIGHTS,
                         help="pose weights to export (default %(default)s). "
                              "Changing this also means updating "
@@ -248,6 +314,11 @@ def main() -> int:
     if args.model in ("both", "pose"):
         produced += export_pose(args.out, args.imgsz, workspace,
                                 weights=args.pose_weights)
+    # Not in "both": it needs a checkpoint the caller supplies, so it would
+    # break every vop/depth/pose export if it were on by default.
+    if args.model == "action":
+        produced += export_action(args.out, args.action_window, workspace,
+                                  args.action_checkpoint)
 
     print("\n[export] record these in utils/model_downloader.py — but re-hash "
           "the COPY DOWNLOADED BACK FROM COS, not these local files: a pin that "

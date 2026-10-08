@@ -220,13 +220,35 @@ class PoseFrame:
     quantities, and so a feature can be asserted on directly in a test.
     """
 
-    __slots__ = ("t", "box", "keypoints", "height", "min_conf",
+    __slots__ = ("t", "box", "keypoints", "height", "min_conf", "image_size",
                  "shoulder", "hip", "torso_deg", "knee_deg", "hip_deg",
                  "hip_knee_dy", "hip_ankle_dy", "aspect", "torso_px",
                  "has_torso", "has_legs")
 
-    def __init__(self, t: float, box, keypoints: np.ndarray, min_conf: float):
+    def __init__(self, t: float, box, keypoints: np.ndarray, min_conf: float,
+                 image_size=None):
+        # Checked here rather than at each use: this class indexes fixed COCO
+        # slots by name, so a differently-sized array fails as an IndexError
+        # from somewhere deep in the geometry — which reads as a bug in the
+        # rules rather than as the wrong input it is.
+        shape = getattr(keypoints, "shape", None)
+        if shape is None or len(shape) != 2 or shape[0] != N_KEYPOINTS or shape[1] < 3:
+            raise ValueError(
+                f"keypoints must be ({N_KEYPOINTS}, 3+) — x, y and visibility "
+                f"for each COCO-17 joint; got {shape}"
+            )
         self.t = float(t)
+        # The frame these pixel coordinates are in. The geometry rules never
+        # need it — every threshold there is relative to the body — but a
+        # learned backend does: PYSKL normalises a skeleton by the *frame*,
+        # because where the person is and how large they appear within it is
+        # information the network was trained with. Optional, and None is
+        # honest; plugins/pose_stgcn.py refuses rather than guessing, since
+        # guessing it from the bounding box would be a silent misnormalisation
+        # and those produce confident nonsense rather than errors.
+        self.image_size = (tuple(int(v) for v in image_size)
+                           if image_size and image_size[0] and image_size[1]
+                           else None)
         self.box = [float(v) for v in box]
         self.keypoints = keypoints
         self.min_conf = float(min_conf)
@@ -721,6 +743,15 @@ class PoseActionClassifier:
         self.action_window_s = float(action_window_s)
 
     @property
+    def last_error(self) -> Optional[str]:
+        """Nothing to report: the geometry has no engine that can fail.
+
+        Present so the three backends answer the same questions — the card's
+        `info` asks every backend this without knowing which one it holds.
+        """
+        return None
+
+    @property
     def history_s(self) -> float:
         """How much history the tracker has to keep for these rules to work.
 
@@ -952,7 +983,7 @@ class PoseTracker:
             return None
         return 1.0 - travel / self.centroid_max_travel
 
-    def update(self, boxes, keypoints, now: float) -> list:
+    def update(self, boxes, keypoints, now: float, image_size=None) -> list:
         """Associate this frame's detections, returning one track per detection
         in the order the detections came in (so the caller can zip them)."""
         self._expire(now)
@@ -986,7 +1017,7 @@ class PoseTracker:
                 self._tracks.append(track)
             frame = PoseFrame(now, box, np.asarray(keypoints[d_index],
                                                    dtype=np.float32),
-                              self.min_conf)
+                              self.min_conf, image_size=image_size)
             track.history.append(frame)
             track.last_seen = now
             self._trim(track, now)

@@ -2555,6 +2555,97 @@ Three rules worth knowing before reading the thresholds:
   `evidence` to the top level, because "someone is pointing" is far less
   actionable than where.
 
+### Action backends: `hybrid` (default), `rules`, `stgcn`
+
+The first version of this card had one backend — hand-written geometry — and on
+a robot it was poor enough that standing, sitting, waving and falling were all
+unreliable. Two of those were outright bugs (see the two subsections above on
+angles and on track continuity); the rest is a ceiling. Hand-tuned ratios over
+2D keypoints from a low camera will only ever get so far, so the card now
+selects a backend.
+
+| `action_backend` | postures | `fall` / `waving` / `pointing` | needs an engine |
+|---|---|---|---|
+| `hybrid` **(default)** | geometry | ST-GCN++ | yes, degrades to `rules` |
+| `rules` | geometry | geometry | no |
+| `stgcn` | — see below | ST-GCN++ | yes |
+
+**ST-GCN++, joint stream, NTU60-XSub, 2D 17-keypoint input.** 1.39 M parameters
+and 1.95 GFLOPs, top-1 89.3% on that benchmark, where ST-GCN is 3.1 M/3.8 G,
+AGCN 3.5 M/4.4 G and CTR-GCN 1.43 M/2.82 G — so it is both the smallest and the
+most accurate of the options with a published 2D-COCO17 checkpoint. Single
+stream, not the four-stream ensemble: 4x the compute for +3.9 points. Against
+the `yolo26s-pose` engine already running ahead of it (10.4 M / 24.1 G) the
+action model is **13% of the parameters and 8% of the compute**.
+
+It runs on **TensorRT**, not ONNX Runtime, and that is not a performance
+preference: a second ONNX Runtime in this process shares one provider bridge
+with the first, which throws on jp6.1 and SIGSEGVs the whole of perception on
+jp5.11.
+
+**Why the default is `hybrid` and not `stgcn`.** NTU-60's label space is built
+from events and transitions, not postures. It has `sit down` (A08), `stand up`
+(A09), `falling down` (A43), `hand waving` (A23) and `pointing` (A31) — and no
+`standing` class and no `sitting` class, because a motionless person is not an
+action. A bare `stgcn` backend therefore maps those two *transitions* onto our
+two *states*, which only fires while someone is in the act of getting up or
+sitting down; a person who has been standing still for a minute produces no
+event at all and reads as `unknown`. `list_actions` returns
+`transition_derived_actions` so a caller can see which labels are like that.
+NTU's mutual classes (A50-A60) are not mapped at all — they are defined on a
+*pair* of skeletons and this backend is fed one person at a time, which is also
+why `walking` stays with the geometry.
+
+Where both backends have an opinion, the learned one wins on its own classes and
+defers on the transitions. `point_direction` always comes from the geometry: the
+model names the act, only the geometry measures where.
+
+**fps matters now in a way it did not before.** The geometry judges most things
+per frame; a skeleton-action model judges a *clip*. At 5 fps a 2.5 s window is
+13 real frames resampled up to the engine's 48, most of it interpolation — and
+the frequency of a wave and the speed of a fall live in exactly those frames. So
+the default fps is **12**, and below that `info` returns an `action_fps_note`.
+The card does not refuse: a thin window still beats no actions, but a quietly
+starved model looks like a wrong model, and that is weeks of misdirected tuning.
+
+**The preprocessing is where this silently fails.** PYSKL's pipeline is
+`PreNormalize2D` → `GenSkeFeat('j')` → `UniformSample(T)` → `FormatGCNInput`,
+and a model fed a differently-normalised skeleton returns confident nonsense
+rather than an error. It is reimplemented in `plugins/pose_stgcn.py` rather than
+imported, because pulling in pyskl/mmaction2 would drag torch into an image that
+deliberately carries neither. Two details worth knowing:
+
+* Normalisation is by the **frame**, not by the person's box. Where someone
+  stands and how large they appear within the frame is information the network
+  trained with. `PoseFrame` therefore carries `image_size`, and the backend
+  **refuses** rather than deriving it from the bounding box — that substitution
+  looks reasonable and is a silent misnormalisation.
+* `UniformSample` is made deterministic (the centre of each bin). Random offsets
+  are for training; a robot wants the same answer twice for the same input.
+
+**Engine not published yet.** `ACTION_MODEL_BUNDLES` has zero pins, so
+`ensure_action_model` raises with the build instructions instead of fetching
+anything unverified. A card configured `hybrid` therefore runs the geometry
+today and says so — `action_backend_effective`, `action_backend_note` and
+`action_engine_error` in `info`. That reporting is the point: a card running
+geometry while its config names a model is how the model gets blamed for the
+geometry's mistakes.
+
+`tools/export_vision_engines.py --model action` needs a checkpoint you supply
+(`--action-checkpoint`, a PYSKL ST-GCN++ NTU60-XSub-2D joint `.pth`). Nothing is
+auto-downloaded: those weights carry a licence and a provenance, and a URL
+guessed by a build script is the wrong way to acquire either. The ONNX export
+itself is **not implemented yet** and says so when run, rather than producing a
+graph whose input is not the tensor the robot has — PYSKL's recogniser wraps the
+backbone in a test-time pipeline that averages over clips and people, so the
+backbone and head have to be traced directly on a `(1, 1, T, 17, 2)` input.
+
+**None of the learned path has run against real weights.** The tests cover the
+tensor layout, the normalisation arithmetic, the sampling, the logit/probability
+handling, the label mapping and every failure path — against a fake engine. They
+cannot establish that ST-GCN++ agrees with these labels on a robot. Read a green
+suite as "the plumbing is right".
+
 ### Occlusion is `unknown`, and that is the point
 
 A person behind a desk has no visible hips or knees — and sitting and standing

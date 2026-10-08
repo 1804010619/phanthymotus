@@ -1265,6 +1265,34 @@ POSE_MODEL_BUNDLES = {
 }
 
 
+# Skeleton-action recognition for the pose card: ST-GCN++, joint stream,
+# NTU60-XSub, 2D 17-keypoint input. 1.39 M params and 1.95 GFLOPs at 100 frames,
+# top-1 89.3% — the smallest of the options with a published 2D-COCO17
+# checkpoint, and on that benchmark also the most accurate (ST-GCN 3.1 M/3.8 G,
+# AGCN 3.5 M/4.4 G). Single stream, not the four-stream ensemble: 4x the compute
+# for +3.9 points.
+#
+# Unpinned, like POSE_MODEL_BUNDLES['jp511'] was: the ONNX has to be exported
+# from the PYSKL checkpoint and the engine built inside each target perception
+# image. ensure_action_model therefore raises with the build instructions rather
+# than fetching anything unverified, and the pose card falls back to the `rules`
+# backend with that message in `info` instead of failing.
+ACTION_MODEL_BUNDLES = {
+    "jp61": {
+        "base_url": f"{VISION_MODEL_BASE}/stgcnpp-ntu60-2d/tensorrt-jp61-trt10.4-orin-t48",
+        "files": {
+            "stgcnpp-ntu60-2d.engine": {"size": 0, "sha256": ""},
+        },
+    },
+    "jp511": {
+        "base_url": f"{VISION_MODEL_BASE}/stgcnpp-ntu60-2d/tensorrt-jp511-trt8.5-orin-t48",
+        "files": {
+            "stgcnpp-ntu60-2d.engine": {"size": 0, "sha256": ""},
+        },
+    },
+}
+
+
 def _ensure_vision_bundle(
     kind: str, bundles: dict, model_dir: str, family: str | None = None,
     progress_cb=None,
@@ -1311,6 +1339,13 @@ def ensure_depth_model(model_dir: str, family: str | None = None,
                        progress_cb=None) -> dict[str, str]:
     """Ensure the monocular depth engine matching the runtime TensorRT is present."""
     return _ensure_vision_bundle("depth", DEPTH_MODEL_BUNDLES, model_dir, family,
+                                 progress_cb=progress_cb)
+
+
+def ensure_action_model(model_dir: str, family: str | None = None,
+                        progress_cb=None) -> dict[str, str]:
+    """Ensure the skeleton-action engine matching the runtime TensorRT is present."""
+    return _ensure_vision_bundle("action", ACTION_MODEL_BUNDLES, model_dir, family,
                                  progress_cb=progress_cb)
 
 

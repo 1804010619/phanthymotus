@@ -57,10 +57,16 @@ from plugins.image_input import BadInput, load_image_bytes
 from plugins.pose_action import (
     ACTION_LABELS_ZH,
     DEFAULT_THRESHOLDS,
-    PoseActionClassifier,
     PoseFrame,
     PoseTracker,
     action_catalogue,
+)
+from plugins.pose_stgcn import (
+    BACKENDS,
+    DEFAULT_MIN_SCORE,
+    DEFAULT_WINDOW_S,
+    NTU60_TO_ACTION,
+    build_backend,
 )
 from plugins.vision_runtime import COCO_KEYPOINTS, COCO_SKELETON, N_KEYPOINTS
 
@@ -96,6 +102,15 @@ _DEFAULT_INSTANCE = "_default"
 DEFAULT_MODEL = "yolo26s-pose"
 
 KEYPOINT_LEVELS = ("off", "compact", "full")
+
+ACTION_BACKENDS = tuple(BACKENDS)
+
+# Below this, a temporal backend is being starved. ST-GCN++ classifies a clip,
+# and at 5 fps a 2.5 s window is 13 real frames resampled up to the engine's 48
+# — mostly interpolation. The card does not refuse (a thin window still beats
+# no actions at all) but it says so in `info`, because a quietly starved model
+# looks like a wrong model.
+MIN_FPS_FOR_TEMPORAL_BACKEND = 12
 
 
 def output_topic_for(input_topic: Optional[str]) -> str:
@@ -189,7 +204,7 @@ TOOLS = [
             "type": "object",
             "properties": {
                 "confidence": {"type": "number", "minimum": 0.0, "maximum": 1.0, "description": "人体检测置信度阈值", "default": 0.4, "scope": "instance"},
-                "fps": {"type": "integer", "minimum": 1, "description": "每秒最多推理几帧", "default": 5, "scope": "instance"},
+                "fps": {"type": "integer", "minimum": 1, "description": "每秒最多推理几帧。12 而不是 5：几何规则逐帧就能判，但骨架动作模型判的是一段视频 —— 2.5s 窗口在 5 fps 下只有 13 帧真实数据，要重采样到 engine 的 48 帧，大部分是插值。低于 12 时 info 会给出 action_fps_note", "default": 12, "scope": "instance"},
                 "kpt_confidence": {"type": "number", "minimum": 0.0, "maximum": 1.0, "description": "单个关键点的可见性阈值。低于此值的关节既不参与动作判定也不绘制 —— 比把它当成 (0,0) 画出来强", "default": 0.3, "scope": "instance"},
                 "max_persons": {"type": "integer", "minimum": 1, "description": "单帧最多处理几个人（按检测置信度取前 N 个）", "default": 5, "scope": "instance"},
                 # Governs the LEAN topic only. The skeleton topic always carries
@@ -199,7 +214,8 @@ TOOLS = [
                 "publish_bbox": {"type": "boolean", "description": "lean 流里带上像素框 [x1,y1,x2,y2]", "default": True, "scope": "instance"},
                 "publish_overlay": {"type": "boolean", "description": "另发一条把骨架画在原始画面上的 JPEG（{topic}/poses/overlay_img）。每帧多一次绘制+编码，外加一条跑 JPEG 的话题，所以默认关闭；要录给人看时再开", "default": False, "scope": "instance"},
                 "action_window_s": {"type": "number", "minimum": 0.2, "description": "动作判定回看多少秒。挥手频率和步频都是在这个窗口里数出来的", "default": 1.5, "scope": "instance"},
-                "action_backend": {"type": "string", "enum": ["rules"], "description": "动作分类后端。rules = 关键点几何规则（纯 numpy，无额外模型）。预留给以后的骨架动作模型", "default": "rules", "scope": "instance"},
+                "action_backend": {"type": "string", "enum": list(ACTION_BACKENDS), "description": "动作分类后端。hybrid（默认）= 姿态走几何规则、跌倒/挥手/指向走 ST-GCN++ 骨架动作模型；rules = 只用几何规则，不需要第二个 engine；stgcn = 只用模型（注意 NTU-60 里没有「站立」「坐」这两个状态类，所以站/坐会变成 unknown）。模型是 1.39M 参数/1.95 GFLOPs，约为 pose engine 的 8% 算力", "default": "hybrid", "scope": "instance"},
+                "action_min_score": {"type": "number", "minimum": 0.0, "maximum": 1.0, "description": "骨架动作模型的得分阈值，低于它不报。调之前先看 info 里 last_prediction 的实际得分 —— 那是区分「模型判错」和「阈值定错」的唯一办法", "default": DEFAULT_MIN_SCORE, "scope": "instance"},
                 # Exposed because they are NOT constants: the same fall measures
                 # differently depending on where the camera is mounted.
                 "fall_drop_ratio": {"type": "number", "minimum": 0.05, "maximum": 1.0, "description": "判定跌倒所需的髋部下降幅度，按站立身高的比例。和机位强相关 —— 相机离地 0.4 m 和 1.2 m 量同一次跌倒得到的数不一样，务必在真机上调", "default": DEFAULT_THRESHOLDS["fall_drop_ratio"], "scope": "instance"},
@@ -392,11 +408,13 @@ class _PoseNode(Node):
         kept_scores = [float(scores[i]) for i in order]
         kept_keypoints = [keypoints[i] for i in order]
 
-        # The tracker's clock is the frame's, not the wall's: every temporal
-        # threshold in pose_action is in seconds of video.
-        tracks = self._tracker.update(boxes, kept_keypoints, now_wall)
-
         height, width = frame.shape[:2] if hasattr(frame, "shape") else (0, 0)
+        # The tracker's clock is the frame's, not the wall's: every temporal
+        # threshold in pose_action is in seconds of video. The frame size goes
+        # with it because a learned backend normalises the skeleton by the
+        # frame, and cannot derive that from the keypoints.
+        tracks = self._tracker.update(boxes, kept_keypoints, now_wall,
+                                      image_size=(width, height))
         half_w, half_h = max(width / 2.0, 1.0), max(height / 2.0, 1.0)
 
         persons = []
@@ -579,7 +597,7 @@ class PosePerceptionPlugin:
         # max_image_bytes straight from it (plugins/image_input.py).
         self._plugin_cfg = dict(plugin_cfg or {})
         self._confidence = float(plugin_cfg.get("confidence", 0.4))
-        self._fps = int(plugin_cfg.get("fps", 5))
+        self._fps = int(plugin_cfg.get("fps", 12))
         self._kpt_confidence = float(
             plugin_cfg.get("kpt_confidence", DEFAULT_THRESHOLDS["kpt_confidence"]))
         self._max_persons = int(plugin_cfg.get("max_persons", 5))
@@ -587,6 +605,12 @@ class PosePerceptionPlugin:
         self._publish_bbox = bool(plugin_cfg.get("publish_bbox", True))
         self._publish_overlay = bool(plugin_cfg.get("publish_overlay", False))
         self._action_window_s = float(plugin_cfg.get("action_window_s", 1.5))
+        self._action_backend = str(plugin_cfg.get("action_backend", "hybrid"))
+        self._action_min_score = float(
+            plugin_cfg.get("action_min_score", DEFAULT_MIN_SCORE))
+        # Why a temporal backend may be unavailable, kept so `info` can say it
+        # instead of the card looking like it chose the geometry on purpose.
+        self._backend_fallback: Optional[str] = None
         self._model_name = str(plugin_cfg.get("model", DEFAULT_MODEL) or DEFAULT_MODEL)
 
         self._model = None  # lazy: see the module docstring on memory
@@ -628,6 +652,10 @@ class PosePerceptionPlugin:
             "publish_overlay": bool(icfg.get("publish_overlay", self._publish_overlay)),
             "action_window_s": float(icfg.get("action_window_s",
                                               self._action_window_s)),
+            "action_backend": str(icfg.get("action_backend",
+                                           self._action_backend)),
+            "action_min_score": float(icfg.get("action_min_score",
+                                               self._action_min_score)),
         }
         for key in _THRESHOLD_KEYS:
             if key in icfg and icfg[key] is not None:
@@ -636,11 +664,37 @@ class PosePerceptionPlugin:
                 merged[key] = self._plugin_cfg[key]
         return merged
 
-    def _classifier_for(self, merged: dict) -> PoseActionClassifier:
+    def _classifier_for(self, merged: dict):
+        """Build the configured action backend.
+
+        Falls back to `rules` when a temporal backend cannot be had — there is
+        no published action engine yet, and a robot with no route to COS is the
+        other case. The fallback is *recorded* rather than silent: a card
+        running geometry while its config says `hybrid` is exactly the kind of
+        divergence that gets diagnosed as "the model is bad".
+        """
         thresholds = {key: merged[key] for key in _THRESHOLD_KEYS if key in merged}
         thresholds.setdefault("kpt_confidence", merged["kpt_confidence"])
-        return PoseActionClassifier(thresholds=thresholds,
-                                    action_window_s=merged["action_window_s"])
+        name = merged["action_backend"]
+        self._backend_fallback = None
+        if name == "rules":
+            return build_backend("rules", thresholds=thresholds,
+                                 action_window_s=merged["action_window_s"])
+        try:
+            return build_backend(
+                name,
+                thresholds=thresholds,
+                action_window_s=merged["action_window_s"],
+                window_s=max(merged["action_window_s"], DEFAULT_WINDOW_S),
+                min_score=merged["action_min_score"],
+            )
+        except Exception as error:  # noqa: BLE001 — the card must still work
+            self._backend_fallback = (
+                f"action_backend={name!r} unavailable ({error}); "
+                f"running the geometry rules instead")
+            log.warning("[pose] %s", self._backend_fallback)
+            return build_backend("rules", thresholds=thresholds,
+                                 action_window_s=merged["action_window_s"])
 
     # ── engine ───────────────────────────────────────────────────────────
 
@@ -947,9 +1001,36 @@ class PosePerceptionPlugin:
             return self._recognize_image(args, url_action="recognize_by_url")
 
         elif action == "list_actions":
+            effective = self._effective_backend()
+            available = (sorted(set(NTU60_TO_ACTION.values()))
+                         if effective == "stgcn" else sorted(ACTION_LABELS_ZH))
+            # Which of those are inferred from a *transition* rather than
+            # observed as a state. `standing` from NTU's "stand up" only fires
+            # while someone is getting up — a person who has been standing
+            # still for a minute produces no event and reads as unknown. That
+            # distinction is the whole reason `hybrid` exists, so it has to be
+            # legible here and not just in a docstring.
+            from plugins.pose_stgcn import NTU60_TRANSITIONS
+            transition_labels = sorted({
+                label for index, label in NTU60_TO_ACTION.items()
+                if index in NTU60_TRANSITIONS
+            }) if effective == "stgcn" else []
             return {
                 "ok": True,
-                "backend": "rules",
+                "backend": effective,
+                "available_actions": available,
+                "transition_derived_actions": transition_labels,
+                "backend_note": (
+                    "stgcn 单独使用时只能产出 NTU-60 里有的那几类。注意 NTU 里"
+                    "没有「站立」「坐」这两个**状态**类，只有 stand up / sit down "
+                    "这种**转换** —— 所以这里的 standing/sitting 只在人起身/坐下"
+                    "的那几秒出现（回复里的 transition_derived_actions 列的就是"
+                    "这些），一个已经站着不动一分钟的人不产生任何事件，会报 "
+                    "unknown。hybrid 就是为此存在的：姿态走几何、事件走模型"
+                    if effective == "stgcn" else
+                    "hybrid：姿态标签来自关键点几何，跌倒/挥手/指向来自 ST-GCN++"
+                    if effective == "hybrid" else
+                    "rules：全部标签来自关键点几何，不需要第二个 engine"),
                 "actions": action_catalogue(),
                 "note": ("姿态标签来自关键点几何，事件标签（跌倒）判的是「转换」"
                          "而不是终态 —— 躺在地上和躺在沙发上是同一个终态。"
@@ -1038,7 +1119,8 @@ class PosePerceptionPlugin:
             "state": "running" if instances else "idle",
             "keypoints": N_KEYPOINTS,
             "keypoint_names": list(COCO_KEYPOINTS),
-            "action_backend": "rules",
+            "action_backend": self._action_backend,
+            "action_backend_effective": self._effective_backend(),
             "actions": sorted(ACTION_LABELS_ZH),
             "instances": instances,
             "topic_in": topics_in,
@@ -1046,6 +1128,40 @@ class PosePerceptionPlugin:
             "desc": ("COCO-17 human keypoints + action labels (TensorRT); "
                      "lean JSON for the agent, full skeleton for the dashboard"),
         }
+
+        # Why the configured backend is not the one running, when that is the
+        # case. Without this the card looks like it chose the geometry.
+        if self._backend_fallback:
+            info["action_backend_note"] = self._backend_fallback
+
+        # A backend can construct fine and then fail on every inference — the
+        # engine is fetched lazily, and there is no published action engine yet.
+        # Reported, because otherwise the card says `hybrid` while answering
+        # from geometry and the model gets blamed for the geometry's mistakes.
+        engine_errors = {
+            key: node._classifier.last_error
+            for key, node in nodes.items()
+            if getattr(node, "_classifier", None) is not None
+            and node._classifier.last_error
+        }
+        if engine_errors:
+            info["action_engine_error"] = engine_errors
+
+        # A temporal backend classifies a *clip*, so it is starved by a low fps
+        # in a way the geometry is not. Said here rather than enforced: a thin
+        # window still beats no actions, but a quietly starved model looks like
+        # a wrong model, and that is weeks of misdirected tuning.
+        if self._action_backend != "rules":
+            configured_fps = [node._fps for node in nodes.values()] or [self._fps]
+            if min(configured_fps) < MIN_FPS_FOR_TEMPORAL_BACKEND:
+                info["action_fps_note"] = (
+                    f"fps={min(configured_fps)} 对 action_backend="
+                    f"{self._action_backend!r} 偏低：模型判的是一段视频，"
+                    f"{self._action_window_s}s 窗口在这个帧率下只有约 "
+                    f"{int(min(configured_fps) * self._action_window_s)} 帧真实数据，"
+                    f"要被重采样到 engine 的 48 帧 —— 大部分是插值出来的。"
+                    f"挥手/跌倒这类动作建议 fps >= "
+                    f"{MIN_FPS_FOR_TEMPORAL_BACKEND}")
 
         # Pass the camera's optics on. Nothing about the picture's geometry
         # changes here — this card reads the frame and publishes text — so the
@@ -1071,6 +1187,10 @@ class PosePerceptionPlugin:
                     "横向偏移，下游拿不到视场角就没法换算成角度。相机卡片补上声明"
                     "即可，见 phanthymotus-driver/README_dev.md 的 Camera Parameters")
         return info
+
+    def _effective_backend(self) -> str:
+        """The backend actually running, which is not always the configured one."""
+        return "rules" if self._backend_fallback else self._action_backend
 
     def _start(self, args: dict, instance_id: str) -> dict:
         input_topic = args.get("input_topic")
@@ -1163,6 +1283,10 @@ class PosePerceptionPlugin:
             self._publish_overlay = bool(cfg["publish_overlay"])
         if "action_window_s" in cfg:
             self._action_window_s = float(cfg["action_window_s"])
+        if "action_backend" in cfg:
+            self._action_backend = str(cfg["action_backend"])
+        if "action_min_score" in cfg:
+            self._action_min_score = float(cfg["action_min_score"])
         for key in _THRESHOLD_KEYS:
             if key in cfg:
                 self._plugin_cfg[key] = cfg[key]

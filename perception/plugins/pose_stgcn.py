@@ -1,0 +1,518 @@
+#!/usr/bin/env python3
+"""
+plugins/pose_stgcn.py — ST-GCN++ skeleton-action backend for the pose card.
+
+The learned alternative to `plugins/pose_action.py`'s geometry. Takes the same
+per-person `PoseFrame` history and returns the same dict, so the plugin does not
+know which one it is talking to — that interface is why `classify()` has always
+taken plain frames and returned a plain dict.
+
+**Model: ST-GCN++, joint stream, NTU60-XSub, 2D 17-keypoint input.** 1.39 M
+parameters and 1.95 GFLOPs at 100 frames (MMAction2's figures for the
+NTU60-XSub-2D setting), top-1 89.3%. On the same benchmark ST-GCN is
+3.1 M/3.8 G, AGCN 3.5 M/4.4 G and CTR-GCN 1.43 M/2.82 G, so this is both the
+smallest and the most accurate of the options with published 2D-COCO17
+checkpoints. Single joint stream rather than the four-stream ensemble: 4x the
+compute for +3.9 points is not the small choice, and the card already spends
+24.1 GFLOPs on `yolo26s-pose` ahead of it.
+
+**TensorRT, not ONNX Runtime.** Not a performance preference — a second ONNX
+Runtime in this process shares one provider bridge with the first, which throws
+on jp6.1 and SIGSEGVs the whole of perception on jp5.11. See
+`plugins/kokoro_worker.py`.
+
+**What this backend cannot do, and why the default is `hybrid`.** NTU-60's label
+space is built from *transitions and events*, not postures: it has `sit down`
+(A08), `stand up` (A09), `falling down` (A43), `hand waving` (A23), `pointing to
+something with finger` (A31). There is no `standing` class and no `sitting`
+class, because a motionless person is not an action. So a straight swap would
+lose the posture labels entirely. `hybrid` runs this backend for what it is good
+at — the dynamic and event labels — and keeps the (now angle-based) geometry for
+the postures.
+
+**The preprocessing is the part that fails silently.** PYSKL's pipeline is
+`PreNormalize2D` → `GenSkeFeat('j')` → `UniformSample(T)` → `FormatGCNInput`,
+and a model fed a differently-normalised skeleton returns confident nonsense
+rather than an error. It is reimplemented here rather than imported, because
+pulling in mmaction2/pyskl would drag torch and a dependency tree into an image
+that deliberately carries neither. The version-sensitive surface is kept to two
+calls — `_build_input` and `_run` — which is the shape
+`actucore/tests/test_smolvla_provider.py` established for a provider whose model
+cannot be loaded on a laptop.
+
+**Unverified against real weights.** There is no checkpoint published for this
+yet, so everything below is covered against a fake engine only: the tensor
+shapes, the normalisation arithmetic, the sampling, the label mapping and the
+failure paths. Whether ST-GCN++ agrees with our labels on a real robot is not
+something these tests can establish. Treat "merged" as "the plumbing is right".
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+import threading
+from typing import Optional
+
+import numpy as np
+
+from plugins.pose_action import (
+    ACTION_PRIORITY,
+    DEFAULT_THRESHOLDS,
+    EVENT_ACTIONS,
+    PoseActionClassifier,
+)
+from plugins.vision_runtime import COCO_INDEX, N_KEYPOINTS
+
+log = logging.getLogger(__name__)
+
+# Frames the network is fed. PYSKL's NTU configs uniform-sample 100; 48 is used
+# here because the card's history is bounded by what the rules need (a few
+# seconds) and because sampling 48 slots out of ~30 real frames interpolates
+# less than stretching them over 100. It must match whatever the engine was
+# exported with — `_build_input` reads the engine's own input shape and uses
+# that, so this is only the fallback when the engine does not declare one.
+DEFAULT_WINDOW_FRAMES = 48
+
+# How much video the window should span. ST-GCN needs an action to be *in* the
+# clip: NTU samples are 1-5 s. At the card's default 5 fps a 2 s window is 10
+# real frames, which is thin — hence the fps coupling the plugin warns about.
+DEFAULT_WINDOW_S = 2.5
+
+# NTU-60 class index → our label. Only the classes this project has a label for
+# and that a single-person skeleton can support; everything else maps to None and
+# is treated as "this model has nothing to say", not as `unknown`.
+#
+# Indices are 0-based, i.e. NTU's A01 is 0. Mutual (two-person) classes A50-A60
+# are deliberately absent: they are defined on a *pair* of skeletons and this
+# backend is fed one person at a time, so a confident prediction there would be
+# meaningless. That includes A59/A60 walking-towards/apart, which is why
+# `walking` is not available from this backend and stays with the geometry.
+NTU60_TO_ACTION = {
+    7:  "sitting",        # A08 sit down      (transition → resulting state)
+    8:  "standing",       # A09 stand up
+    22: "waving",         # A23 hand waving
+    30: "pointing",       # A31 pointing to something with finger
+    42: "fall",           # A43 falling down
+}
+
+# Classes that are *transitions* in NTU but states for us. Reporting `sitting`
+# because the model saw "sit down" is an inference beyond what it was asked, so
+# in `hybrid` these defer to the geometry, which observes the state directly.
+NTU60_TRANSITIONS = {7, 8}
+
+DEFAULT_MIN_SCORE = 0.40
+
+
+class ActionBackendError(RuntimeError):
+    """Raised when the engine is unusable. Never swallowed into a label."""
+
+
+def softmax(logits: np.ndarray) -> np.ndarray:
+    """Numerically stable, because an engine may emit raw logits or probabilities
+    and we have to be able to threshold either."""
+    shifted = logits - np.max(logits)
+    exp = np.exp(shifted)
+    total = exp.sum()
+    return exp / total if total > 0 else np.full_like(exp, 1.0 / exp.size)
+
+
+def looks_like_probabilities(values: np.ndarray) -> bool:
+    """Has this engine already applied a softmax?
+
+    Decided by content, the same way `decode_poses` picks its tensor: an export
+    with the softmax folded in and one without differ in nothing but the numbers,
+    and running softmax twice flattens the distribution towards uniform — which
+    shows up as every score sitting below the threshold and the backend
+    reporting nothing, with no error anywhere.
+    """
+    if values.size == 0:
+        return False
+    return bool(np.all(values >= -1e-4) and np.all(values <= 1.0 + 1e-4)
+                and abs(float(values.sum()) - 1.0) < 1e-2)
+
+
+def uniform_sample_indices(available: int, wanted: int) -> np.ndarray:
+    """PYSKL's UniformSample, deterministic (centre of each bin).
+
+    Bins the clip into `wanted` equal spans and takes the middle of each, so a
+    short clip repeats frames and a long one drops them, both evenly. Random
+    offsets are for training; a robot wants the same answer twice for the same
+    input.
+    """
+    if available <= 0:
+        raise ActionBackendError("cannot sample an empty keypoint sequence")
+    edges = np.linspace(0, available, wanted + 1)
+    centres = (edges[:-1] + edges[1:]) / 2.0
+    return np.clip(centres.astype(np.int64), 0, available - 1)
+
+
+def pre_normalize_2d(keypoints: np.ndarray, image_size) -> np.ndarray:
+    """PYSKL `PreNormalize2D`: pixels → [-1, 1] about the frame centre.
+
+    (T, V, 2) in, same shape out. This is the step whose details decide whether
+    the network sees what it was trained on, and getting it wrong raises nothing
+    — hence the explicit arithmetic and the tests on it.
+
+    PYSKL normalises by the *frame*, not by the person's box. That matters: the
+    person's position and apparent size within the frame are information the
+    network was trained with, and re-centring on the body would throw them away.
+    """
+    width, height = image_size
+    if not (width > 0 and height > 0):
+        raise ActionBackendError(
+            f"frame size {image_size!r} is unusable; keypoints are in frame "
+            "pixels, so there is nothing to normalise against"
+        )
+    out = keypoints.astype(np.float32, copy=True)
+    out[..., 0] = out[..., 0] / (width / 2.0) - 1.0
+    out[..., 1] = out[..., 1] / (height / 2.0) - 1.0
+    return out
+
+
+class SkeletonActionBackend:
+    """ST-GCN++ over a person's keypoint history.
+
+    Interchangeable with `PoseActionClassifier`: same `classify(frames)` /
+    `classify_frame(frame)` / `history_s`, same returned dict.
+    """
+
+    def __init__(self, *, window_s: float = DEFAULT_WINDOW_S,
+                 min_score: float = DEFAULT_MIN_SCORE,
+                 model_dir: Optional[str] = None,
+                 engine=None, thresholds: Optional[dict] = None,
+                 action_window_s: Optional[float] = None):
+        self.window_s = float(action_window_s or window_s)
+        self.min_score = float(min_score)
+        self.thresholds = dict(DEFAULT_THRESHOLDS)
+        self.thresholds.update({k: v for k, v in (thresholds or {}).items()
+                                if k in DEFAULT_THRESHOLDS and v is not None})
+        self._model_dir = model_dir or os.environ.get("ACTION_MODEL_DIR",
+                                                      "/models/action")
+        self._engine = engine          # injectable, which is what makes this testable
+        self._lock = threading.Lock()
+        self._load_error: Optional[str] = None
+
+    # ── engine ───────────────────────────────────────────────────────────
+
+    @property
+    def last_error(self) -> Optional[str]:
+        """The most recent engine failure, or None.
+
+        Sticky on purpose, and surfaced by the card's `info`: there is no
+        published action engine yet, so the common case is a backend that
+        constructs fine and then cannot run. Without this the card reports
+        `action_backend: hybrid` while silently answering from geometry.
+        """
+        return self._load_error
+
+    @property
+    def history_s(self) -> float:
+        """Enough history to fill the window, and no attempt to also cover the
+        rules' fall timings — this backend judges the fall itself."""
+        return max(self.window_s, 1.0)
+
+    def _ensure_engine(self):
+        if self._engine is not None:
+            return self._engine
+        with self._lock:
+            if self._engine is not None:
+                return self._engine
+            from utils.model_downloader import ensure_action_model
+            from utils.model_progress import fetch_status
+
+            progress_cb, _ = fetch_status(lambda text: None, "stgcn++")
+            paths = ensure_action_model(self._model_dir, progress_cb=progress_cb)
+            engine = next(p for name, p in paths.items() if name.endswith(".engine"))
+            log.info("[pose/stgcn] loading action engine: %s", engine)
+            # TensorRTEngine directly, not VisionEngineSession: that class
+            # letterboxes an image, and this engine takes a skeleton tensor.
+            from utils.tensorrt_runtime import TensorRTEngine
+            self._engine = TensorRTEngine(engine)
+            return self._engine
+
+    def _window_frames(self) -> int:
+        """Frames the engine wants, from the engine itself where possible.
+
+        An ST-GCN export has a fixed temporal dimension, and feeding it a
+        different one is a shape error at best and a silent reinterpretation at
+        worst — so the engine's own declaration wins over our constant.
+        """
+        engine = self._engine
+        shape = getattr(engine, "input_shape", None) or getattr(
+            engine, "optimization_shape", None)
+        # (N, M, T, V, C) is PYSKL's FormatGCNInput order.
+        if shape is not None and len(shape) == 5 and int(shape[2]) > 0:
+            return int(shape[2])
+        return DEFAULT_WINDOW_FRAMES
+
+    # ── input construction ───────────────────────────────────────────────
+
+    def _build_input(self, frames: list, window_frames: int) -> np.ndarray:
+        """PoseFrames → (1, 1, T, 17, 2) float32, PYSKL's FormatGCNInput order.
+
+        One of the two version-sensitive calls in this class. Steps, in PYSKL's
+        order: take the joint stream, normalise by the frame, uniform-sample to
+        T. `M=1` because the card classifies one tracked person at a time.
+        """
+        if not frames:
+            raise ActionBackendError("no frames to classify")
+        image_size = _frame_size(frames)
+        arrays = [np.asarray(f.keypoints, dtype=np.float32) for f in frames]
+        # Checked before the stack, not after: np.stack on a ragged list fails
+        # with "all input arrays must have the same shape", which says nothing
+        # about joints and sends the reader to numpy rather than to the caller
+        # who supplied the wrong skeleton.
+        bad = {a.shape for a in arrays if a.ndim != 2 or a.shape[0] != N_KEYPOINTS}
+        if bad:
+            raise ActionBackendError(
+                f"every frame needs {N_KEYPOINTS} keypoints; got {sorted(bad)}")
+        raw = np.stack([a[:, :2] for a in arrays])    # (T0, V, 2)
+        normalised = pre_normalize_2d(raw, image_size)
+        indices = uniform_sample_indices(len(frames), window_frames)
+        sampled = normalised[indices]                # (T, V, 2)
+        return sampled[None, None].astype(np.float32)   # (1, 1, T, V, 2)
+
+    def _run(self, blob: np.ndarray) -> np.ndarray:
+        """Engine call → per-class scores. The other version-sensitive call."""
+        engine = self._ensure_engine()
+        outputs = engine.infer(blob)
+        arrays = [np.asarray(o, dtype=np.float32)
+                  for o in (outputs if isinstance(outputs, (list, tuple))
+                            else [outputs])]
+        for array in arrays:
+            flat = array.reshape(-1)
+            if flat.size >= max(NTU60_TO_ACTION) + 1:
+                return flat
+        raise ActionBackendError(
+            f"no engine output has at least {max(NTU60_TO_ACTION) + 1} classes; "
+            f"got shapes {[a.shape for a in arrays]} — is this an NTU-60 head?"
+        )
+
+    # ── classification ───────────────────────────────────────────────────
+
+    def predict(self, frames: list) -> dict:
+        """Raw model view: every mappable label with its score, best first.
+
+        Separate from `classify` so the plugin's `info` can show what the model
+        actually said, which is the only way to tell "the model is wrong" from
+        "the threshold is wrong" on a robot.
+        """
+        current = frames[-1]
+        window = [f for f in frames if current.t - f.t <= self.window_s] or [current]
+        self._ensure_engine()
+        blob = self._build_input(window, self._window_frames())
+        scores = self._run(blob)
+        if not looks_like_probabilities(scores):
+            scores = softmax(scores)
+        ranked = sorted(
+            ((label, float(scores[index]), index)
+             for index, label in NTU60_TO_ACTION.items() if index < scores.size),
+            key=lambda item: item[1], reverse=True,
+        )
+        return {
+            "frames_used": len(window),
+            "window_frames": self._window_frames(),
+            "scores": [{"action": label, "score": round(score, 3),
+                        "ntu_class": index + 1,
+                        "transition": index in NTU60_TRANSITIONS}
+                       for label, score, index in ranked],
+        }
+
+    def classify(self, frames: list) -> dict:
+        if not frames:
+            return _nothing("no frames")
+        try:
+            prediction = self.predict(frames)
+        except ActionBackendError as error:
+            # Not turned into a label: a backend that cannot run must say so,
+            # because `unknown` would be indistinguishable from "nobody is
+            # doing anything" and would hide a broken engine for weeks.
+            self._load_error = str(error)
+            log.warning("[pose/stgcn] %s", error)
+            return _nothing(str(error), backend_error=True)
+        except Exception as error:                      # noqa: BLE001
+            self._load_error = str(error)
+            log.error("[pose/stgcn] engine failure: %s", error, exc_info=True)
+            return _nothing(f"engine failure: {error}", backend_error=True)
+
+        held = [entry for entry in prediction["scores"]
+                if entry["score"] >= self.min_score]
+        if not held:
+            best = prediction["scores"][0] if prediction["scores"] else None
+            return {
+                **_nothing("no class above min_score"),
+                "evidence": {
+                    "reason": "no class above min_score",
+                    "min_score": self.min_score,
+                    "best": best,
+                    "frames_used": prediction["frames_used"],
+                },
+            }
+
+        actions = [entry["action"] for entry in
+                   sorted(held, key=lambda e: ACTION_PRIORITY.index(e["action"]))]
+        primary = actions[0]
+        best = next(e for e in held if e["action"] == primary)
+        return {
+            "action": primary,
+            "actions": actions,
+            "action_confidence": round(best["score"], 2),
+            "evidence": {
+                "backend": "stgcn",
+                "ntu_class": best["ntu_class"],
+                "transition": best["transition"],
+                "frames_used": prediction["frames_used"],
+                "scores": prediction["scores"][:3],
+            },
+        }
+
+    def classify_frame(self, frame) -> dict:
+        """A single image cannot drive a temporal model at all.
+
+        Padding one frame to T and calling it an action would produce a
+        confident answer from a clip in which nothing moves. The rules backend
+        answers single images; this one declines, and says which labels it
+        would have needed video for.
+        """
+        return {
+            **_nothing("a skeleton-action model needs a sequence, not one frame"),
+            "temporal": False,
+            "unavailable_actions": sorted(set(NTU60_TO_ACTION.values())),
+        }
+
+
+class HybridActionBackend:
+    """Geometry for the postures, ST-GCN++ for the events. The default.
+
+    Not a hedge. NTU-60 has no `standing` and no `sitting` class — a motionless
+    person is not an action — so the learned model cannot supply the postures at
+    all, while the geometry cannot see a fall as anything but its terminal pose
+    without the hand-built transition rules this replaces.
+
+    Where both have an opinion, the learned one wins on its own classes
+    (`waving`, `pointing`, `fall`) and defers on NTU's *transitions*
+    (`sit down`, `stand up`): inferring a state from a transition is beyond what
+    the model was asked, and the geometry observes the state directly.
+    """
+
+    #: Labels the learned backend owns outright.
+    LEARNED = ("fall", "waving", "pointing")
+
+    def __init__(self, *, rules: Optional[PoseActionClassifier] = None,
+                 learned: Optional[SkeletonActionBackend] = None, **kwargs):
+        self.rules = rules or PoseActionClassifier(
+            thresholds=kwargs.get("thresholds"),
+            action_window_s=kwargs.get("action_window_s", 1.5))
+        self.learned = learned or SkeletonActionBackend(**kwargs)
+
+    @property
+    def thresholds(self) -> dict:
+        """The geometry's thresholds. The learned half has no thresholds to
+        tune — it has `min_score`, which is a different kind of knob."""
+        return self.rules.thresholds
+
+    @property
+    def last_error(self) -> Optional[str]:
+        return self.learned.last_error
+
+    @property
+    def history_s(self) -> float:
+        return max(self.rules.history_s, self.learned.history_s)
+
+    def classify(self, frames: list) -> dict:
+        geometry = self.rules.classify(frames)
+        model = self.learned.classify(frames)
+
+        learned_labels = [a for a in model.get("actions", []) if a in self.LEARNED]
+        geometry_labels = [a for a in geometry.get("actions", [])
+                           if a not in self.LEARNED]
+        merged = [a for a in ACTION_PRIORITY
+                  if a in set(learned_labels) | set(geometry_labels)]
+        if not merged:
+            # Neither had anything. Keep the geometry's reason — it is the one
+            # that explains occlusion, which is the common case.
+            return geometry if not model.get("backend_error") else model
+
+        primary = merged[0]
+        source = "stgcn" if primary in learned_labels else "rules"
+        donor = model if source == "stgcn" else geometry
+        result = {
+            "action": primary,
+            "actions": merged,
+            "action_confidence": donor.get("action_confidence", 0.0),
+            "evidence": {**(donor.get("evidence") or {}), "source": source},
+        }
+        if geometry.get("point_direction"):
+            # The geometry measures the direction; the model only names the act.
+            result["point_direction"] = geometry["point_direction"]
+        if model.get("backend_error"):
+            result["evidence"]["stgcn_error"] = model["evidence"].get("reason")
+        return result
+
+    def classify_frame(self, frame) -> dict:
+        """One image: only the geometry can answer, and it says what it cannot."""
+        return self.rules.classify_frame(frame)
+
+
+def _nothing(reason: str, *, backend_error: bool = False) -> dict:
+    result = {
+        "action": "unknown",
+        "actions": [],
+        "action_confidence": 0.0,
+        "evidence": {"reason": reason},
+    }
+    if backend_error:
+        # Distinct from "nobody is doing anything": a broken engine must be
+        # visible as broken, not as a quiet absence of actions.
+        result["backend_error"] = True
+    return result
+
+
+def _frame_size(frames: list):
+    """The frame the keypoints are in, for PreNormalize2D.
+
+    Refuses rather than guessing. The bounding box is in frame pixels, so its
+    extent looks like a usable substitute — and it is not: a person filling the
+    left half of the frame would be normalised as though the frame ended at
+    their shoulder, which is a *silent* misnormalisation, and this model answers
+    a misnormalised skeleton with confident nonsense rather than an error. The
+    plugin knows the real size and passes it; a caller that does not has to say
+    so.
+    """
+    for frame in frames:
+        declared = getattr(frame, "image_size", None)
+        if declared and declared[0] > 0 and declared[1] > 0:
+            return declared
+    raise ActionBackendError(
+        "no frame carries an image_size, and the bounding box is not a "
+        "substitute for it — PYSKL normalises a skeleton by the frame, so "
+        "guessing the frame would silently misnormalise every input. Pass "
+        "image_size when building PoseFrames."
+    )
+
+
+BACKENDS = {
+    "rules": PoseActionClassifier,
+    "stgcn": SkeletonActionBackend,
+    "hybrid": HybridActionBackend,
+}
+
+
+def build_backend(name: str, **kwargs):
+    """Construct the selected backend, falling back loudly rather than quietly.
+
+    An unknown name is a config error and raising is right — a card silently
+    running geometry while its config says `stgcn` is the failure mode this
+    whole exercise is about.
+    """
+    try:
+        factory = BACKENDS[name]
+    except KeyError:
+        raise ActionBackendError(
+            f"unknown action_backend {name!r}; expected one of {sorted(BACKENDS)}"
+        ) from None
+    if factory is PoseActionClassifier:
+        return factory(thresholds=kwargs.get("thresholds"),
+                       action_window_s=kwargs.get("action_window_s", 1.5))
+    return factory(**kwargs)
