@@ -2,7 +2,8 @@
 
 Perception plugins running as one MCP HTTP server: speech (`asr`, `tts`),
 vision (`vop` object detection, `visual_depth` monocular depth, `ocr`,
-`face_recognition`). Connects to Agent Core via MCP tool calls and exchanges
+`face_recognition`, `pose` human keypoints + actions). Connects to Agent Core via
+MCP tool calls and exchanges
 audio, images and results over ROS2 DDS topics. On Jetson the vision models and
 the local TTS engines run on TensorRT.
 
@@ -2436,6 +2437,210 @@ Three traps, all observed:
 Then upload to COS and pin size + SHA256 in `utils/model_downloader.py` — of
 the copy **downloaded back from COS**, not the local file, for the reason the
 other bundles in that file state.
+
+---
+
+## `pose`: human keypoints and action labels
+
+COCO-17 keypoints per person plus **what each person is doing**. Same shape as
+`vop` and `visual_depth` — a prebuilt TensorRT engine fetched as a pinned bundle
+(`ensure_pose_model`), driven directly through `utils.tensorrt_runtime` with the
+letterbox and decode in `plugins/vision_runtime.py` (`decode_poses`). The engine
+loads on the **first `start`**, like `visual_depth`: on an 8 GB Orin already
+running vop, depth, OCR, ASR and TTS the binding constraint is memory, not GPU
+time, so an enabled-but-unwired card has to cost nothing.
+
+Action labels come from `plugins/pose_action.py` — pure numpy geometry over a
+window of keypoints. **No second model and no second inference runtime**, and
+that is not a shortcut: a second ONNX Runtime in this process shares one provider
+bridge with the first, which throws on jp6.1 and SIGSEGVs the whole of perception
+on jp5.11 (see `plugins/kokoro_worker.py`). A learned skeleton-action model
+(ST-GCN and friends) would replace `PoseActionClassifier` and nothing else —
+hence `action_backend`, and hence `classify()` taking plain `PoseFrame`s and
+returning a plain dict.
+
+### Three output topics, and why it is not one
+
+| topic | format | who consumes it |
+|---|---|---|
+| `{input}/poses` | `data/json` | wired to `decision_core` — **lean**: action, centre, bbox |
+| `{input}/poses/skeleton` | `sensor/pose2d` | the dashboard renderer — **full** keypoints |
+| `{input}/poses/overlay_img` | `image/jpeg` | skeleton drawn on the frame (`publish_overlay`, off by default) |
+
+agent-core copies the **whole message** of a subscribed topic into the event bus
+as event text (`agent-core/src/topic_subscriber.py`), so every byte on the topic
+wired to `decision_core` is a byte of LLM context *on every frame*. 17 keypoints x
+3 floats x N people at 5 fps does not fit in that budget — and a skeleton is
+useless to a text model anyway, while being exactly what the dashboard wants to
+draw. So the fat payload goes on a topic the LLM does not subscribe to.
+
+Measured on a 640x480 frame, bytes per published message:
+
+| | lean `off` | lean `compact` | lean `full` | skeleton topic |
+|---|---|---|---|---|
+| 1 person | **196** | 399 | 554 | 982 |
+| 3 people | **441** | 1076 | 1534 | 1936 |
+
+At 5 fps and three people, `publish_keypoints: full` would be ~7.7 kB/s of LLM
+context against 2.2 kB/s — and none of it readable by a text model. (The skeleton
+topic's figures include ~750 B of constant self-description per message, the
+keypoint names and the bone table. It is on the topic nothing reads into a
+prompt, and it is what lets a consumer that is not our renderer work without
+knowing COCO-17 by heart.)
+
+`publish_keypoints` (`off` | `compact` | `full`) can put them on the lean topic
+anyway if something downstream needs them; it does not affect the skeleton topic,
+which is always full. Note `publish_keypoints: "off"` is **quoted** in
+`config.yaml` on purpose — YAML 1.1 parses a bare `off` as boolean `false`.
+
+The one-shot photo actions always answer in full, like vop's: that reply is asked
+for once and read once, so trimming it saves nothing.
+
+### Why the overlay is a third topic rather than drawn in the browser
+
+A dashboard renderer only ever sees **one** topic — `detail-panel.js` opens a
+single `/ws/bus/{topic}` for the selected port — so a camera feed and a keypoint
+feed cannot be combined client-side. Hence `publish_overlay`, which costs a draw
+plus a JPEG encode per frame and a DDS topic carrying JPEGs, and is therefore
+**off** unless asked for. No publisher is created until it is. (The per-frame cost
+has not been measured on an Orin yet — it is bounded by the encode, not the
+drawing, and it is paid at the card's `fps`, not the camera's.)
+
+### Where to look at each one
+
+The card's **查看数据流** button opens the *first* output topic, i.e. the lean
+`data/json` one (`canvas.js` `_openTopicDetailFor` takes the first entry with a
+topic). The skeleton and the overlay are reached from the **监控** tab, which
+gives every resolved output topic its own card with the renderer for its format.
+That ordering is deliberate: the lean topic is the card's primary product — it is
+what the robot acts on — so it stays first and stays the one `camera_info` is
+declared against.
+
+The skeleton renderer is `web/js/renderers/pose2d.js`. It is **not**
+`sensor/skeleton`: that one drives a URDF of the *robot's own* joints and needs a
+`model` resource tool to supply it, with joint names matching the URDF exactly.
+Pointing it at human keypoints gives an empty panel and nothing in any log.
+
+### The action labels
+
+Two fields per person, not one. `action` is the single primary label — what goes
+into the prompt — and `actions` is everything that holds, because "standing while
+waving" is two simultaneously true things.
+
+| group | labels |
+|---|---|
+| posture | `standing` `sitting` `crouching` `bending` `lying` |
+| arms | `raising_hand` `waving` `pointing` `arms_crossed` |
+| motion | `walking` `turning` `still` |
+| event | `fall` |
+| — | `unknown` |
+
+`ACTION_PRIORITY` picks the primary, and it is deliberately **not** "posture
+before motion": a walking person is also standing, and `standing` for someone
+crossing the room in front of the robot is the less useful of two true answers.
+So `walking` sits above `standing` while staying below the postures that
+contradict it, and `still` is last for the mirror-image reason — it says less
+than `standing` does.
+
+Three rules worth knowing before reading the thresholds:
+
+* **Everything is a fraction of the person's bbox height.** The same person at
+  1 m and at 3 m produces the same numbers. A pixel threshold would be a
+  distance threshold wearing a disguise.
+* **`waving` is gated on `raising_hand`.** It is the "someone is calling the
+  robot over" signal, and what separates it from an arm swinging past shoulder
+  height while walking is that the motion *comes back* — reversals in the
+  wrist's horizontal travel, at 0.5-4 Hz. Ungated, every walker waves.
+* **`pointing` reports `point_direction`.** A normalised vector, promoted out of
+  `evidence` to the top level, because "someone is pointing" is far less
+  actionable than where.
+
+### Occlusion is `unknown`, and that is the point
+
+A person behind a desk has no visible hips or knees — and sitting and standing
+have **the same torso axis**. So the posture rules refuse rather than guess.
+`still` carries the same gate, for a reason that only appeared in test: without
+it, a barely-visible motionless person came back as `still`, which turns "I
+cannot see them" into a positive observation *about them*. The arm rules need
+only shoulder/elbow/wrist, so someone visible from the waist up can still be seen
+calling the robot over.
+
+This is the same rule `visual_depth`'s lens-barrel mask exists for: **"I don't
+know" and "nothing is wrong" have to be two different answers**, because the
+second is acted on and the first is not.
+
+### `fall` judges a transition, not a state
+
+Lying on the floor and lying on a sofa are the same terminal pose, so no posture
+test can separate them and neither can any single frame. A fall requires all of:
+
+1. the hip centre drops more than `fall_drop_ratio` of **standing** height,
+2. within `fall_drop_window_s`,
+3. staying horizontal for `fall_settle_s` afterwards,
+4. with **no `sitting` phase** on the way down — sitting is slow and has an
+   unambiguous knee angle.
+
+Standing height is the **tallest bbox in the window**, not the current one: a
+person on the floor has a short, wide box, and normalising by that would divide
+the drop by the post-fall height and overstate it wildly.
+
+Only 2 and 3 holding reports `lying`, and the **rejected evidence comes back
+anyway** (`drop_ratio`, `drop_ms`, `settle_ms`, `had_sitting_phase`, `reason`).
+That is on purpose: "they are lying down and here is why this was not called a
+fall" is what somebody reads when asking why the robot said nothing.
+
+Four things about it that are limitations, not bugs:
+
+* **The thresholds are instance config because they are not constants.** The
+  same fall measures differently with the camera at 0.4 m and at 1.2 m, and pitch
+  and focal length come into it too. The defaults in `config.yaml` are a starting
+  point — tune them on the rig with the camera where it will actually be, and
+  record what you saw.
+* **From a single monocular camera facing the person, "fell over" and "crouched
+  then lay down" are close to indistinguishable.** A side view is far more
+  reliable. `list_actions` says so in its reply, so a caller cannot assume
+  otherwise.
+* **A false positive costs more than a miss.** Every one makes the robot drop
+  what it is doing to ask whether someone is hurt. The plugin therefore only
+  publishes the label — whether to say anything is agent-core's prompt's
+  decision, not this card's.
+* **Occlusion refuses.** Hips not visible at landing yields
+  `is_fall: false` with that as the reason, not a guess.
+
+### Tracking is not re-identification
+
+`PoseTracker` is greedy IoU association, and it exists only to give the action
+rules a timeline. Someone who leaves the frame and comes back gets a **new id**.
+Recognising *who* a person is belongs to the `face_recognition` card; conflating
+the two would promise an identity this cannot keep. `list_actions` states this as
+well.
+
+### What a single photo cannot answer
+
+`recognize_by_photo` / `recognize_by_url` drop the hold requirement on a raised
+hand — that only exists to tell a held gesture from an arm passing through
+shoulder height, and a photo has no "passing through". But `waving`, `walking`,
+`turning`, `still` and `fall` are motion, and one image carries none of them. The
+reply says so (`temporal: false`, `unavailable_actions`) rather than handing back
+`raising_hand` as though it settled "is she waving".
+
+### Building the engine
+
+`tools/export_vision_engines.py --model pose`, **inside a container built from
+the target perception image** — not on the Jetson host, for the reason that file
+opens with (the jp6.1 image ships TensorRT 10.4 while its hosts carry 10.3, and
+an engine plan only loads on the TensorRT that built it). It prefers
+`yolo26n-pose` and falls back to `yolo11n-pose`, because which pose weights the
+image's ultralytics can fetch is a property of the image rather than something to
+assume; the engine is named after whichever was used, so the bundle table and the
+file cannot disagree about what a robot is running. Both decode through
+`decode_poses`, which picks the layout by content.
+
+`POSE_MODEL_BUNDLES` ships with **zero pins**, so `ensure_pose_model` raises with
+the build instructions instead of fetching anything unverified — the standing
+rule for every bundle in that file. Until the engines are exported and published,
+the pose card reports `state: error` with that message and the rest of perception
+is unaffected.
 
 ---
 

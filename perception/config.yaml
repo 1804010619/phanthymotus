@@ -240,8 +240,9 @@ plugins:
     # off —— 看着像配置没生效。
     publish_keypoints: "off"
     publish_bbox: true
-    # 另发一条把骨架画在画面上的 JPEG。每帧多一次绘制 + 编码（640 下 Orin 上
-    # 约 3-6 ms）外加一条跑 JPEG 的话题，所以默认关闭。
+    # 另发一条把骨架画在画面上的 JPEG。每帧多一次绘制 + 编码，外加一条跑 JPEG
+    # 的话题，所以默认关闭。（这个每帧代价还没在 Orin 上实测过；瓶颈是编码而不是
+    # 绘制，而且按卡片的 fps 付、不是按相机的帧率付。）
     #
     # 为什么需要这条、而不是让前端自己叠：dashboard 的 renderer 一次只看一条
     # 话题（detail-panel.js 对选中端口开一条 /ws/bus/{topic}），所以浏览器里
