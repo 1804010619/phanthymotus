@@ -1,14 +1,16 @@
 mcp_port: 15720
 
-# 文件接收 (POST /file/upload)。agent-core 把浏览器/LLM 的上传代理到这里，
-# 本服务写到自己看得见的目录并把「本容器内的绝对路径」回给调用方 ——
-# 两个容器无需共享挂载。详见 utils/file_intake.py。
+# File intake (POST /file/upload). agent-core proxies browser and LLM uploads
+# here; this service writes them somewhere it can see and returns the absolute
+# path **inside this container**, so the two containers need no shared mount.
+# See utils/file_intake.py.
 file_intake:
-  # /models 是本容器唯一可写的宿主机挂载点。
+  # /models is the only host-mounted writable path in this container.
   dir: /models/uploads
   max_bytes: 67108864
-  # 上传只是中转，不是存储：注册人脸留下的是 embedding，从不保留照片。
-  # 不清理会在 57 GB 的 eMMC 上一直涨。
+  # An upload is a transfer, not storage: enrolling a face leaves an embedding
+  # behind and never the photograph. Without cleanup this grows forever on a
+  # 57 GB eMMC.
   retention_days: 7
 
 plugins:
@@ -134,25 +136,30 @@ plugins:
     model: "yoloe-26s-seg"
     confidence: 0.3
     fps: 5
-    # ── 流式载荷的详略 ────────────────────────────────────────────────────
-    # 只管 topic 上那条流；一次性拍照识别（recognize / recognize_by_url）永远
-    # 发全量 —— 那个回复只被读一次，裁剪它省不下什么，而看不到画面的调用方
-    # 没有别的办法拿回像素框。
+    # ── How much the streamed payload carries ────────────────────────────
+    # Governs the stream on the topic only. The one-shot photo actions
+    # (recognize / recognize_by_url) always answer in full: that reply is asked
+    # for once and read once, so trimming it saves nothing, and a caller who
+    # cannot see the frame has no other way to recover the pixel box.
     #
-    # 为什么值得裁：agent-core 把订阅话题的**整条消息**原样塞进 event_bus 当
-    # 事件文本（agent-core/src/topic_subscriber.py），所以发出去的每个字节都是
-    # 每一帧的 LLM 上下文字节。
+    # Why trimming is worth anything: agent-core copies the **whole message** of
+    # a subscribed topic into the event bus as event text
+    # (agent-core/src/topic_subscriber.py), so every byte published here is a
+    # byte of LLM context on every frame.
     #
-    # 像素框。关掉只剩中心点，下游想按目标区域去采样另一张对齐的图（典型是
-    # visual_depth 的深度图）就只能取中心一小块，也无从知道目标多大。33 B。
+    # The pixel box. Off leaves only the centre point, so a consumer wanting to
+    # sample another aligned map over the object (typically visual_depth's) gets
+    # one small patch and no idea how large the thing is. 33 B.
     publish_bbox: true
-    # 颜色详略 off | name | full。
-    #   name（默认）  {"color": "dim muted azure", "brightness": 120.9}   27 B
-    #   full          原来那 12 个数 + 4 个标签，一字不差                 239 B
-    #   off           不发
-    # name 发的是**三元组**而不是 color_name：后者是前者的有损投影（它根本
-    # 不看饱和度，亮度 6 档也压成 3 档），而反过来可以无损还原。详见
-    # README.md § "vop 的流式载荷" 和 plugins/vop.py 的 color_triple 文档。
+    # Colour detail: off | name | full.
+    #   name (default)  {"color": "dim muted azure", "brightness": 120.9}  27 B
+    #   full            the original 12 numbers + 4 labels, verbatim      239 B
+    #   off             nothing
+    # `name` publishes the **triple**, not color_name: the latter is a lossy
+    # projection of the former (it ignores saturation entirely and collapses six
+    # brightness bands into three), while the triple reconstructs it exactly.
+    # See README.md § "vop's streamed payload" and color_triple in
+    # plugins/vop.py.
     publish_color: name
     # NOTE: there is no `classes` key any more. The engine's open-vocabulary
     # class list is frozen when the engine is exported, so it cannot be changed
@@ -187,115 +194,161 @@ plugins:
     cal_b: 0.0
     max_depth_m: 20.0
 
-    # ── 镜筒（渐晕）遮罩 ─────────────────────────────────────────────────
-    # r1_sz 2026-09-23 实测：主相机透过一个圆形镜筒往外看，每一帧四角都是纯黑的
-    # 外壳。深度模型不知道这回事，照样给它编了距离 —— 四角读 0.64~0.83 m（"我正
-    # 前方 0.7 米有东西"），而中心读 1.76 m，同时深度图的有效像素是 **100%**。
+    # ── Lens-barrel (vignette) mask ──────────────────────────────────────
+    # Measured on r1_sz, 2026-09-23: the main camera looks out through a
+    # circular lens barrel, so all four corners of every frame are solid black
+    # housing. The depth model does not know that and invents a distance for
+    # them anyway — the corners read 0.64-0.83 m ("something is 0.7 m straight
+    # ahead") against 1.76 m at the centre, while the depth map's valid-pixel
+    # count sits at **100%**.
     #
-    # 所以下游那层「不知道 ≠ 没东西」的保护（coverage）永远不触发：**这不是缺失，
-    # 是自信地错**，后者严格更糟。代价是实打实的：navi 用来选避让方向的角度三等分
-    # 读的是镜筒而不是房间（一条通畅的走廊上读出左 0.906 / 右 0.993 / 中 1.368），
-    # 近距离时米制走廊也会被机器人自己的镜头逼停。
+    # So the downstream guard that distinguishes "unknown" from "nothing there"
+    # (coverage) never fires: **this is not missing data, it is confidently
+    # wrong data**, which is strictly worse. The cost was real — navi's angular
+    # thirds, which choose which way to go round an obstacle, were reading the
+    # barrel instead of the room (0.906 left / 0.993 right / 1.368 centre down a
+    # clear corridor), and at close range a metric corridor would be blocked by
+    # the robot's own lens.
     #
-    # 判据是「接近纯黑 **且** 与画面边缘连通」—— 边缘连通这一条是关键，它让房间
-    # 中央的黑色物体不被误伤（它四周是场景，自成一个连通域）。剩下的误判是安全
-    # 方向的：被遮住的像素变成「没有读数」，coverage 下降，机器人不往看不清的地方
-    # 走 —— 那正是「不知道」该有的行为。
+    # The test is "near-black **and** connected to the frame edge". The
+    # edge-connectivity half is what makes it safe: a black object in the middle
+    # of the room is surrounded by scene and forms its own component, so it is
+    # not masked. What misfires does so in the safe direction — a masked pixel
+    # becomes "no reading", coverage drops, and the robot does not drive towards
+    # what it cannot see, which is what "unknown" is supposed to do.
     mask_lens_barrel: true
-    # 亮度阈值（0-255）。镜筒是纯黑的，这个值只需要容纳 JPEG 噪声。
+    # Brightness threshold (0-255). The barrel is solid black, so this only has
+    # to absorb JPEG noise.
     lens_barrel_threshold: 24
-    # 超过这个比例就什么都不遮：房间够暗时整幅画会连成一个边缘连通域，而全遮等于
-    # 让机器人失明。「房间黑」和「镜头被挡」需要人做不同的处置，所以不猜。
+    # Past this fraction, mask nothing. In a dark enough room the whole frame
+    # becomes one edge-connected component, and masking all of it blinds the
+    # robot. "The room is dark" and "the lens is blocked" need different human
+    # responses, so this does not guess between them.
     lens_barrel_max_fraction: 0.6
 
-  # 人体关键点 + 动作分类。COCO-17 关键点，动作标签来自关键点几何规则
-  # （plugins/pose_action.py，纯 numpy，没有第二个模型 —— 本进程里再多一份
-  # ONNX Runtime 在 jp5.11 上会直接 SIGSEGV，见 tts 那段注释）。
+  # Human keypoints + action classification. COCO-17 keypoints; postures come
+  # from keypoint geometry (plugins/pose_action.py, pure numpy) and activities
+  # from a skeleton-action model. No second inference runtime: a second ONNX
+  # Runtime in this process SIGSEGVs on jp5.11 — see the tts notes.
   #
-  # 和 visual_depth 一样：engine 在第一次 start 时才加载，所以「打开但没连线」
-  # 的卡片不占内存。8 GB 的 Orin 上绑死的是内存不是 GPU 时间。
+  # Like visual_depth, the engine is loaded lazily on the first `start`, so an
+  # enabled-but-unwired card costs nothing. On an 8 GB Orin the binding
+  # constraint is memory, not GPU time.
   pose:
     enabled: true
     namespace: ""       # auto-detect from hostname if empty
-    # `s` 而不是 `n`：关键点精度在这里不是观感问题，它是动作规则的输入 ——
-    # 手腕抖一点，区分「挥手」和「伸手」的方向反转计数就不准；髋部抖一点，
-    # 区分「跌倒」和「躺下」的 drop_ratio 就不准。57.2 → 63.0 mAP(pose) 买到的是
-    # 更少的误判动作，不是更好看的骨架。代价约 12 MB 常驻 + 约 8 ms/帧（外推）。
-    # 机器内存紧张又不需要 pose，该关的是 enabled，不是换个规则信不过的小模型。
+    # `s` rather than `n`. Keypoint precision is not cosmetic here, it is the
+    # input to the action rules: a noisy wrist breaks the reversal count that
+    # separates waving from reaching, and a noisy hip breaks the drop ratio that
+    # separates a fall from lying down. The 57.2 -> 63.0 mAP(pose) step buys
+    # fewer misjudged actions, not prettier skeletons. Costs ~12 MB resident and
+    # ~8 ms/frame (extrapolated). On a machine short of memory that does not
+    # need pose, the lever is `enabled`, not a smaller model whose keypoints the
+    # rules cannot rely on.
     model: "yolo26s-pose"
-    confidence: 0.4     # 人体检测阈值
-    # 12 而不是 5：几何规则逐帧就能判，但骨架动作模型判的是**一段视频** ——
-    # 2.5 s 窗口在 5 fps 下只有 13 帧真实数据，要被重采样到 engine 的 48 帧，
-    # 大部分是插值出来的。挥手的频率、跌倒的下落速度都在这些帧里。
-    # fps 低于 12 时卡片的 info 会给出 action_fps_note。
+    confidence: 0.4     # person-detection threshold
+    # 12 rather than 5. The geometry judges per frame, but the skeleton-action
+    # model judges a **clip**: a 2.5 s window at 5 fps is 13 real frames
+    # resampled up to the engine's 100, most of it interpolation — and the
+    # frequency of a wave and the speed of a fall live in those frames. Below 12
+    # the card's `info` returns an action_fps_note.
     fps: 12
-    kpt_confidence: 0.3 # 单个关键点的可见性阈值，低于此值的关节不参与判定也不绘制
+    # Per-joint visibility threshold. A joint below it takes no part in the
+    # rules and is not drawn.
+    kpt_confidence: 0.3
     max_persons: 5
-    # ── 三条输出话题，以及为什么要分开 ──────────────────────────────────
-    #   {topic}/poses              data/json      精简：动作 + 位置 + 框
-    #   {topic}/poses/skeleton     sensor/pose2d  全量关键点，给 dashboard 画骨架
-    #   {topic}/poses/overlay_img  image/jpeg     骨架画在原画面上（下面的开关）
+    # ── Three output topics, and why they are separate ───────────────────
+    #   {topic}/poses              data/json      lean: posture + activity
+    #   {topic}/poses/skeleton     sensor/pose2d  full keypoints, for the dashboard
+    #   {topic}/poses/overlay_img  image/jpeg     skeleton drawn on the frame
     #
-    # agent-core 把订阅话题的**整条消息**原样塞进 event_bus 当事件文本
-    # （agent-core/src/topic_subscriber.py），所以连到 decision_core 那条流上
-    # 发出去的每个字节都是每一帧的 LLM 上下文字节。17 关键点 × 3 float × N 人
-    # × 5 fps 塞不进这个预算，而且骨架对文本模型本来也没用 —— 但它恰好是
-    # dashboard 要画的东西。所以胖载荷走 LLM 不订阅的那条话题。
+    # agent-core copies the **whole message** of a subscribed topic into the
+    # event bus as event text (agent-core/src/topic_subscriber.py), so every
+    # byte on the stream wired to decision_core is a byte of LLM context on
+    # every frame. 17 keypoints x 3 floats x N people at 5 fps does not fit that
+    # budget — and a skeleton is useless to a text model anyway, while being
+    # exactly what the dashboard wants to draw. So the fat payload goes on a
+    # topic the LLM does not subscribe to.
     #
-    # off（默认）/ compact（17 个整数像素点）/ full（17×(x,y,可见性)）。
-    # 每人每帧约 60 B → 400 B → 900 B。画骨架不受这里影响。
+    # off (default) / compact (17 integer pixel points) / full (17x(x,y,vis)).
+    # Roughly 60 B -> 400 B -> 900 B per person per frame. The skeleton topic is
+    # unaffected by this setting.
     #
-    # 引号是必须的：YAML 1.1 把裸 off 解析成布尔 false，不是字符串 "off"。
-    # 这里恰好也能工作（非法值退回 off），但 `on` 就会变成 true 然后静默退回
-    # off —— 看着像配置没生效。
+    # The quotes are required: YAML 1.1 parses a bare `off` as boolean false,
+    # not the string "off". It happens to work here (an unusable value falls
+    # back to off), but `on` would become true and then silently fall back to
+    # off, which reads as the setting not taking effect.
     publish_keypoints: "off"
     publish_bbox: true
-    # 另发一条把骨架画在画面上的 JPEG。每帧多一次绘制 + 编码，外加一条跑 JPEG
-    # 的话题，所以默认关闭。（这个每帧代价还没在 Orin 上实测过；瓶颈是编码而不是
-    # 绘制，而且按卡片的 fps 付、不是按相机的帧率付。）
+    # Publish a second stream with the skeleton drawn on the frame. Costs a draw
+    # and a JPEG encode per frame plus a topic carrying JPEGs, so it is off by
+    # default. (That per-frame cost has not been measured on an Orin; it is
+    # bounded by the encode rather than the drawing, and is paid at the card's
+    # fps, not the camera's.)
     #
-    # 为什么需要这条、而不是让前端自己叠：dashboard 的 renderer 一次只看一条
-    # 话题（detail-panel.js 对选中端口开一条 /ws/bus/{topic}），所以浏览器里
-    # 拿不到「画面 + 关键点」两路数据来合成叠加图。
+    # Why it is a published topic rather than something the browser composes: a
+    # dashboard renderer only ever sees one topic (detail-panel.js opens a
+    # single /ws/bus/{topic} for the selected port), so a camera feed and a
+    # keypoint feed cannot be combined client-side.
     publish_overlay: false
-    # 动作判定回看多少秒。挥手频率和步频都是在这个窗口里数出来的。
+    # How far back the action rules look. The frequency of a wave and the
+    # cadence of a walk are both counted inside this window.
     action_window_s: 1.5
-    # ── 动作分类后端 ───────────────────────────────────────────────────
-    # hybrid（默认）= 姿态走几何规则、跌倒/挥手/指向走 ST-GCN++ 骨架动作模型
-    # rules         = 只用几何规则，不加载第二个 engine。这也是取不到 engine 时
-    #                 自动退到的模式；手动选它主要用于在真机上区分「模型判错」
-    #                 和「几何判错」。
+    # ── Action backend ───────────────────────────────────────────────────
+    # hybrid (default) = postures from the geometry, activities from the
+    #                    ST-GCN++ skeleton-action model
+    # rules            = geometry only, no second engine. This is also what the
+    #                    card falls back to when the engine cannot be fetched;
+    #                    selecting it by hand is mainly how "the model is wrong"
+    #                    gets told from "the geometry is wrong" on a robot.
     #
-    # 只用模型的 stgcn 模式**已经撤下**（卡片上不再提供，旧卡片自动迁移到
-    # hybrid 并在 info 里说明）。两个实测理由：
-    #   1. NTU-60 里没有「站立」「坐」这两个状态类 —— 只有 sit down / stand up
-    #      这种*转换*，所以站着不动的人不产生任何事件。
-    #   2. 更糟的是静止片段不会让它「不确定」，而是让它**自信地错**：拿一张真人
-    #      躺在地上的照片铺成 100 帧静止片段，它返回 NTU 的「玩手机」0.997、
-    #      熵 0.03。
-    # 一个只有一个正确值的选项不是选择，是地雷。
+    # The model-only `stgcn` mode has been **withdrawn** (no longer offered on
+    # the card; a card saved with it is migrated to hybrid and says so in
+    # `info`). Two measured reasons:
+    #   1. NTU-60 has no `standing` or `sitting` *state* class — only sit down /
+    #      stand up transitions — so a motionless person produces no event.
+    #   2. Worse, a static clip does not make it unsure, it makes it
+    #      **confidently wrong**: a photograph of a real person lying on
+    #      pavement, held still for 100 frames, came back as NTU's "play with
+    #      phone/tablet" at 0.997, entropy 0.03.
+    # An option with only one correct value is not a choice, it is a trap.
     #
-    # 模型是 ST-GCN++ joint 单流、NTU60-XSub、2D 17 关键点：1.39 M 参数 /
-    # 1.95 GFLOPs，约为 pose engine（10.4 M / 24.1 G）的 8% 算力。单流而非
-    # 四流集成 —— 4 倍算力换 +3.9 个点不划算。
-    #
-    # engine 还没发布（ACTION_MODEL_BUNDLES 的 pin 是空的），所以现在实际跑的
-    # 是 rules，卡片的 info 里会写明原因（action_backend_note）。
+    # The model is ST-GCN++, joint stream, NTU60-XSub, 2D 17-keypoint input:
+    # 1.39 M params / 1.95 GFLOPs, about 8% of the pose engine's compute
+    # (10.4 M / 24.1 G). Single stream rather than the four-stream ensemble —
+    # 4x the compute for +3.9 points is not worth it.
     action_backend: hybrid
-    # 模型得分阈值。调之前先看 info 里的实际得分 —— 那是区分「模型判错」和
-    # 「阈值定错」的唯一办法。
+    # Score threshold for the model. Before changing it, read the actual scores
+    # in `info` — that is the only way to tell "the model is wrong" from "the
+    # threshold is wrong". Falling is held to a higher bar of its own
+    # (FALL_MIN_SCORE), because the engine returns A43 at 0.62 on pure noise and
+    # a false fall makes the robot interrupt itself to ask whether somebody is
+    # hurt.
     action_min_score: 0.40
-    # ── 跌倒阈值 ───────────────────────────────────────────────────────
-    # 这三个**不是常量**：同一次跌倒，相机离地 0.4 m 和 1.2 m 量出的
-    # drop_ratio 完全不同，焦距和俯仰角也进来。所以它们是 instance 级配置，
-    # 下面的值是起点而不是结论 —— 把相机装到最终位置后在真机上调，并记下看到
-    # 的数（卡片的 evidence 里有 drop_ratio / drop_ms / settle_ms）。
+    # Label hysteresis: how many consecutive frames a new label must win before
+    # it replaces the current one. Every threshold here is a cliff, and at the
+    # boundaries the raw answer flips on every frame. The cost is latency on
+    # every genuine change, exactly `hold - 1` frames — 167 ms at 12 fps. The
+    # raw answer stays visible in evidence.raw_posture / raw_activity.
+    label_hold: 3
+    # ── Fall thresholds ──────────────────────────────────────────────────
+    # These are **not** constants, which is why they are instance config. The
+    # same fall measures differently depending on where the camera is mounted:
+    # drop_ratio for one event differs between a camera at 0.4 m and at 1.2 m,
+    # and pitch and focal length come into it too. The values below are a
+    # starting point, not a conclusion — tune them on the rig with the camera
+    # where it will actually be, and record what you saw (the card's evidence
+    # carries drop_ratio / drop_ms / settle_ms).
     #
-    # 判的是「转换」而不是终态：躺在地上和躺在沙发上是同一个终态。要同时满足
-    # 髋部快速下降、落地后保持水平、且下降过程中没有「坐」的中间态。
+    # What is being judged is a **transition**, not a terminal pose: lying on
+    # the floor and lying on a sofa are the same final shape. A fall needs the
+    # hips to drop fast, the body to stay horizontal afterwards, and no
+    # `sitting` phase on the way down.
     #
-    # 已知限制：单目正面视角下「跌倒」和「蹲下再趴下」几乎不可分，侧视角可靠
-    # 得多。误报比漏报贵 —— 每次误报都要机器人打断手上的事去问「你没事吧」。
+    # Known limit: from a single monocular camera facing the person, "fell over"
+    # and "crouched then lay down" are close to indistinguishable; a side view
+    # is far more reliable. A false positive costs more than a miss — each one
+    # makes the robot drop what it is doing to ask whether somebody is hurt.
     fall_drop_ratio: 0.35
     fall_drop_window_s: 0.6
     fall_settle_s: 1.0
@@ -370,26 +423,33 @@ plugins:
     # people are never evicted. Editable from the card.
     unknown_capacity: 500
     max_samples_per_person: 8
-    # 访问记录表 (visits.jsonl): 一次连续出现 = 一条记录，不是一帧一条。
-    # 离开超过 visit_gap_s 才封档落盘；10 分钟避免有人转个头就把一下午切成几十条。
+    # Visit log (visits.jsonl): one continuous appearance is one record, not
+    # one per frame. A visit is closed and written only after the person has
+    # been absent for visit_gap_s; 10 minutes stops somebody turning their head
+    # from cutting an afternoon into dozens of records.
     visit_gap_s: 600.0
-    # 在场的人的 visit 会在内存里挂很久（10 分钟 gap + 一直出现），断电会整条丢，
-    # 所以每 visit_checkpoint_s 把未封档的 visit 落一次小文件，重启后续上。
+    # A present person's visit stays in memory for a long time (10 minute gap
+    # plus continuous presence) and a power cut would lose the whole record, so
+    # open visits are checkpointed to a small file every visit_checkpoint_s and
+    # resumed after a restart.
     visit_checkpoint_s: 60.0
     visit_log_max: 20000
     max_batch: 200
-    # 过大/非常见格式的图片在本地缩放转码，而不是在接口处拒绝。
-    # 检测本身会把图 letterbox 到 det_size(640)，所以 2048 已远超需要，
-    # 在这里用 INTER_AREA 缩一次比让 letterbox 缩更快也更清晰。
+    # Oversized or unusual-format images are rescaled and transcoded locally
+    # rather than refused at the interface. Detection letterboxes to det_size
+    # (640) anyway, so 2048 is already far more than needed, and one INTER_AREA
+    # downscale here is both faster and sharper than letting letterbox do it.
     max_image_side: 2048
-    # 解压炸弹护栏（像素数）：几百 KB 的 PNG 可以声明 30000x30000，
-    # 解出来 2.7 GB 会让 OOM killer 带走整个 perception 进程。
+    # Decompression-bomb guard, in pixels. A few hundred KB of PNG can declare
+    # 30000x30000, and decoding it to 2.7 GB gets the whole perception process
+    # taken out by the OOM killer.
     max_image_pixels: 60000000
-    # 仅为传输/内存护栏，不是策略限制 —— 超大图片会被本地缩放而非拒绝。
+    # A transfer and memory guard, not a policy limit — an oversized image is
+    # rescaled locally rather than refused.
     max_image_bytes: 67108864
     # Caller-supplied image/package paths are confined to these roots — the MCP
     # server has no authentication and runs as root in the container.
     image_roots: ["/models", "/tmp", "/work"]
-    # 检测频率: how many detections per second. Fractional is the point —
+    # Detection rate: how many detections per second. Fractional is the point —
     # 0.5 means once every two seconds; 0 means every frame the camera sends.
     detect_fps: 1.0
