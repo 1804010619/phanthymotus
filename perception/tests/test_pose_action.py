@@ -849,3 +849,94 @@ def test_a_straight_knee_alone_is_enough_when_the_hip_is_unreadable():
     frame = _frame(joints, _standing_box())
     assert frame.knee_deg >= 150
     assert _classify(_steady(joints, _standing_box()))["action"] == "standing"
+
+
+# ── a person on the ground is not gesturing ─────────────────────────────────
+#
+# Reported from a rig: two photographs of someone who had fallen came back as
+# `pointing` and as `raising_hand`. Three bugs, all of the same family as the
+# `hip_knee_dy` one — a claim about the *body* measured against the *image*.
+
+_FLOOR = TOP + 0.90 * H
+
+
+def _lying_with_arm(dx, dy):
+    """A fallen person whose left arm is displaced (dx, dy) from the shoulder.
+
+    In `_lying_body` the head is at -x and the feet at +x, so the body's own
+    "down" points along +x. An arm at -x is stretched past the head; an arm at
+    +dy is held perpendicular to the body, i.e. up towards the ceiling.
+    """
+    joints = dict(_lying_body())
+    shoulder = (CX - 0.30 * H, _FLOOR)
+    joints.update({
+        "left_shoulder": shoulder,
+        "left_elbow": (shoulder[0] + dx * 0.5, shoulder[1] + dy * 0.5),
+        "left_wrist": (shoulder[0] + dx, shoulder[1] + dy),
+    })
+    box = (min(CX - 0.55 * H, shoulder[0] + dx - 10), _FLOOR - 0.10 * H,
+           CX + 0.45 * H, _FLOOR + 0.10 * H)
+    return joints, box
+
+
+def test_a_fallen_person_with_an_arm_along_their_body_is_not_pointing():
+    """The reported failure. `pointing` measured the arm against the image's
+    horizon, and a person on the ground is horizontal by construction — so a
+    straight arm resting alongside them scored as pointing every time."""
+    joints, box = _lying_with_arm(+0.15 * H, +0.02 * H)
+    result = _classify(_steady(joints, box, duration=1.5, fps=12))
+    assert result["action"] == "lying"
+    assert "pointing" not in result["actions"]
+    assert "raising_hand" not in result["actions"]
+
+
+def test_a_fallen_person_is_reported_as_lying_even_with_the_hips_occluded():
+    """The other half of it. `lying` reached the body axis only through
+    `torso_deg`, which needs shoulders *and* hips — so on exactly the frames
+    where "this person is on the ground" matters most, the posture rules
+    returned nothing and the arm rules were left to name the frame."""
+    joints, box = _lying_with_arm(+0.15 * H, +0.02 * H)
+    joints = {k: v for k, v in joints.items() if "hip" not in k}
+    frame = _frame(joints, box)
+    assert frame.torso_deg is None, "the premise: no hips, so no torso angle"
+    assert frame.body_down is not None, "the head-to-shoulder fallback"
+    result = _classify(_steady(joints, box, duration=1.5, fps=12))
+    assert result["action"] == "lying"
+    assert "pointing" not in result["actions"]
+
+
+def test_a_fallen_person_can_still_be_seen_raising_an_arm():
+    """Not suppressed, deliberately: someone on the floor waving for help is
+    exactly the case this card exists for. The posture wins the primary label,
+    the gesture survives in `actions`."""
+    joints, box = _lying_with_arm(-0.20 * H, +0.01 * H)   # past the head
+    result = _classify(_steady(joints, box, duration=1.5, fps=12))
+    assert result["action"] == "lying"
+    assert "raising_hand" in result["actions"]
+
+
+def test_an_arm_perpendicular_to_a_fallen_body_is_pointing():
+    """"Horizontal" now means perpendicular to the body, so an arm held up
+    towards the ceiling by someone lying down reads as pointing — which is what
+    it is."""
+    joints, box = _lying_with_arm(+0.02 * H, -0.18 * H)
+    result = _classify(_steady(joints, box, duration=1.5, fps=12))
+    assert result["action"] == "lying"
+    assert "pointing" in result["actions"]
+
+
+def test_arm_thresholds_do_not_scale_with_the_bounding_box():
+    """A lying person's box is ~56 px tall where they stood 400, so every
+    fraction-of-box-height threshold collapsed to a few pixels and noise walked
+    through it. The scale has to be the body's."""
+    joints, box = _lying_with_arm(+0.15 * H, +0.02 * H)
+    frame = _frame(joints, box)
+    assert frame.height < 0.25 * H, "the premise: the box has collapsed"
+    assert frame.body_scale > 0.25 * H, "the body scale must not collapse with it"
+
+
+def test_the_body_frame_reduces_to_the_image_frame_when_standing():
+    """The rewrite must not move anything for an upright person."""
+    frame = _frame(_body(), _standing_box())
+    assert frame.body_down is not None
+    assert frame.body_down[1] > 0.99, "down is down for someone standing"

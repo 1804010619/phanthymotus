@@ -206,6 +206,75 @@ def _tilt_from_vertical_deg(vector: Optional[np.ndarray]) -> Optional[float]:
     return math.degrees(math.acos(min(1.0, abs(float(vector[1])) / norm)))
 
 
+def _body_down(frame) -> Optional[np.ndarray]:
+    """Unit vector pointing from the head towards the feet, in image space.
+
+    The body's own "down". Every arm rule needs it, because "the wrist is above
+    the shoulder" and "the arm is horizontal" are claims about the *body*, not
+    about the image — and a person lying on the ground has a body whose down
+    points sideways on screen.
+
+    Three sources, strongest first:
+
+    1. shoulder-mid → hip-mid. The torso, longest and best-detected segment.
+    2. nose → shoulder-mid. Available whenever the head and shoulders are, which
+       is the case the hips-occluded failure lives in: a fallen person seen from
+       a robot usually shows head and shoulders and nothing below.
+    3. the ears' midpoint → shoulder-mid, for a head seen from behind.
+
+    No PCA fallback. The principal axis of the visible joints is tempting and is
+    wrong for the pose that matters: a standing person with both arms out is
+    wider than they are tall when only the upper body is in frame, so the major
+    axis turns horizontal and the body reads as lying down.
+    """
+    if frame.shoulder is None:
+        return None
+    if frame.hip is not None:
+        vector = frame.hip - frame.shoulder
+    else:
+        head = frame.joint("nose")
+        if head is None:
+            head = _mid_of([p for p in (frame.joint("left_ear"),
+                                        frame.joint("right_ear"))
+                            if p is not None])
+        if head is None:
+            return None
+        vector = frame.shoulder - head
+    norm = float(np.linalg.norm(vector))
+    if norm < 1e-6:
+        return None
+    return (vector / norm).astype(np.float32)
+
+
+def _body_scale(frame) -> Optional[float]:
+    """Pixel length the arm thresholds are fractions of.
+
+    **Never the bounding box.** A person lying down has a box 56 px tall where
+    they stood 400, so every fraction-of-box-height threshold collapses to a few
+    pixels and sensor noise walks straight through it — which is half of why a
+    fallen person was reported as raising a hand.
+
+    Torso length when the hips are visible. Otherwise the head-to-shoulder span
+    scaled up: on the COCO skeleton nose-to-shoulder runs about 0.12 of standing
+    height against 0.34 for shoulder-to-hip, so ~2.8x. An estimate, and a stable
+    one — it does not change when the person changes posture, which is the whole
+    requirement.
+    """
+    if frame.torso_px is not None:
+        return frame.torso_px
+    if frame.shoulder is None:
+        return None
+    head = frame.joint("nose")
+    if head is None:
+        head = _mid_of([p for p in (frame.joint("left_ear"),
+                                    frame.joint("right_ear"))
+                        if p is not None])
+    if head is None:
+        return None
+    span = float(np.linalg.norm(frame.shoulder - head))
+    return max(span * 2.8, 1.0)
+
+
 def body_height(box) -> float:
     """The scale every threshold is a fraction of. Floored, never zero."""
     return max(float(box[3]) - float(box[1]), 1.0)
@@ -223,7 +292,7 @@ class PoseFrame:
     __slots__ = ("t", "box", "keypoints", "height", "min_conf", "image_size",
                  "shoulder", "hip", "torso_deg", "knee_deg", "hip_deg",
                  "hip_knee_dy", "hip_ankle_dy", "aspect", "torso_px",
-                 "has_torso", "has_legs")
+                 "body_down", "body_scale", "has_torso", "has_legs")
 
     def __init__(self, t: float, box, keypoints: np.ndarray, min_conf: float,
                  image_size=None):
@@ -319,6 +388,9 @@ class PoseFrame:
         self.hip_ankle_dy = (
             None if (self.hip is None or ankle_mid is None)
             else float(ankle_mid[1] - self.hip[1]) / self.height)
+
+        self.body_down = _body_down(self)
+        self.body_scale = _body_scale(self)
 
     def joint(self, name: str) -> Optional[np.ndarray]:
         return _point(self.keypoints, name, self.min_conf)
@@ -417,12 +489,26 @@ def _posture_labels(frame: PoseFrame, th: dict) -> list:
     meant a person whose feet were out of frame had no posture at all.
     """
     out = []
+
+    # `lying` first, and deliberately NOT gated on the hips being visible.
+    #
+    # It used to reach the body axis only through `torso_deg`, which needs
+    # shoulders *and* hips. A fallen person seen from a robot's low camera
+    # usually shows head and shoulders and little below — so on exactly the
+    # frames where "this person is on the ground" is the single most important
+    # thing to report, the posture rules returned nothing at all and the arm
+    # rules were left to name the frame. That is how a person lying on the floor
+    # came back as `pointing`.
+    #
+    # `body_down` falls back to the head-to-shoulder vector, so the axis
+    # survives the occlusion that matters.
+    axis_deg = _tilt_from_vertical_deg(frame.body_down)
+    if (axis_deg is not None and axis_deg >= th["lying_deg"]
+            and frame.aspect >= th["lying_aspect"]):
+        out.append(("lying", _confidence(axis_deg, th["lying_deg"], below=False)))
+
     if frame.torso_deg is None:
         return out
-
-    # lying needs no legs: the torso axis and the box shape settle it.
-    if frame.torso_deg >= th["lying_deg"] and frame.aspect >= th["lying_aspect"]:
-        out.append(("lying", _confidence(frame.torso_deg, th["lying_deg"], below=False)))
 
     upright = frame.torso_deg <= th["upright_deg"]
 
@@ -487,15 +573,28 @@ def _posture_labels(frame: PoseFrame, th: dict) -> list:
 # ── arm rules (frame + short window) ────────────────────────────────────────
 
 def _raised_sides(frame: PoseFrame, th: dict) -> list:
-    """Sides whose wrist is above the shoulder with the elbow not folded shut."""
+    """Sides whose wrist is above the shoulder, **in the body's own frame**.
+
+    "Above" has to mean "towards the head", not "smaller y". A person lying on
+    the ground has a body whose head direction points sideways on screen, so an
+    arm resting on the floor beside them is, in image terms, as far "above"
+    their shoulder as a raised arm is for someone standing. Measuring against
+    `body_down` instead of the image axis is what makes the test mean what its
+    name says.
+
+    The scale is the body's, never the bounding box — see `_body_scale`.
+    """
     sides = []
+    if frame.body_down is None or frame.body_scale is None:
+        return sides
     for side in ("left", "right"):
         shoulder = frame.joint(f"{side}_shoulder")
         elbow = frame.joint(f"{side}_elbow")
         wrist = frame.joint(f"{side}_wrist")
         if shoulder is None or wrist is None:
             continue
-        rise = (float(shoulder[1]) - float(wrist[1])) / frame.height
+        # Positive when the wrist lies towards the head along the body axis.
+        rise = float(np.dot(shoulder - wrist, frame.body_down)) / frame.body_scale
         if rise < th["raise_wrist_above_shoulder"]:
             continue
         elbow_deg = _angle_deg(shoulder, elbow, wrist)
@@ -534,9 +633,16 @@ def _arm_labels(frames: list, th: dict) -> list:
         for frame in frames:
             wrist = frame.joint(f"{side}_wrist")
             shoulder = frame.joint(f"{side}_shoulder")
-            if wrist is None or shoulder is None:
+            if (wrist is None or shoulder is None or frame.body_down is None
+                    or frame.body_scale is None):
                 continue
-            xs.append(float(wrist[0] - shoulder[0]) / frame.height)
+            # Travel *across* the body axis, in body scales. The image's x axis
+            # is the wrong one for the same reason it is wrong for `raised`: a
+            # person waving while lying down waves across their own body, which
+            # is vertical on screen.
+            across = np.array([-frame.body_down[1], frame.body_down[0]],
+                              dtype=np.float32)
+            xs.append(float(np.dot(wrist - shoulder, across)) / frame.body_scale)
             ts.append(frame.t)
         if len(xs) < 3:
             continue
@@ -564,17 +670,25 @@ def _arm_labels(frames: list, th: dict) -> list:
             continue
         reach = wrist - shoulder
         norm = float(np.linalg.norm(reach))
-        if norm < 1e-6:
+        if norm < 1e-6 or current.body_down is None:
             continue
-        from_horizontal = math.degrees(math.asin(min(1.0, abs(float(reach[1])) / norm)))
-        if from_horizontal > th["point_horizontal_deg"]:
+        # "Horizontal" means *perpendicular to the body*, not parallel to the
+        # image's horizon. Measured against the image, a person lying on the
+        # ground has a horizontal arm by construction — their whole body is
+        # horizontal — so every fallen person with a straight arm scored as
+        # pointing. Against the body axis, an arm resting alongside the body is
+        # parallel to it and scores nothing, while an arm held out to the side
+        # scores whatever posture its owner is in.
+        along = abs(float(np.dot(reach / norm, current.body_down)))
+        from_perpendicular = math.degrees(math.asin(min(1.0, along)))
+        if from_perpendicular > th["point_horizontal_deg"]:
             continue
         other = "right" if side == "left" else "left"
         other_speed = _joint_speed(frames, f"{other}_wrist")
         if other_speed is not None and other_speed > th["still_speed"]:
             continue
         out.append(("pointing",
-                    _confidence(from_horizontal, th["point_horizontal_deg"]),
+                    _confidence(from_perpendicular, th["point_horizontal_deg"]),
                     # The direction is worth more than the label: "someone is
                     # pointing" is far less actionable than where.
                     {"side": side,
@@ -582,17 +696,24 @@ def _arm_labels(frames: list, th: dict) -> list:
                                          round(float(reach[1] / norm), 3)]}))
 
     crossed = 0
-    if current.shoulder is not None and current.hip is not None:
-        midline = (float(current.shoulder[0]) + float(current.hip[0])) / 2.0
-        chest_top, chest_bottom = float(current.shoulder[1]), float(current.hip[1])
+    if (current.shoulder is not None and current.hip is not None
+            and current.body_down is not None):
+        # Also in the body frame: "across the midline" and "between shoulders
+        # and hips" are body-relative statements, and reading them off the image
+        # axes makes them mean something else for anyone not standing upright.
+        across = np.array([-current.body_down[1], current.body_down[0]],
+                          dtype=np.float32)
+        centre = (current.shoulder + current.hip) / 2.0
+        torso_span = float(np.dot(current.hip - current.shoulder, current.body_down))
         for side in ("left", "right"):
             wrist = current.joint(f"{side}_wrist")
             shoulder = current.joint(f"{side}_shoulder")
             if wrist is None or shoulder is None:
                 continue
-            own_side = float(shoulder[0]) - midline
-            wrist_side = float(wrist[0]) - midline
-            if own_side * wrist_side < 0 and chest_top <= float(wrist[1]) <= chest_bottom:
+            own_side = float(np.dot(shoulder - centre, across))
+            wrist_side = float(np.dot(wrist - centre, across))
+            depth = float(np.dot(wrist - current.shoulder, current.body_down))
+            if own_side * wrist_side < 0 and 0.0 <= depth <= torso_span:
                 crossed += 1
     if crossed == 2:
         out.append(("arms_crossed", 0.7, {}))
