@@ -574,9 +574,9 @@ class SkeletonActionBackend:
             return max(self.min_score, self.fall_min_score)
         return self.min_score
 
-    def classify(self, frames: list) -> dict:
-        if not frames:
-            return _nothing("no frames")
+    def classify(self, frames: list, want_activity: bool = True) -> dict:
+        if not frames or not want_activity:
+            return _nothing("no frames" if not frames else "activity not requested")
         try:
             prediction = self.predict(frames)
         except ActionBackendError as error:
@@ -699,8 +699,18 @@ class HybridActionBackend:
     def history_s(self) -> float:
         return max(self.rules.history_s, self.learned.history_s)
 
-    def classify(self, frames: list) -> dict:
+    def classify(self, frames: list, want_activity: bool = True) -> dict:
+        """`want_activity=False` skips the model and returns posture only.
+
+        The caller throttles it: the model's window is 2.5 s, so two runs one
+        frame apart share 97% of their input and cost 20 ms each. Measured on
+        Orin 6 with three people in frame, re-running it every frame put the
+        whole card at 98.9 ms per frame — a 10 fps ceiling on a 12 fps stream —
+        while the geometry beside it costs 0.68 ms and can run every frame.
+        """
         geometry = self.rules.classify(frames)
+        if not want_activity:
+            return geometry
         model = self.learned.classify(frames)
 
         result = dict(geometry)                 # posture always comes from here

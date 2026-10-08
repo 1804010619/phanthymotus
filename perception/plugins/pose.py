@@ -236,6 +236,7 @@ TOOLS = [
                 "publish_overlay": {"type": "boolean", "description": "另发一条把骨架画在原始画面上的 JPEG（{topic}/poses/overlay_img）。每帧多一次绘制+编码，外加一条跑 JPEG 的话题，所以默认关闭；要录给人看时再开", "default": False, "scope": "instance"},
                 "action_window_s": {"type": "number", "minimum": 0.2, "description": "动作判定回看多少秒。挥手频率和步频都是在这个窗口里数出来的", "default": 1.5, "scope": "instance"},
                 "action_backend": {"type": "string", "enum": list(ACTION_BACKENDS), "description": "动作分类后端。hybrid（默认）= 姿态走几何规则、跌倒/挥手/指向走 ST-GCN++ 骨架动作模型，两者各做擅长的；rules = 只用几何规则，不加载第二个 engine —— 这也是取不到 engine 时自动退到的模式，手动选它主要用于在真机上区分「模型判错」和「几何判错」。只用模型的 stgcn 模式已撤下：NTU-60 里没有「站立」「坐」这两个状态类，静止的人不但报不出来，还会拿到一个自信的错答案", "default": "hybrid", "scope": "instance"},
+                "activity_interval_s": {"type": "number", "minimum": 0.0, "description": "How often the action model runs, in seconds. Its window is 2.5 s, so two runs one frame apart share 97% of their input and cost 20 ms each; with three people in frame, running it every frame measured 98.9 ms per frame against 41 ms throttled. The geometry still runs every frame, so posture stays frame-rate. 0 disables the throttle.", "default": 0.35, "scope": "instance"},
                 "label_hold": {"type": "integer", "minimum": 1, "description": "标签迟滞：新动作要连续赢多少帧才换。每个阈值都是悬崖，实测在边界上原始答案会逐帧翻（模型得分在 0.40 附近摆动时 9 次比较全翻）。一个每秒跳十几次的标签比一个稳定的错标签更糟 —— 下游没法用、人读不了。代价是每次真实变化也要晚这么多帧（12 fps 下 3 帧 = 250 ms）。原始答案在 evidence.raw_action 里", "default": 3, "scope": "instance"},
                 "action_min_score": {"type": "number", "minimum": 0.0, "maximum": 1.0, "description": "骨架动作模型的得分阈值，低于它不报。跌倒单独用更高的 0.75 —— 实测该 engine 对纯噪声会给出 A43「跌倒」0.62，而误报跌倒的代价是机器人丢下手上的事去问人有没有受伤。调之前先看 info 里的实际得分，那是区分「模型判错」和「阈值定错」的唯一办法", "default": DEFAULT_MIN_SCORE, "scope": "instance"},
                 # Exposed because they are NOT constants: the same fall measures
@@ -264,7 +265,8 @@ class _PoseNode(Node):
                  fps: float, node_suffix: str, *, classifier: PoseActionClassifier,
                  kpt_confidence: float = 0.3, max_persons: int = 5,
                  publish_keypoints: str = "off", publish_bbox: bool = True,
-                 publish_overlay: bool = False, label_hold: int = 3):
+                 publish_overlay: bool = False, label_hold: int = 3,
+                 activity_interval_s: float = 0.35):
         super().__init__(f"pose_{node_suffix}" if node_suffix else "pose")
         # Topic-less is a supported mode, as in vop and tts: a card driven only
         # by recognize_by_photo has no camera, but still wants somewhere to
@@ -284,6 +286,11 @@ class _PoseNode(Node):
         self._publish_overlay = bool(publish_overlay)
         self._frame_interval = 1.0 / max(fps, 0.1)
 
+        self._activity_interval_s = float(activity_interval_s)
+        # Most recent raw model output, so `info` can show what it actually
+        # scored. "The activity field is empty" is otherwise impossible to tell
+        # from "the model was never asked" or "nothing cleared the threshold".
+        self._last_prediction: dict = {}
         self._tracker = PoseTracker(history_s=classifier.history_s,
                                    min_conf=kpt_confidence,
                                    label_hold=label_hold)
@@ -443,7 +450,29 @@ class _PoseNode(Node):
         persons = []
         for track, box, score, kpts in zip(tracks, boxes, kept_scores,
                                            kept_keypoints):
-            verdict = dict(self._classifier.classify(list(track.history)))
+            # The learned backend is throttled, the geometry is not. Its
+            # window is 2.5 s, so two runs one frame apart share 97% of their
+            # input and cost 20 ms each; measured on Orin 6 with three people,
+            # re-running it every frame put the card at 98.9 ms per frame —
+            # a 10 fps ceiling on a 12 fps stream. The geometry beside it costs
+            # 0.68 ms and does run every frame, so posture stays frame-rate.
+            #
+            # Staggered by track id so two people do not both pay on the same
+            # frame, which would show up as a periodic stutter rather than as a
+            # higher average.
+            due = (now_wall - track.activity_t) >= self._activity_interval_s
+            if self._activity_interval_s > 0 and not due:
+                stagger = (track.id % 3) * self._activity_interval_s / 3.0
+                due = (now_wall - track.activity_t) >= (
+                    self._activity_interval_s + stagger)
+            verdict = dict(self._classifier.classify(
+                list(track.history), want_activity=due))
+            if due:
+                track.activity = verdict.get("activity")
+                track.activity_t = now_wall
+                self._last_prediction = verdict.get("evidence") or {}
+            elif track.activity is not None:
+                verdict["activity"] = track.activity
             # Hysteresis, per person, per channel. Every threshold here is a
             # cliff and at the boundaries the raw answer flips on every frame —
             # a label alternating twelve times a second is worse than a stable
@@ -702,6 +731,8 @@ class PosePerceptionPlugin:
         self._action_min_score = float(
             plugin_cfg.get("action_min_score", DEFAULT_MIN_SCORE))
         self._label_hold = int(plugin_cfg.get("label_hold", 3))
+        self._activity_interval_s = float(
+            plugin_cfg.get("activity_interval_s", 0.35))
         # Why a temporal backend may be unavailable, kept so `info` can say it
         # instead of the card looking like it chose the geometry on purpose.
         self._backend_fallback: Optional[str] = None
@@ -751,6 +782,8 @@ class PosePerceptionPlugin:
             "action_min_score": float(icfg.get("action_min_score",
                                                self._action_min_score)),
             "label_hold": int(icfg.get("label_hold", self._label_hold)),
+            "activity_interval_s": float(icfg.get(
+                "activity_interval_s", self._activity_interval_s)),
         }
         for key in _THRESHOLD_KEYS:
             if key in icfg and icfg[key] is not None:
@@ -1022,6 +1055,7 @@ class PosePerceptionPlugin:
                 publish_bbox=merged["publish_bbox"],
                 publish_overlay=merged["publish_overlay"],
                 label_hold=merged["label_hold"],
+                activity_interval_s=merged["activity_interval_s"],
             )
             self._executor.add_node(node)
             self._nodes[node_key] = node
@@ -1234,6 +1268,14 @@ class PosePerceptionPlugin:
         if engine_errors:
             info["action_engine_error"] = engine_errors
 
+        # What the model last actually scored. Without this, an empty activity
+        # field is indistinguishable between "the model was never asked" (no
+        # motion), "nothing cleared the threshold", and "the engine is broken".
+        predictions = {key: node._last_prediction
+                       for key, node in nodes.items() if node._last_prediction}
+        if predictions:
+            info["last_prediction"] = predictions
+
         # A temporal backend classifies a *clip*, so it is starved by a low fps
         # in a way the geometry is not. Said here rather than enforced: a thin
         # window still beats no actions, but a quietly starved model looks like
@@ -1396,6 +1438,8 @@ class PosePerceptionPlugin:
             self._action_min_score = float(cfg["action_min_score"])
         if "label_hold" in cfg:
             self._label_hold = int(cfg["label_hold"])
+        if "activity_interval_s" in cfg:
+            self._activity_interval_s = float(cfg["activity_interval_s"])
         for key in _THRESHOLD_KEYS:
             if key in cfg:
                 self._plugin_cfg[key] = cfg[key]

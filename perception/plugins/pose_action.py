@@ -1029,8 +1029,13 @@ class PoseActionClassifier:
         result["unavailable_activities"] = list(TEMPORAL_ACTIVITIES)
         return result
 
-    def classify(self, frames: list) -> dict:
+    def classify(self, frames: list, want_activity: bool = True) -> dict:
         """Two channels: what shape the body is in, and what it is doing.
+
+        `want_activity` exists so all three backends share one signature — the
+        caller throttles the learned one and must not have to know which it
+        holds. The geometry's own activities cost 0.68 ms, so it computes them
+        either way and the flag changes nothing here.
 
         Neither is derived from the other and neither is a fallback for the
         other. A person always has a posture; they may well not have an
@@ -1149,7 +1154,8 @@ class PoseTrack:
     """One person's timeline. `history` is what the classifier reads."""
 
     __slots__ = ("id", "history", "last_seen",
-                 "posture_stabiliser", "activity_stabiliser")
+                 "posture_stabiliser", "activity_stabiliser",
+                 "activity", "activity_t")
 
     def __init__(self, track_id: int, label_hold: int = 3):
         self.id = track_id
@@ -1161,6 +1167,11 @@ class PoseTrack:
         # activity, or vice versa — they change on different timescales.
         self.posture_stabiliser = LabelStabiliser(label_hold)
         self.activity_stabiliser = LabelStabiliser(label_hold)
+        # Last activity the learned backend produced, and when. The model is not
+        # re-run every frame — its window is seconds long, so consecutive runs
+        # share almost all their input. See the throttle in plugins/pose.py.
+        self.activity = None
+        self.activity_t = -1e9
 
     @property
     def current(self) -> Optional[PoseFrame]:

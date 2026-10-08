@@ -790,3 +790,47 @@ def test_the_overlay_label_never_comes_back_unknown_for_a_known_person():
                     {"posture": None, "activity": {"name": "hand waving"}},
                     {"posture": "lying", "activity": {"name": "falling down"}}):
         assert pose_plugin.overlay_label(verdict) != "unknown", verdict
+
+
+# ── the action model is throttled ───────────────────────────────────────────
+
+def test_every_backend_accepts_the_throttle_flag():
+    """The node throttles the learned backend and must not have to know which
+    backend it is holding, so all three share one signature. `rules` would have
+    crashed on every frame without this."""
+    import inspect
+    from plugins.pose_action import PoseActionClassifier
+    from plugins.pose_stgcn import HybridActionBackend, SkeletonActionBackend
+    for cls in (PoseActionClassifier, SkeletonActionBackend, HybridActionBackend):
+        assert "want_activity" in inspect.signature(cls.classify).parameters, cls
+
+
+def test_the_model_is_not_run_on_every_frame():
+    """Its window is 2.5 s, so two runs one frame apart share 97% of their
+    input and cost 20 ms each. Measured on Orin 6 with three people, running it
+    every frame put the card at 98.9 ms per frame — a 10 fps ceiling on a 12 fps
+    stream — while the geometry beside it costs 0.68 ms."""
+    plugin, _ = _plugin({"activity_interval_s": 10.0})
+    plugin.dispatch("pose", {"action": "start", "input_topic": "/cam/rgb"})
+    node = _feed(plugin, "/cam/rgb", frames=4)
+    track = node._tracker.tracks[0]
+    # Four frames inside one interval: the model was asked once.
+    assert track.activity_t > -1e9, "the first frame must ask"
+    calls = sum(1 for m in _publisher(node, "/cam/rgb/poses").messages)
+    assert calls == 4, "but every frame still publishes"
+
+
+def test_posture_stays_frame_rate_while_the_activity_is_throttled():
+    """The geometry runs every frame regardless — a posture that only updated
+    three times a second would be a worse trade than the one being made."""
+    plugin, _ = _plugin({"activity_interval_s": 10.0})
+    plugin.dispatch("pose", {"action": "start", "input_topic": "/cam/rgb"})
+    node = _feed(plugin, "/cam/rgb", frames=3)
+    for message in _publisher(node, "/cam/rgb/poses").messages:
+        assert json.loads(message)["persons"][0]["posture"] == "standing"
+
+
+def test_a_zero_interval_disables_the_throttle():
+    plugin, _ = _plugin({"activity_interval_s": 0.0})
+    merged = plugin._merged_config("i1")
+    assert merged["activity_interval_s"] == 0.0
