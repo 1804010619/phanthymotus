@@ -2670,6 +2670,57 @@ One bundle per JetPack line, from the Orin on that line: Orin 6 (jp6.1) for
 `jp61`, Orin 5 (jp5.11) for `jp511`. A line with no published bundle reports
 `state: error` on that machine and affects nothing else.
 
+### Measured on the real engine (Orin 6, jp6.1, TensorRT 10.4)
+
+Built in 529 s, 24,704,612 bytes, FP16 at 640. The engine declares one output,
+`output0` with shape `(1, 300, 57)` — pinned as a test, see
+`test_the_real_pose_engine_geometry_decodes`.
+
+| | ms |
+|---|---|
+| `infer()` only, p50 over 20 runs after warmup | **~30** |
+| `decode_poses`, p50 over 50 runs | **0.26** |
+| jpeg decode + infer + decode, 4 people | ~46 |
+
+**These are an upper bound, not the figure to quote.** Orin 6 had its own
+`perception` and `actucore` containers running throughout, so part of this is the
+neighbours — the repo's own rule is that a benchmark taken with services up
+measures them too. An idle number needs those containers stopped first.
+
+Note `decode_poses` measured **10.3 ms on its first call** and 0.26 ms in a loop.
+A single cold timing of a numpy path is almost all first-touch cost; it is not a
+measurement of anything.
+
+30 ms is ~50% worse than the ~20 ms extrapolated from `yoloe-26s-seg`'s 19.8 ms,
+which is what extrapolation across model families is worth. At the default
+`fps: 5` the card asks for 30 ms every 200 ms, so it is not the constraint —
+memory is, as everywhere else on these boxes.
+
+### What the first real photos showed, and why it is the occlusion rule
+
+Two photos, 6 people between them, through the real engine and the real rules:
+
+* **A full-body shot** (4 people): the three with their legs in frame came back
+  `standing` at 0.95-0.98, with torso tilt 1.0-2.7 deg and knee angles
+  151-179 deg — upright and straight-legged, which is what `standing` means. The
+  fourth, half out of frame at the edge with 5 of 17 joints visible, came back
+  `unknown`.
+* **A waist-up shot** (2 people): both `unknown`.
+
+That second result is the design working, not a failure, and the per-keypoint
+visibilities say why. The model reported **hips at v=0.011-0.068, knees at
+0.002-0.004, ankles at 0.001-0.004** — it was explicitly saying it could not see
+the lower body — and it placed those invisible joints at y=696-731 on a
+720-pixel-tall frame, i.e. **pinned to the bottom edge**. That is precisely the
+invented-position-at-the-border effect `undo_letterbox_points` refuses to create
+and `kpt_confidence` refuses to believe. Had the gate not been there, two people
+photographed from the waist up would have been reported standing on the strength
+of coordinates the model itself disclaimed.
+
+It also confirms left/right are not transposed: for a person facing the camera,
+`right_shoulder` came back at x=314 and `left_shoulder` at x=637 — mirrored, as
+COCO defines them.
+
 `POSE_MODEL_BUNDLES` ships with **zero pins**, so `ensure_pose_model` raises with
 the build instructions instead of fetching anything unverified — the standing
 rule for every bundle in that file. Until the engines are exported and published,
