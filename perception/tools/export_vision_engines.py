@@ -54,6 +54,8 @@ deserializes fine and is then rejected on load.
 Outputs, per model:
     yoloe-26s-seg.engine + vocab.json     (vop)
     yolo26n-depth.engine                  (visual_depth)
+    yolo26n-pose.engine                   (pose; yolo11n-pose if the image's
+                                           ultralytics has no yolo26 pose weights)
 
 Then upload to COS and record size + SHA256 of the *uploaded* copy (re-download
 it and hash that) in utils/model_downloader.py. See that file's bundle tables.
@@ -158,9 +160,46 @@ def export_depth(out_dir: str, imgsz: int, workspace: float | None) -> list[str]
     return [target]
 
 
+def export_pose(out_dir: str, imgsz: int, workspace: float | None) -> list[str]:
+    """Build the human-keypoint engine for plugins/pose.py.
+
+    COCO-17, single class. `yolo26n-pose` is preferred for consistency with
+    yolo26n-depth and because the YOLO26 head is NMS-free, but whether the
+    installed ultralytics ships those weights is a property of the image, not
+    something to assume — so fall back to yolo11n-pose and say which was used.
+    Both decode through plugins/vision_runtime.decode_poses, which picks the
+    layout by content.
+    """
+    from ultralytics import YOLO
+
+    weights, model = None, None
+    errors = []
+    for candidate in ("yolo26n-pose.pt", "yolo11n-pose.pt"):
+        try:
+            model = YOLO(candidate)
+            weights = candidate
+            break
+        except Exception as exc:                        # noqa: BLE001
+            errors.append(f"{candidate}: {exc}")
+    if model is None:
+        raise RuntimeError("no pose weights could be loaded — tried:\n  "
+                           + "\n  ".join(errors))
+    print(f"[export] pose weights: {weights}", flush=True)
+
+    engine = model.export(format="engine", imgsz=imgsz, half=True,
+                          workspace=workspace, nms=False)
+    # Named after the weights actually used, so the bundle in
+    # utils/model_downloader.py and the file cannot disagree about which model
+    # a robot is running.
+    target = os.path.join(out_dir, weights.replace(".pt", ".engine"))
+    shutil.move(str(engine), target)
+    return [target]
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--model", choices=("vop", "depth", "both"), default="both")
+    parser.add_argument("--model", choices=("vop", "depth", "pose", "both"),
+                        default="both")
     parser.add_argument("--imgsz", type=int, default=640)
     parser.add_argument("--out", default="./engines")
     # Jetson memory is shared between CPU and GPU, so an unbounded TensorRT
@@ -187,6 +226,8 @@ def main() -> int:
         produced += export_vop(args.out, args.imgsz, workspace)
     if args.model in ("both", "depth"):
         produced += export_depth(args.out, args.imgsz, workspace)
+    if args.model in ("both", "pose"):
+        produced += export_pose(args.out, args.imgsz, workspace)
 
     print("\n[export] record these in utils/model_downloader.py — but re-hash "
           "the COPY DOWNLOADED BACK FROM COS, not these local files: a pin that "

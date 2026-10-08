@@ -73,6 +73,12 @@ ACTIONS = tuple(a for a in ACTION_PRIORITY if a != "unknown")
 # Labels whose meaning is "something happened", not "this is the current pose".
 EVENT_ACTIONS = ("fall",)
 
+# Labels that cannot exist in a single image, however good it is. Waving is
+# motion that comes back, walking is a cadence, a fall is a transition — one
+# frame carries none of them. The one-shot photo actions report this list
+# rather than quietly answering a narrower question than they were asked.
+TEMPORAL_ACTIONS = ("waving", "walking", "turning", "still", "fall")
+
 # Chinese names, for the `list_actions` reply and the card. Kept beside the
 # labels so the two cannot drift.
 ACTION_LABELS_ZH = {
@@ -653,6 +659,25 @@ class PoseActionClassifier:
         th = self.thresholds
         return max(self.action_window_s,
                    th["fall_drop_window_s"] + th["fall_settle_s"] + 0.5)
+
+    def classify_frame(self, frame) -> dict:
+        """Classify a single image — what one frame can honestly support.
+
+        The hold requirement on a raised hand is dropped here, because it only
+        exists to tell a held gesture from an arm passing through shoulder
+        height, and a photo has no "passing through". Everything in
+        TEMPORAL_ACTIONS stays unreachable and is named in the reply, so a
+        caller who asked "is this person waving" is told the question needs a
+        stream rather than being handed `raising_hand` as if it answered.
+        """
+        single = PoseActionClassifier(
+            thresholds={**self.thresholds, "raise_hold_s": 0.0},
+            action_window_s=self.action_window_s,
+        )
+        result = single.classify([frame])
+        result["temporal"] = False
+        result["unavailable_actions"] = list(TEMPORAL_ACTIONS)
+        return result
 
     def classify(self, frames: list) -> dict:
         th = self.thresholds

@@ -208,6 +208,64 @@ plugins:
     # 让机器人失明。「房间黑」和「镜头被挡」需要人做不同的处置，所以不猜。
     lens_barrel_max_fraction: 0.6
 
+  # 人体关键点 + 动作分类。COCO-17 关键点，动作标签来自关键点几何规则
+  # （plugins/pose_action.py，纯 numpy，没有第二个模型 —— 本进程里再多一份
+  # ONNX Runtime 在 jp5.11 上会直接 SIGSEGV，见 tts 那段注释）。
+  #
+  # 和 visual_depth 一样：engine 在第一次 start 时才加载，所以「打开但没连线」
+  # 的卡片不占内存。8 GB 的 Orin 上绑死的是内存不是 GPU 时间。
+  pose:
+    enabled: true
+    namespace: ""       # auto-detect from hostname if empty
+    confidence: 0.4     # 人体检测阈值
+    fps: 5
+    kpt_confidence: 0.3 # 单个关键点的可见性阈值，低于此值的关节不参与判定也不绘制
+    max_persons: 5
+    # ── 三条输出话题，以及为什么要分开 ──────────────────────────────────
+    #   {topic}/poses              data/json      精简：动作 + 位置 + 框
+    #   {topic}/poses/skeleton     sensor/pose2d  全量关键点，给 dashboard 画骨架
+    #   {topic}/poses/overlay_img  image/jpeg     骨架画在原画面上（下面的开关）
+    #
+    # agent-core 把订阅话题的**整条消息**原样塞进 event_bus 当事件文本
+    # （agent-core/src/topic_subscriber.py），所以连到 decision_core 那条流上
+    # 发出去的每个字节都是每一帧的 LLM 上下文字节。17 关键点 × 3 float × N 人
+    # × 5 fps 塞不进这个预算，而且骨架对文本模型本来也没用 —— 但它恰好是
+    # dashboard 要画的东西。所以胖载荷走 LLM 不订阅的那条话题。
+    #
+    # off（默认）/ compact（17 个整数像素点）/ full（17×(x,y,可见性)）。
+    # 每人每帧约 60 B → 400 B → 900 B。画骨架不受这里影响。
+    #
+    # 引号是必须的：YAML 1.1 把裸 off 解析成布尔 false，不是字符串 "off"。
+    # 这里恰好也能工作（非法值退回 off），但 `on` 就会变成 true 然后静默退回
+    # off —— 看着像配置没生效。
+    publish_keypoints: "off"
+    publish_bbox: true
+    # 另发一条把骨架画在画面上的 JPEG。每帧多一次绘制 + 编码（640 下 Orin 上
+    # 约 3-6 ms）外加一条跑 JPEG 的话题，所以默认关闭。
+    #
+    # 为什么需要这条、而不是让前端自己叠：dashboard 的 renderer 一次只看一条
+    # 话题（detail-panel.js 对选中端口开一条 /ws/bus/{topic}），所以浏览器里
+    # 拿不到「画面 + 关键点」两路数据来合成叠加图。
+    publish_overlay: false
+    # 动作判定回看多少秒。挥手频率和步频都是在这个窗口里数出来的。
+    action_window_s: 1.5
+    # rules = 关键点几何规则。预留给以后的骨架动作模型（ST-GCN 之类）。
+    action_backend: rules
+    # ── 跌倒阈值 ───────────────────────────────────────────────────────
+    # 这三个**不是常量**：同一次跌倒，相机离地 0.4 m 和 1.2 m 量出的
+    # drop_ratio 完全不同，焦距和俯仰角也进来。所以它们是 instance 级配置，
+    # 下面的值是起点而不是结论 —— 把相机装到最终位置后在真机上调，并记下看到
+    # 的数（卡片的 evidence 里有 drop_ratio / drop_ms / settle_ms）。
+    #
+    # 判的是「转换」而不是终态：躺在地上和躺在沙发上是同一个终态。要同时满足
+    # 髋部快速下降、落地后保持水平、且下降过程中没有「坐」的中间态。
+    #
+    # 已知限制：单目正面视角下「跌倒」和「蹲下再趴下」几乎不可分，侧视角可靠
+    # 得多。误报比漏报贵 —— 每次误报都要机器人打断手上的事去问「你没事吧」。
+    fall_drop_ratio: 0.35
+    fall_drop_window_s: 0.6
+    fall_settle_s: 1.0
+
   ocr:
     enabled: true
     provider: rapidocr

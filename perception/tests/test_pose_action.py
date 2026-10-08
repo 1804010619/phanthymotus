@@ -581,3 +581,39 @@ def test_an_occluded_body_can_still_report_its_arms():
                          "right_shoulder": (CX + 0.10 * H, TOP + 0.18 * H)})
     result = _classify(_steady(upper, _standing_box(), duration=1.0))
     assert result["action"] == "raising_hand"
+
+
+# ── single-image classification ─────────────────────────────────────────────
+
+def test_a_single_frame_drops_the_hold_requirement_on_a_raised_hand():
+    """The hold only exists to tell a held gesture from an arm swinging
+    through shoulder height, and a photo has no "swinging through"."""
+    frame = _frame(_raised_arm(_body()), _standing_box(), 0.0)
+    result = PoseActionClassifier().classify_frame(frame)
+    assert result["action"] == "raising_hand"
+    assert result["temporal"] is False
+
+
+def test_a_single_frame_says_which_actions_it_cannot_answer():
+    """Waving, walking and falling are motion; one image carries none of them.
+
+    Saying so beats answering a narrower question than was asked — a caller
+    who asked "is this person waving" would otherwise get `raising_hand` back
+    as though it settled the matter.
+    """
+    frame = _frame(_body(), _standing_box(), 0.0)
+    result = PoseActionClassifier().classify_frame(frame)
+    assert result["action"] == "standing"
+    assert "waving" in result["unavailable_actions"]
+    assert "fall" in result["unavailable_actions"]
+    assert "standing" not in result["unavailable_actions"]
+    assert "still" not in result["actions"]
+
+
+def test_a_single_frame_still_refuses_an_occluded_posture():
+    upper = {**_head(),
+             "left_shoulder": (CX - 0.10 * H, TOP + 0.18 * H),
+             "right_shoulder": (CX + 0.10 * H, TOP + 0.18 * H)}
+    result = PoseActionClassifier().classify_frame(
+        _frame(upper, _standing_box(), 0.0))
+    assert result["action"] == "unknown"

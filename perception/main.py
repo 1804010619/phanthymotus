@@ -9,6 +9,7 @@ perception/main.py — Perception Stack bundle 统一入口。
   vop              物体检测（YOLOE-26 + TensorRT）
   visual_depth     单目深度（YOLO26-depth + TensorRT）
   ocr              文字识别（RapidOCR + TensorRT）
+  pose             人体关键点与动作分类（COCO-17 + TensorRT，动作为几何规则）
   face_recognition 人脸识别与建库（InsightFace buffalo_sc）
 
 每个插件自带一个 `enabled` 开关，加载失败的插件不会拖垮其余插件 —— 它的卡片
@@ -161,6 +162,25 @@ class PerceptionBundle:
                 log.info("VideoDepthPerceptionPlugin loaded (namespace=%s)", namespace)
             except Exception:
                 log.error("VideoDepthPerceptionPlugin failed to load; continuing without depth",
+                          exc_info=True)
+
+        if plugins_cfg.get("pose", {}).get("enabled", False):
+            import re, socket
+            namespace = plugins_cfg["pose"].get("namespace", "").strip()
+            if not namespace:
+                namespace = re.sub(r"[^a-zA-Z0-9_]", "_", socket.gethostname())
+            from plugins.pose import PosePerceptionPlugin
+            # Guarded like TTSPlugin / VideoDepthPerceptionPlugin: this one needs
+            # a TensorRT engine bundle for the running JetPack line, and a
+            # machine that cannot fetch it must still get ASR/TTS/VOP/OCR. The
+            # card simply does not appear, which is visible in the dashboard.
+            try:
+                self._plugins.append(
+                    PosePerceptionPlugin(plugins_cfg["pose"], namespace, executor)
+                )
+                log.info("PosePerceptionPlugin loaded (namespace=%s)", namespace)
+            except Exception:
+                log.error("PosePerceptionPlugin failed to load; continuing without pose",
                           exc_info=True)
 
         if plugins_cfg.get("ocr", {}).get("enabled", False):

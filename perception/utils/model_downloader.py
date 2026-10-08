@@ -1238,6 +1238,28 @@ DEPTH_MODEL_BUNDLES = {
 }
 
 
+POSE_MODEL_BUNDLES = {
+    "jp61": {
+        "base_url": f"{VISION_MODEL_BASE}/yolo26n-pose/tensorrt-jp61-trt10.4-orin-640",
+        "files": {
+            "yolo26n-pose.engine": {
+                "size": 0,
+                "sha256": "",
+            },
+        },
+    },
+    "jp511": {
+        "base_url": f"{VISION_MODEL_BASE}/yolo26n-pose/tensorrt-jp511-trt8.5-orin-640",
+        "files": {
+            "yolo26n-pose.engine": {
+                "size": 0,
+                "sha256": "",
+            },
+        },
+    },
+}
+
+
 def _ensure_vision_bundle(
     kind: str, bundles: dict, model_dir: str, family: str | None = None,
     progress_cb=None,
@@ -1260,9 +1282,11 @@ def _ensure_vision_bundle(
         raise RuntimeError(
             f"{kind.upper()}_MODEL_BUNDLES[{key!r}] has no pinned size/sha256 for "
             f"{sorted(unpinned)} — build the engine with "
-            "tools/export_vision_engines.py on a host of that JetPack line, "
-            "publish it to COS, and record the size and SHA256 of the *uploaded* "
-            "copy here"
+            "tools/export_vision_engines.py in a container built from the "
+            f"{key} perception image (NOT on the Jetson host: the image and the "
+            "host ship different TensorRT versions and an engine only loads on "
+            "the one that built it), publish it to COS, and record the size and "
+            "SHA256 of the *uploaded* copy here"
         )
     log.info(f"[model_downloader] {kind}: using {key} bundle")
     return ensure_verified_bundle(
@@ -1282,4 +1306,20 @@ def ensure_depth_model(model_dir: str, family: str | None = None,
                        progress_cb=None) -> dict[str, str]:
     """Ensure the monocular depth engine matching the runtime TensorRT is present."""
     return _ensure_vision_bundle("depth", DEPTH_MODEL_BUNDLES, model_dir, family,
+                                 progress_cb=progress_cb)
+
+
+def ensure_pose_model(model_dir: str, family: str | None = None,
+                      progress_cb=None) -> dict[str, str]:
+    """Ensure the human-keypoint engine matching the runtime TensorRT is present.
+
+    The pins above are still zero, so this raises with the build instructions
+    until the engines have been exported inside the jp6.1 and jp5.11 perception
+    images and published. That is the intended behaviour, not a gap:
+    _ensure_vision_bundle refuses an unpinned entry rather than downloading it,
+    because size+SHA256 verification is what makes a multi-source fetch safe at
+    all. A pose card on a machine without the bundle reports `state: error` with
+    that message, and ASR/TTS/VOP/OCR are untouched.
+    """
+    return _ensure_vision_bundle("pose", POSE_MODEL_BUNDLES, model_dir, family,
                                  progress_cb=progress_cb)
