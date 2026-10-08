@@ -2555,6 +2555,87 @@ Three rules worth knowing before reading the thresholds:
   `evidence` to the top level, because "someone is pointing" is far less
   actionable than where.
 
+### The posture rules use angles, and which angles matters
+
+The first version of these rules was poor enough on a robot that standing,
+sitting, waving and falling were all unreliable. Most of it was two bugs, both
+worth recording because both were a *category* of mistake rather than a bad
+constant.
+
+**Image-space length ratios cannot survive a camera below eye level.**
+`standing` was gated on `hip_knee_dy >= 0.15` — the hip-to-knee vertical gap as
+a fraction of bounding-box height — *on top of* the torso-tilt and knee-angle
+tests. For a person who is definitely standing, with the legs foreshortened as a
+low camera foreshortens them:
+
+| leg compression | `hip_knee_dy` | `knee_deg` | `torso_deg` | verdict |
+|---|---|---|---|---|
+| 1.00 | 0.232 | 180.0 | 0.0 | `standing` |
+| 0.60 | 0.171 | 180.0 | 0.0 | `standing` |
+| **0.45** | 0.140 | **180.0** | **0.0** | **`unknown`** |
+| 0.25 | 0.089 | 180.0 | 0.0 | `unknown` |
+
+The angles were right the whole way down. The ratio added no information and
+only a viewpoint dependence — and a robot camera at 0.4-1.2 m looking at someone
+1-2 m away is well past 0.45. Worse, `sitting` keyed on the *other side of the
+same fragile quantity* (`|hip_knee_dy| <= 0.15`), so a standing person seen from
+below either vanished into `unknown` or landed in the sitting band. Both labels
+being wrong was the consequence, not bad luck.
+
+So `sitting` is a **hip angle** (shoulder-hip-knee: the thigh folded towards the
+chest), `standing` is the absence of folding, and the three `_dy` thresholds are
+gone. A test asserts no length-ratio threshold can come back. Visibility is also
+graded rather than all-or-nothing: legs are readable as soon as *either* the hip
+or the knee angle is available, so the common robot framing — knees in frame,
+feet cropped — reads as standing instead of unknown. A torso-only view still
+refuses, because standing and sitting genuinely share a torso axis.
+
+**And then the same mistake one level down.** Running the fixed rules against
+**real engine keypoints** rather than synthetic bodies caught it: 2D joint angles
+are invariant to scale and rotation but **not to foreshortening**, which is
+anisotropic scaling. With a real skeleton's legs compressed to 0.35, the hip
+angle moved 170.3 → 162.7 deg while the knee angle moved 151.1 → **126.0** —
+thigh and shin are never exactly collinear, and squashing y amplifies whatever
+lateral offset they have. Requiring a straight knee for `standing` was therefore
+a fragile measurement vetoing a robust one: the hip angle spans the torso, the
+longest and best-detected segment, while the knee spans two short noisy ones.
+`standing` now holds on *either* an open hip or a straight knee, and the knee
+keeps exactly one job — objecting to a leg folded past a squat, so a crouch
+cannot read as standing.
+
+"Use angles, they are robust" was too strong. Use the angle over the longest
+segment you can see, and let the short ones corroborate rather than veto.
+
+### The track has to survive the fall
+
+A standing box `[260,100,380,500]` against the same person's lying box
+`[140,436,500,492]` scores **IoU 0.109** — under any usable `iou_min`. So the
+track split at the instant of the fall, the new track began with an empty
+history, and `_fall_evidence` could only ever see horizontal frames and report
+"no fast drop". Fall detection required continuity across the one event that
+destroys box overlap.
+
+Association therefore has a second, independent cue: the centroid of the visible
+joints against the body's own scale. The box changes shape when someone falls;
+the body does not teleport. Either cue passing is enough, because they fail in
+different situations. The gate is 1.0 body height and is a **sanity bound, not
+the discriminator** — greedy nearest-match does the work, since each detection
+and each track is used once and the closest pair is taken first. 0.5 was tried
+and vetoed a real fall by 0.03, which is what a threshold set to the magnitude of
+the thing it must admit does: a fall moves the centroid about half a body height
+*by definition*. Erring loose is the right direction — merging two people costs
+one wrong label, splitting a track makes every temporal label undetectable.
+
+**This fix is a prerequisite for the learned backend, not an alternative to it.**
+ST-GCN++ is fed one continuous `(T, V, C)` sequence per person, so a track that
+splits mid-action hides the action from the model exactly as it did from the
+rules.
+
+Not confirmed, and recorded because it was the first suspicion: **fps is not why
+waving failed.** Simulated 1-4 Hz waves are detected at 5, 10, 15 and 30 fps on
+clean signals, so Nyquist does not explain the field reports. fps matters for a
+different reason — see the backends below.
+
 ### Action backends: `hybrid` (default), `rules`, `stgcn`
 
 The first version of this card had one backend — hand-written geometry — and on
