@@ -59,7 +59,13 @@ log = logging.getLogger(__name__)
 # could not rely on it coming from a known set.
 
 #: What the geometry can say about a body's shape. Closed.
-POSTURES = ("lying", "crouching", "sitting", "bending", "standing")
+#:
+#: `upright` is the coarse one: torso vertical, legs not readable. It exists
+#: because "I cannot tell standing from sitting" and "I know nothing about this
+#: body" were being reported as the same thing, and they are not. The common
+#: webcam framing — head, shoulders and arms, nothing below the waist — gave
+#: `unknown` on every frame while the body axis was perfectly measurable.
+POSTURES = ("lying", "crouching", "sitting", "bending", "standing", "upright")
 
 #: Activities the geometry can read without a model. Open to the model's own
 #: vocabulary on top — see plugins/pose_stgcn.py.
@@ -68,7 +74,9 @@ GEOMETRY_ACTIVITIES = ("falling down", "hand waving", "point to something",
 
 #: Order within each vocabulary, most informative first. `standing` is last
 #: among postures for the reason `walking` beat it before: it says the least.
-POSTURE_PRIORITY = POSTURES
+#: Most specific first: `upright` only wins when nothing sharper holds.
+POSTURE_PRIORITY = ("lying", "crouching", "sitting", "bending", "standing",
+                    "upright")
 
 #: Within activities: the one a robot acts on first, then gestures aimed at it,
 #: then what somebody is doing on their own.
@@ -118,7 +126,7 @@ ACTIVITY_LABELS_ZH = {
 #: Chinese names for the postures.
 POSTURE_LABELS_ZH = {
     "standing": "站立", "sitting": "坐", "crouching": "蹲",
-    "bending": "弯腰", "lying": "躺",
+    "bending": "弯腰", "lying": "躺", "upright": "直立(分不清站/坐)",
 }
 
 # Kept while callers migrate off the flattened vocabulary.
@@ -613,6 +621,15 @@ def _posture_labels(frame: PoseFrame, th: dict) -> list:
         if frame.aspect >= th["lying_aspect"]:
             score = min(1.0, score + 0.1)
         out.append(("lying", score))
+
+    # Legs or hips unreadable — the common webcam framing is head, shoulders and
+    # arms with nothing below the waist. The body axis is still perfectly
+    # measurable (`body_down` falls back to the head-to-shoulder vector), so say
+    # the part that is known. "I cannot tell standing from sitting" and "I know
+    # nothing about this body" were being reported as the same `unknown`, and a
+    # head-and-shoulders view can certainly tell either of them from lying down.
+    if not out and axis_deg is not None and axis_deg <= th["upright_deg"]:
+        out.append(("upright", _confidence(axis_deg, th["upright_deg"])))
 
     if frame.torso_deg is None:
         return out

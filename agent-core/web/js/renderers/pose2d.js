@@ -186,14 +186,21 @@ export function visibleJoints(person, minConfidence, transform) {
 }
 
 /** The one-line summary drawn over each person.
-
-    Activity first when there is one, because it says more: a fallen person is
-    better described by "falling down" than by "lying". */
+ *
+ * Both channels when both are there — `upright · hand waving` — because they
+ * answer different questions and showing only one hides the other. Posture
+ * first: it is the one that is always available, so the label does not change
+ * shape as an activity comes and goes. */
 export function personLabel(person) {
-  const label = person.activity || person.posture || 'unknown';
-  const confidence = person.confidence === null || person.activity
-    ? '' : ` ${Math.round(person.confidence * 100)}%`;
-  return `#${person.id} ${label}${confidence}`;
+  const parts = [];
+  if (person.posture) parts.push(person.posture);
+  if (person.activity) parts.push(person.activity);
+  if (!parts.length) parts.push('unknown');
+  // The confidence belongs to the posture, so it is only shown when the
+  // posture is the only thing being reported.
+  const confidence = (person.confidence !== null && person.posture && !person.activity)
+    ? ` ${Math.round(person.confidence * 100)}%` : '';
+  return `#${person.id} ${parts.join(' · ')}${confidence}`;
 }
 
 /** Which label decides the colour — the alerting one wins. */

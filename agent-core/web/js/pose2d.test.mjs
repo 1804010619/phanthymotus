@@ -226,9 +226,18 @@ test('an id that is not a number still picks a colour', () => {
   assert.ok(TRACK_COLOURS.includes(trackColour(-3, 'standing')));
 });
 
-test('the label prefers the activity, which says more than the posture', () => {
+test('the label shows both channels when both are there', () => {
+  // They answer different questions — what shape the body is in, and what the
+  // person is doing — so showing one hides the other.
   assert.equal(personLabel({ id: 2, posture: 'lying', activity: 'falling down',
-                             confidence: 0.82 }), '#2 falling down');
+                             confidence: 0.82 }), '#2 lying · falling down');
+  assert.equal(personLabel({ id: 7, posture: 'upright', activity: 'hand waving',
+                             confidence: 0.9 }), '#7 upright · hand waving');
+});
+
+test('an activity with no posture is still shown', () => {
+  assert.equal(personLabel({ id: 2, posture: null, activity: 'hand waving',
+                             confidence: null }), '#2 hand waving');
 });
 
 test('with no activity the posture is drawn, with its confidence', () => {

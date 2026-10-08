@@ -247,21 +247,22 @@ def test_a_horizontal_body_is_lying():
 
 # ── occlusion ───────────────────────────────────────────────────────────────
 
-def test_a_body_with_no_visible_hips_refuses_to_guess_a_posture():
-    """Sitting at a desk and standing behind it have the same torso axis.
+def test_a_body_with_no_visible_hips_says_upright_not_standing():
+    """Sitting at a desk and standing behind it have the same torso axis, so
+    neither may be claimed. But the axis itself is measurable, and reporting
+    `unknown` threw that away too — which is what the common webcam framing
+    (head, shoulders, arms, nothing below the waist) produced on every frame.
 
-    This is the case the plugin exists to not get wrong: inferring a posture
-    from the shoulders alone would make "I can't see" indistinguishable from
-    "nothing is wrong".
+    `upright` is the honest middle: this body is vertical, and which of
+    standing or sitting it is cannot be told from here.
     """
     upper = {**_head(),
              "left_shoulder": (CX - 0.10 * H, TOP + 0.18 * H),
              "right_shoulder": (CX + 0.10 * H, TOP + 0.18 * H)}
     result = _classify(_steady(upper, _standing_box()))
-    assert _action(result) == "unknown"
-    assert _labels(result) == set()
-    assert result["evidence"]["reason"] == "occluded"
-    assert result["evidence"]["has_torso"] is False
+    assert result["posture"] == "upright"
+    assert "standing" not in _labels(result)
+    assert "sitting" not in _labels(result)
 
 
 def test_a_nearly_invisible_body_is_unknown():
@@ -654,13 +655,15 @@ def test_a_single_frame_says_which_actions_it_cannot_answer():
 
 
 
-def test_a_single_frame_still_refuses_an_occluded_posture():
+def test_a_single_frame_reports_upright_for_an_occluded_body():
+    """One image of a head-and-shoulders view: the axis is measurable even
+    though standing and sitting are not separable."""
     upper = {**_head(),
              "left_shoulder": (CX - 0.10 * H, TOP + 0.18 * H),
              "right_shoulder": (CX + 0.10 * H, TOP + 0.18 * H)}
     result = PoseActionClassifier().classify_frame(
         _frame(upper, _standing_box(), 0.0))
-    assert _action(result) == "unknown"
+    assert result["posture"] == "upright"
 
 
 # ── track continuity through a fall ─────────────────────────────────────────
@@ -812,13 +815,23 @@ def test_a_cropped_view_with_knees_but_no_feet_still_reads_as_standing():
     assert _action(result) == "standing"
 
 
-def test_a_torso_only_view_still_refuses_to_pick_a_posture():
-    """The honest limit, unchanged by the rewrite: with no knee in frame there
-    is no hip angle, and standing and sitting have the same torso axis."""
+def test_a_torso_only_view_reports_upright_and_nothing_sharper():
+    """With no knee in frame there is no hip angle, so standing and sitting
+    stay indistinguishable — but the body is plainly vertical and that is worth
+    saying."""
     joints = {k: v for k, v in _body().items()
               if "knee" not in k and "ankle" not in k and "hip" not in k}
     box = (CX - 0.15 * H, TOP, CX + 0.15 * H, TOP + 0.55 * H)
-    assert _action(_classify(_steady(joints, box))) == "unknown"
+    result = _classify(_steady(joints, box))
+    assert result["posture"] == "upright"
+    assert "standing" not in _labels(result) and "sitting" not in _labels(result)
+
+
+def test_a_head_with_no_shoulders_still_reports_nothing():
+    """The real limit. Without shoulders there is no body axis at all, and
+    `upright` would be a guess rather than a coarser truth."""
+    box = (CX - 0.1 * H, TOP, CX + 0.1 * H, TOP + 0.1 * H)
+    assert _classify(_steady(_head(), box))["posture"] is None
 
 
 def test_the_posture_rules_use_no_image_space_length_ratios():

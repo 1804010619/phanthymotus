@@ -648,22 +648,39 @@ _ALERT_COLOUR = (87, 119, 215)      # var(--orange) in BGR
 _ALERT_LABELS = ("falling down", "lying")
 
 
-def overlay_label(verdict: dict) -> str:
-    """The one line drawn over a person, from the two-channel verdict.
+def is_alerting(verdict: dict) -> bool:
+    """Is this person on the ground?
 
-    Activity first, because it says more — "falling down" beats "lying" — and
-    the posture when there is no activity. This read `verdict["action"]` until
-    that field was removed, and then silently labelled everybody `unknown`: the
-    existing drawing tests passed because they fed a hand-built verdict that
-    still had the old key, which is exactly how a renderer keeps drawing after
-    its data has moved.
+    Decided from the channels, never from `overlay_label`'s output: that is a
+    compound string once both channels are present ("lying · falling down"), so
+    testing it for membership in a label set silently stops matching.
     """
     activity = verdict.get("activity")
-    if isinstance(activity, dict) and activity.get("name"):
-        return activity["name"]
-    if isinstance(activity, str) and activity:
-        return activity
-    return verdict.get("posture") or "unknown"
+    if isinstance(activity, dict):
+        activity = activity.get("name")
+    return verdict.get("posture") in _ALERT_LABELS or activity in _ALERT_LABELS
+
+
+def overlay_label(verdict: dict) -> str:
+    """The one line drawn over a person.
+
+    Both channels when both are there — `upright · hand waving` — because they
+    answer different questions and showing only one hides the other. Posture
+    first: it is the thing that is always available, so the label does not
+    change shape when an activity comes and goes.
+
+    This read `verdict["action"]` until that field was removed, and then
+    silently labelled everybody `unknown`: the drawing tests passed because they
+    fed a hand-built verdict that still had the old key, which is exactly how a
+    renderer keeps drawing after its data has moved.
+    """
+    activity = verdict.get("activity")
+    if isinstance(activity, dict):
+        activity = activity.get("name")
+    posture = verdict.get("posture")
+    if posture and activity:
+        return f"{posture} · {activity}"
+    return posture or activity or "unknown"
 
 
 def draw_skeleton(canvas, persons: list, kpt_confidence: float) -> None:
@@ -679,7 +696,7 @@ def draw_skeleton(canvas, persons: list, kpt_confidence: float) -> None:
         keypoints = np.asarray(person["keypoints"], dtype=np.float32)
         verdict = person.get("verdict") or {}
         label = overlay_label(verdict)
-        colour = (_ALERT_COLOUR if label in _ALERT_LABELS
+        colour = (_ALERT_COLOUR if is_alerting(verdict)
                   else _TRACK_COLOURS[int(person.get("id", 0)) % len(_TRACK_COLOURS)])
         visible = keypoints[:, 2] >= kpt_confidence
         for a, b in COCO_SKELETON:

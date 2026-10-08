@@ -360,6 +360,8 @@ def test_a_fallen_person_is_drawn_in_the_alert_colour():
               "verdict": {"posture": "lying",
                           "activity": {"name": "falling down"}}}
     pose_plugin.draw_skeleton(canvas, [person], 0.3)
+    # The colour keys on the alerting label, which is now part of a compound
+    # string, so it is matched by membership rather than equality.
     assert tuple(int(v) for v in canvas[200, 250]) == pose_plugin._ALERT_COLOUR
 
 
@@ -774,13 +776,17 @@ def test_the_overlay_label_reads_the_two_channel_verdict():
     hand-built verdict that still carried the old key. That is exactly how a
     renderer keeps drawing after its data has moved underneath it."""
     assert pose_plugin.overlay_label(
-        {"posture": "lying", "activity": {"name": "falling down"}}) == "falling down"
+        {"posture": "lying", "activity": {"name": "falling down"}}
+    ) == "lying · falling down"
     assert pose_plugin.overlay_label(
         {"posture": "standing", "activity": None}) == "standing"
     assert pose_plugin.overlay_label({"posture": None, "activity": None}) == "unknown"
     # A published record carries the activity as a plain string, not a dict.
     assert pose_plugin.overlay_label(
-        {"posture": "sitting", "activity": "reading"}) == "reading"
+        {"posture": "sitting", "activity": "reading"}) == "sitting · reading"
+    # Either alone is shown on its own.
+    assert pose_plugin.overlay_label(
+        {"posture": None, "activity": "reading"}) == "reading"
 
 
 def test_the_overlay_label_never_comes_back_unknown_for_a_known_person():
@@ -834,3 +840,20 @@ def test_a_zero_interval_disables_the_throttle():
     plugin, _ = _plugin({"activity_interval_s": 0.0})
     merged = plugin._merged_config("i1")
     assert merged["activity_interval_s"] == 0.0
+
+
+def test_the_alert_colour_keys_on_the_channels_not_the_label():
+    """`overlay_label` became a compound string once both channels are shown
+    ("lying · falling down"), so testing it for membership in a label set
+    silently stopped matching and a fallen person was drawn in a track colour."""
+    assert pose_plugin.is_alerting({"posture": "lying", "activity": None})
+    assert pose_plugin.is_alerting(
+        {"posture": None, "activity": {"name": "falling down"}})
+    assert pose_plugin.is_alerting(
+        {"posture": "lying", "activity": {"name": "falling down"}})
+    assert not pose_plugin.is_alerting(
+        {"posture": "standing", "activity": {"name": "reading"}})
+    # And the compound label itself is never in the set, which is the trap.
+    assert pose_plugin.overlay_label(
+        {"posture": "lying", "activity": {"name": "falling down"}}
+    ) not in pose_plugin._ALERT_LABELS
