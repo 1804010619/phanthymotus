@@ -197,12 +197,10 @@ def _register_core_mcp(silent=False):
                 'name': 'remote_camera',
                 'type': 'sensor',
                 'description': (
-                    '远程摄像头 — 把浏览器的摄像头作为一路实时图像源推到 DDS。'
-                    'remote_image 一次只能上传一张图，所以挥手、走动、跌倒这类'
-                    '需要连续画面的东西根本测不了；没有摄像头的机器（测试机）'
-                    '更是完全没有图像源。这张卡片发的是 image/jpeg，和真实相机'
-                    '卡片同一个格式，所以 vop / pose / face / ocr 可以直接连上，'
-                    '无需任何特殊处理。'
+                    'Remote camera — stream a video device attached to the '
+                    'browser as a live image source for the robot. Publishes '
+                    'image/jpeg, the same format the on-robot camera drivers '
+                    'emit, so any vision card accepts it directly.'
                 ),
                 'inputSchema': {'type': 'object', 'properties': {
                     'action': {'type': 'string', 'enum': ['start', 'stop', 'info'],
@@ -213,7 +211,7 @@ def _register_core_mcp(silent=False):
                     'properties': {
                         'device_id': {
                             'type': 'string',
-                            'description': '浏览器视频输入设备',
+                            'description': 'Video input device',
                             'format': 'video-input-device',
                             'scope': 'instance',
                         },
@@ -221,14 +219,17 @@ def _register_core_mcp(silent=False):
                             'type': 'integer', 'minimum': 1, 'maximum': 30,
                             'default': 12, 'scope': 'instance',
                             'description': (
-                                '每秒推送几帧。12 是 pose 卡片的默认值：骨架动作'
-                                '模型判的是一段视频，再低就只剩插值了。浏览器要在'
-                                '主线程上逐帧 JPEG 编码，所以上限 30。'),
+                                'Frames per second. 12 matches the pose card, '
+                                'whose action model classifies a clip rather '
+                                'than a frame. Capped at 30 because each frame '
+                                'is JPEG-encoded on the browser main thread.'),
                         },
                         'width': {
                             'type': 'integer', 'minimum': 160, 'maximum': 1920,
                             'default': 640, 'scope': 'instance',
-                            'description': '长边像素。按摄像头真实宽高比缩放，不拉伸',
+                            'description': ('Long edge in pixels. Scaled to the '
+                                            'camera\'s own aspect ratio, never '
+                                            'stretched.'),
                         },
                     },
                 },
@@ -943,12 +944,9 @@ async def _ws_mic(ws: fastapi.WebSocket):
 
 # ── Camera WebSocket endpoint (receive browser JPEG frames, publish to ROS2) ──
 #
-# The visual twin of /ws/mic, and it exists for the same reason: a card that
-# consumes a live sensor cannot be tested from a file. `remote_image` publishes
-# one picture, which exercises a detector and says nothing about anything
-# temporal — waving is motion that comes back, a fall is a transition. And a
-# machine with no camera, which is every Orin test rig, had no image source at
-# all.
+# The visual twin of /ws/mic: a video device on whatever machine has the browser
+# open becomes an image source for the robot. Published as image/jpeg, the
+# format the on-robot camera drivers emit, so no consumer needs a special case.
 _camera_pub = None
 _camera_frame_count = 0
 _camera_ws_connected = False

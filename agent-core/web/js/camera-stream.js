@@ -1,23 +1,15 @@
 /**
- * camera-stream.js — 浏览器摄像头采集 + JPEG 编码 + WebSocket 发送
+ * camera-stream.js — browser camera capture, JPEG encode, WebSocket send.
  *
- * The visual counterpart to mic-stream.js, and built the same way for the same
- * reason: a card that needs a live sensor cannot be tested from a file.
- *
- * `remote_image` uploads one picture, which is enough to exercise a detector and
- * useless for anything temporal — waving is motion that comes back, a fall is a
- * transition, and neither exists in a single frame. A machine with no camera
- * (every Orin test rig) therefore had no way to test those at all.
- *
- * Frames go out as JPEG over a WebSocket and the server republishes them on
- * `/remote_control/camera` as `image/jpeg`, which is exactly what the vision
- * cards already take as input — so a browser webcam wires into vop, pose, face
- * or ocr with no special case anywhere.
+ * The visual counterpart to mic-stream.js: a video device on whatever machine
+ * has the dashboard open becomes a live image source for the robot. Frames go
+ * out as JPEG and the server republishes them on `/remote_control/camera` as
+ * `image/jpeg` — the format the on-robot camera drivers emit — so any vision
+ * card consumes it with no special case.
  *
  *   import { toggleCameraStream, isCameraActive } from './camera-stream.js';
  *   await toggleCameraStream(wsUrl, onStateChange, { fps: 12 });
  */
-
 let _stream = null;
 let _ws = null;
 let _timer = null;
@@ -68,7 +60,7 @@ export async function listCameras() {
     const devices = await navigator.mediaDevices.enumerateDevices();
     return devices
       .filter(d => d.kind === 'videoinput')
-      .map(d => ({ deviceId: d.deviceId, label: d.label || '摄像头' }));
+      .map(d => ({ deviceId: d.deviceId, label: d.label || 'Camera' }));
   } catch {
     return [];
   }
@@ -115,7 +107,7 @@ export async function toggleCameraStream(wsUrl, onStateChange, opts = {}) {
     _ws.binaryType = 'arraybuffer';
     await new Promise((resolve, reject) => {
       _ws.onopen = resolve;
-      _ws.onerror = () => reject(new Error('WebSocket 连接失败'));
+      _ws.onerror = () => reject(new Error('WebSocket connection failed'));
       setTimeout(() => reject(new Error('WS timeout')), 5000);
     });
 

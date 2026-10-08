@@ -1992,7 +1992,7 @@ async function _startProject() {
     const cfg = remoteCameraCard.config || {};
     toggleCameraStream(`${wsProto}://${location.host}/ws/camera`, () => {}, {
       fps: cfg.fps, width: cfg.width, deviceId: cfg.device_id,
-    }).catch(err => _logActivity('warn', `摄像头启动失败: ${err.message}`));
+    }).catch(err => _logActivity('warn', `Camera failed to start: ${err.message}`));
   }
 
   // Call unified backend start-project

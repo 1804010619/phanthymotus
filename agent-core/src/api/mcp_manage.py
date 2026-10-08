@@ -1113,10 +1113,13 @@ async def mcp_call_tool(mcp_id: str, req: MCPCallRequest,
                 if not _start_mod._camera_ws_connected:
                     return {'code': 200, 'data': {
                         'state': 'error',
-                        'message': '等待浏览器摄像头连接超时（10s）— 请在 dashboard 允许摄像头权限'}}
+                        'message': 'Timed out after 10s waiting for the browser '
+                                   'camera to connect — allow camera access in '
+                                   'the dashboard'}}
                 return {'code': 200, 'data': {
                     'state': 'error',
-                    'message': '浏览器已连接但未收到画面 — 请检查摄像头是否被其他程序占用'}}
+                    'message': 'Browser connected but sent no frames — the camera '
+                               'may be in use by another application'}}
             elif action == 'stop':
                 return {'code': 200, 'data': {'state': 'idle'}}
             elif action == 'info':
