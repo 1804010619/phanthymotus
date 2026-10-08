@@ -462,9 +462,23 @@ def _posture_labels(frame: PoseFrame, th: dict) -> list:
     # of folding rather than the presence of a vertical gap, which is the whole
     # point of this rewrite.
     if upright:
-        knee_straight = knee is None or knee >= th["leg_straight_deg"]
-        hip_open = hip is None or hip >= th["hip_open_min_deg"]
-        if knee_straight and hip_open and not (knee is None and hip is None):
+        # The hip angle carries this, and the knee may only veto a *clearly*
+        # folded leg. Making a straight knee a requirement repeated the mistake
+        # this rewrite was supposed to remove, one level down.
+        #
+        # 2D joint angles are invariant to scale and rotation but NOT to the
+        # anisotropic scaling that foreshortening is. Measured on a real
+        # skeleton from the engine, legs compressed to 0.35 of their vertical
+        # extent: the hip angle moved 170.3 -> 162.7 deg while the knee angle
+        # moved 151.1 -> 126.0, because the thigh and shin are never exactly
+        # collinear and squashing y amplifies whatever lateral offset they have.
+        # The knee spans two short noisy segments; the hip spans the torso,
+        # which is the longest and best-detected part of the body. So the robust
+        # measurement decides and the fragile one only objects to a squat.
+        hip_open = hip is not None and hip >= th["hip_open_min_deg"]
+        knee_unfolded = knee is not None and knee >= th["leg_straight_deg"]
+        not_squatting = knee is None or knee >= th["knee_bent_min_deg"]
+        if (hip_open or knee_unfolded) and not_squatting:
             out.append(("standing", _confidence(frame.torso_deg, th["upright_deg"])))
 
     return out

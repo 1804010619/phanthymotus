@@ -803,3 +803,49 @@ def test_a_squat_is_crouching_only_and_not_also_sitting():
     result = _classify(_steady(_crouching_body(), box))
     assert result["action"] == "crouching"
     assert "sitting" not in result["actions"]
+
+
+def test_a_foreshortened_knee_angle_cannot_veto_an_open_hip():
+    """2D angles are invariant to scale and rotation — not to foreshortening.
+
+    Measured on a real skeleton from the engine, legs compressed to 0.35 of
+    their vertical extent: the hip angle moved 170.3 -> 162.7 deg while the knee
+    angle moved 151.1 -> 126.0. Thigh and shin are never exactly collinear, and
+    squashing y amplifies whatever lateral offset they have. Requiring a
+    straight knee for `standing` therefore repeated, one level down, the mistake
+    the `hip_knee_dy` rewrite removed: a fragile measurement vetoing a robust
+    one. The knee spans two short noisy segments; the hip spans the torso.
+    """
+    joints = dict(_body())
+    hip_y = TOP + 0.52 * H
+    # Knees and ankles pulled towards the hip, with the small lateral offset a
+    # real leg has, which is what bends the apparent knee angle.
+    for name, frac, dx in (("knee", 0.225, 0.02), ("ankle", 0.45, -0.01)):
+        for side in ("left", "right"):
+            key = f"{side}_{name}"
+            sign = -1.0 if side == "left" else 1.0
+            joints[key] = (CX + sign * 0.07 * H + dx * H,
+                           hip_y + frac * H * 0.35)
+    box = (CX - 0.15 * H, TOP, CX + 0.15 * H, hip_y + 0.45 * H * 0.35 + 10)
+    frame = _frame(joints, box)
+    assert frame.hip_deg is not None and frame.hip_deg >= 145
+    assert frame.knee_deg < 150, "the premise: the knee angle has bent"
+    assert _classify(_steady(joints, box))["action"] == "standing"
+
+
+def test_a_squat_can_still_veto_standing():
+    """The knee keeps one job: objecting to a clearly folded leg. Without that
+    the loosened rule would call a squat standing."""
+    box = (CX - 0.20 * H, TOP, CX + 0.22 * H, TOP + 0.78 * H)
+    result = _classify(_steady(_crouching_body(), box))
+    assert result["action"] == "crouching"
+    assert "standing" not in result["actions"]
+
+
+def test_a_straight_knee_alone_is_enough_when_the_hip_is_unreadable():
+    """Either robust cue suffices; the rule is a disjunction, not a chain."""
+    joints = {k: v for k, v in _body().items() if "shoulder" not in k}
+    joints.update({"left_shoulder": (CX - 0.10 * H, TOP + 0.18 * H)})
+    frame = _frame(joints, _standing_box())
+    assert frame.knee_deg >= 150
+    assert _classify(_steady(joints, _standing_box()))["action"] == "standing"
