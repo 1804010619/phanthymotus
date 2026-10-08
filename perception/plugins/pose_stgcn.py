@@ -121,6 +121,19 @@ NTU60_TRANSITIONS = {7, 8}
 
 DEFAULT_MIN_SCORE = 0.40
 
+# `fall` is held to a higher bar than the rest, and measured evidence says it
+# has to be. Feeding the built engine **pure Gaussian noise** returns
+# A43 "falling down" at **0.62** — above the general threshold, from a skeleton
+# that is not a body at all. The class is evidently where this network puts
+# input it cannot parse, which is the worst possible default for the one label a
+# robot acts on: a false fall makes it drop what it is doing to ask whether
+# somebody is hurt.
+#
+# Two guards, because neither alone is enough. This threshold, and in `hybrid`
+# the requirement that the geometry agree the person is not upright — a
+# corroboration the noise case cannot produce.
+FALL_MIN_SCORE = 0.75
+
 
 class ActionBackendError(RuntimeError):
     """Raised when the engine is unusable. Never swallowed into a label."""
@@ -213,11 +226,13 @@ class SkeletonActionBackend:
 
     def __init__(self, *, window_s: float = DEFAULT_WINDOW_S,
                  min_score: float = DEFAULT_MIN_SCORE,
+                 fall_min_score: float = FALL_MIN_SCORE,
                  model_dir: Optional[str] = None,
                  engine=None, thresholds: Optional[dict] = None,
                  action_window_s: Optional[float] = None):
         self.window_s = float(action_window_s or window_s)
         self.min_score = float(min_score)
+        self.fall_min_score = float(fall_min_score)
         self.thresholds = dict(DEFAULT_THRESHOLDS)
         self.thresholds.update({k: v for k, v in (thresholds or {}).items()
                                 if k in DEFAULT_THRESHOLDS and v is not None})
@@ -366,6 +381,12 @@ class SkeletonActionBackend:
                        for label, score, index in ranked],
         }
 
+    def _threshold_for(self, action: str) -> float:
+        """Per-class score bar. `fall` is held higher — see FALL_MIN_SCORE."""
+        if action == "fall":
+            return max(self.min_score, self.fall_min_score)
+        return self.min_score
+
     def classify(self, frames: list) -> dict:
         if not frames:
             return _nothing("no frames")
@@ -384,7 +405,7 @@ class SkeletonActionBackend:
             return _nothing(f"engine failure: {error}", backend_error=True)
 
         held = [entry for entry in prediction["scores"]
-                if entry["score"] >= self.min_score]
+                if entry["score"] >= self._threshold_for(entry["action"])]
         if not held:
             best = prediction["scores"][0] if prediction["scores"] else None
             return {
@@ -472,6 +493,23 @@ class HybridActionBackend:
         model = self.learned.classify(frames)
 
         learned_labels = [a for a in model.get("actions", []) if a in self.LEARNED]
+        # `fall` additionally needs the geometry to agree the body is not
+        # upright. The model returns A43 at 0.62 on pure noise, so a score bar
+        # alone is one guard against the single label the robot acts on; this is
+        # the second, and it is one the noise case cannot satisfy. A real fall
+        # ends with the person on the ground, which the geometry can see — and
+        # where it cannot (camera looking along the body) the drop detector in
+        # the rules is the third path to the same label.
+        if "fall" in learned_labels:
+            geometry_agrees = any(a in ("lying", "fall", "crouching", "bending")
+                                  for a in geometry.get("actions", []))
+            withheld = None
+            if not geometry_agrees:
+                learned_labels = [a for a in learned_labels if a != "fall"]
+                withheld = ("the model called it a fall; the geometry still "
+                            "reads the body as upright")
+        else:
+            withheld = None
         geometry_labels = [a for a in geometry.get("actions", [])
                            if a not in self.LEARNED]
         merged = [a for a in ACTION_PRIORITY
@@ -495,6 +533,11 @@ class HybridActionBackend:
             result["point_direction"] = geometry["point_direction"]
         if model.get("backend_error"):
             result["evidence"]["stgcn_error"] = model["evidence"].get("reason")
+        if withheld:
+            # Recorded whichever backend won the primary label: "the model
+            # thought this was a fall and was overruled" is the thing somebody
+            # needs when asking why the robot stayed quiet.
+            result["evidence"]["fall_withheld"] = withheld
         return result
 
     def classify_frame(self, frame) -> dict:

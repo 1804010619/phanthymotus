@@ -1272,11 +1272,15 @@ POSE_MODEL_BUNDLES = {
 # AGCN 3.5 M/4.4 G). Single stream, not the four-stream ensemble: 4x the compute
 # for +3.9 points.
 #
-# Unpinned, like POSE_MODEL_BUNDLES['jp511'] was: the ONNX has to be exported
-# from the PYSKL checkpoint and the engine built inside each target perception
-# image. ensure_action_model therefore raises with the build instructions rather
-# than fetching anything unverified, and the pose card falls back to the `rules`
-# backend with that message in `info` instead of failing.
+# jp61 is built and pinned: 4,384,468 bytes, 4.66 ms GPU latency on Orin 6,
+# T=100 as the checkpoint was trained. jp511 still has to come from Orin 5 and
+# stays unpinned, so ensure_action_model raises there with the build
+# instructions rather than fetching anything unverified, and the pose card falls
+# back to the `rules` backend with that message in `info` instead of failing.
+#
+# Built by tools/stgcn_export.py (checkpoint -> ONNX, validated against torch to
+# 2.9e-06) then trtexec --fp16 inside the jp6.1 image. The engine agrees with the
+# ONNX to three decimal places on the same inputs.
 # The ST-GCN++ *checkpoint*, mirrored onto COS so the engine build is
 # reproducible and does not depend on download.openmmlab.com being reachable
 # from wherever it runs. Not a runtime download — no robot ever fetches this; it
@@ -1305,13 +1309,16 @@ ACTION_CHECKPOINT = {
 
 ACTION_MODEL_BUNDLES = {
     "jp61": {
-        "base_url": f"{VISION_MODEL_BASE}/stgcnpp-ntu60-2d/tensorrt-jp61-trt10.4-orin-t48",
+        "base_url": f"{VISION_MODEL_BASE}/stgcnpp-ntu60-2d/tensorrt-jp61-trt10.4-orin-t100",
         "files": {
-            "stgcnpp-ntu60-2d.engine": {"size": 0, "sha256": ""},
+            "stgcnpp-ntu60-2d.engine": {
+                "size": 4384468,
+                "sha256": "fea60df0ebfa190dd1483705d1e53bd3124480afd6612258c6545e919e6f74f6",
+            },
         },
     },
     "jp511": {
-        "base_url": f"{VISION_MODEL_BASE}/stgcnpp-ntu60-2d/tensorrt-jp511-trt8.5-orin-t48",
+        "base_url": f"{VISION_MODEL_BASE}/stgcnpp-ntu60-2d/tensorrt-jp511-trt8.5-orin-t100",
         "files": {
             "stgcnpp-ntu60-2d.engine": {"size": 0, "sha256": ""},
         },

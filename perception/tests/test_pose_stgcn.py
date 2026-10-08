@@ -27,6 +27,7 @@ from plugins.pose_action import (  # noqa: E402
     PoseFrame,
 )
 from plugins.pose_stgcn import (  # noqa: E402
+    DEFAULT_MIN_SCORE,
     DEFAULT_WINDOW_FRAMES,
     NUM_CHANNELS,
     NUM_PERSON_SLOTS,
@@ -374,10 +375,13 @@ def test_hybrid_takes_postures_from_geometry():
 
 
 def test_hybrid_lets_the_model_win_on_its_own_classes():
-    engine = _FakeEngine({42: 9.0})
+    """`waving`, not `fall`: fall carries an extra corroboration requirement of
+    its own (see the noise-bias tests), so it is the wrong example of the
+    general rule."""
+    engine = _FakeEngine({22: 9.0})
     backend = HybridActionBackend(engine=engine)
     result = backend.classify(_frames(_standing, n=20))
-    assert result["action"] == "fall"
+    assert result["action"] == "waving"
     assert result["evidence"]["source"] == "stgcn"
 
 
@@ -461,3 +465,56 @@ def test_every_backend_offers_the_same_interface():
         assert callable(backend.classify)
         assert callable(backend.classify_frame)
         assert isinstance(backend.history_s, float)
+
+
+# ── the one label the robot acts on ─────────────────────────────────────────
+
+def test_fall_is_held_to_a_higher_score_than_the_rest():
+    """Measured: the built engine returns A43 "falling down" at **0.62** on pure
+    Gaussian noise — above the general threshold, from a skeleton that is not a
+    body. The class is where this network puts input it cannot parse, which is
+    the worst possible default for the label a robot acts on."""
+    from plugins.pose_stgcn import FALL_MIN_SCORE
+    assert FALL_MIN_SCORE > DEFAULT_MIN_SCORE
+    backend = SkeletonActionBackend(engine=_FakeEngine({42: 9.0}))
+    assert backend._threshold_for("fall") == FALL_MIN_SCORE
+    assert backend._threshold_for("waving") == backend.min_score
+
+
+def test_a_noise_level_fall_score_does_not_become_a_fall():
+    """0.62, the measured noise response, must not clear the bar."""
+    probabilities = np.zeros(N_CLASSES, dtype=np.float32)
+    probabilities[42] = 0.62
+    probabilities[0] = 0.38
+    engine = _FakeEngine(outputs=[probabilities[None]])
+    result = SkeletonActionBackend(engine=engine).classify(_frames(_standing))
+    assert result["action"] != "fall"
+
+
+def test_a_confident_fall_still_passes():
+    probabilities = np.zeros(N_CLASSES, dtype=np.float32)
+    probabilities[42] = 0.90
+    probabilities[0] = 0.10
+    engine = _FakeEngine(outputs=[probabilities[None]])
+    assert SkeletonActionBackend(engine=engine).classify(
+        _frames(_standing))["action"] == "fall"
+
+
+def test_hybrid_withholds_a_fall_the_geometry_contradicts():
+    """Second guard, and one the noise case cannot satisfy: a real fall ends
+    with the person on the ground, which the geometry can see."""
+    engine = _FakeEngine({42: 20.0})          # model is certain
+    result = HybridActionBackend(engine=engine).classify(_frames(_standing, n=20))
+    assert result["action"] != "fall", "a standing body cannot have just fallen"
+    assert "fall_withheld" in str(result["evidence"])
+
+
+def test_hybrid_accepts_a_fall_the_geometry_corroborates():
+    engine = _FakeEngine({42: 20.0})
+    frames = []
+    for i in range(20):
+        frames.append(PoseFrame(i / 12, _lying_box(), _kp(**_lying_body()), 0.3,
+                                image_size=FRAME))
+    result = HybridActionBackend(engine=engine).classify(frames)
+    assert result["action"] == "fall"
+    assert result["evidence"]["source"] == "stgcn"
