@@ -111,11 +111,14 @@ DEFAULT_THRESHOLDS = {
     "lying_deg": 60.0,            # torso past this = horizontal
     "lying_aspect": 1.2,          # bbox w/h past this = lying down
     "leg_straight_deg": 150.0,    # knee angle past this = straight leg
-    "knee_bent_max_deg": 120.0,   # sitting: knee between bent_min and this
-    "knee_bent_min_deg": 70.0,    # crouching: knee below this
-    "sit_hip_knee_dy": 0.15,      # |y_hip - y_knee| / h below this = sitting
-    "crouch_hip_ankle_dy": 0.25,  # (y_ankle - y_hip) / h below this = crouching
-    "stand_hip_knee_dy": 0.15,    # knees must be this far below the hips
+    "knee_bent_max_deg": 140.0,   # sitting: knee not straighter than this
+    "knee_bent_min_deg": 70.0,    # crouching: knee folded past this
+    # Hip angle (shoulder-hip-knee). ~90 deg seated, ~175 deg standing. These
+    # replaced three image-space `dy` ratios that could not survive a camera
+    # below eye level — see _posture_labels.
+    "hip_folded_min_deg": 55.0,   # sitting: thigh folded up to at least here
+    "hip_folded_max_deg": 135.0,  # sitting: and not beyond here
+    "hip_open_min_deg": 145.0,    # standing: hip essentially unfolded
     # arms
     "raise_wrist_above_shoulder": 0.10,   # (y_shoulder - y_wrist) / h
     "elbow_open_deg": 90.0,
@@ -218,8 +221,8 @@ class PoseFrame:
     """
 
     __slots__ = ("t", "box", "keypoints", "height", "min_conf",
-                 "shoulder", "hip", "torso_deg", "knee_deg",
-                 "hip_knee_dy", "hip_ankle_dy", "aspect",
+                 "shoulder", "hip", "torso_deg", "knee_deg", "hip_deg",
+                 "hip_knee_dy", "hip_ankle_dy", "aspect", "torso_px",
                  "has_torso", "has_legs")
 
     def __init__(self, t: float, box, keypoints: np.ndarray, min_conf: float):
@@ -238,6 +241,12 @@ class PoseFrame:
         self.shoulder = _midpoint(ls, rs)
         self.hip = _midpoint(lh, rh)
         self.has_torso = self.shoulder is not None and self.hip is not None
+        # Shoulder-to-hip distance in pixels: a body scale that does not change
+        # when the legs leave the frame, unlike the bounding box. Used for the
+        # arm and motion thresholds, which are the ones a crop silently
+        # rescaled — measured bias was up to 2x at a waist-up crop.
+        self.torso_px = (None if not self.has_torso else
+                         max(float(np.linalg.norm(self.hip - self.shoulder)), 1.0))
         self.torso_deg = _tilt_from_vertical_deg(
             None if not self.has_torso else self.hip - self.shoulder)
 
@@ -256,7 +265,29 @@ class PoseFrame:
             if ankle_p is not None:
                 ankle_pts.append(ankle_p)
         self.knee_deg = float(np.mean(knees)) if knees else None
-        self.has_legs = self.knee_deg is not None and self.hip is not None
+
+        # Hip angle: shoulder-hip-knee, i.e. how far the thigh is folded up
+        # towards the chest. This is what actually separates sitting from
+        # standing, and it is an ANGLE — see the class docstring on why the
+        # image-space version of that test could not work.
+        hips_angles = []
+        for side in ("left", "right"):
+            hip_p = _point(keypoints, f"{side}_hip", min_conf)
+            knee_p = _point(keypoints, f"{side}_knee", min_conf)
+            shoulder_p = _point(keypoints, f"{side}_shoulder", min_conf)
+            # Explicit None test, never `or`: these are numpy arrays, and
+            # `array or fallback` raises on truthiness rather than falling back.
+            anchor = shoulder_p if shoulder_p is not None else self.shoulder
+            angle = _angle_deg(anchor, hip_p, knee_p)
+            if angle is not None:
+                hips_angles.append(angle)
+        self.hip_deg = float(np.mean(hips_angles)) if hips_angles else None
+
+        # Legs are "readable" as soon as the hip angle or the knee angle is
+        # available. Requiring the full hip-knee-ankle chain meant a person
+        # whose feet were out of frame — which is most people, seen from a
+        # robot — had no posture at all.
+        self.has_legs = (self.knee_deg is not None or self.hip_deg is not None)
 
         knee_mid = _mid_of(knee_pts)
         ankle_mid = _mid_of(ankle_pts)
@@ -331,47 +362,88 @@ def _body_speed(frames: list) -> Optional[float]:
 def _posture_labels(frame: PoseFrame, th: dict) -> list:
     """Postures that hold for this frame, as (label, confidence) pairs.
 
-    Returns empty when the body is too occluded to say — which is the whole
-    point of the has_torso / has_legs gates. A person behind a desk gives a
-    perfectly good torso axis and no legs at all, and sitting and standing
-    have the *same* torso axis.
+    **Angles only. No image-space length ratios.** That rule is the result of a
+    measured failure, not a preference. The first version gated `standing` on
+    `hip_knee_dy >= 0.15` — the vertical gap between hips and knees as a
+    fraction of bounding-box height — on top of the torso-tilt and knee-angle
+    tests. Simulating a person who is definitely standing, with the legs
+    foreshortened as a low camera foreshortens them:
+
+        leg compression  hip_knee_dy  knee_deg  torso_deg   verdict
+             1.00            0.232      180.0       0.0     standing
+             0.60            0.171      180.0       0.0     standing
+             0.45            0.140      180.0       0.0     UNKNOWN
+             0.25            0.089      180.0       0.0     UNKNOWN
+
+    `knee_deg=180` and `torso_deg=0` stay exactly right the whole way down —
+    upright, legs straight, no ambiguity. The length ratio added no information
+    and contributed only a viewpoint dependence that killed the rule. A robot
+    camera at 0.4-1.2 m looking up at someone 1-2 m away is well past 0.45.
+
+    Worse, `sitting` keyed on the *other side of the same fragile quantity*
+    (`|hip_knee_dy| <= 0.15`), so a standing person seen from a low camera
+    either vanished into `unknown` or landed in the sitting band. "Standing and
+    sitting are both wrong" was the predictable consequence.
+
+    So: sitting is now a *hip* angle (shoulder-hip-knee, the thigh folded up
+    towards the chest) plus a knee angle. Both are angles, both survive
+    perspective, and neither needs the feet to be in frame.
+
+    Visibility is graded rather than all-or-nothing: a torso alone supports
+    `lying` and `bending`, and legs are "readable" as soon as *either* the hip
+    or the knee angle is available. Requiring the whole hip-knee-ankle chain
+    meant a person whose feet were out of frame had no posture at all.
     """
     out = []
     if frame.torso_deg is None:
         return out
 
-    # lying needs no legs: the torso axis and the bbox shape settle it, and a
-    # person on the floor usually has their legs in frame anyway.
+    # lying needs no legs: the torso axis and the box shape settle it.
     if frame.torso_deg >= th["lying_deg"] and frame.aspect >= th["lying_aspect"]:
         out.append(("lying", _confidence(frame.torso_deg, th["lying_deg"], below=False)))
+
+    upright = frame.torso_deg <= th["upright_deg"]
+
+    # Straight legs separate bending from crouching: both put the torso over
+    # the floor, only one folds the knees. Needs a knee angle specifically.
+    if (frame.knee_deg is not None
+            and th["bend_deg"] <= frame.torso_deg < th["lying_deg"]
+            and frame.knee_deg >= th["leg_straight_deg"]):
+        out.append(("bending", _confidence(frame.torso_deg, th["bend_deg"],
+                                           below=False)))
 
     if not frame.has_legs:
         return out
 
     knee = frame.knee_deg
-    upright = frame.torso_deg <= th["upright_deg"]
+    hip = frame.hip_deg
 
-    if (upright and th["knee_bent_min_deg"] <= knee <= th["knee_bent_max_deg"]
-            and frame.hip_knee_dy is not None
-            and abs(frame.hip_knee_dy) <= th["sit_hip_knee_dy"]):
-        out.append(("sitting", _confidence(abs(frame.hip_knee_dy),
-                                           th["sit_hip_knee_dy"])))
+    # Sitting: thigh folded up towards the chest. The hip angle is the primary
+    # test because it is readable without the feet; the knee angle corroborates
+    # when it is there, and is required to not be straight.
+    if upright and hip is not None and th["hip_folded_min_deg"] <= hip <= th["hip_folded_max_deg"]:
+        # The knee must be bent, but not folded shut: past `knee_bent_min_deg`
+        # it is a squat, and a squat reporting `sitting` alongside `crouching`
+        # is noise — priority would hide it, but `actions` would still carry it.
+        knee_ok = knee is None or (th["knee_bent_min_deg"] <= knee
+                                   <= th["knee_bent_max_deg"])
+        if knee_ok:
+            out.append(("sitting", _confidence(abs(hip - 90.0),
+                                               th["hip_folded_max_deg"] - 90.0)))
 
-    if (knee < th["knee_bent_min_deg"] and frame.hip_ankle_dy is not None
-            and frame.hip_ankle_dy <= th["crouch_hip_ankle_dy"]):
+    # Crouching: knees folded shut. Distinguished from sitting by how far —
+    # a squat closes the knee past where a chair does.
+    if knee is not None and knee < th["knee_bent_min_deg"]:
         out.append(("crouching", _confidence(knee, th["knee_bent_min_deg"])))
 
-    # Straight legs are what separates bending from crouching: both put the
-    # torso over the floor, but only one folds the knees.
-    if (th["bend_deg"] <= frame.torso_deg < th["lying_deg"]
-            and knee >= th["leg_straight_deg"]):
-        out.append(("bending", _confidence(frame.torso_deg, th["bend_deg"],
-                                           below=False)))
-
-    if (upright and knee >= th["leg_straight_deg"]
-            and frame.hip_knee_dy is not None
-            and frame.hip_knee_dy >= th["stand_hip_knee_dy"]):
-        out.append(("standing", _confidence(frame.torso_deg, th["upright_deg"])))
+    # Standing: upright torso, and the legs not folded. Stated as the absence
+    # of folding rather than the presence of a vertical gap, which is the whole
+    # point of this rewrite.
+    if upright:
+        knee_straight = knee is None or knee >= th["leg_straight_deg"]
+        hip_open = hip is None or hip >= th["hip_open_min_deg"]
+        if knee_straight and hip_open and not (knee is None and hip is None):
+            out.append(("standing", _confidence(frame.torso_deg, th["upright_deg"])))
 
     return out
 
@@ -749,6 +821,19 @@ class PoseActionClassifier:
 
 # ── tracking ────────────────────────────────────────────────────────────────
 
+def _visible_centroid(keypoints: np.ndarray, min_conf: float):
+    """Mean of the visible joints, or None.
+
+    Continuous through a fall in a way the bounding box is not: the box flips
+    from tall-and-narrow to short-and-wide, but the body's visible joints stay
+    in roughly the same place from one frame to the next.
+    """
+    visible = keypoints[keypoints[:, 2] >= min_conf]
+    if len(visible) == 0:
+        return None
+    return visible[:, :2].mean(axis=0)
+
+
 def _iou(a, b) -> float:
     ax1, ay1, ax2, ay2 = (float(v) for v in a)
     bx1, by1, bx2, by2 = (float(v) for v in b)
@@ -788,11 +873,32 @@ class PoseTracker:
     """
 
     def __init__(self, history_s: float = 3.0, iou_min: float = 0.2,
-                 timeout_s: float = 1.0, min_conf: float = 0.3):
+                 timeout_s: float = 1.0, min_conf: float = 0.3,
+                 centroid_max_travel: float = 1.0):
         self.history_s = float(history_s)
         self.iou_min = float(iou_min)
         self.timeout_s = float(timeout_s)
         self.min_conf = float(min_conf)
+        # How far the visible-joint centroid may move between frames, as a
+        # fraction of body height, and still count as the same person.
+        #
+        # This is a sanity bound, NOT the discriminator — greedy nearest-match
+        # does the actual work, since each detection and each track is used
+        # once and the closest pair is taken first. The bound only has to be
+        # loose enough not to veto a real transition, and a fall moves the
+        # centroid by about half a body height *by definition*: a standing
+        # person's centroid sits ~0.55h above the floor and a fallen one's
+        # ~0.05h. Measured on the synthetic fall it is 0.53h in a single frame
+        # (the worst case — one frame at 5 fps covering the whole descent; at
+        # 15 fps each step is a third of that). A gate of 0.5 vetoed it by
+        # 0.03, which is how a threshold set to the magnitude of the thing it
+        # must admit behaves.
+        #
+        # Erring loose is the right direction: merging two people who swapped
+        # places costs one wrong action label, while splitting a track makes
+        # every temporal label undetectable. This tracker is explicitly not
+        # re-identification, so it has no identity to protect.
+        self.centroid_max_travel = float(centroid_max_travel)
         self._tracks: list = []
         self._next_id = 1
 
@@ -803,20 +909,61 @@ class PoseTracker:
     def reset(self) -> None:
         self._tracks = []
 
+    def _affinity(self, box, keypoints, track) -> Optional[float]:
+        """How much this detection looks like the continuation of `track`.
+
+        IoU alone is not enough, and the case it fails is the one that matters
+        most. Measured on a synthetic fall: a standing box [260,100,380,500]
+        against the same person's lying box [140,436,500,492] scores
+        **IoU 0.109**, under any usable iou_min — so the track split at the
+        instant of the fall, the new track started with an empty history, and
+        `_fall_evidence` could only ever see the horizontal frames and report
+        "no fast drop". Fall detection required continuity across precisely the
+        event that destroys box overlap.
+
+        So a second, independent cue: the centroid of the visible joints,
+        compared against the body's own scale. The box changes shape when
+        someone falls; the body does not teleport. Either cue passing is enough,
+        because they fail in different situations — IoU covers a person standing
+        still whose keypoints are noisy, the centroid covers a person whose box
+        geometry changes abruptly.
+
+        A learned skeleton-action backend needs this fix just as much as the
+        rules do: it is fed one continuous (T, V, C) sequence per person, so a
+        track that splits mid-action hides the action from it too.
+        """
+        current = track.current
+        if current is None:
+            return None
+        overlap = _iou(box, current.box)
+        if overlap >= self.iou_min:
+            return 1.0 + overlap          # ranked above any centroid-only match
+
+        here = _visible_centroid(keypoints, self.min_conf)
+        there = _visible_centroid(current.keypoints, self.min_conf)
+        if here is None or there is None:
+            return None
+        # Scale is the larger of the two bodies' heights, so the gate means "it
+        # did not move more than `centroid_max_travel` of a body height" and
+        # carries no pixel constant.
+        scale = max(body_height(box), current.height)
+        travel = float(np.linalg.norm(here - there)) / max(scale, 1.0)
+        if travel > self.centroid_max_travel:
+            return None
+        return 1.0 - travel / self.centroid_max_travel
+
     def update(self, boxes, keypoints, now: float) -> list:
         """Associate this frame's detections, returning one track per detection
         in the order the detections came in (so the caller can zip them)."""
         self._expire(now)
 
         boxes = [list(map(float, box)) for box in boxes]
+        arrays = [np.asarray(k, dtype=np.float32) for k in keypoints]
         pairs = []
         for d_index, box in enumerate(boxes):
             for t_index, track in enumerate(self._tracks):
-                current = track.current
-                if current is None:
-                    continue
-                score = _iou(box, current.box)
-                if score >= self.iou_min:
+                score = self._affinity(box, arrays[d_index], track)
+                if score is not None:
                     pairs.append((score, d_index, t_index))
         pairs.sort(reverse=True)
 

@@ -516,11 +516,21 @@ def test_an_overlapping_box_keeps_its_track_id():
 
 
 def test_a_disjoint_box_starts_a_new_track():
+    """Each detection carries the keypoints that actually lie inside its box.
+
+    This test used to hand two far-apart boxes the *same* absolute keypoint
+    array, which is physically impossible — a person at (0,0,50,100) cannot
+    have joints at y=260 — and it only passed while association looked at the
+    box alone. Now that the visible-joint centroid is a second cue, an
+    incoherent input produces an incoherent answer, so the input is fixed.
+    """
     tracker = PoseTracker()
-    keypoints = [_kp(**_body())]
-    first = tracker.update([(0, 0, 50, 100)], keypoints, 0.0)[0]
-    second = tracker.update([(500, 400, 560, 500)], keypoints, 0.1)[0]
-    assert first.id != second.id
+    near_box, far_box = (0, 0, 50, 100), (500, 400, 560, 500)
+    near = tracker.update(
+        [near_box], [_kp(**_body(cx=25, top=0, h=100))], 0.0)[0]
+    far = tracker.update(
+        [far_box], [_kp(**_body(cx=530, top=400, h=100))], 0.1)[0]
+    assert near.id != far.id
 
 
 def test_two_people_keep_separate_timelines():
@@ -617,3 +627,179 @@ def test_a_single_frame_still_refuses_an_occluded_posture():
     result = PoseActionClassifier().classify_frame(
         _frame(upper, _standing_box(), 0.0))
     assert result["action"] == "unknown"
+
+
+# ── track continuity through a fall ─────────────────────────────────────────
+
+def test_a_falling_person_keeps_their_track():
+    """The case bounding-box overlap cannot handle, and the one that matters most.
+
+    Measured: a standing box [260,100,380,500] against the same person's lying
+    box [140,436,500,492] scores IoU 0.109 — under any usable iou_min. Before
+    the centroid cue the track split at the instant of the fall, the new track
+    started with an empty history, and _fall_evidence could only ever see the
+    horizontal frames and report "no fast drop". Fall detection required
+    continuity across precisely the event that destroys box overlap.
+    """
+    from plugins.pose_action import _iou
+    stand, lie = _standing_box(), _lying_box()
+    assert _iou(stand, lie) < 0.2, "the premise of this test is that IoU fails"
+
+    tracker = PoseTracker(history_s=3.0)
+    ids = []
+    for i in range(6):
+        ids.append(tracker.update([stand], [_kp(**_body())], i / 10.0)[0].id)
+    for i in range(6, 18):
+        ids.append(tracker.update([lie], [_kp(**_lying_body())], i / 10.0)[0].id)
+    assert len(set(ids)) == 1, f"track split at the fall: {ids}"
+
+
+@pytest.mark.parametrize("fps", [5, 10, 15])
+def test_a_fall_is_detected_through_the_real_tracker(fps):
+    """End to end: detections in, one track out, `fall` from its own history.
+
+    The earlier fall tests fed the classifier a hand-built frame list, so they
+    passed while the real pipeline could never produce that list.
+    """
+    tracker = PoseTracker(history_s=3.0)
+    classifier = PoseActionClassifier()
+    t, step = 0.0, 1.0 / fps
+    track = None
+    while t < 1.0:
+        track = tracker.update([_standing_box()], [_kp(**_body())], t)[0]
+        t += step
+    while t < 2.4:
+        track = tracker.update([_lying_box()], [_kp(**_lying_body())], t)[0]
+        t += step
+    result = classifier.classify(list(track.history))
+    assert result["action"] == "fall", result
+    assert result["evidence"]["is_fall"] is True
+
+
+def test_an_iou_match_still_outranks_a_centroid_match():
+    """Overlap is the stronger cue when it is available, so two people standing
+    close together must not be swapped by whichever centroid is nearer."""
+    tracker = PoseTracker()
+    left, right = (0, 0, 100, 300), (90, 0, 190, 300)
+    kps = [_kp(**_body(cx=50)), _kp(**_body(cx=140))]
+    a1, b1 = tracker.update([left, right], kps, 0.0)
+    a2, b2 = tracker.update([left, right], kps, 0.1)
+    assert (a1.id, b1.id) == (a2.id, b2.id)
+    assert a1.id != b1.id
+
+
+def test_a_detection_with_no_visible_joints_cannot_be_matched_by_centroid():
+    """No joints means no centroid, so the only cue left is overlap — and an
+    invented match would hand a learned backend somebody else's history."""
+    tracker = PoseTracker()
+    blank = np.zeros((N_KEYPOINTS, 3), dtype=np.float32)
+    first = tracker.update([(0, 0, 100, 300)], [_kp(**_body())], 0.0)[0]
+    far = tracker.update([(400, 0, 500, 300)], [blank], 0.1)[0]
+    assert first.id != far.id
+
+
+def test_the_centroid_gate_is_a_sanity_bound_not_the_discriminator():
+    """Greedy nearest-match does the work; the gate only vetoes absurd jumps."""
+    tracker = PoseTracker(centroid_max_travel=1.0)
+    near = tracker.update([_standing_box()], [_kp(**_body())], 0.0)[0]
+    # Five body heights away, with no overlap: not the same person.
+    away = (CX + 5 * H, TOP, CX + 5 * H + 0.3 * H, TOP + H)
+    other = tracker.update([away], [_kp(**_body(cx=CX + 5 * H))], 0.1)[0]
+    assert near.id != other.id
+
+
+# ── viewpoint robustness: the bug behind "standing and sitting are both wrong" ──
+
+def _standing_with_foreshortened_legs(k, cx=CX, top=TOP, h=H):
+    """A standing person whose legs are vertically compressed by `k`.
+
+    What a low camera does: looking up at someone, the floor-to-hip span
+    projects to far fewer pixels than the hip-to-head span. The person is still
+    standing — knees straight, torso vertical — only image-space distances
+    change. A robot camera at 0.4-1.2 m looking at someone 1-2 m away is well
+    into this regime.
+    """
+    hip_y = top + 0.52 * h
+    knee_y = hip_y + 0.225 * h * k
+    ankle_y = hip_y + 0.45 * h * k
+    joints = dict(_body(cx=cx, top=top, h=h))
+    joints.update({
+        "left_hip": (cx - 0.07 * h, hip_y), "right_hip": (cx + 0.07 * h, hip_y),
+        "left_knee": (cx - 0.07 * h, knee_y), "right_knee": (cx + 0.07 * h, knee_y),
+        "left_ankle": (cx - 0.07 * h, ankle_y), "right_ankle": (cx + 0.07 * h, ankle_y),
+    })
+    return joints, (cx - 0.15 * h, top, cx + 0.15 * h, ankle_y)
+
+
+@pytest.mark.parametrize("k", [1.0, 0.6, 0.45, 0.25, 0.15])
+def test_standing_survives_any_leg_foreshortening(k):
+    """The regression this whole rewrite exists for.
+
+    The first version gated `standing` on `hip_knee_dy >= 0.15` — an
+    image-space length ratio — on top of the torso-tilt and knee-angle tests.
+    Measured, for a person definitely standing:
+
+        k=1.00  hip_knee_dy 0.232  knee 180  torso 0  -> standing
+        k=0.45  hip_knee_dy 0.140  knee 180  torso 0  -> UNKNOWN
+        k=0.25  hip_knee_dy 0.089  knee 180  torso 0  -> UNKNOWN
+
+    The angles were right the whole way down. The ratio added no information
+    and only a viewpoint dependence.
+    """
+    joints, box = _standing_with_foreshortened_legs(k)
+    result = _classify(_steady(joints, box))
+    assert result["action"] == "standing", f"k={k}: {result}"
+
+
+@pytest.mark.parametrize("k", [1.0, 0.6, 0.35, 0.15])
+def test_sitting_survives_any_leg_foreshortening(k):
+    """And is never mistaken for standing, which is the other half of the bug:
+    `sitting` used to key on the opposite side of the same fragile quantity."""
+    hip_y = TOP + 0.52 * H
+    joints = dict(_body())
+    joints.update({
+        "left_knee": (CX + 0.13 * H, hip_y), "right_knee": (CX + 0.27 * H, hip_y),
+        "left_ankle": (CX + 0.13 * H, hip_y + 0.23 * H * k),
+        "right_ankle": (CX + 0.27 * H, hip_y + 0.23 * H * k),
+    })
+    box = (CX - 0.22 * H, TOP, CX + 0.34 * H, hip_y + 0.23 * H * k + 10)
+    result = _classify(_steady(joints, box))
+    assert result["action"] == "sitting", f"k={k}: {result}"
+    assert "standing" not in result["actions"]
+
+
+def test_a_cropped_view_with_knees_but_no_feet_still_reads_as_standing():
+    """The common robot framing: someone close enough that their feet are out
+    of frame. Requiring the whole hip-knee-ankle chain gave them no posture."""
+    joints = {k: v for k, v in _body().items()
+              if k not in ("left_ankle", "right_ankle")}
+    box = (CX - 0.15 * H, TOP, CX + 0.15 * H, TOP + 0.80 * H)
+    result = _classify(_steady(joints, box))
+    assert result["action"] == "standing"
+
+
+def test_a_torso_only_view_still_refuses_to_pick_a_posture():
+    """The honest limit, unchanged by the rewrite: with no knee in frame there
+    is no hip angle, and standing and sitting have the same torso axis."""
+    joints = {k: v for k, v in _body().items()
+              if "knee" not in k and "ankle" not in k and "hip" not in k}
+    box = (CX - 0.15 * H, TOP, CX + 0.15 * H, TOP + 0.55 * H)
+    assert _classify(_steady(joints, box))["action"] == "unknown"
+
+
+def test_the_posture_rules_use_no_image_space_length_ratios():
+    """A guard on the rule that produced the bug. Every posture threshold must
+    be an angle; a `_dy`/ratio threshold creeping back in is the regression."""
+    from plugins.pose_action import DEFAULT_THRESHOLDS as TH
+    posture_keys = [k for k in TH
+                    if k.endswith("_deg") or "dy" in k or k.endswith("_aspect")]
+    offenders = [k for k in posture_keys if "dy" in k]
+    assert offenders == [], f"image-space length thresholds are back: {offenders}"
+
+
+def test_a_squat_is_crouching_only_and_not_also_sitting():
+    """Both fired at first. Priority hid it, but `actions` still carried it."""
+    box = (CX - 0.20 * H, TOP, CX + 0.22 * H, TOP + 0.78 * H)
+    result = _classify(_steady(_crouching_body(), box))
+    assert result["action"] == "crouching"
+    assert "sitting" not in result["actions"]
