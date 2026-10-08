@@ -230,8 +230,13 @@ def export_action(out_dir: str, window: int, workspace: float | None,
     image does not carry — so this step runs in a throwaway container like the
     others, with those installed alongside onnx/onnxslim.
 
-    Input is (N, M, T, V, C) = (1, 1, window, 17, 2), PYSKL's FormatGCNInput
-    order, matching `SkeletonActionBackend._build_input`. The temporal size is
+    Input is (N, M, T, V, C) = (1, 2, window, 17, 3), PYSKL's FormatGCNInput
+    order, matching `SkeletonActionBackend._build_input` — M is
+    NUM_PERSON_SLOTS and C is NUM_CHANNELS (x, y, score), both read from
+    plugins/pose_stgcn.py rather than restated. An earlier version of this
+    line said M=1 and C=2; the checkpoint's `data_bn.weight` is 51 = 3x17,
+    which settles C, and getting either wrong produces a graph the robot's
+    tensor cannot be fed to. The temporal size is
     baked into the engine, and the backend reads it back off the engine rather
     than trusting its own constant — but the two still have to agree about the
     *layout*, which is why both name it in the same order.
@@ -262,7 +267,7 @@ def export_action(out_dir: str, window: int, workspace: float | None,
         "(`forward_test` averages over clips and people), so exporting the "
         "recogniser gives a graph whose input is not the tensor the robot has. "
         "The backbone + head have to be traced directly on a "
-        f"(1, 1, {window}, 17, 2) input, and that wiring depends on the pyskl "
+        f"(1, 2, {window}, 17, 3) input, and that wiring depends on the pyskl "
         "version in the container.\n"
         "\n"
         "The checkpoint itself is in hand and pinned, and its state_dict says "
