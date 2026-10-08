@@ -69,6 +69,30 @@ export function achievedFps() {
   return seconds > 0.5 ? _sent / seconds : 0;
 }
 
+/**
+ * Ask for camera permission now, and release it immediately.
+ *
+ * The permission prompt is a human clicking a dialog, and it was sitting inside
+ * the card's 10 s self-check window: the first start after a page load timed
+ * out with "waiting for the browser camera", and every start after that
+ * succeeded because the grant was remembered. Warming it before the start
+ * request takes the human out of the critical path.
+ *
+ * Resolves true if permission is held, false otherwise. Never throws — a
+ * refusal is an answer, not a failure.
+ */
+export async function warmPermission(deviceId) {
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({
+      video: deviceId ? { deviceId: { exact: deviceId } } : true, audio: false,
+    });
+    stream.getTracks().forEach(t => t.stop());
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 /** List the browser's video inputs, for the card's device picker. */
 export async function listCameras() {
   try {
@@ -110,6 +134,14 @@ export async function toggleCameraStream(wsUrl, onStateChange, opts = {}) {
     _video.srcObject = _stream;
     _video.muted = true;
     _video.playsInline = true;
+    // Attached to the document, off-screen. A detached <video> is not
+    // *presented*, and requestVideoFrameCallback fires per presented frame —
+    // so a video element that never enters the DOM delivers a trickle. Measured
+    // on a live session: 2 fps out of a 12 fps request, with the network, the
+    // server and the DDS publish all verified clean at 12.4 fps.
+    _video.style.cssText =
+      'position:fixed;left:-10000px;top:0;width:2px;height:2px;opacity:0;pointer-events:none';
+    document.body.appendChild(_video);
     await _video.play();
 
     const size = fitCapture(_video.videoWidth, _video.videoHeight, target);
@@ -166,17 +198,25 @@ export async function toggleCameraStream(wsUrl, onStateChange, opts = {}) {
     // requestVideoFrameCallback fires per decoded frame and is throttled far
     // less aggressively. The interval stays as a fallback for browsers without
     // it, and `sendFrame` rate-limits either way.
+    // **Both**, not either. They fail in different situations and the rate
+    // limiter in sendFrame makes running both harmless:
+    //
+    //   setInterval alone  — clamped to 1 Hz in a hidden or background tab
+    //   rvfc alone         — depends on the video being presented, and is
+    //                        throttled with the page's rendering
+    //
+    // Each covers the other's gap, and whichever fires first in a given window
+    // sends the frame; the second finds `now - lastSent` too small and returns.
     if (typeof _video.requestVideoFrameCallback === 'function') {
       const onFrame = () => {
-        if (!_active && _rvfcArmed) return;
+        if (!_active) return;
         sendFrame();
         if (_video) _video.requestVideoFrameCallback(onFrame);
       };
       _rvfcArmed = true;
       _video.requestVideoFrameCallback(onFrame);
-    } else {
-      _timer = setInterval(sendFrame, interval);
     }
+    _timer = setInterval(sendFrame, interval);
 
     _active = true;
     _sent = 0;
@@ -193,7 +233,11 @@ function _stopCamera() {
   if (_timer) { clearInterval(_timer); _timer = null; }
   if (_ws) { try { _ws.close(); } catch { /* already closed */ } _ws = null; }
   if (_stream) { _stream.getTracks().forEach(t => t.stop()); _stream = null; }
-  if (_video) { _video.srcObject = null; _video = null; }
+  if (_video) {
+    _video.srcObject = null;
+    _video.remove();              // it is in the document now
+    _video = null;
+  }
   _canvas = null;
   _rvfcArmed = false;
   _active = false;

@@ -1110,16 +1110,24 @@ async def mcp_call_tool(mcp_id: str, req: MCPCallRequest,
                             'state': 'running', 'ws_path': '/ws/camera',
                             'frames_received': _start_mod._camera_frame_count}}
                     await asyncio.sleep(0.5)
-                if not _start_mod._camera_ws_connected:
+                if _start_mod._camera_ws_connected:
+                    # The browser is attached, so frames are imminent — a
+                    # camera takes a moment to warm up and the first JPEG can
+                    # land after this window closes. Reporting `error` here
+                    # made a card that was merely still starting look broken,
+                    # which is how a 10 s race got read as a permanent fault.
                     return {'code': 200, 'data': {
-                        'state': 'error',
-                        'message': 'Timed out after 10s waiting for the browser '
-                                   'camera to connect — allow camera access in '
-                                   'the dashboard'}}
+                        'state': 'running', 'ws_path': '/ws/camera',
+                        'frames_received': _start_mod._camera_frame_count,
+                        'warning': 'The browser is connected but has not sent a '
+                                   'frame yet. If nothing appears, the camera may '
+                                   'be in use by another application.'}}
                 return {'code': 200, 'data': {
                     'state': 'error',
-                    'message': 'Browser connected but sent no frames — the camera '
-                               'may be in use by another application'}}
+                    'message': 'The browser has not connected. Open the dashboard, '
+                               'allow camera access when prompted, and keep that '
+                               'tab visible — a background tab is throttled to '
+                               '1 frame per second.'}}
             elif action == 'stop':
                 return {'code': 200, 'data': {'state': 'idle'}}
             elif action == 'info':

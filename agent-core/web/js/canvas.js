@@ -16,7 +16,7 @@ import { showToast } from './toast.js';
 import { showTopicDetail } from './detail-panel.js';
 import { showToolDetail, isToolConfigured, isInstanceConfigured, openInstanceConfigModal, hasSharedRequired } from './sidebar.js';
 import { toggleMicStream, isMicActive } from './mic-stream.js';
-import { toggleCameraStream, isCameraActive } from './camera-stream.js';
+import { toggleCameraStream, isCameraActive, warmPermission } from './camera-stream.js';
 import { sessionId } from './session.js';
 import { getToken } from './auth.js';
 // Shared with the monitor dashboard so both sides shape the `info` call the
@@ -1986,13 +1986,18 @@ async function _startProject() {
   // Same trick as the mic: start the browser camera in parallel with the API
   // call, because the card's self-check waits for real frames and the browser
   // cannot be started from the server side.
+  //
+  // The permission prompt is awaited *first*, though. It is a human clicking a
+  // dialog, and it used to sit inside the card's 10 s self-check window: the
+  // first start after a page load timed out with "waiting for the browser
+  // camera", and every start afterwards worked because the grant was
+  // remembered. Warming it here takes the person out of the critical path.
   const remoteCameraCard = _cards.find(c => c.toolName === 'remote_camera');
   if (remoteCameraCard && !isCameraActive()) {
     const wsProto = location.protocol === 'https:' ? 'wss' : 'ws';
-    const cfg = remoteCameraCard.config || {};
-    toggleCameraStream(`${wsProto}://${location.host}/ws/camera`, () => {}, {
-      fps: cfg.fps, width: cfg.width, deviceId: cfg.device_id,
-    }).catch(err => _logActivity('warn', `Camera failed to start: ${err.message}`));
+    await warmPermission();
+    toggleCameraStream(`${wsProto}://${location.host}/ws/camera`, () => {}, {})
+      .catch(err => _logActivity('warn', `Camera failed to start: ${err.message}`));
   }
 
   // Call unified backend start-project
