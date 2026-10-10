@@ -57,11 +57,25 @@ import numpy as np
 
 from plugins.hand_runtime import HAND_INDEX, N_HAND_KEYPOINTS
 
-#: Above this a finger counts as extended. Measured extended readings start at
-#: +0.26; this leaves almost no margin above, which is deliberate — the cost
-#: of calling an extended finger "unknown" is one unreported gesture, and the
-#: cost of calling a folded one extended is a wrong one.
-FINGER_EXTENDED = 0.25
+#: Above this a finger counts as extended.
+#:
+#: This was 0.25, read off five stock photographs, on the reasoning that
+#: calling an extended finger "unknown" costs one unreported gesture while
+#: calling a folded one extended costs a wrong one. The asymmetry is right;
+#: the number was not. Measured over 147 hands from the robot's own 640x480
+#: camera, the per-finger distribution is clearly bimodal — a folded cluster
+#: around -0.3 and an extended cluster around 0.35-0.42 — and the *valley*
+#: between them sits at 0.0-0.12, not at 0.25. At 0.25 the band of refusal
+#: covered the lower half of the extended cluster: the middle finger's median
+#: extended reading was 0.20 and the pinky had 31 samples in 0.2-0.3, all of
+#: them refused. A large, steady, unmistakable open palm was named about a
+#: third of the time.
+#:
+#: Scored against 83 hand-labelled frames (victory, open_palm, ok, pointing),
+#: moving 0.25 -> 0.12 takes correct namings from 33 to 55 while wrong ones go
+#: from 2 to 3. That is the part that matters: this is not coverage bought
+#: with accuracy. Caveat worth keeping: one person, one session, one camera.
+FINGER_EXTENDED = 0.12
 
 #: Below this a finger counts as folded. Measured folded readings stop at
 #: -0.17, so this has 0.12 of margin.
@@ -86,6 +100,17 @@ THUMB_NEAR = 0.75
 #: hidden fingertip placed by the model's prior is exactly the input that
 #: makes a rule confident and wrong.
 MIN_JOINT_CONF = 0.30
+
+#: The wrist gets its own, lower threshold. It is joint 0 and the ROI is
+#: centred on the *hand*, so the wrist sits at the edge of the crop by
+#: construction and the model is systematically less certain there: measured
+#: over 147 real hands, wrist confidence has p50 0.36 and p10 0.27 while
+#: middle_mcp — the other joint the visibility gate reads — has p50 0.63.
+#: Judging both by one number meant the gate was effectively a wrist gate: of
+#: 30 hands refused as "palm_occluded", all 30 failed on the wrist and *none*
+#: failed on middle_mcp. They were not occluded palms. They were large, clear,
+#: well-tracked open hands, which is what made the card look broken.
+WRIST_MIN_CONF = 0.15
 
 #: Chinese names, for the agent-facing vocabulary.
 GESTURE_LABELS_ZH = {
@@ -154,7 +179,8 @@ def measure(keypoints, min_conf: float = MIN_JOINT_CONF) -> Optional[HandShape]:
         return None
 
     conf = k[:, 2]
-    visible = bool(conf[0] >= min_conf and conf[HAND_INDEX["middle_mcp"]] >= min_conf)
+    visible = bool(conf[0] >= WRIST_MIN_CONF
+                   and conf[HAND_INDEX["middle_mcp"]] >= min_conf)
 
     reach = {}
     for name, tip in _TIPS.items():

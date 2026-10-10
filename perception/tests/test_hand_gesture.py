@@ -23,8 +23,10 @@ from plugins.hand_gesture import (  # noqa: E402
     FINGER_CURLED,
     FINGER_EXTENDED,
     GESTURE_LABELS_ZH,
+    MIN_JOINT_CONF,
     OK_TOUCH_GAP,
     THUMB_AWAY,
+    WRIST_MIN_CONF,
     THUMB_NEAR,
     classify,
     gesture_catalogue,
@@ -305,3 +307,33 @@ def test_two_unreadable_fingers_are_still_too_many():
     k[_TIP["ring"], 2] = 0.05
     k[_TIP["pinky"], 2] = 0.05
     assert classify(k, allowed=("fist",))["gesture"] is None
+
+
+def test_the_wrist_is_judged_by_its_own_threshold():
+    """The wrist is joint 0 and the ROI is centred on the hand, so the wrist
+    sits at the edge of the crop by construction and the model is
+    systematically less certain there. Measured over 147 real hands: wrist
+    confidence p50 0.36, middle_mcp p50 0.63. Judging both by MIN_JOINT_CONF
+    made the visibility gate a wrist gate — of 30 hands refused as
+    "palm_occluded", all 30 failed on the wrist and none on middle_mcp."""
+    k = _hand()
+    k[0, 2] = 0.20                                   # below MIN_JOINT_CONF
+    k[HAND_INDEX["middle_mcp"], 2] = 0.9
+
+    assert WRIST_MIN_CONF < MIN_JOINT_CONF
+    assert measure(k).visible is True
+    assert classify(k)["reason"] != "palm_occluded"
+
+
+def test_a_palm_the_model_genuinely_could_not_see_is_still_refused():
+    """Lowering the wrist threshold must not remove the gate. middle_mcp keeps
+    MIN_JOINT_CONF, and a wrist below even the lower bar still refuses —
+    otherwise the shape rules run on an origin the model never located, and
+    every reach is measured from the wrong point."""
+    k = _hand()
+    k[HAND_INDEX["middle_mcp"], 2] = 0.1
+    assert classify(k)["reason"] == "palm_occluded"
+
+    k = _hand()
+    k[0, 2] = 0.05
+    assert classify(k)["reason"] == "palm_occluded"
