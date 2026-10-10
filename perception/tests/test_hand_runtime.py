@@ -994,3 +994,24 @@ def test_one_shoulder_still_answers_through_the_span():
 
     assert source == "shoulder_wrist"
     assert scale == pytest.approx(200.0 * SHOULDER_WRIST_TO_FOREARM)
+
+
+def test_a_hand_rejected_on_confidence_is_counted():
+    """The one failure that costs an inference was the one counted nowhere.
+
+    Measured over a real session: 239 ROIs reached the engine, 229 of their
+    decodes fell below the confidence gate, and `info` still reported
+    `ran: 239, skipped: {all zeros}` beside ten published hands. A card that
+    says it skipped nothing and produced nothing is unreadable — and it points
+    the reader at the engine, which was working exactly as intended.
+    """
+    session = _HandSession(conf=0.01)      # decodes, but far too weak to use
+    channel = HandChannel(session, max_rois=2, interval_s=0.0,
+                          hold_s=0.0, confidence=0.42)
+    person = _person()
+
+    channel.update([person], _frame(), 0.0)
+
+    assert channel.ran >= 1
+    assert channel.skipped["low_confidence"] >= 1
+    assert person["hands"]["right"] is None

@@ -181,7 +181,15 @@ HAND_CENTRE_OFFSET = 0.35
 
 #: Why a hand was not attempted. Reported per instance so that "no hands" is
 #: never ambiguous between these and a broken engine.
-SKIP_REASONS = ("wrist_occluded", "no_scale", "too_far", "throttled")
+#: Why a hand produced nothing. `low_confidence` is the only one that costs an
+#: inference — the engine ran and its answer was not trustworthy enough to
+#: publish — and it was missing, so the one failure that happens most was
+#: counted nowhere. Measured over one real session: 239 ROIs, 229 of them
+#: rejected here, and `info` reported `ran: 239, skipped: {all zeros}` while
+#: ten hands came out. A card that says it skipped nothing and produced
+#: nothing is unreadable; worse, it points the reader at the engine.
+SKIP_REASONS = ("wrist_occluded", "no_scale", "too_far", "throttled",
+                "low_confidence")
 
 #: Where the hand's expected size came from, best first. The wrist says where
 #: the hand is; something else has to say how big it is, and the elbow is only
@@ -784,6 +792,7 @@ class HandChannel:
             entry = self._state.setdefault(key, {})
             entry["t"] = now
             if float(np.mean(decoded[:, 2])) < self._confidence:
+                self.skipped["low_confidence"] += 1
                 entry.pop("box", None)
                 held = self._hold(key, now)
                 if held is not None:
