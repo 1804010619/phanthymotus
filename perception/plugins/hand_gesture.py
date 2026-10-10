@@ -74,7 +74,23 @@ from plugins.hand_runtime import HAND_INDEX, N_HAND_KEYPOINTS
 #: Scored against 83 hand-labelled frames (victory, open_palm, ok, pointing),
 #: moving 0.25 -> 0.12 takes correct namings from 33 to 55 while wrong ones go
 #: from 2 to 3. That is the part that matters: this is not coverage bought
-#: with accuracy. Caveat worth keeping: one person, one session, one camera.
+#: with accuracy.
+#:
+#: Confirmed afterwards on a second session recorded and labelled separately
+#: (197 frames, 86 labelled hands, mostly ok/fist with some victory and open
+#: palm): **61 correct, 0 wrong, 25 declined**. Not one misclassification.
+#:
+#: 0.12 is the knee, not a floor. Swept lower against both labelled sets:
+#: 0.08, 0.05 and 0.02 leave the first session completely unchanged and turn
+#: exactly one of the second session's declines into an error. Below here,
+#: loosening only converts "I don't know" into "wrong".
+#:
+#: What is left is not a threshold problem. Both sessions decline about a
+#: quarter of their hands, almost all as "unclear: middle,ring" on a palm
+#: angled away from the camera. `reach` is a 2-D projection, so a finger
+#: pointing at the lens is foreshortened into the same reading as a half-
+#: curled one, and no single number separates those. That ceiling is the
+#: argument for a small learned classifier over these same 21 joints.
 FINGER_EXTENDED = 0.12
 
 #: Below this a finger counts as folded. Measured folded readings stop at
