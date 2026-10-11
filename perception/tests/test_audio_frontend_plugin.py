@@ -586,12 +586,20 @@ def test_an_unknown_action_is_declined_not_answered(plugin):
     assert plugin.dispatch("audio_frontend", {"action": "speak"}) is None
 
 
-def test_the_cpu_cost_is_reported(plugin):
+def test_the_callback_cost_is_reported(plugin):
+    """Reported as wall time in the callback, which is what the name says.
+
+    It is not CPU time: the other plugins' threads contend for the GIL in this
+    process, and on Orin 5 the live figure was 29.7 ms per audio second against
+    3.6 ms for the same callback profiled on its own. Naming it `cpu_*` invited
+    exactly the wrong conclusion from the difference.
+    """
     plugin.dispatch("audio_frontend", {"action": "start", "instance_id": "c1",
                                        "input_topic": "/mic/audio"})
     node = plugin._nodes["c1"]
     speech = _bursts(0.032, seed=21).tobytes()
     for index in range(30):
         _hear(node, speech, BASE_T + index * 0.032)
-    cost = node.diagnostics()["cpu_ms_per_audio_s"]
+    cost = node.diagnostics()["callback_wall_ms_per_audio_s"]
     assert cost is not None and cost >= 0.0
+    assert "cpu_ms_per_audio_s" not in node.diagnostics()
