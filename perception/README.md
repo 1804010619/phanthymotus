@@ -3322,7 +3322,7 @@ an LLM's context. Hence, and please keep all three:
 
 ```
 jp6.1   cp310   PyPI wheel, pinned 3.1.1
-jp5.11  cp38    in-house wheel on COS, built from the 2.3.0 sdist
+jp5.11  cp38    in-house wheel on COS, built from the 2.2.0 sdist
 ```
 
 Two independent reasons, either one sufficient:
@@ -3331,23 +3331,45 @@ Two independent reasons, either one sufficient:
   oldest release carrying aarch64 wheels starts at cp310. Checked against the
   PyPI JSON API rather than inferred from `requires_python`, which lies (see the
   Thai deps section for the same trap).
-* **3.x requires C++20** (`CMAKE_CXX_STANDARD_REQUIRED ON`), which focal's gcc 9
-  is not. 2.3.0 leaves it `OFF` and builds there. So the *version* differs per
-  line, not just the delivery method.
+* **2.3.0 and up do not compile on focal's gcc 9.** `core/src/WriteBarcode.h`
+  uses a C++20 `requires` clause and gcc 9 answers `'requires' does not name a
+  type`. This was first written here as "2.3.0 leaves
+  `CMAKE_CXX_STANDARD_REQUIRED OFF` so it builds on gcc 9" — a reasonable read
+  of the CMakeLists that the build then disproved at 4%. The CMake flag is
+  irrelevant when the *source* is C++20.
+
+**2.2.0 is the version to build**, for two reasons that happen to agree: it is
+the newest release whose core has no reachable C++20 (`Generator.h` includes
+`<concepts>`, but nothing includes `Generator.h`), and it is the newest release
+below 2.3.0 that exists on PyPI at all — 2.2.1 is a git tag only, so
+`pip wheel "zxing-cpp==2.2.1"` fails with "no matching distribution".
 
 Building the sdist inside `Dockerfile.jetson` is not the answer: the x86 build
-host cross-compiles this image under qemu, where a C++ compile of this size is
-hours. The in-house-wheel-on-COS route is the one sherpa-onnx already uses.
+host cross-compiles this image under qemu, where this compile took ~8 minutes
+single-threaded — payable once on COS, or on every image build. The
+in-house-wheel-on-COS route is the one sherpa-onnx already uses.
 
-`plugins/barcode_runtime.py` absorbs the API difference — **2.3.0 has no
-`try_invert`** — by reading `read_barcodes`' real signature out of its docstring,
-which both pybind11 (2.x) and nanobind (3.x) generate from the actual binding.
-Not from the `TypeError`: pybind11 answers an unexpected keyword with
+`plugins/barcode_runtime.py` absorbs the API difference by reading
+`read_barcodes`' real signature out of its docstring, which both pybind11 (2.x)
+and nanobind (3.x) generate from the actual binding. Not from the `TypeError`:
+pybind11 answers an unexpected keyword with
 `Invoked with: ... kwargs: try_rotate=True, try_invert=True`, listing *every*
 keyword passed rather than the one it rejected, so retry-on-error cannot tell
-them apart and would drop all of them. A keyword the build does not declare is
-simply not sent, and `max_number_of_symbols` — which 3.1.1 does **not** have,
-despite 2.3.0 having it — is capped in Python instead.
+them apart and would drop all of them.
+
+What the two shipped builds actually declare, read off the installed wheels
+rather than a changelog:
+
+| | 2.2.0 (jp5.11) | 3.1.1 (jp6.1) |
+|---|---|---|
+| `try_rotate`, `try_downscale`, `is_pure`, `formats` | yes | yes |
+| `try_invert` | **no** | yes |
+| `max_number_of_symbols` | **no** | **no** |
+| writer | `write_barcode` | `create_barcode` |
+| `__version__` on the module | yes | **no** (use `importlib.metadata`) |
+
+`max_number_of_symbols` is therefore capped in Python on both lines, and the
+round-trip test feature-detects the writer rather than picking one.
 
 A missing wheel does not fail the image build: the import is lazy and `info`
 reports `decoder.available: false` with the reason on the card. The build log
@@ -3356,25 +3378,52 @@ anything.
 
 #### Rebuilding the cp38 wheel
 
-**Not yet run — the COS key the Dockerfile references does not exist yet.** The
-recipe, to be done on Orin 5 (jp5.11 is the only line that needs it) inside a
-container off that line's own image, so the wheel is tagged for the interpreter
-that will import it:
+Done once on the **x86 build host** (`172.18.66.241`) under qemu, not on a rig:
+the rigs are what the image is tested on, and installing a toolchain on one to
+produce a build artefact is the wrong place for it. The jp5.11 image is already
+present there, and running the build *inside that image* is the point — the
+wheel is then tagged for, and linked against, the exact interpreter and
+libstdc++ that will import it.
 
 ```bash
-# on Orin 5 (10.100.121.14)
-docker run --rm -v /tmp/wheels:/out <jp511-perception-image> bash -c '
-  apt-get update && apt-get install -y --no-install-recommends cmake g++ python3-dev &&
-  pip3 wheel "zxing-cpp==2.3.0" --no-binary :all: -w /out'
-# → /tmp/wheels/zxing_cpp-2.3.0-cp38-cp38-linux_aarch64.whl
-# verify it imports on cp38 before trusting it (requires_python lies):
-docker run --rm -v /tmp/wheels:/w <jp511-perception-image> bash -c '
-  pip3 install /w/zxing_cpp-2.3.0-cp38-cp38-linux_aarch64.whl &&
-  python3 -c "import zxingcpp; print(zxingcpp.read_barcodes.__doc__.split(chr(10))[0])"'
+# on 172.18.66.241 (x86_64, qemu-aarch64 binfmt registered; ~8 min)
+IMG=bj-warehouse.tencentcloudcr.com/phanthy-motus/perception:<tag>-jetson-jp5.11
+docker run --rm -v /root/zxwheels:/out "$IMG" bash -lc '
+  pip3 wheel "zxing-cpp==2.2.0" --no-binary zxing-cpp \
+    -i https://mirrors.tencentyun.com/pypi/simple/ -w /out'
 ```
 
-Then upload to COS under `public/zxing-cpp/jp511/` (credentials:
-`resource-center/deploy/values.env`), which is the key `ZXING_WHEEL_511` names.
+`--no-binary zxing-cpp`, **not** `--no-binary :all:`: the latter also forbids
+wheels for the build dependencies, so pip starts compiling hatchling, cmake and
+ninja from source under qemu and the run sits on "Installing build
+dependencies: still running..." for as long as you let it. No `apt-get` is
+needed — the image already has g++ 9.4, cmake 3.27 and `Python.h`.
+
+Then verify in a **clean** container of the same image, which is the step that
+proves there is no ABI mismatch and that the keyword set is what the code
+expects:
+
+```bash
+docker run --rm -v /root/zxwheels:/w "$IMG" bash -lc '
+  pip3 install /w/zxing_cpp-2.2.0-cp38-cp38-linux_aarch64.whl &&
+  python3 -c "import zxingcpp, numpy as np;
+sig=zxingcpp.read_barcodes.__doc__.splitlines()[0];
+print(\"try_invert\" in sig);
+a=np.asarray(zxingcpp.write_barcode(zxingcpp.BarcodeFormat.QRCode, \"x\", width=240, height=240));
+print([b.text for b in zxingcpp.read_barcodes(a)])"'
+```
+
+Upload with the artefact script (`upload-figs.js` cannot be used — it forces the
+`resource-center/uploads/` prefix and image MIME types):
+
+```bash
+cd resource-center && node prisma/articles/upload-artifact.js deploy/values.env \
+  /tmp/zxing_cpp-2.2.0-cp38-cp38-linux_aarch64.whl \
+  public/zxing-cpp/jp511/zxing_cpp-2.2.0-cp38-cp38-linux_aarch64.whl
+curl -sI <the printed URL> | head -1     # must be 200 before building the image
+```
+
+That key is what `ZXING_WHEEL_511` names.
 
 ### ArUco / AprilTag are deliberately not here
 

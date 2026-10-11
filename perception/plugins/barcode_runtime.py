@@ -11,11 +11,13 @@ concurrency be tested on a laptop that has no zxing at all (the pattern
 Two version differences this has to absorb, because the two JetPack lines
 cannot run the same zxing-cpp:
 
-* **jp6.1 runs the PyPI wheel (3.x); jp5.11 runs an in-house 2.3.0 build.**
-  zxing-cpp has never published a cp38 aarch64 wheel, and 3.x requires a
-  C++20 compiler that Ubuntu 20.04's gcc 9 is not. 2.3.0 sets
-  `CMAKE_CXX_STANDARD_REQUIRED OFF`, so it builds there.
-* **2.3.0 has no `try_invert`** (3.x added it, defaulting to on). Rather than
+* **jp6.1 runs the PyPI wheel (3.1.1); jp5.11 runs an in-house 2.2.0 build.**
+  zxing-cpp has never published a cp38 aarch64 wheel, and 2.3.0+ does not
+  compile on Ubuntu 20.04's gcc 9 — `core/src/WriteBarcode.h` uses a C++20
+  `requires` clause. 2.2.0 is the newest PyPI release that builds there.
+* **2.2.0 has neither `try_invert` nor `max_number_of_symbols`**, and 3.1.1 has
+  `try_invert` but *not* `max_number_of_symbols`. Read off the two real builds,
+  not from a changelog. Rather than
   branching on a version string — which says nothing about what a given build
   actually accepts — the keywords are read out of `read_barcodes.__doc__`,
   which both pybind11 (2.x) and nanobind (3.x) generate from the real
@@ -64,7 +66,8 @@ DEFAULT_MAX_TEXT_CHARS = 2048
 
 # More than this in one frame is a sheet of labels, not a thing being shown
 # to a robot; the cap keeps a pathological frame from producing a result the
-# LLM cannot read.
+# LLM cannot read. Enforced in Python because *neither* shipped build exposes
+# `max_number_of_symbols` to the reader — 2.2.0 and 3.1.1 both lack it.
 DEFAULT_MAX_SYMBOLS = 16
 
 

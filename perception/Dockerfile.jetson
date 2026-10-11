@@ -610,28 +610,36 @@ RUN if [ "${ENABLE_THAI_TTS}" = "1" ]; then \
 # But it cannot be one `pip install` for both lines:
 #
 #   jp6.1   cp310  PyPI wheel (3.1.1)
-#   jp5.11  cp38   in-house wheel on COS, built from the 2.3.0 sdist
+#   jp5.11  cp38   in-house wheel on COS, built from the 2.2.0 sdist
 #
 # Two independent reasons, either one sufficient:
 #   * zxing-cpp has NEVER published a cp38 aarch64 wheel, at any version — the
 #     oldest release with aarch64 wheels starts at cp310. Checked against the
 #     PyPI JSON API, not inferred from requires_python.
-#   * 3.x sets CMAKE_CXX_STANDARD_REQUIRED ON at C++20, which focal's gcc 9 is
-#     not. 2.3.0 leaves it OFF and builds there, which is why the pinned
-#     version differs per line rather than only the delivery method.
+#   * 2.3.0 and up do not compile on focal's gcc 9: core/src/WriteBarcode.h
+#     uses a C++20 `requires` clause, and gcc 9 answers with
+#     "'requires' does not name a type". Measured, not predicted — an earlier
+#     version of this comment claimed 2.3.0 builds there because its CMake
+#     leaves CMAKE_CXX_STANDARD_REQUIRED OFF, and the build then failed at 4%.
+#     The CMake flag is irrelevant when the *source* is C++20.
+#     2.2.0 is the newest release whose core has no reachable C++20
+#     (`Generator.h` includes <concepts> but nothing includes it) and is the
+#     newest on PyPI below 2.3.0 — 2.2.1 exists only as a git tag.
 # Building the sdist *here* is not the answer: the x86 build host cross-compiles
-# this image under qemu, where a C++ compile of this size is hours.
+# this image under qemu, where this compile took ~8 min single-threaded and
+# would be paid on every image build.
 #
-# plugins/barcode_runtime.py absorbs the API difference between the two (2.3.0
-# has no `try_invert`) by reading read_barcodes' real signature, so neither
-# version is special-cased in Python.
+# plugins/barcode_runtime.py absorbs the API difference between the two by
+# reading read_barcodes' real signature, so neither version is special-cased in
+# Python. Verified against the built wheel: 2.2.0 declares neither `try_invert`
+# nor `max_number_of_symbols`, both of which 3.x-era code would pass.
 #
 # A missing wheel does not fail the build: the plugin imports zxing lazily and
 # its `info` reports the reason on the card. The build log says so too — if you
 # see [build] zxing-cpp: NOT INSTALLED, that image cannot scan anything and the
 # wheel needs rebuilding (recipe in perception/README.md § Barcode Scanning).
 ARG ZXING_VERSION_61=3.1.1
-ARG ZXING_WHEEL_511=jp511/zxing_cpp-2.3.0-cp38-cp38-linux_aarch64.whl
+ARG ZXING_WHEEL_511=jp511/zxing_cpp-2.2.0-cp38-cp38-linux_aarch64.whl
 RUN . /etc/jetpack.env; \
     case "${JP_VERSION}" in \
       61) echo "[build] zxing-cpp: PyPI wheel ${ZXING_VERSION_61} (python ${PY_ABI})" && \
