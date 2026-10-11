@@ -52,12 +52,13 @@ from utils.qos import CAMERA_QOS
 from utils.ros_lifecycle import dispose_node
 
 from plugins.barcode_runtime import (
-    DEFAULT_MAX_SYMBOLS,
-    DEFAULT_MAX_TEXT_CHARS,
+    SCAN_MODE_ALL,
+    SCAN_MODES,
     DecodeError,
     decode_codes,
     decoder_status,
     reader_options,
+    resolve_scan_mode,
 )
 from plugins.image_input import BadInput, REASON_BAD_INPUT, load_image_bytes
 
@@ -138,14 +139,14 @@ TOOLS = [
                     "type": "number",
                     "description": f"scan_by_stream 回看最近多少秒的画面，默认 {DEFAULT_WINDOW_S}，上限为卡片配置的 window_s",
                 },
-                "formats": {
-                    "type": "array", "items": {"type": "string"},
+                "scan_mode": {
+                    "type": "string", "enum": list(SCAN_MODES),
                     "description": (
-                        "只认这些格式，如 [\"QRCode\"] 或 [\"EAN13\",\"Code128\"]。"
-                        "留空=全认。收窄能提速并减少误识别。**可用名字必须看 info 的 "
-                        "decoder.formats** —— 聚合名在两条 JetPack 线上拼法不同"
-                        "（jp6.1 的 zxing 3.x 叫 AllMatrix/AllLinear，jp5.11 的 2.2.0 "
-                        "叫 MatrixCodes/LinearCodes），具体格式名才是两边都有的"
+                        "Which kinds of code to look for, overriding the card's "
+                        "setting for this one call. all = every type (default); "
+                        "qr = QR codes only; 2d = QR/DataMatrix/Aztec/PDF417; "
+                        "1d = barcodes (EAN/UPC/Code128/...). 收窄能提速，也能避免"
+                        "把条纹衣服读成条码"
                     ),
                 },
             },
@@ -162,18 +163,18 @@ TOOLS = [
                 },
                 "config": {"params": [], "description": "Update configuration"},
                 "scan_by_stream": {
-                    "params": ["window_s", "formats"],
+                    "params": ["window_s", "scan_mode"],
                     "description": (
                         "读摄像头里现在举着的码 — 取最近几帧，解出一个就返回。"
                         "需要先 start 并连上摄像头。没扫到不是错误，返回 count: 0"
                     ),
                 },
                 "scan_by_photo": {
-                    "params": ["image_path", "formats"],
+                    "params": ["image_path", "scan_mode"],
                     "description": "读一张图片里的码 — 一次性，不需要摄像头也不需要先 start",
                 },
                 "scan_by_url": {
-                    "params": ["url", "formats"],
+                    "params": ["url", "scan_mode"],
                     "description": "读图片 URL 里的码 — 与 scan_by_photo 相同，只是图片来自 http(s)",
                 },
             },
@@ -181,36 +182,47 @@ TOOLS = [
         # Deliberately minimal, as in ocr.py: only what an operator decides.
         # try_downscale / is_pure / window_max_frames / image_roots /
         # max_image_bytes stay config.yaml-only — dispatch honours them.
+        # Deliberately two fields. The rest — try_rotate, try_invert,
+        # try_downscale, is_pure, max_frames_scanned, max_symbols,
+        # max_text_chars, window_max_frames, image_roots — stay config.yaml-only
+        # and dispatch still honours them. They are answers an operator has no
+        # basis to give: nobody looking at this card knows what to put in
+        # "max symbols per frame", and a field like that is worse than absent.
+        #
+        # `title` carries the label and `description` the explanation: with only
+        # a description the whole sentence becomes the label and the form turns
+        # into an essay (web/js/sidebar.js builds it that way). `oneOf` rather
+        # than `enum` so the dropdown reads "QR codes only" instead of "qr".
+        # Both are scope: instance, which is what gets them the per-instance
+        # form *and* the shared-defaults form.
         "configSchema": {
             "type": "object",
             "properties": {
-                "formats": {
-                    "type": "array", "items": {"type": "string"}, "default": [],
-                    "description": "默认只认这些格式（留空=全认）。单扫二维码的场景填 [\"QRCode\"]：更快，也不会把条纹衣服读成条码。可用名字见 info 的 decoder.formats",
-                },
-                "try_rotate": {
-                    "type": "boolean", "default": True,
-                    "description": "也尝试旋转后的码（横放的条码、侧着举的二维码）。关掉略快",
-                },
-                "try_invert": {
-                    "type": "boolean", "default": True,
-                    "description": "也尝试反色的码（屏幕暗色模式、白底黑字反过来印）。较老的 zxing 构建没有这个开关，会被忽略",
+                "scan_mode": {
+                    "type": "string",
+                    "title": "Code types to scan",
+                    "default": SCAN_MODE_ALL,
+                    "scope": "instance",
+                    "oneOf": [
+                        {"const": "all", "title": "All code types"},
+                        {"const": "qr",  "title": "QR codes only"},
+                        {"const": "2d",  "title": "2D codes only (QR, DataMatrix, Aztec, PDF417)"},
+                        {"const": "1d",  "title": "Barcodes only (EAN, UPC, Code128, ...)"},
+                    ],
+                    "description": (
+                        "Narrowing this makes a scan faster and stops striped "
+                        "patterns — clothing, shelving — from being read as a "
+                        "barcode."
+                    ),
                 },
                 "window_s": {
                     "type": "number", "minimum": 0.1, "default": DEFAULT_WINDOW_S,
-                    "description": "scan_by_stream 的回看窗口上限(秒)", "scope": "instance",
-                },
-                "max_frames_scanned": {
-                    "type": "integer", "minimum": 1, "default": DEFAULT_MAX_FRAMES_SCANNED,
-                    "description": "scan_by_stream 最多解几帧（从新到旧，解出即停）。调高只在运动模糊严重时有意义",
-                },
-                "max_symbols": {
-                    "type": "integer", "minimum": 1, "default": DEFAULT_MAX_SYMBOLS,
-                    "description": "一帧里最多返回几个码",
-                },
-                "max_text_chars": {
-                    "type": "integer", "minimum": 1, "default": DEFAULT_MAX_TEXT_CHARS,
-                    "description": "单个码的文本截断长度。码里的内容是不可信输入，会直接进 LLM 的上下文 —— 这是对那个暴露面的上限",
+                    "title": "Stream look-back (seconds)",
+                    "scope": "instance",
+                    "description": (
+                        "How much recent camera video a stream scan may look "
+                        "at. Raise it if the code is only held up briefly."
+                    ),
                 },
             },
         },
@@ -372,10 +384,18 @@ class BarcodeScanPlugin:
             return {**self._plugin_cfg, **self._instance_configs.get(node_key, {})}
 
     def _scan_options(self, cfg: dict, args: dict) -> dict:
-        """Card config, with the call's `formats` taking precedence."""
+        """Card config, with this call's `scan_mode` taking precedence.
+
+        `formats` stays readable from config.yaml as a raw list of symbology
+        names, for the case a mode cannot express — but it is not offered on
+        the card or to the LLM, because the names are not portable between the
+        two zxing builds. An explicit list wins over a mode: somebody who wrote
+        one meant it.
+        """
         options = dict(cfg)
-        if args.get("formats"):
-            options["formats"] = args["formats"]
+        if not options.get("formats"):
+            mode = args.get("scan_mode") or cfg.get("scan_mode") or SCAN_MODE_ALL
+            options["formats"] = resolve_scan_mode(mode)
         return reader_options(options)
 
     # ── info ─────────────────────────────────────────────────────────────

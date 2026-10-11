@@ -49,8 +49,11 @@ __all__ = [
     "REASON_DECODE_FAILED",
     "DEFAULT_MAX_TEXT_CHARS",
     "DEFAULT_MAX_SYMBOLS",
+    "SCAN_MODES",
+    "SCAN_MODE_ALL",
     "decode_codes",
     "decoder_status",
+    "resolve_scan_mode",
     "supported_formats",
     "reader_options",
 ]
@@ -185,6 +188,57 @@ def supported_formats() -> list[str]:
         if name[:1].isupper() and name.lower() not in _NON_FORMAT_NAMES
     ]
     return sorted(names)
+
+
+# ── scan modes ───────────────────────────────────────────────────────────────
+#
+# What a person configuring this card actually decides is *what kind of code
+# they are pointing it at*, not which of zxing's 51 symbologies to enable. The
+# format names are also not portable between the two JetPack lines — 3.1.1
+# spells the aggregates `AllMatrix`/`AllLinear`, 2.2.0 spells them
+# `MatrixCodes`/`LinearCodes` — so a card configured on one robot would be
+# rejected on the other. Both problems go away by making the *mode* the
+# setting and resolving it against the names this build actually has.
+SCAN_MODE_ALL = "all"
+SCAN_MODES = (SCAN_MODE_ALL, "qr", "2d", "1d")
+
+# Tried in order; the first name this build has wins. The explicit lists are
+# the fallback for a build with neither aggregate spelling.
+_MODE_CANDIDATES = {
+    "qr": (["QRCode", "MicroQRCode", "RMQRCode"],),
+    "2d": (["AllMatrix"], ["MatrixCodes"],
+           ["QRCode", "MicroQRCode", "RMQRCode", "DataMatrix", "Aztec",
+            "PDF417", "MaxiCode"]),
+    "1d": (["AllLinear"], ["LinearCodes"],
+           ["EAN13", "EAN8", "UPCA", "UPCE", "Code128", "Code39", "Code93",
+            "Codabar", "ITF", "DataBar", "DataBarExpanded"]),
+}
+
+
+def resolve_scan_mode(mode: str) -> list[str]:
+    """`"2d"` → the format names *this* build calls 2D codes.
+
+    `[]` means "do not narrow", which is both the `all` mode and the honest
+    answer when no candidate name exists — narrowing to nothing would silently
+    decode nothing at all.
+    """
+    name = str(mode or SCAN_MODE_ALL).strip().lower()
+    if name in ("", SCAN_MODE_ALL):
+        return []
+    if name not in _MODE_CANDIDATES:
+        raise DecodeError(
+            f"unknown scan_mode {mode!r}. Use one of: " + ", ".join(SCAN_MODES)
+        )
+    available = set(supported_formats())
+    if not available:
+        return []
+    for candidate in _MODE_CANDIDATES[name]:
+        present = [item for item in candidate if item in available]
+        if present:
+            return present
+    log.warning("[barcode] this zxing build has no format names for scan_mode "
+                "%r; scanning every type instead", name)
+    return []
 
 
 def _resolve_formats(module, names) -> object | None:

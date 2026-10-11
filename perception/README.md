@@ -3448,13 +3448,51 @@ curl -s localhost:15720 -d '{"jsonrpc":"2.0","id":1,"method":"tools/call",
   "image_path":"/tmp/qr.png"}}}'
 ```
 
-`formats` accepts aggregate names too, but **they are spelled differently on the
-two lines** — 3.1.1 has `AllMatrix` / `AllLinear`, 2.2.0 has `MatrixCodes` /
-`LinearCodes`. Specific names (`QRCode`, `EAN13`, `Code128`) exist on both.
-`info`'s `decoder.formats` is the authority for the installed build: 51 names on
-3.1.1, 20 on 2.2.0. The tool description says the same thing, because an LLM on
-a jp5.11 robot that copies `AllMatrix` out of a doc gets
-`unknown barcode format(s): AllMatrix`.
+### The card stores a mode, not format names
+
+`scan_mode` is `all` | `qr` | `2d` | `1d`, and `plugins/barcode_runtime.resolve_scan_mode`
+turns it into the names **this build actually has** at scan time. Two separate
+reasons, and the first one alone settles it:
+
+* **The names are not portable between the two lines.** 3.1.1 spells the
+  aggregates `AllMatrix` / `AllLinear`; 2.2.0 spells them `MatrixCodes` /
+  `LinearCodes`. A card configured on Orin 6 and moved to Orin 5 would be
+  rejected with `unknown barcode format(s): AllMatrix` — and the blame would
+  land on whoever typed it. Storing the mode means the card survives the move.
+* **Nobody is choosing between 51 symbologies.** What a person configuring this
+  decides is what they are pointing the camera at.
+
+`info`'s `decoder.formats` still reports the real list per build (51 names on
+3.1.1, 20 on 2.2.0) — it is the answer to "what does this image support", not a
+thing to copy into config.
+
+`formats` remains readable from `config.yaml` as a raw list, for a narrowing no
+mode expresses (`[DataMatrix]`). A non-empty list wins over the mode: somebody
+who wrote one meant it. It is deliberately offered neither on the card nor to
+the LLM.
+
+### What is on the card, and what is not
+
+Two fields: **Code types to scan** (a dropdown, via `oneOf` titles) and
+**Stream look-back (seconds)**. Everything else — `try_rotate`, `try_invert`,
+`try_downscale`, `is_pure`, `max_frames_scanned`, `max_symbols`,
+`max_text_chars`, `window_max_frames`, `image_roots` — is `config.yaml`-only and
+still honoured by dispatch.
+
+The cut is "can the person in front of this card answer the question". Nobody
+knows what to put in *max symbols per frame*, and a field like that is worse
+than no field. Three things about the rendering, all of them learned by looking
+at the form rather than the schema (`web/js/sidebar.js`):
+
+* **An array of strings is not a multi-select.** `_isStringList` catches it
+  first and renders a comma-separated text box — carrying vop's placeholder,
+  `逗号分隔，如 person, chair`, which is nonsense on a barcode card. `oneOf`
+  with `const` + `title` is the only path to a real dropdown with readable
+  option text; a bare `enum` renders the raw values.
+* **Without `title`, the whole `description` becomes the label.** Set `title`
+  for the label and keep `description` for the explanation.
+* **The config panel is English.** The LLM-facing `inputSchema` is not bound by
+  this — it is read by a model, not shown in the form.
 
 
 ## Camera Parameters (`camera_info`)

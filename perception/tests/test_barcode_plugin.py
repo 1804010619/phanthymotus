@@ -464,7 +464,9 @@ def test_hits_carry_the_untrusted_note(card, tmp_path):
 
 # ── options plumbing ─────────────────────────────────────────────────────────
 
-def test_card_config_reaches_the_decoder(monkeypatch, tmp_path):
+def test_yaml_only_knobs_still_reach_the_decoder(monkeypatch, tmp_path):
+    """try_rotate and max_text_chars are off the card on purpose, but a
+    config.yaml that sets them must still be honoured."""
     decoder = _DecoderProbe()
     plugin, _, _ = _make_plugin(
         monkeypatch, decoder,
@@ -479,15 +481,46 @@ def test_card_config_reaches_the_decoder(monkeypatch, tmp_path):
     assert opts["max_text_chars"] == 32
 
 
-def test_per_call_formats_override_the_card(monkeypatch, tmp_path):
+def test_per_call_scan_mode_overrides_the_card(monkeypatch, tmp_path):
     decoder = _DecoderProbe()
     plugin, _, _ = _make_plugin(
         monkeypatch, decoder,
-        cfg={"formats": ["QRCode"], "image_roots": [str(tmp_path)]})
+        cfg={"scan_mode": "1d", "image_roots": [str(tmp_path)]})
+    monkeypatch.setattr(barcode_plugin, "resolve_scan_mode",
+                        lambda mode: {"1d": ["Code128"], "qr": ["QRCode"]}[mode])
     plugin.dispatch("barcode", {"action": "scan_by_photo",
                                 "image_path": _photo(tmp_path),
-                                "formats": ["EAN13"]})
-    assert decoder.calls[0]["opts"]["formats"] == ["EAN13"]
+                                "scan_mode": "qr"})
+    assert decoder.calls[0]["opts"]["formats"] == ["QRCode"]
+
+
+def test_an_explicit_yaml_format_list_wins_over_the_mode(monkeypatch, tmp_path):
+    """`formats` is the config.yaml escape hatch; somebody who wrote one meant it."""
+    decoder = _DecoderProbe()
+    plugin, _, _ = _make_plugin(
+        monkeypatch, decoder,
+        cfg={"formats": ["DataMatrix"], "scan_mode": "qr",
+             "image_roots": [str(tmp_path)]})
+    plugin.dispatch("barcode", {"action": "scan_by_photo",
+                                "image_path": _photo(tmp_path)})
+    assert decoder.calls[0]["opts"]["formats"] == ["DataMatrix"]
+
+
+def test_scan_mode_is_resolved_against_this_builds_names(monkeypatch, tmp_path):
+    """The point of the mode: the two zxing builds spell the aggregates
+    differently, so the card stores `2d` and the runtime picks the name that
+    exists here."""
+    decoder = _DecoderProbe()
+    plugin, _, _ = _make_plugin(monkeypatch, decoder,
+                                cfg={"image_roots": [str(tmp_path)]})
+    seen = []
+    monkeypatch.setattr(barcode_plugin, "resolve_scan_mode",
+                        lambda mode: seen.append(mode) or ["MatrixCodes"])
+    plugin.dispatch("barcode", {"action": "scan_by_photo",
+                                "image_path": _photo(tmp_path),
+                                "scan_mode": "2d"})
+    assert seen == ["2d"]
+    assert decoder.calls[0]["opts"]["formats"] == ["MatrixCodes"]
 
 
 def test_config_changes_the_live_window(card):
@@ -540,3 +573,46 @@ def test_action_style_tool_names_dispatch(card, tmp_path):
     result = plugin.dispatch("scan_by_photo", {"image_path": _photo(tmp_path)})
     assert result["ok"] is True
     assert plugin.dispatch("info", {})["decoder"]["available"] is True
+
+
+# ── the config panel ─────────────────────────────────────────────────────────
+#
+# web/js/sidebar.js renders this; the three rules below came from reading the
+# rendered form rather than the schema.
+
+def test_config_offers_only_questions_an_operator_can_answer():
+    """Expert knobs stay in config.yaml. A field nobody knows how to fill —
+    "max symbols per frame" — is worse than no field."""
+    props = barcode_plugin.TOOLS[0]["configSchema"]["properties"]
+    assert set(props) == {"scan_mode", "window_s"}
+
+
+def test_config_labels_and_help_are_english():
+    """The config panel is English; the LLM-facing descriptions are not bound
+    by this."""
+    props = barcode_plugin.TOOLS[0]["configSchema"]["properties"]
+    for key, field in props.items():
+        text = f"{field.get('title', '')} {field.get('description', '')}"
+        for option in field.get("oneOf", []):
+            text += " " + option.get("title", "")
+        assert not any("\u4e00" <= ch <= "\u9fff" for ch in text), key
+
+
+def test_code_type_choice_is_a_dropdown_not_a_free_text_list():
+    """An array of strings renders as a comma-separated text box (with vop's
+    "person, chair" placeholder, no less) — there is no multi-select widget.
+    A mode with `oneOf` titles is a real dropdown, and it also keeps the
+    unportable zxing format names out of a saved card."""
+    field = barcode_plugin.TOOLS[0]["configSchema"]["properties"]["scan_mode"]
+    assert field["type"] == "string"
+    assert [entry["const"] for entry in field["oneOf"]] == ["all", "qr", "2d", "1d"]
+    assert all(entry.get("title") for entry in field["oneOf"])
+
+
+def test_every_config_field_has_a_short_title():
+    """Without `title` the whole description becomes the label and the form
+    turns into an essay."""
+    props = barcode_plugin.TOOLS[0]["configSchema"]["properties"]
+    for key, field in props.items():
+        assert field.get("title"), key
+        assert len(field["title"]) <= 40, key

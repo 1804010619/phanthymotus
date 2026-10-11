@@ -313,3 +313,48 @@ def test_decodes_a_real_qr_code(monkeypatch):
     result = runtime.decode_codes(buffer.tobytes(), {})
     assert [code["text"] for code in result["codes"]] == [payload]
     assert result["codes"][0]["format"] == "QRCode"
+
+
+# ── scan modes ───────────────────────────────────────────────────────────────
+
+def test_scan_mode_prefers_the_aggregate_this_build_has(monkeypatch):
+    """3.1.1 spells it AllMatrix; 2.2.0 spells it MatrixCodes. Same mode."""
+    monkeypatch.setattr(runtime, "supported_formats",
+                        lambda: ["AllMatrix", "QRCode", "DataMatrix"])
+    assert runtime.resolve_scan_mode("2d") == ["AllMatrix"]
+    monkeypatch.setattr(runtime, "supported_formats",
+                        lambda: ["MatrixCodes", "QRCode", "DataMatrix"])
+    assert runtime.resolve_scan_mode("2d") == ["MatrixCodes"]
+
+
+def test_scan_mode_falls_back_to_explicit_names(monkeypatch):
+    monkeypatch.setattr(runtime, "supported_formats",
+                        lambda: ["QRCode", "DataMatrix", "Aztec"])
+    assert runtime.resolve_scan_mode("2d") == ["QRCode", "DataMatrix", "Aztec"]
+
+
+def test_qr_mode_takes_every_qr_variant_present(monkeypatch):
+    monkeypatch.setattr(runtime, "supported_formats",
+                        lambda: ["QRCode", "MicroQRCode", "EAN13"])
+    assert runtime.resolve_scan_mode("qr") == ["QRCode", "MicroQRCode"]
+
+
+def test_all_means_do_not_narrow(monkeypatch):
+    monkeypatch.setattr(runtime, "supported_formats", lambda: ["QRCode"])
+    assert runtime.resolve_scan_mode("all") == []
+    assert runtime.resolve_scan_mode("") == []
+    assert runtime.resolve_scan_mode(None) == []
+
+
+def test_a_mode_with_no_usable_name_scans_everything(monkeypatch):
+    """Narrowing to nothing would decode nothing at all — worse than not
+    narrowing, and silent."""
+    monkeypatch.setattr(runtime, "supported_formats", lambda: ["QRCode"])
+    assert runtime.resolve_scan_mode("1d") == []
+
+
+def test_unknown_mode_names_the_valid_ones(monkeypatch):
+    monkeypatch.setattr(runtime, "supported_formats", lambda: ["QRCode"])
+    with pytest.raises(runtime.DecodeError) as caught:
+        runtime.resolve_scan_mode("qrcodes")
+    assert "qr" in caught.value.detail and "scan_mode" in caught.value.detail

@@ -388,10 +388,16 @@ plugins:
     min_interval_ms: 0
 
   # 扫码：二维码 / 条形码，按需识别（actuator，没有输出 topic）
-  # 零模型零下载 —— zxing-cpp 是解码库。formats 留空=全认；只扫二维码的场景
-  # 填 [QRCode] 更快，也不会把条纹衣服读成条码。
+  # 零模型零下载 —— zxing-cpp 是解码库。
+  #
+  # scan_mode 是卡片上唯一的格式开关：all | qr | 2d | 1d。它在运行时解析成
+  # 这个镜像里的 zxing **实际有的**名字 —— jp6.1 的 3.1.1 叫 AllMatrix，
+  # jp5.11 的 2.2.0 叫 MatrixCodes，所以卡片上存模式而不是存名字。
+  # formats 是给这里用的逃生口：写死一组 symbology 名（如 [DataMatrix]），
+  # 非空时压过 scan_mode。卡片和 LLM 都看不到它，因为名字跨镜像不通用。
   barcode:
     enabled: true
+    scan_mode: all
     formats: []
     try_rotate: true
     try_downscale: true
