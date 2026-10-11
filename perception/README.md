@@ -3448,9 +3448,13 @@ curl -s localhost:15720 -d '{"jsonrpc":"2.0","id":1,"method":"tools/call",
   "image_path":"/tmp/qr.png"}}}'
 ```
 
-`formats` accepts the aggregates too: `["AllMatrix"]` is "2D codes only",
-`["AllLinear"]` is "barcodes only". `info`'s `decoder.formats` lists what the
-installed build actually has (51 names on 3.1.1).
+`formats` accepts aggregate names too, but **they are spelled differently on the
+two lines** — 3.1.1 has `AllMatrix` / `AllLinear`, 2.2.0 has `MatrixCodes` /
+`LinearCodes`. Specific names (`QRCode`, `EAN13`, `Code128`) exist on both.
+`info`'s `decoder.formats` is the authority for the installed build: 51 names on
+3.1.1, 20 on 2.2.0. The tool description says the same thing, because an LLM on
+a jp5.11 robot that copies `AllMatrix` out of a doc gets
+`unknown barcode format(s): AllMatrix`.
 
 
 ## Camera Parameters (`camera_info`)

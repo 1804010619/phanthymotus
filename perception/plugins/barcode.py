@@ -141,10 +141,11 @@ TOOLS = [
                 "formats": {
                     "type": "array", "items": {"type": "string"},
                     "description": (
-                        "只认这些格式，如 [\"QRCode\"] 或 [\"EAN13\",\"Code128\"]；"
-                        "[\"AllMatrix\"] = 只认二维码类，[\"AllLinear\"] = 只认条形码类。"
-                        "留空=全认。收窄能提速并减少误识别；可用名字见 info 的 "
-                        "decoder.formats"
+                        "只认这些格式，如 [\"QRCode\"] 或 [\"EAN13\",\"Code128\"]。"
+                        "留空=全认。收窄能提速并减少误识别。**可用名字必须看 info 的 "
+                        "decoder.formats** —— 聚合名在两条 JetPack 线上拼法不同"
+                        "（jp6.1 的 zxing 3.x 叫 AllMatrix/AllLinear，jp5.11 的 2.2.0 "
+                        "叫 MatrixCodes/LinearCodes），具体格式名才是两边都有的"
                     ),
                 },
             },
@@ -185,7 +186,7 @@ TOOLS = [
             "properties": {
                 "formats": {
                     "type": "array", "items": {"type": "string"}, "default": [],
-                    "description": "默认只认这些格式（留空=全认）。单扫二维码的场景填 [\"QRCode\"] 或 [\"AllMatrix\"]：更快，也不会把条纹衣服读成条码",
+                    "description": "默认只认这些格式（留空=全认）。单扫二维码的场景填 [\"QRCode\"]：更快，也不会把条纹衣服读成条码。可用名字见 info 的 decoder.formats",
                 },
                 "try_rotate": {
                     "type": "boolean", "default": True,
