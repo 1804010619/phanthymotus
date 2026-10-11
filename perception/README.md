@@ -1,8 +1,9 @@
 # Perception Stack
 
-Perception plugins running as one MCP HTTP server: speech (`asr`, `tts`),
-vision (`vop` object detection, `visual_depth` monocular depth, `ocr`,
-`face_recognition`, `pose` human keypoints + actions, `barcode` QR/条码扫码).
+Perception plugins running as one MCP HTTP server: speech (`asr`, `tts`,
+`audio_frontend` echo handling), vision (`vop` object detection, `visual_depth`
+monocular depth, `ocr`, `face_recognition`, `pose` human keypoints + actions,
+`barcode` QR/条码扫码).
 Connects to Agent Core via MCP tool calls and exchanges
 audio, images and results over ROS2 DDS topics. On Jetson the vision models and
 the local TTS engines run on TensorRT.
@@ -77,6 +78,146 @@ The VAD parameters can be adjusted per ASR canvas card via the instance config (
 | `vad_threshold` | `0.5` | Speech probability threshold (0–1). Raise to `0.7`–`0.85` in noisy environments (e.g. robot motor noise). |
 | `vad_silence_ms` | `400` | Silence duration (ms) required before an utterance is considered complete. |
 | `vad_pre_roll_ms` | `500` | Audio retained from *before* the VAD tripped. Recovers clipped word onsets — without it the first syllable is often missing, which costs wake-word recall. |
+
+---
+
+## Audio Frontend: keeping the robot's own voice out of its microphone
+
+The robot's TTS reaches its own microphone acoustically, and until this card
+existed nothing in perception removed it. The symptoms did not look like one
+problem: ASR transcribes the robot's own sentence and hands it to the LLM as if
+a person had said it, speaker recognition enrols that voice as a person (see
+`plugins/speaker.py`, which says so in a comment), and nobody can interrupt the
+robot mid-sentence.
+
+Wire it between the microphone card and everything that consumes microphone
+audio:
+
+```
+mic ──▶ audio_frontend ──▶ asr
+                       └──▶ soundevent
+```
+
+### Why a card and not a switch inside ASR
+
+`soundevent` subscribes to the microphone topic itself, and speaker recognition
+runs off the segment ASR cut. Cleaning the signal inside ASR cleans it for ASR
+alone. As a card it is cleaned once for everything downstream, and the cleaned
+audio is a topic a human can listen to on the dashboard.
+
+Two costs, both real. One extra DDS hop, on loopback — one chunk of latency,
+32-100 ms depending on the mic driver. And the downstream topic names change:
+`/g1/mic/audio/asr` becomes `/g1/mic/audio/clean/asr`, so agent-core's
+`event.subscribe_topics` and any saved canvas have to be re-wired. Inserting
+this card into a working robot is not a no-op.
+
+### The reference signal is config, not a connection
+
+The card has to know what the robot is saying, which is the TTS card's audio
+output — the same PCM the speaker driver plays. That is a config field and not a
+second in-port, for three reasons:
+
+- the canvas matches connections by `format` alone, and a card-level drop takes
+  the first in-port of that format (`agent-core/web/js/canvas.js`), so two
+  `audio/pcm-16k` in-ports would be a coin flip;
+- what reaches a plugin is a role-less `input_topics` list ordered by click
+  order (`web/js/topic-derive.js`);
+- and the reference is not input data. It is "what another card on this machine
+  is publishing right now", and there is almost always exactly one right answer.
+
+So the default, `auto`, asks the TTS plugin in this same process — the way ASR
+is handed a handle to speaker recognition in `main.py`. Nobody fills anything
+in, and it follows the TTS card when that gets re-wired. The dropdown is filled
+per `tools/list` with the topics TTS is publishing at that moment; a topic set
+in `config.yaml` is honoured even when it is not in the list, which is the
+escape hatch for a TTS running in another container.
+
+`auto` can resolve to nothing — vendor TTS that never passes through Agent Core
+(Tianyi speaks over a ROS service), or a TTS in another container. That
+degrades the card to a passthrough, so `info()` always reports
+`robot_voice_topic`, `robot_voice_seen` and `last_robot_voice_s_ago`, and the
+card's own description says which of the two happened.
+
+### Parameters
+
+Three fields, two of them hidden unless they apply. Every one is answerable
+from something an operator can hear; anything that needs a measurement is
+reported by `info()` instead.
+
+| Field | Choices | Notes |
+|---|---|---|
+| `mode` | `mute_while_talking` (default), `off` | Muting is half-duplex and says so: while the robot talks the microphone genuinely carries nothing, so it cannot be interrupted. In exchange it removes 100% of the echo and works on a robot whose speech never reaches Agent Core. `off` is for A/B against no processing. |
+| `robot_voice_topic` | `auto` (default), or a live TTS topic | Above. |
+| `mute_tail` | `auto` (default), `300ms`, `800ms`, `1500ms` | How long to keep muting after the robot's last audio frame. |
+
+Deliberately **not** offered: frame size, filter length, adaptation step size,
+double-talk thresholds. They derive from the fields above or stay internal
+constants.
+
+### Why the mute needs a tail, and why `auto` is the default
+
+Publishing the last frame of an utterance is not the end of the sound. The
+speaker path buffers: the G1 driver prefills 9 600 bytes (~300 ms), merges into
+300 ms blocks and runs up to 240 ms ahead of the MCU's queue
+(`phanthymotus-driver` `unitree/g1/device.py`), and the measured gap between
+"TTS finished publishing" and "the robot stopped being audible" is 0.7-1.2 s on
+that robot. A mute that ended with the reference stream would therefore
+transcribe the last few words of the robot's own sentence — the exact failure
+this card exists to remove.
+
+That number is a property of the robot and its speaker, nobody knows it in
+advance, and it moves with bus load. Hence `auto`: the tail follows the delay
+the card measures for itself (`measured_echo_delay_ms` + 200 ms), falling back
+to 800 ms before the first measurement. The explicit values do exactly what
+they say, and when one of them is shorter than the measured delay the card says
+so on its face rather than only in a diagnostics field.
+
+TTS's 8-byte end-of-utterance marker is **not** used to open the gate: it marks
+the end of *publishing*, which is several hundred milliseconds before the end of
+the sound.
+
+### The delay measurement
+
+`_DelayTracker` cross-correlates the two signals' 100 Hz RMS envelopes over a
+0-1.5 s lag range, once a second, on a 3 s window. Envelope domain rather than
+waveform: what is being measured is a bulk transport delay, and an envelope
+carries that as well at 1/160th of the arithmetic. It runs in
+`mute_while_talking` too, where the gate barely needs it — so that an operator
+can read the robot's real delay off a running card before deciding anything.
+
+What the synthetic sweeps in `tests/test_audio_frontend_plugin.py` establish:
+
+| Condition | Result |
+|---|---|
+| Delays 0-1.45 s, 5 seeds each | Exact, 0 ms error (the lag indexing has no off-by-one) |
+| Echo attenuated 20x | Still exact |
+| No echo at all, noisy room | Reports nothing — never a confident 0 ms |
+| Echo beyond the 1.5 s range | Mostly nothing; a peak pinned to the last lag is refused outright, because that is the signature of a delay *beyond* the range |
+| A person talking over the robot at the robot's own level | **A single window can be wrong by a second.** The median over up to 20 windows held at 420 ms with 80% of windows contaminated, while `echo_delay_spread_ms` grew to ~1 s |
+
+The last row is why `measured` is a median and not the latest value, and why the
+spread is reported at all: an operator needs to be able to tell "this robot's
+delay is 420 ms" from "this number is moving".
+
+Two things it does not and cannot cover, both needing a machine with a speaker
+and a microphone in one room: whether a given robot's speaker path is linear
+enough for *cancellation* to be worth building (the G1 plays through a vendor
+MCU, which may apply EQ, limiting and resampling we cannot see), and the sample
+clock drift between the microphone and the speaker.
+
+### What is not here yet
+
+Cancellation — an adaptive filter that keeps the microphone open and allows
+barge-in — and noise reduction, which is a different thing from echo
+cancellation and cannot remove the robot's own voice (DeepFilterNet3 and GTCRN
+have no reference input). The delay measurement cancellation will need is
+already here, so that its one unanswerable parameter can be read off a running
+robot rather than guessed.
+
+Processing currently happens in the microphone callback, with no worker thread:
+the work is a comparison and a memset, and the estimate is a 300x150 dot
+product once a second. `info()` reports `cpu_ms_per_audio_s`, which is the
+figure that decides whether that stays true once a filter lands here.
 
 ---
 
@@ -3658,6 +3799,7 @@ Three rules that follow, each with a reason:
 |-----------|--------------|--------|
 | Input (mic) | `/{namespace}/mic/audio` or `/{namespace}/ext_mic/{id}/audio` | `audio/pcm-16k` |
 | Output (ASR result) | `{input_topic}/asr` | `data/json` |
+| Output (audio_frontend) | `{input_topic}/clean` | `audio/pcm-16k` |
 | Output (vop) | `{input_topic}/objects` | `data/json` |
 | Output (visual_depth map) | `{input_topic}/visual_depth` | `image/depth-zlib` |
 | Output (visual_depth summary) | `{input_topic}/visual_depth_summary` | `data/json` |

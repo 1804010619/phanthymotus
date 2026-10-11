@@ -412,6 +412,24 @@ plugins:
 
   soundevent:
     enabled: true
+  # 把机器人自己的 TTS 从麦克风里拿掉。接在麦克风卡和 ASR 卡之间，不是 ASR 的
+  # 一个开关 —— soundevent 也直接订麦克风，声纹又跑在 ASR 切出来的段上，装在
+  # ASR 里面只治 ASR 一家。详见 plugins/audio_frontend.py 的模块文档。
+  #
+  # 默认开着：这张卡不加载任何模型、不占显存，没被拖到画布上连线时什么都不做。
+  # 关掉它只是让卡片从侧边栏消失 —— 而真正的代价是没人发现它存在。
+  audio_frontend:
+    enabled: true
+    # off | mute_while_talking。默认静音是半双工的，诚实地说就是机器人说话时
+    # 不能被打断；换来的是 100% 没有回声，而且在 TTS 不经过 Agent Core 的机器
+    # 上（天轶走厂商 lyre 的 ROS service）这是唯一可用的模式。
+    mode: mute_while_talking
+    # auto = 问本进程里的 TTS 插件它正在发哪个 topic。几乎总是对的；只有 TTS 在
+    # 别的容器里才需要在这里写死一个 topic 名（写死的值在卡片下拉框里也保留）。
+    robot_voice_topic: auto
+    # auto | 300ms | 800ms | 1500ms。发完最后一帧 ≠ 播完：G1 的扬声器链路实测还
+    # 压着 0.7-1.2 s。auto 跟着这张卡自己量出来的延迟走，量到之前用 800ms。
+    mute_tail: auto
   speaker_recognition:
     enabled: true
     # 3D-Speaker CAM++, 200k speakers, 中英双语, 192-d, 28 MB, Apache-2.0.
