@@ -216,8 +216,30 @@ robot rather than guessed.
 
 Processing currently happens in the microphone callback, with no worker thread:
 the work is a comparison and a memset, and the estimate is a 300x150 dot
-product once a second. `info()` reports `cpu_ms_per_audio_s`, which is the
-figure that decides whether that stays true once a filter lands here.
+product once a second.
+
+Measured on Orin 5 (jp5.11), one stream, idle box, against an injected 450 ms
+echo on real DDS topics:
+
+| | ms per second of audio |
+|---|---|
+| callback profiled in isolation | 3.6 |
+| `callback_wall_ms_per_audio_s`, live, reference playing | 29.7 |
+| same, before the `array.array` fix below | 46.9 |
+| same, live, no reference at all (no correlation) | 40.7 → the correlation costs ~6 |
+
+The two columns differ because the reported figure is **wall** time inside the
+callback, not CPU time: nine other plugins' threads contend for the GIL in this
+process. Treat it as a headroom indicator and a regression tripwire, and
+profile in isolation before concluding anything about cost.
+
+The `array.array` fix is worth repeating elsewhere. Assigning a Python list to
+an `uint8[]` field makes the generated setter validate it element by element
+(`all(isinstance(v, int) and 0 <= v < 256 ...)`, 1024 iterations per chunk);
+assigning an `array.array('B')` takes a buffer fast path. Measured here: 0.226
+vs 0.021 ms per chunk, which was the single largest cost in this callback.
+`plugins/tts.py` and every mic driver in `phanthymotus-driver` still write
+`list(...)` and can have the same saving.
 
 ---
 

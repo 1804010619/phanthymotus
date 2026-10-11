@@ -73,6 +73,7 @@ and authoritative for anyone who wants to pin it.
 
 from __future__ import annotations
 
+import array
 import copy
 import logging
 import math
@@ -786,7 +787,14 @@ class _AudioFrontendNode(Node):
         # this card's own latency to the speaker's timeline.
         out.header.stamp = source.header.stamp
         out.format = AUDIO_FORMAT
-        out.data = list(pcm)
+        # `array.array('B')` and not `list(pcm)`, which is what the rest of the
+        # project writes. The generated `data` setter validates a list
+        # element-by-element — `all(isinstance(v, int) and 0 <= v < 256 ...)`,
+        # 1024 iterations per chunk — and takes a buffer fast path for an array
+        # of matching typecode. Measured on Orin 5: 0.226 ms vs 0.021 ms per
+        # chunk, which was the single largest cost in this callback. The same
+        # saving is available to plugins/tts.py and the mic drivers.
+        out.data = array.array('B', pcm)
         try:
             publisher.publish(out)
         except Exception as error:  # noqa: BLE001 - a dead publisher must not kill the callback
@@ -845,11 +853,16 @@ class _AudioFrontendNode(Node):
             "publish_errors": stats["publish_errors"],
             "ref_chunks": stats["ref_chunks"],
             "ref_utterances_ended": stats["ref_eof"],
-            # Processing cost per second of audio, in ms. The figure that
-            # decides whether the callback can stay on the audio path once an
-            # adaptive filter lands here.
-            "cpu_ms_per_audio_s": (None if audio_s <= 0
-                                   else round(process_s / audio_s * 1000, 2)),
+            # Wall time spent inside the microphone callback per second of
+            # audio, in ms. **Not** CPU time, and the difference is not small:
+            # nine other plugins' threads contend for the GIL in this process,
+            # so this inflates when the box is busy. Measured on Orin 5 with a
+            # reference playing: 29.7 ms/s live against 3.6 ms/s for the same
+            # callback profiled in isolation. Read it as a headroom indicator
+            # and a regression tripwire, not as a CPU share — and profile in
+            # isolation before concluding anything about cost.
+            "callback_wall_ms_per_audio_s": (None if audio_s <= 0
+                                             else round(process_s / audio_s * 1000, 2)),
             **report,
         }
         # The one comparison nobody can do in their head, spelled out: an
