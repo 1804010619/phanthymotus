@@ -420,10 +420,16 @@ plugins:
   # 关掉它只是让卡片从侧边栏消失 —— 而真正的代价是没人发现它存在。
   audio_frontend:
     enabled: true
-    # off | mute_while_talking。默认静音是半双工的，诚实地说就是机器人说话时
-    # 不能被打断；换来的是 100% 没有回声，而且在 TTS 不经过 Agent Core 的机器
-    # 上（天轶走厂商 lyre 的 ROS service）这是唯一可用的模式。
+    # off | mute_while_talking | remove_echo。默认静音是半双工的，诚实地说就是
+    # 机器人说话时不能被打断；换来的是 100% 没有回声，而且在 TTS 不经过 Agent
+    # Core 的机器上（天轶走厂商 lyre 的 ROS service）这是唯一可用的模式。
+    # remove_echo 保持麦克风一直开着（可以打断机器人），代价是只去掉 20-28 dB
+    # 而不是全部，而且需要参考信号；它在量到延迟之前会自动退回静音。
     mode: mute_while_talking
+    # gentle | normal | aggressive，只在 remove_echo 下有意义，而且只影响"有人
+    # 在机器人说话时插话"这一种情况。实测（人声是机器人的四分之一）：gentle 去
+    # 18 dB 回声、人声保留 18 dB；normal 去 23 保留 12；aggressive 去 28 保留 7。
+    removal_strength: normal
     # auto = 问本进程里的 TTS 插件它正在发哪个 topic。几乎总是对的；只有 TTS 在
     # 别的容器里才需要在这里写死一个 topic 名（写死的值在卡片下拉框里也保留）。
     robot_voice_topic: auto

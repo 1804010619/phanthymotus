@@ -146,13 +146,25 @@ reported by `info()` instead.
 
 | Field | Choices | Notes |
 |---|---|---|
-| `mode` | `mute_while_talking` (default), `off` | Muting is half-duplex and says so: while the robot talks the microphone genuinely carries nothing, so it cannot be interrupted. In exchange it removes 100% of the echo and works on a robot whose speech never reaches Agent Core. `off` is for A/B against no processing. |
+| `mode` | `mute_while_talking` (default), `remove_echo`, `off` | Muting is half-duplex and says so: while the robot talks the microphone genuinely carries nothing, so it cannot be interrupted. In exchange it removes 100% of the echo and works on a robot whose speech never reaches Agent Core. `remove_echo` keeps the mic open — which is what allows interruption — and removes 20-28 dB instead of all of it. `off` is for A/B against no processing. |
 | `robot_voice_topic` | `auto` (default), or a live TTS topic | Above. |
-| `mute_tail` | `auto` (default), `300ms`, `800ms`, `1500ms` | How long to keep muting after the robot's last audio frame. |
+| `mute_tail` | `auto` (default), `300ms`, `800ms`, `1500ms` | How long to keep muting after the robot's last audio frame. Also used by `remove_echo`, which mutes until it has measured the delay. |
+| `removal_strength` | `gentle`, `normal` (default), `aggressive` | `remove_echo` only, and it only changes what happens when somebody talks **while** the robot is talking. |
 
 Deliberately **not** offered: frame size, filter length, adaptation step size,
-double-talk thresholds. They derive from the fields above or stay internal
-constants.
+double-talk thresholds, and the delay search range. They derive from the fields
+above or stay internal constants.
+
+**The "filter tail" knob was planned and then dropped**, which is worth stating
+because it was promised. Once the bulk delay is measured and compensated by
+shifting the reference, the filter only has to model the echo's *spread*, and a
+tail longer than the path actively costs cancellation: against a 60 ms
+synthetic room, 64 ms of tail gives 23 dB, 128 ms gives 20, 256 ms gives 18 and
+512 ms gives 14. So "raise it if echo remains" — the only advice an operator
+could act on — would have been wrong advice. It is a 128 ms constant, reported
+as `filter_tail_ms`. The delay *search range* went the same way: it is 1.5 s,
+the measurement costs ~6 ms per second of audio, and 1.5 s covers every robot
+measured, so there is nothing for anybody to decide.
 
 ### Why the mute needs a tail, and why `auto` is the default
 
@@ -205,14 +217,126 @@ enough for *cancellation* to be worth building (the G1 plays through a vendor
 MCU, which may apply EQ, limiting and resampling we cannot see), and the sample
 clock drift between the microphone and the speaker.
 
+### Cancellation (`remove_echo`)
+
+A partitioned-block frequency-domain NLMS filter, 16 ms blocks, 128 ms tail,
+followed by a soft gate on the residual. In numpy, not bound to speexdsp's MDF:
+that binding is a PyPI sdist needing swig and `libspeexdsp-dev` inside a 16 GB
+image built for two JetPack lines and cp38, it exposes `process(near, far)` and
+nothing else — no delay handling, no access to the preprocessor's residual
+stage — and it would have to be hand-fed lock-step frames anyway. This is ~40
+lines of arithmetic, runs on both lines with the numpy already in the image,
+can be tested against synthetic echo paths offline, and can be hot-copied onto
+a rig.
+
+**The delay is measured, not modelled.** The reference is fetched by time from
+`_RefBuffer` at `measured_delay - 32 ms`, so the filter spans the room and the
+alignment error rather than the speaker's several hundred milliseconds of
+buffering. Covering that with taps instead would need 5-75x the arithmetic to
+model what is mostly a constant offset — and, per the tail measurements above,
+would cancel *less*.
+
+Until a delay has been measured, `remove_echo` **mutes** instead: subtracting an
+unaligned reference adds noise rather than removing echo. The card says so on
+its face while that lasts.
+
+Two guards, both earning their place with a measured failure:
+
+- **Skip the update when the error is bigger than the microphone.** That is
+  either double-talk or divergence, and skipping is what keeps a bad second from
+  undoing a good minute. Measured: 19.8 dB before a 4 s double-talk stretch,
+  1.7 dB during it (the person is in the microphone and is *supposed* to
+  survive, so low ERLE there is correct), 22.1 dB after.
+- **Zero the filter when its output is measurably worse than its input**, over
+  a window of far-end-active blocks. Only that — the guard started out asking
+  the more useful question, "is this filter doing anything at all", at a +1 dB
+  threshold, and a rig showed why that cannot work: *in powers alone* a filter
+  converged to 20 dB and then talked over is indistinguishable from one that
+  has learned nothing, because the residual is dominated by the person either
+  way. On Orin 5 it zeroed a converged filter three times during one 4 s
+  double-talk stretch and put "this microphone barely hears the speaker" on the
+  card — reintroducing from inside the guard the failure the per-block skip
+  exists to prevent.
+
+**Whether there is coupling worth cancelling is decided by correlation, not by
+powers**, because correlation can tell those two cases apart. The delay tracker
+already measures it, so `remove_echo` requires a *fresh* measurement: one
+accepted within the last 15 s **of the robot actually talking** (wall clock
+would be wrong — a delay measured an hour ago is still right if the robot has
+been silent since). Without one the card mutes, reports `coupling_lost`, and
+says to check the volume.
+
+That is also what protects against the no-coupling case, where a canceller makes
+a microphone *worse*: with the reference playing and no echo in the mic, the
+filter cannot explain a person with the reference, the gradient is pure noise
+and it injects that noise — measured at 4.5 dB below passthrough over 18 s. With
+no coupling the tracker accepts nothing, so cancellation never runs at all.
+
+Measured on synthetic rooms (12-18 s, 60 ms path):
+
+| | echo removed | a person talking over the robot, preserved |
+|---|---|---|
+| `gentle` (linear filter only) | 18.1 dB | 18.1 dB |
+| `normal` | 22.9 dB | 12.0 dB |
+| `aggressive` | 27.9 dB | 6.5 dB |
+
+The scale stops at `aggressive` because ERLE saturates there: suppression
+factors of 1.5 and 2.5 also give 27.9 dB and cost another 2-3 dB of the
+person's voice, so offering them would only let somebody pick a strictly worse
+point.
+
+The step size is 0.2, a factor of two below the measured stability edge: 0.3
+reaches 22-25 dB, 0.4 collapses to about 0 dB and 0.5 diverges. A diverged
+filter is worse than no filter, and these robots' speakers have not been
+characterised.
+
+Measured on Orin 5 over real DDS topics, with a 450 ms delay and a 60 ms room
+convolved in (`normal`, one 24 s session):
+
+| phase | microphone in | published out | change |
+|---|---|---|---|
+| person only, robot silent | 3649 | 3649 | **0.0 dB** — untouched |
+| robot only, before the delay was measured | 1659 | 0 | muted (the fallback) |
+| robot only, converging | 1750 | 453 | **11.7 dB** |
+| both talking | 3491 | 2714 | 2.2 dB — the person survives |
+| robot only, after the double-talk | 1704 | 242 | **17.0 dB** |
+| person only again | 3331 | 3331 | **0.0 dB** |
+
+The delay came back as 460 ms against the 450 injected, with a 10 ms spread.
+The reported `echo_removed_db` was 14.1 dB and no filter reset fired.
+
+`echo_removed_db` is an exponentially-weighted average over roughly the last
+1.5 s **of the robot talking**, and only over echo-dominant blocks. Both of
+those are rig findings rather than design: a lifetime average read 3.8 dB at the
+end of that same session, and including double-talk blocks read 4.3 dB — in a
+session whose settled phases removed 11.7 and 17.0. A card that says 4 while
+removing 17 is not a diagnostic.
+
+Cost on Orin 5, callback profiled in isolation: **3.8 ms per second of audio**,
+against 3.7 for `mute_while_talking` — the FFT work is almost free next to the
+forwarding. The live `callback_wall_ms_per_audio_s` reads ~91 ms/s, which is GIL
+contention in a process running nine other plugins, not CPU (see the cost note
+above). Caching the delay median mattered: it is read once per chunk, and
+`np.median` was a third of this path's cost before.
+
+Reframing into 16 ms blocks means published audio is up to one block older than
+the chunk that triggered it, so a cancelled chunk carries **its own** stamp
+rather than the input's — ASR reads that header as the capture time.
+
 ### What is not here yet
 
-Cancellation — an adaptive filter that keeps the microphone open and allows
-barge-in — and noise reduction, which is a different thing from echo
-cancellation and cannot remove the robot's own voice (DeepFilterNet3 and GTCRN
-have no reference input). The delay measurement cancellation will need is
-already here, so that its one unanswerable parameter can be read off a running
-robot rather than guessed.
+Noise reduction, which is a different thing from echo cancellation and cannot
+remove the robot's own voice (DeepFilterNet3 and GTCRN have no reference input).
+
+A per-bin spectral residual suppressor, which would improve double-talk quality
+rather than remove more echo — the current one is a broadband soft gate, ramped
+across the block so it cannot click, and a spectral one needs its own windowed
+overlap-add framing.
+
+And the two things no amount of code can settle from here: nonlinear echo (a
+speaker driven into its limiter, which is what a vendor MCU may well do) and
+sample clock drift between the microphone and the speaker. Both need a machine
+with a speaker and a microphone in one room.
 
 Processing currently happens in the microphone callback, with no worker thread:
 the work is a comparison and a memset, and the estimate is a 300x150 dot
