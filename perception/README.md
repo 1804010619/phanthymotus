@@ -2,8 +2,8 @@
 
 Perception plugins running as one MCP HTTP server: speech (`asr`, `tts`),
 vision (`vop` object detection, `visual_depth` monocular depth, `ocr`,
-`face_recognition`, `pose` human keypoints + actions). Connects to Agent Core via
-MCP tool calls and exchanges
+`face_recognition`, `pose` human keypoints + actions, `barcode` QR/条码扫码).
+Connects to Agent Core via MCP tool calls and exchanges
 audio, images and results over ROS2 DDS topics. On Jetson the vision models and
 the local TTS engines run on TensorRT.
 
@@ -3271,6 +3271,138 @@ the pose card reports `state: error` with that message and the rest of perceptio
 is unaffected.
 
 ---
+
+## Barcode Scanning (`barcode`)
+
+扫码：QR / 条形码，按需识别。`plugins/barcode.py` + `plugins/barcode_runtime.py`.
+
+Zero models and nothing to download — zxing-cpp is a decoder, not a network. The
+card is up the moment the container is.
+
+### It is an actuator, and that is the design
+
+The card declares `topic_in` (a camera, optional) and **no `topic_out`**, which is
+what `canvas.js` reads as an actuator: one input port, no output port.
+
+Nothing wants a barcode *stream*. A code is read because somebody is holding one
+up — 扫码配网, 读物料码, 读快递单 — and the answer belongs to whoever asked, as the
+tool's return value. A processor publishing at camera rate would be putting "no
+code in this frame" on the bus 30 times a second.
+
+What follows from that:
+
+| | |
+|---|---|
+| no worker thread, no model | `start` has nothing to wait for; the node holds a subscription and a 1s frame window, nothing else |
+| `scan_by_stream` | reads the window newest-first, stops at the first frame that decodes, reports `frames_examined` |
+| `scan_by_photo` / `scan_by_url` | work with no camera and no `start` at all — shared `plugins/image_input.py`, so the path confinement and transfer caps are the same ones vop/ocr/face use |
+
+**Nothing found is a success.** `ok: true, count: 0` — `ok: false` is reserved for
+a scan that could not happen (bad path, dead URL, no frames, no decoder), because
+an LLM handed `ok: false` retries a scan that worked fine.
+
+**Several frames, not several votes.** A code either decodes or it does not;
+there is nothing to average. Scanning up to `max_frames_scanned` (3) frames only
+guards motion blur, which is why it stops at the first hit rather than
+cross-checking.
+
+### A decoded payload is untrusted text
+
+It is chosen by whoever printed the sticker, and this card feeds it straight into
+an LLM's context. Hence, and please keep all three:
+
+* `max_text_chars` (2048) truncates, and says `truncated: true` — never silently,
+  because an LLM acting on a URL that lost its tail acts on a different URL;
+* every logged payload goes through `escape_log_text`;
+* the warning rides along in both the tool description *and* every hit's `note`.
+  The description is read once at registration; the note travels with the payload
+  it is about.
+
+### The two JetPack lines cannot run the same zxing-cpp
+
+```
+jp6.1   cp310   PyPI wheel, pinned 3.1.1
+jp5.11  cp38    in-house wheel on COS, built from the 2.3.0 sdist
+```
+
+Two independent reasons, either one sufficient:
+
+* **zxing-cpp has never published a cp38 aarch64 wheel**, at any version — the
+  oldest release carrying aarch64 wheels starts at cp310. Checked against the
+  PyPI JSON API rather than inferred from `requires_python`, which lies (see the
+  Thai deps section for the same trap).
+* **3.x requires C++20** (`CMAKE_CXX_STANDARD_REQUIRED ON`), which focal's gcc 9
+  is not. 2.3.0 leaves it `OFF` and builds there. So the *version* differs per
+  line, not just the delivery method.
+
+Building the sdist inside `Dockerfile.jetson` is not the answer: the x86 build
+host cross-compiles this image under qemu, where a C++ compile of this size is
+hours. The in-house-wheel-on-COS route is the one sherpa-onnx already uses.
+
+`plugins/barcode_runtime.py` absorbs the API difference — **2.3.0 has no
+`try_invert`** — by reading `read_barcodes`' real signature out of its docstring,
+which both pybind11 (2.x) and nanobind (3.x) generate from the actual binding.
+Not from the `TypeError`: pybind11 answers an unexpected keyword with
+`Invoked with: ... kwargs: try_rotate=True, try_invert=True`, listing *every*
+keyword passed rather than the one it rejected, so retry-on-error cannot tell
+them apart and would drop all of them. A keyword the build does not declare is
+simply not sent, and `max_number_of_symbols` — which 3.1.1 does **not** have,
+despite 2.3.0 having it — is capped in Python instead.
+
+A missing wheel does not fail the image build: the import is lazy and `info`
+reports `decoder.available: false` with the reason on the card. The build log
+says `[build] zxing-cpp: NOT INSTALLED` — if you see that, the image cannot scan
+anything.
+
+#### Rebuilding the cp38 wheel
+
+**Not yet run — the COS key the Dockerfile references does not exist yet.** The
+recipe, to be done on Orin 5 (jp5.11 is the only line that needs it) inside a
+container off that line's own image, so the wheel is tagged for the interpreter
+that will import it:
+
+```bash
+# on Orin 5 (10.100.121.14)
+docker run --rm -v /tmp/wheels:/out <jp511-perception-image> bash -c '
+  apt-get update && apt-get install -y --no-install-recommends cmake g++ python3-dev &&
+  pip3 wheel "zxing-cpp==2.3.0" --no-binary :all: -w /out'
+# → /tmp/wheels/zxing_cpp-2.3.0-cp38-cp38-linux_aarch64.whl
+# verify it imports on cp38 before trusting it (requires_python lies):
+docker run --rm -v /tmp/wheels:/w <jp511-perception-image> bash -c '
+  pip3 install /w/zxing_cpp-2.3.0-cp38-cp38-linux_aarch64.whl &&
+  python3 -c "import zxingcpp; print(zxingcpp.read_barcodes.__doc__.split(chr(10))[0])"'
+```
+
+Then upload to COS under `public/zxing-cpp/jp511/` (credentials:
+`resource-center/deploy/values.env`), which is the key `ZXING_WHEEL_511` names.
+
+### ArUco / AprilTag are deliberately not here
+
+Their output is a 6-DoF pose, not text, and producing it needs the marker's
+printed size plus camera intrinsics. That is a different card with a different
+config and a different output port; `info` says so in `markers` rather than
+leaving the question open. `cv2.aruco`'s presence in the JetPack base OpenCV is
+also unverified, and the only clean way to add it would be replacing OpenCV —
+`opencv-contrib-python` from pip would shadow the base `cv2` the whole vision
+stack and rapidocr are built against (see the `pip uninstall opencv-python` step
+in `Dockerfile.jetson`).
+
+### Verifying
+
+```bash
+# in the container
+curl -s localhost:15720 -d '{"jsonrpc":"2.0","id":1,"method":"tools/call",
+  "params":{"name":"barcode","arguments":{"action":"info"}}}'   # decoder + formats
+# a photo, no camera needed
+curl -s localhost:15720 -d '{"jsonrpc":"2.0","id":1,"method":"tools/call",
+  "params":{"name":"barcode","arguments":{"action":"scan_by_photo",
+  "image_path":"/tmp/qr.png"}}}'
+```
+
+`formats` accepts the aggregates too: `["AllMatrix"]` is "2D codes only",
+`["AllLinear"]` is "barcodes only". `info`'s `decoder.formats` lists what the
+installed build actually has (51 names on 3.1.1).
+
 
 ## Camera Parameters (`camera_info`)
 

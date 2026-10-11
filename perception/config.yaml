@@ -387,6 +387,23 @@ plugins:
       det_box_thresh: 0.1
     min_interval_ms: 0
 
+  # 扫码：二维码 / 条形码，按需识别（actuator，没有输出 topic）
+  # 零模型零下载 —— zxing-cpp 是解码库。formats 留空=全认；只扫二维码的场景
+  # 填 [QRCode] 更快，也不会把条纹衣服读成条码。
+  barcode:
+    enabled: true
+    formats: []
+    try_rotate: true
+    try_downscale: true
+    try_invert: true
+    is_pure: false
+    window_s: 1.0
+    window_max_frames: 30
+    max_frames_scanned: 3
+    max_symbols: 16
+    # 码里的内容是不可信输入，会直接进 LLM 的上下文 —— 这是对那个暴露面的上限
+    max_text_chars: 2048
+
   soundevent:
     enabled: true
   speaker_recognition:

@@ -602,6 +602,54 @@ RUN if [ "${ENABLE_THAI_TTS}" = "1" ]; then \
       cd /work && python3 -m plugins.thai_frontend; \
     fi
 
+# ── zxing-cpp (barcode / QR decoding for plugins/barcode.py) ─────
+# Deliberately the last dependency step in this file: a new ARG or layer near
+# the top rebuilds all ~16 GB from there down, and this one is ~2 MB.
+#
+# Zero models, nothing to download at runtime — it is a decoder, not a network.
+# But it cannot be one `pip install` for both lines:
+#
+#   jp6.1   cp310  PyPI wheel (3.1.1)
+#   jp5.11  cp38   in-house wheel on COS, built from the 2.3.0 sdist
+#
+# Two independent reasons, either one sufficient:
+#   * zxing-cpp has NEVER published a cp38 aarch64 wheel, at any version — the
+#     oldest release with aarch64 wheels starts at cp310. Checked against the
+#     PyPI JSON API, not inferred from requires_python.
+#   * 3.x sets CMAKE_CXX_STANDARD_REQUIRED ON at C++20, which focal's gcc 9 is
+#     not. 2.3.0 leaves it OFF and builds there, which is why the pinned
+#     version differs per line rather than only the delivery method.
+# Building the sdist *here* is not the answer: the x86 build host cross-compiles
+# this image under qemu, where a C++ compile of this size is hours.
+#
+# plugins/barcode_runtime.py absorbs the API difference between the two (2.3.0
+# has no `try_invert`) by reading read_barcodes' real signature, so neither
+# version is special-cased in Python.
+#
+# A missing wheel does not fail the build: the plugin imports zxing lazily and
+# its `info` reports the reason on the card. The build log says so too — if you
+# see [build] zxing-cpp: NOT INSTALLED, that image cannot scan anything and the
+# wheel needs rebuilding (recipe in perception/README.md § Barcode Scanning).
+ARG ZXING_VERSION_61=3.1.1
+ARG ZXING_WHEEL_511=jp511/zxing_cpp-2.3.0-cp38-cp38-linux_aarch64.whl
+RUN . /etc/jetpack.env; \
+    case "${JP_VERSION}" in \
+      61) echo "[build] zxing-cpp: PyPI wheel ${ZXING_VERSION_61} (python ${PY_ABI})" && \
+          pip3 install --no-cache-dir -i ${PYPI_MIRROR} "zxing-cpp==${ZXING_VERSION_61}" || true ;; \
+      511) FILE="$(basename "${ZXING_WHEEL_511}")"; \
+           echo "[build] zxing-cpp: in-house wheel ${ZXING_WHEEL_511}" && \
+           python3 -c "import urllib.request, urllib.parse, sys; \
+key, dest = sys.argv[1], sys.argv[2]; \
+urllib.request.urlretrieve('https://agi-phanthy-dev-1252788780.cos.ap-beijing.myqcloud.com/public/zxing-cpp/' + urllib.parse.quote(key), dest)" \
+               "${ZXING_WHEEL_511}" "/tmp/${FILE}" && \
+           pip3 install --no-cache-dir "/tmp/${FILE}"; \
+           rm -f "/tmp/${FILE}"; true ;; \
+      *) echo "[build] zxing-cpp: PyPI (unlisted JP_VERSION ${JP_VERSION})" && \
+         pip3 install --no-cache-dir -i ${PYPI_MIRROR} zxing-cpp || true ;; \
+    esac; \
+    python3 -c "import zxingcpp; print('[build] zxing-cpp:', zxingcpp.__version__, 'ok')" \
+      || echo "[build] zxing-cpp: NOT INSTALLED — the barcode card will report decoder_unavailable"
+
 EXPOSE 15720
 EXPOSE 15721
 
