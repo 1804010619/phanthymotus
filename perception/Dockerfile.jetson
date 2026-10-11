@@ -655,7 +655,9 @@ urllib.request.urlretrieve('https://agi-phanthy-dev-1252788780.cos.ap-beijing.my
       *) echo "[build] zxing-cpp: PyPI (unlisted JP_VERSION ${JP_VERSION})" && \
          pip3 install --no-cache-dir -i ${PYPI_MIRROR} zxing-cpp || true ;; \
     esac; \
-    python3 -c "import zxingcpp; print('[build] zxing-cpp:', zxingcpp.__version__, 'ok')" \
+    python3 -c "import zxingcpp; from importlib.metadata import version; \
+print('[build] zxing-cpp:', version('zxing-cpp'), 'ok,', \
+      'try_invert' in zxingcpp.read_barcodes.__doc__.splitlines()[0] and 'with try_invert' or 'no try_invert')" \
       || echo "[build] zxing-cpp: NOT INSTALLED — the barcode card will report decoder_unavailable"
 
 EXPOSE 15720
