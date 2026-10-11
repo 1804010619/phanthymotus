@@ -120,7 +120,8 @@ _AUDIO_QOS = QoSProfile(
 
 MODE_OFF = "off"
 MODE_MUTE = "mute_while_talking"
-MODES = (MODE_OFF, MODE_MUTE)
+MODE_CANCEL = "remove_echo"
+MODES = (MODE_OFF, MODE_MUTE, MODE_CANCEL)
 DEFAULT_MODE = MODE_MUTE
 
 REF_AUTO = "auto"
@@ -171,6 +172,13 @@ DELAY_MIN_REF_ACTIVE_S = 0.5
 DELAY_MIN_PEAK = 0.30
 DELAY_MIN_PROMINENCE = 2.0
 DELAY_HISTORY = 20
+# How many seconds of the robot actually talking may pass with no accepted
+# measurement before the one on hand is treated as stale. Counted in far-end
+# activity rather than wall clock: a measurement taken an hour ago is still the
+# right answer if the robot has been silent since. Crossing it means the
+# microphone has stopped hearing the speaker — somebody turned the volume down,
+# or unplugged it — and cancellation has nothing to align to.
+DELAY_STALE_AFTER_FAR_ACTIVE_S = 15.0
 
 # RMS below this (on int16 scale) is silence rather than speech, for deciding
 # whether the robot is talking and whether a window is worth correlating.
@@ -211,6 +219,62 @@ def _envelope(pcm: bytes) -> np.ndarray:
 # buffers them. The remainder is carried into the next chunk instead, and only
 # discarded when the stream is not continuous there.
 MAX_ENVELOPE_JOIN_GAP_S = 0.05
+# How far behind the write cursor a chunk's stamp may be and still be treated as
+# a continuation. plugins/tts.py publishes the first PREBUF_FRAMES=5 frames of
+# every utterance in one burst — `emit()` backdates the pacing schedule so they
+# are all already due — and `publish()` stamps each one with now(), so 500 ms of
+# audio arrives carrying near-identical stamps. Positioning that by stamp piles
+# five chunks on top of each other at the start of every utterance, which is
+# exactly where the echo starts, and leaves the series non-monotonic in time —
+# `np.interp` then returns nonsense with no warning at all.
+MAX_ENVELOPE_BACKWARD_S = 1.0
+
+
+class _ContiguousStream:
+    """Timeline bookkeeping for one stream of nominally contiguous audio.
+
+    The rule, which both the envelope and the reference ring follow: **audio is
+    contiguous, and the stamp is only used to detect that it is not.** A chunk
+    whose stamp continues the write cursor (or sits behind it, as a burst does)
+    extends the cursor by its own duration; only a stamp well ahead of the
+    cursor is treated as a gap and resynchronised.
+
+    `position(stamp, samples)` returns the time of the chunk's first sample and
+    whether it was a resynchronisation.
+    """
+
+    def __init__(self) -> None:
+        self._next_t: Optional[float] = None
+        self._last_t = 0.0
+
+    @property
+    def next_t(self) -> Optional[float]:
+        return self._next_t
+
+    def reset(self) -> None:
+        self._next_t = None
+
+    def position(self, stamp: float) -> Tuple[float, bool]:
+        if self._next_t is None:
+            start = stamp
+            resynced = True
+        else:
+            drift = stamp - self._next_t
+            if drift > MAX_ENVELOPE_JOIN_GAP_S or drift < -MAX_ENVELOPE_BACKWARD_S:
+                # Never backwards past what has already been written: a clock
+                # that jumped must not make the series non-monotonic, because
+                # every consumer of it interpolates.
+                start = max(stamp, self._last_t)
+                resynced = True
+            else:
+                start = self._next_t
+                resynced = False
+        self._last_t = max(self._last_t, start)
+        return start, resynced
+
+    def advance(self, to_t: float) -> None:
+        self._next_t = to_t
+        self._last_t = max(self._last_t, to_t)
 
 
 class _EnvelopeStream:
@@ -224,30 +288,28 @@ class _EnvelopeStream:
 
     def __init__(self) -> None:
         self.points: Deque[Tuple[float, float]] = deque()
+        self._timeline = _ContiguousStream()
         self._carry = b''
-        self._carry_t = 0.0
 
-    def add(self, pcm: bytes, start_t: float, now: float) -> None:
-        if self._carry:
-            expected = self._carry_t + (len(self._carry) // BYTES_PER_SAMPLE) / SAMPLE_RATE
-            if abs(start_t - expected) <= MAX_ENVELOPE_JOIN_GAP_S:
-                pcm = self._carry + pcm
-                start_t = self._carry_t
-            # else: a gap — the stub is dropped rather than mis-dated. At most
-            # one hop of audio is lost, and the gap counter already records it.
+    def add(self, pcm: bytes, stamp: float, now: float) -> None:
+        start_t, resynced = self._timeline.position(stamp)
+        if resynced:
+            self._carry = b''
+        elif self._carry:
+            pcm = self._carry + pcm
             self._carry = b''
 
-        hops = len(pcm) // BYTES_PER_SAMPLE // ENVELOPE_HOP_SAMPLES
+        samples = len(pcm) // BYTES_PER_SAMPLE
+        hops = samples // ENVELOPE_HOP_SAMPLES
         if hops:
             consumed = hops * ENVELOPE_HOP_SAMPLES * BYTES_PER_SAMPLE
             envelope = _envelope(pcm[:consumed])
             for index, value in enumerate(envelope):
                 self.points.append((start_t + index * ENVELOPE_HOP_S, float(value)))
             self._carry = pcm[consumed:]
-            self._carry_t = start_t + hops * ENVELOPE_HOP_S
         else:
             self._carry = pcm
-            self._carry_t = start_t
+        self._timeline.advance(start_t + hops * ENVELOPE_HOP_S)
 
         horizon = now - ENVELOPE_HISTORY_S
         while self.points and self.points[0][0] < horizon:
@@ -282,6 +344,11 @@ class _DelayTracker:
         self._last_estimate_at = 0.0
         self._attempts = 0
         self._rejected = 0
+        self._far_active_since_accept = 0.0
+        # The median is cached because `measured` is read once per microphone
+        # chunk on the cancellation path, and profiling on Orin 5 put
+        # `np.median` at a third of that path's cost.
+        self._median: Optional[float] = None
 
     # ── feeding ──────────────────────────────────────────────────────────
 
@@ -290,6 +357,15 @@ class _DelayTracker:
 
     def add_ref(self, pcm: bytes, start_t: float, now: float) -> None:
         self._ref.add(pcm, start_t, now)
+
+    def note_far_active(self, seconds: float) -> None:
+        """Audible reference audio, for judging whether a measurement is stale."""
+        self._far_active_since_accept += seconds
+
+    def fresh(self) -> bool:
+        """True when the measurement still describes the current acoustic path."""
+        return (bool(self._estimates)
+                and self._far_active_since_accept < DELAY_STALE_AFTER_FAR_ACTIVE_S)
 
     # ── estimating ───────────────────────────────────────────────────────
 
@@ -370,8 +446,15 @@ class _DelayTracker:
             return None
 
         delay = peak_index * ENVELOPE_HOP_S
-        self._estimates.append(delay)
+        self._accept(delay)
         return delay
+
+    def _accept(self, delay: float) -> None:
+        """Record an accepted measurement and refresh the cached median."""
+        self._estimates.append(delay)
+        self._far_active_since_accept = 0.0
+        self._median = float(np.median(
+            np.fromiter(self._estimates, dtype=np.float64, count=len(self._estimates))))
 
     # ── reporting ────────────────────────────────────────────────────────
 
@@ -382,9 +465,7 @@ class _DelayTracker:
         Median rather than latest: a single estimate is one 3 s window, and the
         gate should not follow its noise.
         """
-        if not self._estimates:
-            return None
-        return float(np.median(np.fromiter(self._estimates, dtype=np.float64)))
+        return self._median
 
     @property
     def spread(self) -> Optional[float]:
@@ -403,6 +484,375 @@ class _DelayTracker:
             "echo_delay_samples": len(self._estimates),
             "echo_delay_attempts": self._attempts,
             "echo_delay_rejected": self._rejected,
+            "echo_delay_fresh": self.fresh(),
+            "robot_talk_since_measurement_s": round(self._far_active_since_accept, 1),
+        }
+
+
+# ── cancellation ─────────────────────────────────────────────────────────────
+
+# 16 ms blocks, 512-point FFT, 50% overlap — the overlap-save framing every
+# frequency-domain adaptive filter uses. 16 ms is short enough that the extra
+# latency this adds to the microphone path is below one chunk, and long enough
+# that the FFT cost per second of audio stays in the single-digit milliseconds.
+AEC_BLOCK = 256
+AEC_FFT = 2 * AEC_BLOCK
+AEC_BINS = AEC_FFT // 2 + 1
+
+# How much echo *spread* the filter covers — reverberation and alignment error,
+# **not** the transport delay. 128 ms, measured: against a 60 ms synthetic room,
+# 64 ms of tail gives 23 dB, 128 ms gives 20, 256 ms gives 18 and 512 ms gives
+# 14 — more partitions mean more gradient noise, so a tail far longer than the
+# path actively costs ERLE. 128 ms leaves ~96 ms for the room and the alignment
+# error after the 32 ms backoff below. The delay is measured and compensated by shifting
+# the reference (see _RefBuffer), which is what keeps this short: covering G1's
+# 450-1200 ms of speaker buffering with filter taps instead would need 5-75x the
+# arithmetic to model a path that is mostly a constant offset.
+AEC_TAIL_S = 0.128
+# The reference is aligned to (measured delay - this), so the real echo lands
+# inside the tail with slack on both sides of the estimate.
+AEC_ALIGN_BACKOFF_S = 0.032
+
+# NLMS step size, normalised by the reference power across partitions. Measured
+# on synthetic echo paths (12 s, three seeds, 60 ms room): 0.2 reaches 20-23 dB
+# ERLE and 0.3 reaches 22-25, but 0.4 collapses to ~0 dB and 0.5 diverges. The
+# edge is between 0.3 and 0.4, so this sits a factor of two below it rather than
+# taking the extra 2 dB — a diverged filter is worse than no filter, and the
+# robots this runs on have speakers nothing has characterised yet.
+AEC_MU = 0.2
+# Bleeds the filter towards zero, bounding what a long run of bad updates can
+# accumulate. 0.9995 per 16 ms block is a ~32 s time constant: slow enough not
+# to fight convergence, fast enough that a diverged filter recovers.
+AEC_LEAK = 0.9995
+AEC_EPS = 1e-6
+
+# Residual suppression. A broadband soft gate on the residual, ramped across the
+# block so it cannot click — deliberately not a per-bin spectral suppressor,
+# which needs its own windowed overlap-add framing; that is the next step here
+# and would buy better double-talk quality rather than more echo removal.
+# Residual suppression. A broadband soft gate on the residual, ramped across the
+# block so it cannot click — deliberately not a per-bin spectral suppressor,
+# which needs its own windowed overlap-add framing; that is the next step here,
+# and it would buy better double-talk quality rather than more echo removal.
+#
+# The three values are the measured trade (12 s, 60 ms room, a person talking
+# over the robot at a quarter of its level), ERLE against how much of the
+# person's voice survives:
+#
+#   0.0  18.1 dB / 18.1 dB      0.5  22.9 dB / 12.0 dB      1.0  27.9 dB / 6.5 dB
+#
+# It stops at 1.0 because ERLE saturates there: 1.5 and 2.5 also give 27.9 dB
+# and cost another 2-3 dB of the person's voice, so offering them would only let
+# somebody choose a strictly worse point.
+SUPPRESSION_STRENGTHS = {
+    "gentle":     0.0,   # linear filter only — best double-talk, least echo removed
+    "normal":     0.5,
+    "aggressive": 1.0,
+}
+DEFAULT_REMOVAL_STRENGTH = "normal"
+# The floor the soft gate may attenuate to. Not zero: a residual gated to
+# silence makes the robot's own voice disappear *and* takes the room with it, so
+# a listener cannot tell a working canceller from a dead microphone.
+SUPPRESSION_FLOOR = 0.05
+
+# Divergence guard: zero the filter when its output is measurably *worse* than
+# its input, over a window of far-end-active blocks.
+#
+# The threshold is -3 dB and not the +1 dB it started as, and the difference was
+# only visible on a rig. A filter converged to 20 dB that is then talked over
+# looks identical, *in powers alone*, to a filter that has learned nothing: in
+# both cases the residual is dominated by the person. With +1 dB, Orin 5 zeroed
+# a converged filter three times during one 4 s double-talk stretch and put
+# "this microphone barely hears the speaker" on the card — reintroducing from
+# inside the guard the exact failure the per-block skip exists to prevent.
+#
+# Powers cannot separate those two cases. Correlation can, and the delay tracker
+# already measures it, so *that* decides whether there is coupling worth
+# cancelling (`_DelayTracker.fresh`, and the node's cancel path). What is left
+# here is the unambiguous half: an output worse than its input is never worth
+# keeping.
+AEC_GUARD_BLOCKS = 64            # ~1 s of far-end audio
+AEC_GUARD_MIN_DB = -3.0
+AEC_GUARD_FREEZE_BLOCKS = 300    # ~5 s before trying again
+# ...doubling each consecutive time the answer is still "no", up to ~40 s. A
+# robot with no usable coupling should spend less and less time re-learning
+# that: each attempt costs one guard window of junk on the output.
+AEC_GUARD_FREEZE_MAX_FACTOR = 8
+
+# ERLE is reported over roughly the last 1.5 s of robot speech (16 ms blocks, and
+# only blocks where it *is* speaking — pauses freeze the figure rather than
+# diluting it), once there has been half a second of it to average.
+#
+# 1.5 s and not 5 s: on Orin 5 a 5 s window still read 3.8 dB at the end of a
+# session whose last settled phase removed 17 dB, because the robot had only
+# talked for about one time constant in total and the average was still mostly
+# the convergence period. A card that says 3.8 while removing 17 is not a
+# diagnostic, it is a distraction.
+ERLE_ALPHA = 1.0 / 94
+ERLE_MIN_BLOCKS = 32
+
+
+class _RefBuffer:
+    """The reference signal on a time axis, so a block can fetch its own echo.
+
+    Samples rather than chunks: the canceller needs an arbitrary window starting
+    at an arbitrary time, and a list of chunks cannot answer that without
+    stitching on every call. Follows the same contiguity rule as
+    `_EnvelopeStream` — stamps detect gaps, they do not position every chunk —
+    because the reference arrives in bursts whose stamps are nearly identical.
+    """
+
+    def __init__(self, seconds: float) -> None:
+        self._capacity = max(1, int(seconds * SAMPLE_RATE))
+        self._samples = np.zeros(0, dtype=np.int16)
+        self._start_t: Optional[float] = None
+        self._timeline = _ContiguousStream()
+
+    def add(self, pcm: bytes, stamp: float) -> None:
+        block = np.frombuffer(pcm, dtype='<i2')
+        if block.size == 0:
+            return
+        start, _ = self._timeline.position(stamp)
+        if self._start_t is None:
+            self._start_t = start
+            self._samples = block.copy()
+        else:
+            index = int(round((start - self._start_t) * SAMPLE_RATE))
+            end = self._samples.size
+            if index > end:
+                # A hole means the speaker played nothing, so it is silence —
+                # not a seam to be closed by sliding the next audio earlier.
+                if index - end > self._capacity:
+                    self._start_t, self._samples = start, block.copy()
+                else:
+                    self._samples = np.concatenate(
+                        (self._samples, np.zeros(index - end, dtype=np.int16), block))
+            elif index == end:
+                self._samples = np.concatenate((self._samples, block))
+            elif index >= 0:
+                self._samples = np.concatenate((self._samples[:index], block))
+            else:
+                self._start_t, self._samples = start, block.copy()
+        self._timeline.advance(start + block.size / SAMPLE_RATE)
+
+        if self._samples.size > self._capacity:
+            drop = self._samples.size - self._capacity
+            self._samples = self._samples[drop:]
+            self._start_t += drop / SAMPLE_RATE
+
+    def fetch(self, start_t: float, count: int) -> np.ndarray:
+        """`count` samples from `start_t`, zero-filled where there is nothing."""
+        out = np.zeros(count, dtype=np.float32)
+        if self._start_t is None or count <= 0:
+            return out
+        index = int(round((start_t - self._start_t) * SAMPLE_RATE))
+        lo, hi = max(index, 0), min(index + count, self._samples.size)
+        if hi > lo:
+            out[lo - index:hi - index] = self._samples[lo:hi]
+        return out
+
+    def covers(self, start_t: float, count: int) -> bool:
+        if self._start_t is None:
+            return False
+        index = int(round((start_t - self._start_t) * SAMPLE_RATE))
+        return index >= 0 and index + count <= self._samples.size
+
+
+class _EchoCanceller:
+    """Partitioned-block frequency-domain NLMS, plus a soft gate on the residual.
+
+    Written in numpy rather than bound to speexdsp's MDF on purpose. The binding
+    on PyPI is an sdist needing swig and `libspeexdsp-dev` in a 16 GB image built
+    for two JetPack lines and cp38, it exposes `process(near, far)` and nothing
+    else — no delay handling, no access to the preprocessor's residual stage —
+    and it would have to be hand-fed lock-step frames anyway. This is ~40 lines
+    of arithmetic, runs on both lines with the numpy already in the image, can be
+    tested against synthetic echo paths offline, and can be hot-copied to a rig.
+
+    What it does not do is the hard part of a production AEC: nonlinear echo (a
+    speaker driven into its limiter), and sample clock drift between the
+    microphone and the speaker. Both need a machine with a speaker and a
+    microphone in one room before there is any point writing code for them.
+    """
+
+    def __init__(self, tail_s: float = AEC_TAIL_S, mu: float = AEC_MU,
+                 strength: str = DEFAULT_REMOVAL_STRENGTH) -> None:
+        self.partitions = max(1, int(math.ceil(tail_s * SAMPLE_RATE / AEC_BLOCK)))
+        self._mu = mu
+        self._beta = SUPPRESSION_STRENGTHS.get(strength,
+                                               SUPPRESSION_STRENGTHS[DEFAULT_REMOVAL_STRENGTH])
+        self._weights = np.zeros((self.partitions, AEC_BINS), dtype=np.complex128)
+        self._spectra = np.zeros((self.partitions, AEC_BINS), dtype=np.complex128)
+        self._ref_prev = np.zeros(AEC_BLOCK, dtype=np.float32)
+        self._power = np.full(AEC_BINS, AEC_EPS)
+        self._gain = 1.0          # carried across blocks so the ramp is smooth
+        self._blocks = 0
+        self._adapted = 0
+        self._skipped = 0
+        # usefulness guard
+        self._window_mic = 0.0
+        self._window_err = 0.0
+        self._window_blocks = 0
+        self._frozen_for = 0
+        self._benefit_db: Optional[float] = None
+        self._resets = 0
+        self._diverged_streak = 0
+        # ERLE accounting: an exponentially-weighted average over blocks where
+        # the reference was actually playing, not a lifetime one. A lifetime
+        # average is the wrong statistic for something an operator reads off a
+        # card — it never recovers from the seconds spent converging, and it
+        # cannot show that the filter has *stopped* working. Measured on Orin 5:
+        # a session whose settled phases removed 11.7 and 17.0 dB reported 3.8
+        # dB as a lifetime figure.
+        self._mic_energy = 0.0
+        self._out_energy = 0.0
+        self._erle_blocks = 0
+
+    def set_strength(self, strength: str) -> None:
+        """Change the suppressor without discarding a converged filter."""
+        if strength in SUPPRESSION_STRENGTHS:
+            self._beta = SUPPRESSION_STRENGTHS[strength]
+
+    # ── one 16 ms block ──────────────────────────────────────────────────
+
+    def process(self, mic: np.ndarray, ref: np.ndarray) -> np.ndarray:
+        window = np.concatenate((self._ref_prev, ref))
+        self._ref_prev = ref
+        spectrum = np.fft.rfft(window)
+        self._spectra = np.roll(self._spectra, 1, axis=0)
+        self._spectra[0] = spectrum
+
+        estimate = np.fft.irfft((self._weights * self._spectra).sum(axis=0))[AEC_BLOCK:]
+        error = mic - estimate
+
+        mic_power = float(np.mean(np.square(mic)))
+        ref_power = float(np.mean(np.square(ref)))
+        error_power = float(np.mean(np.square(error)))
+        far_active = ref_power > SILENCE_RMS ** 2
+
+        # Echo-dominant: the far end is playing and what is left after
+        # subtraction is well below the microphone, i.e. this block is not
+        # mostly somebody talking. Both the full-rate update and the ERLE figure
+        # are restricted to these blocks.
+        echo_dominant = far_active and error_power <= 0.5 * mic_power
+        if far_active and self._frozen_for <= 0:
+            # Only adapt while the far end is playing: with no reference there
+            # is no information in the gradient, and updating anyway is how a
+            # converged filter is slowly destroyed by near-end speech.
+            if error_power > mic_power:
+                # Worse than doing nothing — double-talk, or divergence. Skip
+                # rather than scale: this is the guard that keeps a bad second
+                # from undoing a good minute.
+                self._skipped += 1
+            else:
+                scale = 1.0
+                if error_power > 0.5 * mic_power:
+                    # Near-end speech probably present: slow down rather than
+                    # stop, so a permanently noisy room still converges.
+                    scale = 0.25
+                spectrum_error = np.fft.rfft(
+                    np.concatenate((np.zeros(AEC_BLOCK, dtype=np.float32), error)))
+                self._power = (0.9 * self._power
+                               + 0.1 * np.abs(self._spectra).__pow__(2).sum(axis=0))
+                step = (self._mu * scale) / (self._power + AEC_EPS)
+                self._weights *= AEC_LEAK
+                self._weights += step * np.conj(self._spectra) * spectrum_error
+                self._adapted += 1
+
+        out = self._suppress(error, estimate, far_active)
+        self._blocks += 1
+        if echo_dominant:
+            # ERLE is measured on echo-dominant blocks only. Averaging
+            # double-talk blocks into it would be the same mistake the
+            # divergence guard made: while a person is talking the residual is
+            # dominated by their voice, so ERLE there is near 0 dB and says
+            # nothing about echo removal. On Orin 5 the last 0.4 s of a robot
+            # utterance overlapping the next person's turn was enough to report
+            # 4.3 dB for a filter that was removing 17.
+            out_power = float(np.mean(np.square(out)))
+            if self._erle_blocks == 0:
+                self._mic_energy, self._out_energy = mic_power, out_power
+            else:
+                self._mic_energy += ERLE_ALPHA * (mic_power - self._mic_energy)
+                self._out_energy += ERLE_ALPHA * (out_power - self._out_energy)
+            self._erle_blocks += 1
+        if far_active:
+            # Divergence, in contrast, is judged over *every* far-active block —
+            # harm has to be visible wherever it happens — and on the linear
+            # error rather than the suppressed output, so a diverging filter
+            # cannot hide behind the soft gate.
+            self._check_divergence(mic_power, error_power)
+        if self._frozen_for > 0:
+            self._frozen_for -= 1
+        return out
+
+    def _check_divergence(self, mic_power: float, error_power: float) -> None:
+        self._window_mic += mic_power
+        self._window_err += error_power
+        self._window_blocks += 1
+        if self._window_blocks < AEC_GUARD_BLOCKS:
+            return
+        benefit = 10.0 * math.log10((self._window_mic + AEC_EPS)
+                                    / (self._window_err + AEC_EPS))
+        self._window_mic = self._window_err = 0.0
+        self._window_blocks = 0
+        self._benefit_db = round(benefit, 1)
+        if benefit >= AEC_GUARD_MIN_DB:
+            self._diverged_streak = 0
+            return
+        # Diverging. Zeroing the weights is what makes this safe: with no
+        # weights the estimate is zero, so the error is the microphone and the
+        # suppressor's ratio is zero — the card becomes a passthrough rather
+        # than a noise source.
+        self._resets += 1
+        self._diverged_streak += 1
+        factor = min(AEC_GUARD_FREEZE_MAX_FACTOR, 2 ** (self._diverged_streak - 1))
+        self._frozen_for = AEC_GUARD_FREEZE_BLOCKS * factor
+        self._weights[:] = 0.0
+        self._gain = 1.0
+
+    def _suppress(self, error: np.ndarray, estimate: np.ndarray,
+                  far_active: bool) -> np.ndarray:
+        """Soft-gate the residual by how much echo was there to begin with.
+
+        The gain is ramped across the block from the previous block's value, so
+        a decision that changes every 16 ms cannot be heard as a click.
+        """
+        target = 1.0
+        if far_active and self._beta > 0.0:
+            residual = float(np.mean(np.square(error)))
+            echo = float(np.mean(np.square(estimate)))
+            if residual > AEC_EPS:
+                # How much of what is left looks like echo rather than speech.
+                ratio = math.sqrt(echo / (residual + AEC_EPS))
+                target = max(SUPPRESSION_FLOOR, 1.0 - self._beta * min(ratio, 1.0))
+        ramp = np.linspace(self._gain, target, error.size, dtype=np.float32)
+        self._gain = target
+        return error * ramp
+
+    # ── reporting ────────────────────────────────────────────────────────
+
+    @property
+    def erle_db(self) -> Optional[float]:
+        """Echo return loss enhancement over the last few seconds of robot speech."""
+        if self._mic_energy <= 0.0 or self._erle_blocks < ERLE_MIN_BLOCKS:
+            return None
+        return round(10.0 * math.log10((self._mic_energy + AEC_EPS)
+                                       / (self._out_energy + AEC_EPS)), 1)
+
+    def report(self) -> Dict[str, Any]:
+        return {
+            "echo_removed_db": self.erle_db,
+            "filter_tail_ms": round(self.partitions * AEC_BLOCK / SAMPLE_RATE * 1000),
+            "aec_blocks": self._blocks,
+            "aec_blocks_adapted": self._adapted,
+            "aec_updates_skipped": self._skipped,
+            # False means the filter was measured to be doing nothing and has
+            # been zeroed — on this robot the microphone does not hear the
+            # speaker enough to cancel, and `mute_while_talking` is the mode
+            # that works. None means it has not been judged yet.
+            "filter_benefit_db": self._benefit_db,
+            "aec_filter_resets": self._resets,
         }
 
 
@@ -458,14 +908,21 @@ TOOLS = [
                     "oneOf": [
                         {"const": MODE_MUTE,
                          "title": "Mute the mic while the robot is talking"},
+                        {"const": MODE_CANCEL,
+                         "title": "Remove the robot's voice, keep listening "
+                                  "(people can interrupt it)"},
                         {"const": MODE_OFF,
                          "title": "Off — pass the microphone through unchanged"},
                     ],
                     "description": (
                         "Muting is complete and foolproof, but nobody can interrupt "
                         "the robot mid-sentence: while it talks, the microphone "
-                        "carries nothing. 'Off' is for comparing against no "
-                        "processing at all."
+                        "carries nothing. Removing keeps the microphone open the "
+                        "whole time, which is what allows interruption, but it "
+                        "removes 20-28 dB of the robot's voice rather than all of "
+                        "it, and it needs the robot's voice feed below. It falls "
+                        "back to muting until it has measured the delay. 'Off' is "
+                        "for comparing against no processing at all."
                     ),
                 },
                 "robot_voice_topic": {
@@ -490,12 +947,34 @@ TOOLS = [
                         "which case this card cannot tell when it is talking."
                     ),
                 },
+                "removal_strength": {
+                    "type": "string",
+                    "title": "How hard to scrub",
+                    "default": DEFAULT_REMOVAL_STRENGTH,
+                    "scope": "instance",
+                    "x-show-when": {"mode": [MODE_CANCEL]},
+                    "oneOf": [
+                        {"const": "gentle",
+                         "title": "Gentle — most natural voices, some echo remains"},
+                        {"const": "normal", "title": "Normal"},
+                        {"const": "aggressive",
+                         "title": "Aggressive — least echo, interrupting voices "
+                                  "come out quieter"},
+                    ],
+                    "description": (
+                        "Only affects what happens when somebody talks *while* the "
+                        "robot is talking. Measured against a person speaking over "
+                        "the robot: gentle removes 18 dB of the robot and keeps the "
+                        "person at 18 dB, normal removes 23 and keeps 12, "
+                        "aggressive removes 28 and keeps 7."
+                    ),
+                },
                 "mute_tail": {
                     "type": "string",
                     "title": "Keep the mic muted after the robot stops",
                     "default": DEFAULT_MUTE_TAIL,
                     "scope": "instance",
-                    "x-show-when": {"mode": [MODE_MUTE]},
+                    "x-show-when": {"mode": [MODE_MUTE, MODE_CANCEL]},
                     "oneOf": [
                         {"const": MUTE_TAIL_AUTO,
                          "title": "Automatic — follow the delay this card measures"},
@@ -545,7 +1024,8 @@ class _AudioFrontendNode(Node):
 
     def __init__(self, input_topic: str, ref_topic: str = '', *,
                  node_suffix: str = '', mode: str = DEFAULT_MODE,
-                 mute_tail: str = DEFAULT_MUTE_TAIL) -> None:
+                 mute_tail: str = DEFAULT_MUTE_TAIL,
+                 removal_strength: str = DEFAULT_REMOVAL_STRENGTH) -> None:
         super().__init__(f"audio_frontend_{node_suffix}" if node_suffix
                          else "audio_frontend")
         self._input_topic = input_topic or ''
@@ -559,6 +1039,8 @@ class _AudioFrontendNode(Node):
 
         self._mode = mode if mode in MODES else DEFAULT_MODE
         self._mute_tail = mute_tail if mute_tail in MUTE_TAIL_CHOICES else DEFAULT_MUTE_TAIL
+        self._removal_strength = (removal_strength if removal_strength in SUPPRESSION_STRENGTHS
+                                  else DEFAULT_REMOVAL_STRENGTH)
 
         self._node_lock = threading.RLock()
         self._retired = False
@@ -573,11 +1055,24 @@ class _AudioFrontendNode(Node):
         self._tracker = _DelayTracker()
         self._tracker_lock = threading.Lock()
 
+        # Cancellation state. The reference ring is kept whatever the mode is,
+        # so switching into remove_echo does not start from an empty buffer.
+        self._aec_lock = threading.Lock()
+        self._aec = _EchoCanceller(strength=self._removal_strength)
+        self._ref_buffer = _RefBuffer(DELAY_SEARCH_MAX_S + 1.0)
+        self._mic_timeline = _ContiguousStream()
+        self._pending = b''        # mic samples not yet a whole block
+        self._pending_t = 0.0      # time of the first pending sample
+        self._out = b''            # cancelled samples not yet published
+        self._out_t = 0.0
+
         self._stats_lock = threading.Lock()
         self._stats: Dict[str, int] = {
             "mic_chunks": 0, "mic_bytes": 0, "published": 0, "muted_chunks": 0,
             "muted_bytes": 0, "ref_chunks": 0, "ref_eof": 0, "mic_gaps": 0,
             "format_violations": 0, "misaligned_chunks": 0, "publish_errors": 0,
+            "cancel_waiting_for_delay": 0, "cancel_resyncs": 0,
+            "cancel_coupling_lost": 0,
         }
         self._last_mic_t = 0.0
         self._process_s = 0.0   # processing time, for the CPU figure
@@ -641,7 +1136,8 @@ class _AudioFrontendNode(Node):
         return {"state": "idle"}
 
     def apply_config(self, mode: Optional[str] = None,
-                     mute_tail: Optional[str] = None) -> None:
+                     mute_tail: Optional[str] = None,
+                     removal_strength: Optional[str] = None) -> None:
         """Change the live knobs. Neither needs the node rebuilt.
 
         `robot_voice_topic` is not here on purpose — a subscription cannot be
@@ -650,10 +1146,25 @@ class _AudioFrontendNode(Node):
         so the plugin disposes the node and builds a new one instead.
         """
         with self._node_lock:
-            if mode in MODES:
+            if mode in MODES and mode != self._mode:
                 self._mode = mode
+                if mode == MODE_CANCEL:
+                    # A filter converged against a path nobody was listening to
+                    # is not worth keeping, and the reframing buffers must not
+                    # carry audio from before the switch.
+                    with self._aec_lock:
+                        self._aec = _EchoCanceller(strength=self._removal_strength)
+                        self._pending = b''
+                        self._out = b''
+                        self._mic_timeline.reset()
             if mute_tail in MUTE_TAIL_CHOICES:
                 self._mute_tail = mute_tail
+            if removal_strength in SUPPRESSION_STRENGTHS:
+                self._removal_strength = removal_strength
+                with self._aec_lock:
+                    # Live, without discarding the converged filter: the
+                    # suppressor sits after it and shares no state with it.
+                    self._aec.set_strength(removal_strength)
 
     # ── the gate ─────────────────────────────────────────────────────────
 
@@ -699,6 +1210,10 @@ class _AudioFrontendNode(Node):
 
         with self._tracker_lock:
             self._tracker.add_ref(pcm, timestamp, now)
+            if talking:
+                self._tracker.note_far_active(duration)
+        with self._aec_lock:
+            self._ref_buffer.add(pcm, timestamp)
 
         with self._gate_lock:
             self._ref_seen = True
@@ -759,24 +1274,99 @@ class _AudioFrontendNode(Node):
             if self._tracker.due(now):
                 self._tracker.estimate(now)
 
-        muted = False
-        if self._mode == MODE_MUTE:
-            with self._gate_lock:
-                muted = timestamp < self._mute_until
-            if muted:
-                # Silence, not a dropped chunk. Downstream VAD treats a gap and
-                # silence the same way, but a continuous stream keeps ASR's
-                # "have I ever received audio" check and its pre-roll sane, and
-                # keeps this card's own gap counter meaningful.
-                pcm = b'\x00' * len(pcm)
-
-        self._publish(pcm, message, muted)
+        if self._mode == MODE_CANCEL:
+            self._cancel(pcm, message, timestamp)
+        else:
+            muted = False
+            if self._mode == MODE_MUTE:
+                with self._gate_lock:
+                    muted = timestamp < self._mute_until
+                if muted:
+                    # Silence, not a dropped chunk. Downstream VAD treats a gap
+                    # and silence the same way, but a continuous stream keeps
+                    # ASR's "have I ever received audio" check and its pre-roll
+                    # sane, and keeps this card's own gap counter meaningful.
+                    pcm = b'\x00' * len(pcm)
+            self._publish(pcm, message, muted)
 
         with self._stats_lock:
             self._process_s += time.perf_counter() - started
             self._audio_s += duration
 
-    def _publish(self, pcm: bytes, source: Any, muted: bool) -> None:
+    def _cancel(self, pcm: bytes, source: Any, timestamp: float) -> None:
+        """Subtract the robot's own voice, in 16 ms blocks.
+
+        Two things make this different from the gate path. The reference is
+        fetched by *time* — aligned using the measured delay, so the filter only
+        models the echo's spread and not the speaker's several hundred ms of
+        buffering — and the output is reframed, because 16 ms blocks do not
+        divide an arbitrary chunk size. Reframing means the audio published with
+        a given chunk is up to one block older than the chunk that triggered it,
+        so it carries **its own** stamp rather than the input's. ASR reads that
+        stamp as the capture time; mislabelling it by 16 ms would be a small lie
+        told on every chunk.
+        """
+        with self._tracker_lock:
+            measured = self._tracker.measured
+            fresh = self._tracker.fresh()
+        if measured is None or not fresh:
+            # Nothing to align to — subtracting an unaligned reference adds
+            # noise rather than removing echo. Fall back to the gate, which
+            # needs no measurement. `measured is None` is the first seconds
+            # after startup; `not fresh` is the robot having talked for 15 s
+            # with no measurable echo since, i.e. the microphone has stopped
+            # hearing the speaker. The correlation is what tells those apart
+            # from a converged filter being talked over — powers cannot.
+            with self._gate_lock:
+                muted = timestamp < self._mute_until
+            with self._stats_lock:
+                self._stats["cancel_waiting_for_delay"] += 1
+                if measured is not None:
+                    self._stats["cancel_coupling_lost"] += 1
+            self._publish(b'\x00' * len(pcm) if muted else pcm, source, muted)
+            return
+
+        align = max(0.0, measured - AEC_ALIGN_BACKOFF_S)
+        start_t, resynced = self._mic_timeline.position(timestamp)
+        with self._aec_lock:
+            if resynced or not self._pending:
+                if resynced and self._pending:
+                    with self._stats_lock:
+                        self._stats["cancel_resyncs"] += 1
+                self._pending = pcm
+                self._pending_t = start_t
+            else:
+                self._pending += pcm
+            self._mic_timeline.advance(start_t + len(pcm)
+                                       / (SAMPLE_RATE * BYTES_PER_SAMPLE))
+
+            block_bytes = AEC_BLOCK * BYTES_PER_SAMPLE
+            produced = bytearray()
+            produced_t = self._pending_t
+            while len(self._pending) >= block_bytes:
+                block = np.frombuffer(self._pending[:block_bytes],
+                                      dtype='<i2').astype(np.float32)
+                reference = self._ref_buffer.fetch(self._pending_t - align, AEC_BLOCK)
+                cleaned = self._aec.process(block, reference)
+                produced += np.clip(cleaned, -32768, 32767).astype('<i2').tobytes()
+                self._pending = self._pending[block_bytes:]
+                self._pending_t += AEC_BLOCK / SAMPLE_RATE
+
+            if produced:
+                if not self._out:
+                    self._out_t = produced_t
+                self._out += bytes(produced)
+
+            if len(self._out) < len(pcm):
+                return                      # not a whole chunk's worth yet
+            chunk, self._out = self._out[:len(pcm)], self._out[len(pcm):]
+            stamp = self._out_t
+            self._out_t += len(chunk) / (SAMPLE_RATE * BYTES_PER_SAMPLE)
+
+        self._publish(chunk, source, False, stamp=stamp)
+
+    def _publish(self, pcm: bytes, source: Any, muted: bool,
+                 stamp: Optional[float] = None) -> None:
         publisher = self._pub
         if publisher is None:
             return
@@ -785,7 +1375,13 @@ class _AudioFrontendNode(Node):
         # The *input's* stamp, not now(): downstream reads it as the capture
         # time (ASR's audio_start_ts comes from it), so re-stamping would charge
         # this card's own latency to the speaker's timeline.
-        out.header.stamp = source.header.stamp
+        if stamp is None:
+            out.header.stamp = source.header.stamp
+        else:
+            # Reframed audio describes its own capture time, not the time of the
+            # chunk that happened to trigger it.
+            out.header.stamp.sec = int(stamp)
+            out.header.stamp.nanosec = int(round((stamp - int(stamp)) * 1e9))
         out.format = AUDIO_FORMAT
         # `array.array('B')` and not `list(pcm)`, which is what the rest of the
         # project writes. The generated `data` setter validates a list
@@ -832,9 +1428,12 @@ class _AudioFrontendNode(Node):
         with self._tracker_lock:
             report = self._tracker.report()
             measured = self._tracker.measured
+            fresh = self._tracker.fresh()
 
         published = stats["published"] or 1
         tail = self._tail_s()
+        with self._aec_lock:
+            aec_report = self._aec.report()
         result: Dict[str, Any] = {
             "mode": self._mode,
             "robot_voice_topic": self._ref_topic or None,
@@ -864,7 +1463,15 @@ class _AudioFrontendNode(Node):
             "callback_wall_ms_per_audio_s": (None if audio_s <= 0
                                              else round(process_s / audio_s * 1000, 2)),
             **report,
+            **(aec_report if self._mode == MODE_CANCEL else {}),
         }
+        if self._mode == MODE_CANCEL:
+            result["removal_strength"] = self._removal_strength
+            result["waiting_for_delay"] = (measured is None) or not fresh
+            result["coupling_lost"] = (measured is not None) and not fresh
+            result["cancel_chunks_without_a_delay"] = stats["cancel_waiting_for_delay"]
+            result["cancel_resyncs"] = stats["cancel_resyncs"]
+            result["cancel_chunks_after_coupling_lost"] = stats["cancel_coupling_lost"]
         # The one comparison nobody can do in their head, spelled out: an
         # explicit tail shorter than the delay the card measured means the end
         # of the robot's own sentence reaches ASR.
@@ -1032,7 +1639,8 @@ class AudioFrontendPlugin:
                 continue
             merged = self._merged_cfg(key)
             node.apply_config(mode=merged.get("mode"),
-                              mute_tail=merged.get("mute_tail"))
+                              mute_tail=merged.get("mute_tail"),
+                              removal_strength=merged.get("removal_strength"))
             wanted, _ = self._resolve_ref(merged)
             if wanted != node._ref_topic:
                 # A subscription cannot be recreated on a spinning node — it
@@ -1061,6 +1669,8 @@ class AudioFrontendPlugin:
             node_suffix=node_key.replace('/', '_').replace('-', '_').strip('_'),
             mode=str(cfg.get("mode") or DEFAULT_MODE),
             mute_tail=str(cfg.get("mute_tail") or DEFAULT_MUTE_TAIL),
+            removal_strength=str(cfg.get("removal_strength")
+                                 or DEFAULT_REMOVAL_STRENGTH),
         )
 
     def _dispose(self, node_key: str, node: _AudioFrontendNode) -> None:
@@ -1164,6 +1774,21 @@ class AudioFrontendPlugin:
                         "unchanged")
             return "No robot voice topic set — microphone passed through unchanged"
         diagnostics = node.diagnostics()
+        if node._mode == MODE_CANCEL:
+            if not diagnostics.get("robot_voice_seen"):
+                return (f"Waiting for audio on {node._ref_topic} — nothing heard "
+                        f"yet, so nothing is being removed")
+            if diagnostics.get("coupling_lost"):
+                return ("This microphone has stopped hearing the speaker — "
+                        "muting instead. Check the volume, or use 'mute while "
+                        "talking'")
+            if diagnostics.get("waiting_for_delay"):
+                return ("Muting for now — measuring how late the robot's voice "
+                        "comes back before it can be removed")
+            removed = diagnostics.get("echo_removed_db")
+            if removed is not None:
+                return f"Removing {removed} dB of the robot's own voice"
+            return self._DESC
         if not diagnostics.get("robot_voice_seen"):
             return (f"Waiting for audio on {node._ref_topic} — nothing heard yet, "
                     f"so nothing is being muted")

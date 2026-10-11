@@ -139,7 +139,11 @@ class _FakeAudioChunk:
     """Stands in for audio_msgs.msg.AudioChunk (built from a ROS .msg on device)."""
 
     def __init__(self):
-        self.header = types.SimpleNamespace(stamp=None)
+        # A real AudioChunk always *has* a stamp (a zeroed builtin_interfaces
+        # Time), so a plugin may assign `header.stamp.sec`. This used to be
+        # None, which only works for code that replaces the whole stamp object.
+        self.header = types.SimpleNamespace(
+            stamp=types.SimpleNamespace(sec=0, nanosec=0))
         self.format = ""
         self.data = []
 
