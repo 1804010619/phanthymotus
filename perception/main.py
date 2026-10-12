@@ -143,6 +143,7 @@ class PerceptionBundle:
             log.info("ASRPlugin loaded (speaker=%s)",
                      "yes" if speaker_plugin else "no")
 
+        tts_plugin = None
         if plugins_cfg.get("tts", {}).get("enabled", False):
             from plugins.tts import TTSPlugin
             # Guarded: TTSPlugin validates its engine configuration in the
@@ -150,11 +151,25 @@ class PerceptionBundle:
             # config must not take ASR/VOP/OCR down with it — the tool simply
             # does not appear, which is visible in the dashboard.
             try:
-                self._plugins.append(TTSPlugin(plugins_cfg["tts"], executor))
+                tts_plugin = TTSPlugin(plugins_cfg["tts"], executor)
+                self._plugins.append(tts_plugin)
                 log.info("TTSPlugin loaded")
             except Exception:
                 log.error("TTSPlugin failed to load; continuing without TTS",
                           exc_info=True)
+
+        # Built after TTS and holding a handle to it, for the same reason ASR
+        # holds one to speaker_recognition: the echo cancellation's reference
+        # signal *is* the TTS card's audio output, and asking the plugin in this
+        # process is what lets `robot_voice_topic: auto` need no configuration
+        # at all. The handle is optional — without it `auto` resolves to
+        # nothing and the card says so on its face rather than muting at random.
+        if plugins_cfg.get("echo_cancellation", {}).get("enabled", True):
+            from plugins.echo_cancellation import EchoCancellationPlugin
+            self._plugins.append(EchoCancellationPlugin(
+                plugins_cfg.get("echo_cancellation", {}), executor, tts=tts_plugin))
+            log.info("EchoCancellationPlugin loaded (tts=%s)",
+                     "yes" if tts_plugin else "no")
 
         if plugins_cfg.get("vop", {}).get("enabled", False):
             import re, socket
