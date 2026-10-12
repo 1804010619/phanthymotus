@@ -2420,6 +2420,19 @@ what an operator reasons about, and it stays meaningful when the camera's own ra
 changes. (`min_interval_ms`, the knob this replaced, is still honoured when
 `detect_fps` is absent, so a canvas saved by an earlier build keeps working.)
 
+**OCR has the same knob, `ocr_fps`**, with the same semantics, the same 1.0
+default and the same `min_interval_ms` fallback. It used to default to every
+frame, which on a 14fps 720p camera cost a full core: inference is TensorRT and
+sits on the GPU, but the JPEG decode in front of it does not — measured on Tianyi
+(Orin, 30W), **37.6 ms/frame** to decode 1280x720 plus 7.1 ms for the shape-
+preserving enhancement. Text in front of a robot does not change at frame rate, so
+once a second is the sensible default and the rest was heat.
+
+Note that lowering `max_side_len` is *not* a way to make the decode cheaper. The
+same measurement at 960 took **66.5 ms** — worse than 1600, because a bound below
+the source resolution turns a straight decode into a decode plus a resample. The
+frame rate is the knob that matters.
+
 A face that *fails* the gate is reported with `person_id: null`, `quality: "low"`
 and a `reason`, and is neither matched nor enrolled. Matching a blurred 30 px face
 is a coin flip, and enrolling one would spend an `unknown-N` slot forever on a

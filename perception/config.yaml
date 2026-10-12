@@ -385,7 +385,7 @@ plugins:
       enabled: true
       det_thresh: 0.1
       det_box_thresh: 0.1
-    min_interval_ms: 0
+    ocr_fps: 1.0
 
   # 扫码：二维码 / 条形码，按需识别（actuator，没有输出 topic）
   # 零模型零下载 —— zxing-cpp 是解码库。

@@ -54,8 +54,12 @@ import rclpy.executors
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(name)s] %(levelname)s %(message)s',
                     datefmt='%H:%M:%S')
 log = logging.getLogger(__name__)
-# suppress noisy third-party loggers
-for _quiet in ('urllib3', 'websockets', 'httpcore', 'httpx'):
+# suppress noisy third-party loggers.
+# pyvips logs six INFO lines per decoded image ("thumbnailing N bytes",
+# "selected loader is ...", "converting to processing space srgb", ...). At a
+# camera's frame rate that is the only thing in the log: measured on Tianyi,
+# ~4 lines/second with every other perception message buried under it.
+for _quiet in ('urllib3', 'websockets', 'httpcore', 'httpx', 'pyvips'):
     logging.getLogger(_quiet).setLevel(logging.WARNING)
 
 # Cap on how much of an MCP argument dict reaches the log. A tool call can carry
