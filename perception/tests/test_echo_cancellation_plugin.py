@@ -1110,6 +1110,23 @@ def test_info_without_an_instance_reports_the_card(plugin):
     assert info["instances"] == {"c1": {"state": "running"}}
 
 
+def test_the_summary_reports_the_card_that_is_working(plugin):
+    """A canvas routinely holds a second card nobody has wired up yet.
+
+    On Orin 5 the summary came from that one: it truthfully said "no
+    microphone, no reference heard" while the wired card beside it was running,
+    which reads as the working card being broken — and sent a debugging session
+    after a reference topic that was fine.
+    """
+    plugin.dispatch("echo_cancellation", {"action": "start", "instance_id": "unwired"})
+    plugin.dispatch("echo_cancellation", {"action": "start", "instance_id": "wired",
+                                          "input_topic": "/mic/audio"})
+    info = plugin.dispatch("echo_cancellation", {"action": "info"})
+    assert info["diagnostics"]["instance_id"] == "wired"
+    assert info["diagnostics"]["robot_voice_topic"] == "/tts/audio"
+    assert "Not connected to a microphone" not in info["desc"]
+
+
 def test_an_unknown_action_is_declined_not_answered(plugin):
     assert plugin.dispatch("echo_cancellation", {"action": "speak"}) is None
 

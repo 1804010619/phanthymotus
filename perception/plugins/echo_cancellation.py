@@ -1859,10 +1859,23 @@ class EchoCancellationPlugin:
         if nodes:
             result["instances"] = {key: {"state": self._nodes[key].state}
                                    for key in keys if key in self._nodes}
-            first = nodes[0]
-            _, how = self._resolve_ref(self._merged_cfg(keys[0]))
-            result["desc"] = self._desc(first, how)
-            result["diagnostics"] = first.diagnostics()
+            # Report the instance that is actually doing the work, not whichever
+            # happens to be first in the dict. A canvas routinely holds a second
+            # card nobody has wired up yet, and on Orin 5 the summary was coming
+            # from that one: it truthfully said "no microphone, no reference
+            # heard" while the wired card beside it was running — which reads as
+            # the working card being broken.
+            index = next((i for i, item in enumerate(nodes)
+                          if item.state == "running" and item._input_topic),
+                         0)
+            chosen, chosen_key = nodes[index], keys[index]
+            _, how = self._resolve_ref(self._merged_cfg(chosen_key))
+            result["desc"] = self._desc(chosen, how)
+            result["diagnostics"] = chosen.diagnostics()
+            # Which one these numbers describe. Without it a summary that picks
+            # a different instance than last time is indistinguishable from the
+            # same instance changing its mind.
+            result["diagnostics"]["instance_id"] = chosen_key
         return result
 
 
