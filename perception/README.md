@@ -295,11 +295,13 @@ the new path and gets better, so it is.
 |---|---|---|
 | steady path | 26.8 dB | 26.8 dB, no promotions |
 | path changes at 9 s | 0.6 dB, never recovers | **20.2 dB**, one promotion |
+| the same on Orin 5, over real DDS | — | 20.2 dB before, 1.4 dB just after, **17.2 dB** six seconds later, two promotions |
 | 4 s of double-talk | 22.9 → 24.2 dB across it | unchanged, no promotions |
 | person preserved during double-talk | 17.0 dB | 17.0 dB |
 
-Recovery after a path change takes 4-6 s. It costs one extra filter's
-arithmetic.
+Recovery after a path change takes 4-6 s offline and 6-9 s on the rig, where
+the robot's speech is bursty and only far-end-active blocks count. The shadow
+costs 5.5 ms per second of audio, a fifth of the cancel path.
 
 Two further guards, both earning their place with a measured failure:
 
@@ -374,9 +376,25 @@ end of that same session, and including double-talk blocks read 4.3 dB — in a
 session whose settled phases removed 11.7 and 17.0. A card that says 4 while
 removing 17 is not a diagnostic.
 
-Cost on Orin 5, callback profiled in isolation: **3.8 ms per second of audio**,
-against 3.7 for the plain forwarding path — the FFT work is almost free next
-to it. The live `callback_wall_ms_per_audio_s` reads ~91 ms/s, which is GIL
+Cost on Orin 5, callback profiled in isolation:
+
+| | ms per second of audio |
+|---|---|
+| forwarding only (warmup, or a card with nothing to cancel) | 3.7 |
+| cancelling | **27.3** |
+| cancelling, with the shadow filter | **32.8** |
+
+This section said 3.8 ms for cancelling until the shadow filter was measured,
+and that figure was wrong by a factor of eight. The benchmark fed the whole
+reference signal in before the first microphone chunk, so by the time a block
+asked for its echo the audio had aged out of the 2.5 s reference ring: every
+block came back silent, nothing was far-end-active, and **neither filter ever
+ran**. The giveaway was in the output the whole time — `adapted 0 blocks`.
+
+The same trap had already been caught once in `tests/`, where the end-to-end
+test cancelled nothing for the same reason and was fixed by interleaving the
+two streams by stamp, which is what the executor does. Anything that drives
+this card has to interleave them. The live `callback_wall_ms_per_audio_s` reads ~91 ms/s, which is GIL
 contention in a process running nine other plugins, not CPU (see the cost note
 above). Caching the delay median mattered: it is read once per chunk, and
 `np.median` was a third of this path's cost before.
