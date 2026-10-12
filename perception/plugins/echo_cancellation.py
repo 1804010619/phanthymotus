@@ -604,6 +604,34 @@ AEC_GUARD_FREEZE_BLOCKS = 300    # ~5 s before trying again
 # that: each attempt costs one guard window of junk on the output.
 AEC_GUARD_FREEZE_MAX_FACTOR = 8
 
+# ── the shadow filter ────────────────────────────────────────────────────────
+#
+# A second filter, adapting with none of the double-talk protection, whose
+# output is never published. Every window the two are compared on the error they
+# would have produced, and the shadow replaces the foreground when it is clearly
+# better. This is the standard two-filter arrangement, and it is here because
+# the protection the foreground needs makes it unable to recover from anything:
+#
+#   the skip guard refuses an update whenever the error exceeds the microphone,
+#   which is what double-talk looks like — and also what a *changed echo path*
+#   looks like. So when the robot turned its head mid-session the filter was
+#   locked to the old path forever: measured at -2.9 dB (worse than passing the
+#   microphone through, because a stale filter adds a wrong estimate) and never
+#   recovering, with 355 consecutive updates refused. The same run with the
+#   guards disabled recovered to 17.4 dB within six seconds.
+#
+# Double-talk and a changed path cannot be separated by powers, which is the
+# third time that has been true in this file. The shadow separates them by
+# *outcome* instead: during double-talk it adapts to a person and gets worse, so
+# it is not promoted; after a path change it learns the new path and gets
+# better, so it is. Measured: path change -2.9 → 16.6 dB with one promotion;
+# steady and double-talk unchanged, with none.
+#
+# It costs one extra filter's arithmetic — about 3.8 ms per second of audio on
+# Orin 5, doubling this card's cost and still leaving it cheap.
+AEC_SHADOW_WINDOW = 64        # far-end-active blocks per comparison, ~1 s
+AEC_SHADOW_MARGIN_DB = 2.0    # how much better the shadow must be to be promoted
+
 # ERLE is reported over roughly the last 1.5 s of robot speech (16 ms blocks, and
 # only blocks where it *is* speaking — pauses freeze the figure rather than
 # diluting it), once there has been half a second of it to average.
@@ -707,6 +735,7 @@ class _EchoCanceller:
         self._beta = SUPPRESSION_STRENGTHS.get(strength,
                                                SUPPRESSION_STRENGTHS[DEFAULT_REMOVAL_STRENGTH])
         self._weights = np.zeros((self.partitions, AEC_BINS), dtype=np.complex128)
+        self._shadow = np.zeros((self.partitions, AEC_BINS), dtype=np.complex128)
         self._spectra = np.zeros((self.partitions, AEC_BINS), dtype=np.complex128)
         self._ref_prev = np.zeros(AEC_BLOCK, dtype=np.float32)
         self._power = np.full(AEC_BINS, AEC_EPS)
@@ -722,6 +751,12 @@ class _EchoCanceller:
         self._benefit_db: Optional[float] = None
         self._resets = 0
         self._diverged_streak = 0
+        # shadow comparison
+        self._fg_error = 0.0
+        self._sh_error = 0.0
+        self._mic_power_sum = 0.0
+        self._compare_blocks = 0
+        self._promotions = 0
         # ERLE accounting: an exponentially-weighted average over blocks where
         # the reference was actually playing, not a lifetime one. A lifetime
         # average is the wrong statistic for something an operator reads off a
@@ -760,6 +795,17 @@ class _EchoCanceller:
         # mostly somebody talking. Both the full-rate update and the ERLE figure
         # are restricted to these blocks.
         echo_dominant = far_active and error_power <= 0.5 * mic_power
+        # The reference power estimate is updated on every far-active block,
+        # not only on blocks the foreground is allowed to learn from: it
+        # describes the *reference*, which double-talk does not touch, and both
+        # filters normalise by it.
+        spectrum_error = None
+        if far_active:
+            self._power = (0.9 * self._power
+                           + 0.1 * np.abs(self._spectra).__pow__(2).sum(axis=0))
+            spectrum_error = np.fft.rfft(
+                np.concatenate((np.zeros(AEC_BLOCK, dtype=np.float32), error)))
+
         if far_active and self._frozen_for <= 0:
             # Only adapt while the far end is playing: with no reference there
             # is no information in the gradient, and updating anyway is how a
@@ -775,14 +821,13 @@ class _EchoCanceller:
                     # Near-end speech probably present: slow down rather than
                     # stop, so a permanently noisy room still converges.
                     scale = 0.25
-                spectrum_error = np.fft.rfft(
-                    np.concatenate((np.zeros(AEC_BLOCK, dtype=np.float32), error)))
-                self._power = (0.9 * self._power
-                               + 0.1 * np.abs(self._spectra).__pow__(2).sum(axis=0))
                 step = (self._mu * scale) / (self._power + AEC_EPS)
                 self._weights *= AEC_LEAK
                 self._weights += step * np.conj(self._spectra) * spectrum_error
                 self._adapted += 1
+
+        if far_active:
+            self._run_shadow(mic, mic_power, error_power, spectrum_error)
 
         out = self._suppress(error, estimate, far_active)
         self._blocks += 1
@@ -810,6 +855,41 @@ class _EchoCanceller:
         if self._frozen_for > 0:
             self._frozen_for -= 1
         return out
+
+    def _run_shadow(self, mic: np.ndarray, mic_power: float, error_power: float,
+                    spectrum_error: np.ndarray) -> None:
+        """Adapt the unprotected filter, and promote it when it is clearly better."""
+        shadow_estimate = np.fft.irfft(
+            (self._shadow * self._spectra).sum(axis=0))[AEC_BLOCK:]
+        shadow_error = mic - shadow_estimate
+        shadow_spectrum = np.fft.rfft(
+            np.concatenate((np.zeros(AEC_BLOCK, dtype=np.float32), shadow_error)))
+        step = self._mu / (self._power + AEC_EPS)
+        self._shadow *= AEC_LEAK
+        self._shadow += step * np.conj(self._spectra) * shadow_spectrum
+
+        self._fg_error += error_power
+        self._sh_error += float(np.mean(np.square(shadow_error)))
+        self._mic_power_sum += mic_power
+        self._compare_blocks += 1
+        if self._compare_blocks < AEC_SHADOW_WINDOW:
+            return
+
+        margin = 10.0 ** (-AEC_SHADOW_MARGIN_DB / 10.0)
+        if self._sh_error < self._fg_error * margin:
+            # Clearly better over a whole window — not a lucky block. Promoting
+            # on anything less would let double-talk noise win a coin toss.
+            self._weights = self._shadow.copy()
+            self._promotions += 1
+            self._frozen_for = 0
+            self._diverged_streak = 0
+        elif self._sh_error > self._mic_power_sum:
+            # The shadow is worse than not filtering at all. Nothing it has
+            # learned is worth keeping, and starting it over is what lets it
+            # catch a path change that happened while it was lost.
+            self._shadow[:] = 0.0
+        self._fg_error = self._sh_error = self._mic_power_sum = 0.0
+        self._compare_blocks = 0
 
     def _check_divergence(self, mic_power: float, error_power: float) -> None:
         self._window_mic += mic_power
@@ -878,6 +958,7 @@ class _EchoCanceller:
             # that works. None means it has not been judged yet.
             "filter_benefit_db": self._benefit_db,
             "aec_filter_resets": self._resets,
+            "aec_shadow_promotions": self._promotions,
         }
 
 

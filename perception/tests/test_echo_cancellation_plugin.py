@@ -642,6 +642,83 @@ def test_the_reported_erle_ignores_double_talk_blocks():
         f"the echo-only span — double-talk blocks are leaking into the average")
 
 
+def _changing_room(reference, seed, gain, change_at, seconds):
+    """An echo path that changes halfway: the robot turned its head."""
+    first = np.convolve(reference, _room(60, seed) * gain)[:reference.size]
+    second = np.convolve(reference, _room(60, seed + 31) * gain)[:reference.size]
+    at = int(change_at * ec.SAMPLE_RATE)
+    return np.concatenate([first[:at], second[at:]]).astype(np.float32)
+
+
+def _session(mic, reference, strength="normal"):
+    canceller = ec._EchoCanceller(strength=strength)
+    out = np.zeros_like(mic)
+    for start in range(0, reference.size - ec.AEC_BLOCK + 1, ec.AEC_BLOCK):
+        stop = start + ec.AEC_BLOCK
+        out[start:stop] = canceller.process(mic[start:stop], reference[start:stop])
+    return out, canceller
+
+
+def test_a_changed_echo_path_is_relearned():
+    """The robot turns its head. Without the shadow filter this never recovers.
+
+    The skip guard refuses an update whenever the error exceeds the microphone,
+    which is what double-talk looks like — and what a changed path looks like
+    too. Measured before the shadow filter existed: -2.9 dB and still -2.9 dB
+    six seconds later, with 355 consecutive updates refused. Worse than passing
+    the microphone through, because a stale filter adds a wrong estimate.
+    """
+    seconds, change_at = 20.0, 9.0
+    reference = _bursts(seconds, seed=1).astype(np.float32)
+    echo = _changing_room(reference, 1, 0.5, change_at, seconds)
+    mic = (echo + np.random.default_rng(10).normal(0, 30, echo.size)).astype(np.float32)
+    out, canceller = _session(mic, reference)
+
+    def erle(lo, hi):
+        return _db(mic, out, slice(int(lo * ec.SAMPLE_RATE), int(hi * ec.SAMPLE_RATE)))
+
+    assert erle(6, 9) > 20.0, "converged before the change"
+    assert erle(15, 20) > 15.0, "and again after it"
+    assert canceller._promotions >= 1
+    assert canceller.report()["aec_shadow_promotions"] >= 1
+
+
+def test_double_talk_does_not_promote_the_shadow():
+    """The shadow adapts to a person and gets worse, so it is not promoted.
+
+    This is the whole reason the comparison is on outcome rather than on
+    powers: double-talk and a changed path are indistinguishable from the
+    error's size alone, which is the third time that is true in this file.
+    """
+    mic, out, person, canceller = _cancel_session(talk=(8.0, 12.0), talker=8000)
+    assert canceller._promotions == 0
+    after = _db(mic, out, slice(int(13 * ec.SAMPLE_RATE), int(18 * ec.SAMPLE_RATE)))
+    before = _db(mic, out, slice(int(5 * ec.SAMPLE_RATE), int(8 * ec.SAMPLE_RATE)))
+    assert after >= before - 1.0
+    assert _db(person, out - person,
+               slice(int(8 * ec.SAMPLE_RATE), int(12 * ec.SAMPLE_RATE))) > 12.0
+
+
+def test_the_shadow_filter_costs_nothing_when_nothing_changes():
+    """A steady path must not be disturbed by a second filter looking over it."""
+    mic, out, _, canceller = _cancel_session()
+    assert canceller._promotions == 0
+    assert _db(mic, out, slice(int(12 * ec.SAMPLE_RATE), mic.size)) > 20.0
+
+
+def test_a_lost_shadow_filter_is_restarted():
+    """Otherwise it can never win again, and the foreground is stuck for good."""
+    canceller = ec._EchoCanceller(strength="gentle")
+    canceller._shadow += 50.0                       # as if it had diverged
+    rng = np.random.default_rng(4)
+    reference = rng.normal(0, 6000, ec.AEC_BLOCK * 200).astype(np.float32)
+    for index in range(200):
+        block = slice(index * ec.AEC_BLOCK, (index + 1) * ec.AEC_BLOCK)
+        canceller.process(rng.normal(0, 300, ec.AEC_BLOCK).astype(np.float32),
+                          reference[block])
+    assert np.abs(canceller._shadow).max() < 50.0
+
+
 def test_the_step_size_stays_under_the_measured_stability_edge():
     """The constant encodes a measurement, so a plausible edit must fail here.
 

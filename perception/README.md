@@ -272,7 +272,36 @@ unaligned reference adds noise rather than removing echo. The card says so on
 its face while that lasts, and it lasts about 3 s into the robot's first
 utterance.
 
-Two guards, both earning their place with a measured failure:
+#### A second filter, because the guards cannot be relaxed
+
+The protection the published filter needs makes it unable to recover from
+anything. The skip guard refuses an update whenever the error exceeds the
+microphone — which is what double-talk looks like, and *also* what a changed
+echo path looks like. So when the robot turns its head mid-session the filter
+locks to the old path forever: measured at **-2.9 dB and still -2.9 dB six
+seconds later**, with 355 consecutive updates refused. Worse than passing the
+microphone through, because a stale filter adds a wrong estimate. The same run
+with the guards disabled recovered to 17.4 dB within six seconds.
+
+Double-talk and a changed path cannot be separated by powers — the third time
+that is true in this file. So a second filter adapts with none of the
+protection, its output is never published, and every ~1 s of far-end audio the
+two are compared on the error they produced. The shadow replaces the foreground
+when it is better by 2 dB over a whole window. During double-talk it adapts to a
+person and gets *worse*, so it is not promoted; after a path change it learns
+the new path and gets better, so it is.
+
+| | before | after |
+|---|---|---|
+| steady path | 26.8 dB | 26.8 dB, no promotions |
+| path changes at 9 s | 0.6 dB, never recovers | **20.2 dB**, one promotion |
+| 4 s of double-talk | 22.9 → 24.2 dB across it | unchanged, no promotions |
+| person preserved during double-talk | 17.0 dB | 17.0 dB |
+
+Recovery after a path change takes 4-6 s. It costs one extra filter's
+arithmetic.
+
+Two further guards, both earning their place with a measured failure:
 
 - **Skip the update when the error is bigger than the microphone.** That is
   either double-talk or divergence, and skipping is what keeps a bad second from
@@ -355,6 +384,34 @@ above). Caching the delay median mattered: it is read once per chunk, and
 Reframing into 16 ms blocks means published audio is up to one block older than
 the chunk that triggered it, so a cancelled chunk carries **its own** stamp
 rather than the input's — ASR reads that header as the capture time.
+
+### Where this breaks, measured
+
+Every number above comes from a synthetic echo path: linear, time-invariant,
+sample-clock-locked — the assumptions the algorithm itself makes. That makes
+them necessary but not sufficient, so the assumptions were broken one at a time
+to find out what the margin is:
+
+| | ERLE |
+|---|---|
+| baseline | 26.8 dB |
+| speaker clipping at 50% / 30% / 15% of peak | 24.6 / 18.0 / 12.6 dB |
+| sample clock drift 10 / 50 / 200 ppm | 15.0 / **3.0** / ~1 dB |
+| echo path changes mid-session | 20.2 dB (with the shadow filter; 0.6 without) |
+
+Nonlinearity degrades gracefully. A changed path is handled. **Drift is a wall**:
+50 ppm — well inside the spread of two ordinary crystals — leaves nothing. Over
+18 s, 50 ppm is a slide of only 14 samples, but at 8 kHz that is more than half
+a period, so the high band decorrelates completely.
+
+That makes one deployment condition non-negotiable and unverified here: **the
+microphone and the speaker must share a sample clock**, which they do when both
+sit on one codec and do not when the microphone is a USB device and the speaker
+is on-board. Which robots are which is a question only hardware can answer.
+
+Nor has any of this met a real speaker. On a box with no audio hardware the
+echo path is something this file computes, and a real one adds exactly the
+effects above in combinations nobody has measured here.
 
 ### What is not here yet
 
