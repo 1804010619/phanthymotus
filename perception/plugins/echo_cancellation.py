@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-plugins/audio_frontend.py — keep the robot's own voice out of its own microphone.
+plugins/echo_cancellation.py — keep the robot's own voice out of its own microphone.
 
 The robot's TTS reaches its microphone acoustically, and nothing in perception
 removed it until this card existed. The consequences were spread across three
@@ -13,7 +13,7 @@ would have to reach is busy listening to the robot.
 This is a card in the audio path, not a switch inside ASR, for one reason that
 decides it: `soundevent` subscribes to the microphone topic too, and speaker
 recognition runs off the segment ASR cut. Cleaning the signal inside ASR cleans
-it for ASR alone. Wired as `mic -> audio_frontend -> {asr, soundevent}` it is
+it for ASR alone. Wired as `mic -> echo_cancellation -> {asr, soundevent}` it is
 cleaned once, for everything downstream, and the cleaned audio is a topic a human
 can listen to on the dashboard.
 
@@ -870,13 +870,13 @@ class _EchoCanceller:
 # internal constants. A card with sixteen knobs is a card nobody dares touch.
 TOOLS = [
     {
-        "name": "audio_frontend",
+        "name": "echo_cancellation",
         "type": "processor",
         "multiInstance": True,
         "description": (
-            "语音前端处理 — 把机器人自己说话的声音从麦克风里拿掉，否则 ASR 会把"
-            "机器人自己说的话当成别人说的。接在麦克风和 ASR 之间"
-            "（Audio frontend: keeps the robot's own voice out of its microphone）"
+            "回声消除 — 把机器人自己说话的声音从麦克风里拿掉，否则 ASR 会把机器人"
+            "自己说的话当成别人说的。接在麦克风卡和 ASR 卡之间"
+            "（Echo cancellation: keeps the robot's own voice out of its microphone）"
         ),
         "inputSchema": {
             "type": "object",
@@ -1005,7 +1005,7 @@ TOOLS = [
 
 # ── ROS2 node ────────────────────────────────────────────────────────────────
 
-class _AudioFrontendNode(Node):
+class _EchoCancellationNode(Node):
     """One microphone in, the same microphone cleaned out.
 
     Processing happens in the microphone callback rather than on a worker
@@ -1026,15 +1026,15 @@ class _AudioFrontendNode(Node):
                  node_suffix: str = '', mode: str = DEFAULT_MODE,
                  mute_tail: str = DEFAULT_MUTE_TAIL,
                  removal_strength: str = DEFAULT_REMOVAL_STRENGTH) -> None:
-        super().__init__(f"audio_frontend_{node_suffix}" if node_suffix
-                         else "audio_frontend")
+        super().__init__(f"echo_cancellation_{node_suffix}" if node_suffix
+                         else "echo_cancellation")
         self._input_topic = input_topic or ''
         self._output_topic = f"{self._input_topic}{OUTPUT_SUFFIX}" if self._input_topic else ''
         # A reference topic equal to the microphone topic would make the card
         # correlate the mic against itself and mute permanently at delay 0.
         self._ref_topic = ref_topic if ref_topic and ref_topic != self._input_topic else ''
         if ref_topic and not self._ref_topic:
-            log.warning("[audio_frontend] ignoring robot_voice_topic %r: it is the "
+            log.warning("[echo_cancellation] ignoring robot_voice_topic %r: it is the "
                         "microphone topic", ref_topic)
 
         self._mode = mode if mode in MODES else DEFAULT_MODE
@@ -1082,7 +1082,7 @@ class _AudioFrontendNode(Node):
         self._sub = None
         self._ref_sub = None
 
-        log.info("[audio_frontend] node created: mic=%s -> %s, robot_voice=%s, "
+        log.info("[echo_cancellation] node created: mic=%s -> %s, robot_voice=%s, "
                  "mode=%s, mute_tail=%s",
                  self._input_topic or "(none)", self._output_topic or "(none)",
                  self._ref_topic or "(none)", self._mode, self._mute_tail)
@@ -1099,7 +1099,7 @@ class _AudioFrontendNode(Node):
                 return self.status()
             if not self._input_topic:
                 return {"state": "error",
-                        "message": "audio_frontend needs a microphone topic "
+                        "message": "echo_cancellation needs a microphone topic "
                                    "(connect one on the canvas)"}
             from audio_msgs.msg import AudioChunk
             if self._pub is None:
@@ -1111,7 +1111,7 @@ class _AudioFrontendNode(Node):
                 self._ref_sub = self.create_subscription(
                     AudioChunk, self._ref_topic, self._ref_cb, _AUDIO_QOS)
             self.state = "running"
-            log.info("[audio_frontend] started: %s -> %s (mode=%s)",
+            log.info("[echo_cancellation] started: %s -> %s (mode=%s)",
                      self._input_topic, self._output_topic, self._mode)
             return self.status()
 
@@ -1132,7 +1132,7 @@ class _AudioFrontendNode(Node):
             self.state = "idle"
         with self._gate_lock:
             self._mute_until = 0.0
-        log.info("[audio_frontend] stopped: %s", self._input_topic)
+        log.info("[echo_cancellation] stopped: %s", self._input_topic)
         return {"state": "idle"}
 
     def apply_config(self, mode: Optional[str] = None,
@@ -1396,7 +1396,7 @@ class _AudioFrontendNode(Node):
         except Exception as error:  # noqa: BLE001 - a dead publisher must not kill the callback
             with self._stats_lock:
                 self._stats["publish_errors"] += 1
-            log.warning("[audio_frontend] publish failed on %s: %s",
+            log.warning("[echo_cancellation] publish failed on %s: %s",
                         self._output_topic, error)
             return
         with self._stats_lock:
@@ -1494,8 +1494,8 @@ class _AudioFrontendNode(Node):
 _DEFAULT_INSTANCE = "_default"
 
 
-class AudioFrontendPlugin:
-    """Perception facade for the audio frontend card.
+class EchoCancellationPlugin:
+    """Perception facade for the echo cancellation card.
 
     Holds no model and loads nothing, so unlike the vision cards it has no
     `loading` state and the constructor cannot fail on a missing file. What it
@@ -1507,7 +1507,7 @@ class AudioFrontendPlugin:
     `auto` resolves to nothing and the card says so.
     """
 
-    PREFIX = "audio_frontend"
+    PREFIX = "echo_cancellation"
     _DESC = "Keeps the robot's own voice out of its microphone"
 
     def __init__(self, plugin_cfg: Mapping[str, Any], executor: Any,
@@ -1515,10 +1515,10 @@ class AudioFrontendPlugin:
         self._plugin_cfg: Dict[str, Any] = dict(plugin_cfg or {})
         self._executor = executor
         self._tts = tts
-        self._nodes: Dict[str, _AudioFrontendNode] = {}
+        self._nodes: Dict[str, _EchoCancellationNode] = {}
         self._instance_configs: Dict[str, Dict[str, Any]] = {}
         self._state_lock = threading.RLock()
-        log.info("[audio_frontend] plugin init: mode=%s, robot_voice_topic=%s, "
+        log.info("[echo_cancellation] plugin init: mode=%s, robot_voice_topic=%s, "
                  "mute_tail=%s, tts_handle=%s",
                  self._plugin_cfg.get("mode", DEFAULT_MODE),
                  self._plugin_cfg.get("robot_voice_topic", DEFAULT_ROBOT_VOICE_TOPIC),
@@ -1544,7 +1544,7 @@ class AudioFrontendPlugin:
                       for entry in (info.get("topic_out") or [])
                       if (entry.get("format") or "") in _AUDIO_FORMATS]
         except Exception as error:  # noqa: BLE001
-            log.debug("[audio_frontend] could not ask TTS for its topics: %s", error)
+            log.debug("[echo_cancellation] could not ask TTS for its topics: %s", error)
             return []
         seen: List[str] = []
         for topic in topics:
@@ -1568,7 +1568,7 @@ class AudioFrontendPlugin:
         if len(topics) > 1:
             # Several TTS cards: picking one silently would be a coin flip in a
             # place nobody would look. Take the first and say which.
-            log.info("[audio_frontend] auto found %d TTS audio topics, using %s",
+            log.info("[echo_cancellation] auto found %d TTS audio topics, using %s",
                      len(topics), topics[0])
         return topics[0], "auto"
 
@@ -1649,7 +1649,7 @@ class AudioFrontendPlugin:
                 rebuild.append((key, node._input_topic))
 
         for key, input_topic in rebuild:
-            log.info("[audio_frontend] robot_voice_topic changed, rebuilding %s", key)
+            log.info("[echo_cancellation] robot_voice_topic changed, rebuilding %s", key)
             self._do_stop(key)
             self._do_start(key, input_topic)
 
@@ -1660,10 +1660,10 @@ class AudioFrontendPlugin:
 
     # ── start / stop ─────────────────────────────────────────────────────
 
-    def _create_node(self, node_key: str, input_topic: str) -> _AudioFrontendNode:
+    def _create_node(self, node_key: str, input_topic: str) -> _EchoCancellationNode:
         cfg = self._merged_cfg(node_key)
         ref_topic, _ = self._resolve_ref(cfg)
-        return _AudioFrontendNode(
+        return _EchoCancellationNode(
             input_topic,
             ref_topic,
             node_suffix=node_key.replace('/', '_').replace('-', '_').strip('_'),
@@ -1673,12 +1673,12 @@ class AudioFrontendPlugin:
                                  or DEFAULT_REMOVAL_STRENGTH),
         )
 
-    def _dispose(self, node_key: str, node: _AudioFrontendNode) -> None:
+    def _dispose(self, node_key: str, node: _EchoCancellationNode) -> None:
         try:
             node.retire()
         finally:
-            dispose_node(self._executor, node, label=f"audio_frontend/{node_key}")
-        log.info("[audio_frontend] node disposed: %s", node_key)
+            dispose_node(self._executor, node, label=f"echo_cancellation/{node_key}")
+        log.info("[echo_cancellation] node disposed: %s", node_key)
 
     def _do_start(self, instance_id: str, input_topic: str) -> Dict[str, Any]:
         node_key = instance_id or input_topic or _DEFAULT_INSTANCE
@@ -1709,7 +1709,7 @@ class AudioFrontendPlugin:
                 try:
                     self._executor.add_node(node)
                 except Exception as error:  # noqa: BLE001
-                    log.error("[audio_frontend] failed to register instance %r: %s",
+                    log.error("[echo_cancellation] failed to register instance %r: %s",
                               node_key, error)
                 else:
                     self._nodes[node_key] = node
@@ -1740,7 +1740,7 @@ class AudioFrontendPlugin:
         return result
 
     def _do_stop(self, instance_id: str) -> Dict[str, Any]:
-        to_dispose: List[Tuple[str, _AudioFrontendNode]] = []
+        to_dispose: List[Tuple[str, _EchoCancellationNode]] = []
         with self._state_lock:
             if instance_id:
                 node = self._nodes.pop(instance_id, None)
@@ -1755,7 +1755,7 @@ class AudioFrontendPlugin:
 
     # ── info ─────────────────────────────────────────────────────────────
 
-    def _desc(self, node: Optional[_AudioFrontendNode], how: str) -> str:
+    def _desc(self, node: Optional[_EchoCancellationNode], how: str) -> str:
         """The card's one-line face. Carries the misconfiguration, when there is one.
 
         `auto` resolving to nothing is the failure this card can suffer silently:
@@ -1799,8 +1799,8 @@ class AudioFrontendPlugin:
         return self._DESC
 
     def _do_info(self, instance_id: str, input_topic: str) -> Dict[str, Any]:
-        base = {"name": "AudioFrontend", "manufacture": "Embodied",
-                "model": "echo-gate"}
+        base = {"name": "EchoCancellation", "manufacture": "Embodied",
+                "model": "aec"}
         with self._state_lock:
             node = self._nodes.get(instance_id) if instance_id else None
             keys = list(self._nodes)
@@ -1849,4 +1849,4 @@ class AudioFrontendPlugin:
         return result
 
 
-__all__ = ["AudioFrontendPlugin", "TOOLS", "AUDIO_FORMAT", "OUTPUT_SUFFIX"]
+__all__ = ["EchoCancellationPlugin", "TOOLS", "AUDIO_FORMAT", "OUTPUT_SUFFIX"]

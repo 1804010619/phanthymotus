@@ -414,11 +414,11 @@ plugins:
     enabled: true
   # 把机器人自己的 TTS 从麦克风里拿掉。接在麦克风卡和 ASR 卡之间，不是 ASR 的
   # 一个开关 —— soundevent 也直接订麦克风，声纹又跑在 ASR 切出来的段上，装在
-  # ASR 里面只治 ASR 一家。详见 plugins/audio_frontend.py 的模块文档。
+  # ASR 里面只治 ASR 一家。详见 plugins/echo_cancellation.py 的模块文档。
   #
   # 默认开着：这张卡不加载任何模型、不占显存，没被拖到画布上连线时什么都不做。
   # 关掉它只是让卡片从侧边栏消失 —— 而真正的代价是没人发现它存在。
-  audio_frontend:
+  echo_cancellation:
     enabled: true
     # off | mute_while_talking | remove_echo。默认静音是半双工的，诚实地说就是
     # 机器人说话时不能被打断；换来的是 100% 没有回声，而且在 TTS 不经过 Agent
