@@ -1,4 +1,4 @@
-"""Host-side tests for the audio frontend card — no ROS, no audio hardware.
+"""Host-side tests for the echo cancellation card — no ROS, no audio hardware.
 
 Two halves. The first drives `_DelayTracker` with synthetic signals, which is
 the only way the thresholds in it can be defended: every one of them is a
@@ -22,7 +22,7 @@ import pytest
 
 from vision_stubs import _FakeAudioChunk, _FakeExecutor, _FakeNode
 
-import plugins.audio_frontend as af
+import plugins.echo_cancellation as ec
 
 
 BASE_T = 1_700_000_000.0
@@ -32,7 +32,7 @@ REF_CHUNK_SAMPLES = 1600       # 100 ms, what plugins/tts.py publishes
 
 # ── helpers ──────────────────────────────────────────────────────────────────
 
-def _chunk(pcm: bytes, timestamp: float, fmt: str = af.AUDIO_FORMAT) -> _FakeAudioChunk:
+def _chunk(pcm: bytes, timestamp: float, fmt: str = ec.AUDIO_FORMAT) -> _FakeAudioChunk:
     message = _FakeAudioChunk()
     seconds = int(timestamp)
     message.header.stamp = types.SimpleNamespace(
@@ -50,13 +50,13 @@ def _bursts(seconds: float, seed: int = 0, amplitude: int = 6000) -> np.ndarray:
     broken.
     """
     rng = np.random.default_rng(seed)
-    total = int(seconds * af.SAMPLE_RATE)
+    total = int(seconds * ec.SAMPLE_RATE)
     wave = rng.normal(0, amplitude, total)
     gate = np.zeros(total)
     position = 0
     while position < total:
-        on = int(rng.uniform(0.15, 0.35) * af.SAMPLE_RATE)
-        off = int(rng.uniform(0.10, 0.25) * af.SAMPLE_RATE)
+        on = int(rng.uniform(0.15, 0.35) * ec.SAMPLE_RATE)
+        off = int(rng.uniform(0.10, 0.25) * ec.SAMPLE_RATE)
         gate[position:position + on] = rng.uniform(0.4, 1.0)
         position += on + off
     return (wave * gate).astype(np.int16)
@@ -66,20 +66,20 @@ def _delayed(wave: np.ndarray, delay_s: float, gain: float = 0.5,
              noise: int = 40, seed: int = 7) -> np.ndarray:
     """`wave` as it would arrive at a microphone `delay_s` later, attenuated."""
     rng = np.random.default_rng(seed)
-    shift = int(round(delay_s * af.SAMPLE_RATE))
+    shift = int(round(delay_s * ec.SAMPLE_RATE))
     echo = np.zeros_like(wave, dtype=np.float64)
     if shift < wave.size:
         echo[shift:] = wave[:wave.size - shift] * gain
     return (echo + rng.normal(0, noise, wave.size)).astype(np.int16)
 
 
-def _feed(tracker: af._DelayTracker, mic: np.ndarray, ref: np.ndarray,
+def _feed(tracker: ec._DelayTracker, mic: np.ndarray, ref: np.ndarray,
           now: float) -> None:
     for start in range(0, ref.size - REF_CHUNK_SAMPLES + 1, REF_CHUNK_SAMPLES):
-        timestamp = BASE_T + start / af.SAMPLE_RATE
+        timestamp = BASE_T + start / ec.SAMPLE_RATE
         tracker.add_ref(ref[start:start + REF_CHUNK_SAMPLES].tobytes(), timestamp, now)
     for start in range(0, mic.size - MIC_CHUNK_SAMPLES + 1, MIC_CHUNK_SAMPLES):
-        timestamp = BASE_T + start / af.SAMPLE_RATE
+        timestamp = BASE_T + start / ec.SAMPLE_RATE
         tracker.add_mic(mic[start:start + MIC_CHUNK_SAMPLES].tobytes(), timestamp, now)
 
 
@@ -97,7 +97,7 @@ def _silent(pcm: bytes) -> bool:
 def test_tracker_measures_a_known_delay(delay_s):
     ref = _bursts(6.0, seed=1)
     mic = _delayed(ref, delay_s)
-    tracker = af._DelayTracker()
+    tracker = ec._DelayTracker()
     now = BASE_T + 6.0
     _feed(tracker, mic, ref, now)
 
@@ -108,9 +108,9 @@ def test_tracker_measures_a_known_delay(delay_s):
 
 
 def test_tracker_says_nothing_when_the_robot_is_silent():
-    ref = np.zeros(int(6.0 * af.SAMPLE_RATE), dtype=np.int16)
+    ref = np.zeros(int(6.0 * ec.SAMPLE_RATE), dtype=np.int16)
     mic = _bursts(6.0, seed=2)        # a person talking, robot quiet
-    tracker = af._DelayTracker()
+    tracker = ec._DelayTracker()
     now = BASE_T + 6.0
     _feed(tracker, mic, ref, now)
 
@@ -127,7 +127,7 @@ def test_tracker_refuses_an_uncorrelated_microphone():
     """
     ref = _bursts(6.0, seed=3)
     mic = _bursts(6.0, seed=99)       # independent audio, same statistics
-    tracker = af._DelayTracker()
+    tracker = ec._DelayTracker()
     now = BASE_T + 6.0
     _feed(tracker, mic, ref, now)
 
@@ -136,7 +136,7 @@ def test_tracker_refuses_an_uncorrelated_microphone():
 
 
 def test_tracker_reports_a_median_and_a_spread():
-    tracker = af._DelayTracker()
+    tracker = ec._DelayTracker()
     for value in (0.40, 0.42, 0.44, 0.60):
         tracker._accept(value)
     assert tracker.measured == pytest.approx(0.43)
@@ -148,7 +148,7 @@ def test_a_quiet_echo_is_still_measurable():
     """A speaker at low volume still has to be found: 20x attenuation, measured."""
     ref = _bursts(6.0, seed=5)
     mic = _delayed(ref, 0.42, gain=0.05)
-    tracker = af._DelayTracker()
+    tracker = ec._DelayTracker()
     now = BASE_T + 6.0
     _feed(tracker, mic, ref, now)
     assert tracker.estimate(now) == pytest.approx(0.42, abs=0.03)
@@ -169,14 +169,14 @@ def test_a_delay_beyond_the_search_range_is_mostly_refused():
     for seed in range(10):
         ref = _bursts(6.0, seed=seed)
         mic = _delayed(ref, 2.0, seed=seed + 7)
-        tracker = af._DelayTracker()
+        tracker = ec._DelayTracker()
         _feed(tracker, mic, ref, BASE_T + 6.0)
         estimate = tracker.estimate(BASE_T + 6.0)
         if estimate is not None:
             accepted.append(estimate)
 
     assert len(accepted) <= 3, f"too many spurious measurements: {accepted}"
-    limit = af.DELAY_SEARCH_MAX_S - af.ENVELOPE_HOP_S
+    limit = ec.DELAY_SEARCH_MAX_S - ec.ENVELOPE_HOP_S
     assert all(value < limit for value in accepted), \
         "a peak at the end of the search range must be refused"
 
@@ -191,7 +191,7 @@ def test_double_talk_fools_a_single_window_but_not_the_median():
     80% of windows contaminated, while the spread grew to ~1 s and says so.
     """
     truth = 0.42
-    tracker = af._DelayTracker()
+    tracker = ec._DelayTracker()
     rng = np.random.default_rng(3)
     for window in range(20):
         ref = _bursts(6.0, seed=window)
@@ -200,7 +200,7 @@ def test_double_talk_fools_a_single_window_but_not_the_median():
             talker = _bursts(6.0, seed=window + 500, amplitude=8000)
             mic = np.clip(mic.astype(np.int32) + talker.astype(np.int32),
                           -32768, 32767).astype(np.int16)
-        window_tracker = af._DelayTracker()
+        window_tracker = ec._DelayTracker()
         _feed(window_tracker, mic, ref, BASE_T + 6.0)
         estimate = window_tracker.estimate(BASE_T + 6.0)
         if estimate is not None:
@@ -215,7 +215,7 @@ def test_tracker_needs_both_streams_covering_the_window():
     """A reference that only started a moment ago cannot be correlated yet."""
     ref = _bursts(1.0, seed=4)
     mic = _delayed(_bursts(6.0, seed=4), 0.4)
-    tracker = af._DelayTracker()
+    tracker = ec._DelayTracker()
     now = BASE_T + 6.0
     _feed(tracker, mic, ref, now)
     assert tracker.estimate(now) is None
@@ -230,7 +230,7 @@ def test_a_prebuffer_burst_is_laid_out_as_contiguous_audio():
     start of every utterance — exactly where the echo starts — and leaves the
     series non-monotonic, which makes `np.interp` return nonsense silently.
     """
-    stream = af._EnvelopeStream()
+    stream = ec._EnvelopeStream()
     wave = _bursts(0.5, seed=31)
     burst_stamp = BASE_T
     for index in range(5):                     # five 100 ms frames, one burst
@@ -247,7 +247,7 @@ def test_a_prebuffer_burst_is_laid_out_as_contiguous_audio():
 
 def test_a_real_gap_resynchronises_instead_of_continuing():
     """After a silence the next utterance must land where its stamp says."""
-    stream = af._EnvelopeStream()
+    stream = ec._EnvelopeStream()
     chunk = _bursts(0.1, seed=32)[:REF_CHUNK_SAMPLES].tobytes()
     stream.add(chunk, BASE_T, BASE_T)
     stream.add(chunk, BASE_T + 5.0, BASE_T + 5.1)       # 5 s later
@@ -257,7 +257,7 @@ def test_a_real_gap_resynchronises_instead_of_continuing():
 
 
 def test_a_backwards_clock_cannot_break_monotonicity():
-    stream = af._EnvelopeStream()
+    stream = ec._EnvelopeStream()
     chunk = _bursts(0.1, seed=33)[:REF_CHUNK_SAMPLES].tobytes()
     stream.add(chunk, BASE_T + 10.0, BASE_T + 10.0)
     stream.add(chunk, BASE_T, BASE_T + 10.1)            # clock jumped back 10 s
@@ -270,7 +270,7 @@ def test_the_tracker_measures_through_prebuffer_bursts():
     delay = 0.42
     ref = _bursts(6.0, seed=34)
     mic = _delayed(ref, delay)
-    tracker = af._DelayTracker()
+    tracker = ec._DelayTracker()
     now = BASE_T + 6.0
 
     # Reference in bursts of five frames sharing a stamp, as tts.py emits them.
@@ -284,7 +284,7 @@ def test_the_tracker_measures_through_prebuffer_bursts():
         frame += 5
     for start in range(0, mic.size - MIC_CHUNK_SAMPLES + 1, MIC_CHUNK_SAMPLES):
         tracker.add_mic(mic[start:start + MIC_CHUNK_SAMPLES].tobytes(),
-                        BASE_T + start / af.SAMPLE_RATE, now)
+                        BASE_T + start / ec.SAMPLE_RATE, now)
 
     assert tracker.estimate(now) == pytest.approx(delay, abs=0.03)
 
@@ -293,7 +293,7 @@ def test_the_tracker_measures_through_prebuffer_bursts():
 
 @pytest.fixture
 def node():
-    instance = af._AudioFrontendNode('/mic/audio', '/tts/audio',
+    instance = ec._EchoCancellationNode('/mic/audio', '/tts/audio',
                                      node_suffix='t', mute_tail='300ms')
     instance.start()
     yield instance
@@ -305,7 +305,7 @@ def _say(node, seconds: float, start_t: float) -> None:
     wave = _bursts(seconds, seed=11)
     for start in range(0, wave.size - REF_CHUNK_SAMPLES + 1, REF_CHUNK_SAMPLES):
         node._ref_cb(_chunk(wave[start:start + REF_CHUNK_SAMPLES].tobytes(),
-                            start_t + start / af.SAMPLE_RATE))
+                            start_t + start / ec.SAMPLE_RATE))
 
 
 def _hear(node, pcm: bytes, timestamp: float) -> None:
@@ -339,8 +339,8 @@ def test_the_mute_outlasts_the_robots_last_frame_by_the_tail(node):
 
 
 def test_off_mode_passes_the_microphone_through_untouched():
-    instance = af._AudioFrontendNode('/mic/audio', '/tts/audio',
-                                     node_suffix='off', mode=af.MODE_OFF)
+    instance = ec._EchoCancellationNode('/mic/audio', '/tts/audio',
+                                     node_suffix='off', mode=ec.MODE_OFF)
     instance.start()
     speech = _bursts(0.032, seed=14).tobytes()
     _say(instance, 1.0, BASE_T)
@@ -363,7 +363,7 @@ def test_the_published_chunk_keeps_the_input_stamp(node):
     published = node._pub.raw_messages[0]
     assert published.header.stamp.sec == incoming.header.stamp.sec
     assert published.header.stamp.nanosec == incoming.header.stamp.nanosec
-    assert published.format == af.AUDIO_FORMAT
+    assert published.format == ec.AUDIO_FORMAT
 
 
 def test_the_end_of_utterance_marker_is_not_reference_audio(node):
@@ -372,7 +372,7 @@ def test_the_end_of_utterance_marker_is_not_reference_audio(node):
     Treating it as audio would extend the mute by its own duration and, worse,
     feed four samples of square wave to the delay tracker.
     """
-    node._ref_cb(_chunk(af.AUDIO_EOF_MAGIC, BASE_T))
+    node._ref_cb(_chunk(ec.AUDIO_EOF_MAGIC, BASE_T))
     diagnostics = node.diagnostics()
     assert diagnostics["ref_utterances_ended"] == 1
     assert diagnostics["ref_chunks"] == 0
@@ -394,7 +394,7 @@ def test_a_silent_reference_chunk_does_not_arm_the_gate(node):
 
 def test_the_microphone_topic_is_refused_as_a_reference():
     """Correlating the mic against itself would mute permanently at delay 0."""
-    instance = af._AudioFrontendNode('/mic/audio', '/mic/audio', node_suffix='self')
+    instance = ec._EchoCancellationNode('/mic/audio', '/mic/audio', node_suffix='self')
     assert instance._ref_topic == ''
     instance.start()
     assert [sub.topic for sub in instance.subscriptions] == ['/mic/audio']
@@ -424,22 +424,22 @@ def test_a_foreign_format_is_counted_but_still_processed(node):
 
 
 def test_auto_tail_follows_the_measured_delay(node):
-    node.apply_config(mute_tail=af.MUTE_TAIL_AUTO)
-    assert node._tail_s() == pytest.approx(af.AUTO_TAIL_FALLBACK_S)
+    node.apply_config(mute_tail=ec.MUTE_TAIL_AUTO)
+    assert node._tail_s() == pytest.approx(ec.AUTO_TAIL_FALLBACK_S)
     with node._tracker_lock:
         node._tracker._accept(1.10)
-    assert node._tail_s() == pytest.approx(1.10 + af.AUTO_TAIL_MARGIN_S)
+    assert node._tail_s() == pytest.approx(1.10 + ec.AUTO_TAIL_MARGIN_S)
 
 
 def test_the_output_topic_is_the_input_plus_a_suffix(node):
     topic_in, topic_out = node.topics()
     assert topic_in[0]["topic"] == '/mic/audio'
-    assert topic_out[0]["topic"] == '/mic/audio' + af.OUTPUT_SUFFIX
-    assert topic_out[0]["format"] == af.AUDIO_FORMAT
+    assert topic_out[0]["topic"] == '/mic/audio' + ec.OUTPUT_SUFFIX
+    assert topic_out[0]["format"] == ec.AUDIO_FORMAT
 
 
 def test_starting_without_a_microphone_is_an_error_not_a_silent_no_op():
-    instance = af._AudioFrontendNode('', '/tts/audio', node_suffix='bare')
+    instance = ec._EchoCancellationNode('', '/tts/audio', node_suffix='bare')
     result = instance.start()
     assert result["state"] == "error"
     assert "microphone" in result["message"]
@@ -448,7 +448,7 @@ def test_starting_without_a_microphone_is_an_error_not_a_silent_no_op():
 # ── reference buffer ─────────────────────────────────────────────────────────
 
 def test_the_reference_buffer_answers_by_time():
-    buffer = af._RefBuffer(2.0)
+    buffer = ec._RefBuffer(2.0)
     wave = _bursts(0.3, seed=40)
     for index in range(3):
         start = index * REF_CHUNK_SAMPLES
@@ -466,7 +466,7 @@ def test_a_hole_in_the_reference_is_silence_not_a_seam():
     block after it — and the misalignment is indistinguishable from the delay
     having changed, which is the one thing the card is trying to track.
     """
-    buffer = af._RefBuffer(10.0)
+    buffer = ec._RefBuffer(10.0)
     chunk = _bursts(0.1, seed=41)[:REF_CHUNK_SAMPLES].tobytes()
     buffer.add(chunk, BASE_T)
     buffer.add(chunk, BASE_T + 3.0)
@@ -475,7 +475,7 @@ def test_a_hole_in_the_reference_is_silence_not_a_seam():
 
 
 def test_the_reference_buffer_keeps_a_prebuffer_burst_contiguous():
-    buffer = af._RefBuffer(2.0)
+    buffer = ec._RefBuffer(2.0)
     wave = _bursts(0.5, seed=42)
     for index in range(5):
         start = index * REF_CHUNK_SAMPLES
@@ -486,7 +486,7 @@ def test_the_reference_buffer_keeps_a_prebuffer_burst_contiguous():
 
 
 def test_the_reference_buffer_drops_the_oldest_audio_and_keeps_its_axis():
-    buffer = af._RefBuffer(0.3)
+    buffer = ec._RefBuffer(0.3)
     wave = _bursts(1.0, seed=43)
     for index in range(10):
         start = index * REF_CHUNK_SAMPLES
@@ -503,9 +503,9 @@ def test_the_reference_buffer_drops_the_oldest_audio_and_keeps_its_axis():
 def _room(ms: float = 60, seed: int = 0, decay_ms: float = 40.0) -> np.ndarray:
     """A synthetic echo path: decaying random taps, unit energy."""
     rng = np.random.default_rng(seed)
-    taps = int(ms * af.SAMPLE_RATE / 1000)
+    taps = int(ms * ec.SAMPLE_RATE / 1000)
     impulse = rng.normal(0, 1, taps) * np.exp(
-        -np.arange(taps) / (decay_ms * af.SAMPLE_RATE / 1000))
+        -np.arange(taps) / (decay_ms * ec.SAMPLE_RATE / 1000))
     return impulse / np.sqrt(np.square(impulse).sum())
 
 
@@ -517,16 +517,16 @@ def _cancel_session(strength="gentle", seconds=18.0, seed=1, gain=0.5, room_ms=6
     person = np.zeros_like(reference)
     if talk is not None:
         voice = _bursts(seconds, seed=seed + 77, amplitude=talker).astype(np.float32)
-        lo, hi = int(talk[0] * af.SAMPLE_RATE), int(talk[1] * af.SAMPLE_RATE)
+        lo, hi = int(talk[0] * ec.SAMPLE_RATE), int(talk[1] * ec.SAMPLE_RATE)
         person[lo:hi] = voice[lo:hi]
     rng = np.random.default_rng(seed + 9)
     mic = (echo.astype(np.float32) + person
            + rng.normal(0, noise, reference.size).astype(np.float32))
 
-    canceller = af._EchoCanceller(strength=strength)
+    canceller = ec._EchoCanceller(strength=strength)
     out = np.zeros_like(mic)
-    for start in range(0, reference.size - af.AEC_BLOCK + 1, af.AEC_BLOCK):
-        stop = start + af.AEC_BLOCK
+    for start in range(0, reference.size - ec.AEC_BLOCK + 1, ec.AEC_BLOCK):
+        stop = start + ec.AEC_BLOCK
         out[start:stop] = canceller.process(mic[start:stop], reference[start:stop])
     return mic, out, person, canceller
 
@@ -540,7 +540,7 @@ def _db(signal, residual, window=None):
 
 def test_the_canceller_converges_on_a_synthetic_room():
     mic, out, _, canceller = _cancel_session()
-    settled = slice(int(12 * af.SAMPLE_RATE), mic.size)
+    settled = slice(int(12 * ec.SAMPLE_RATE), mic.size)
     assert _db(mic, out, settled) > 15.0
     # Reported over the last few seconds of robot speech, not the whole run,
     # so it tracks the settled figure rather than being dragged down by
@@ -561,8 +561,8 @@ def test_the_canceller_converges_on_a_synthetic_room():
 ])
 def test_removal_strength_is_the_trade_it_claims(strength, min_erle, min_person):
     mic, out, person, _ = _cancel_session(strength=strength, talk=(8.0, 12.0))
-    echo_only = slice(int(5 * af.SAMPLE_RATE), int(8 * af.SAMPLE_RATE))
-    double_talk = slice(int(8 * af.SAMPLE_RATE), int(12 * af.SAMPLE_RATE))
+    echo_only = slice(int(5 * ec.SAMPLE_RATE), int(8 * ec.SAMPLE_RATE))
+    double_talk = slice(int(8 * ec.SAMPLE_RATE), int(12 * ec.SAMPLE_RATE))
     assert _db(mic, out, echo_only) > min_erle
     assert _db(person, out - person, double_talk) > min_person
 
@@ -575,8 +575,8 @@ def test_double_talk_does_not_destroy_a_converged_filter():
     filter kept improving rather than being dragged apart.
     """
     mic, out, _, _ = _cancel_session(talk=(8.0, 12.0))
-    before = _db(mic, out, slice(int(5 * af.SAMPLE_RATE), int(8 * af.SAMPLE_RATE)))
-    after = _db(mic, out, slice(int(13 * af.SAMPLE_RATE), int(18 * af.SAMPLE_RATE)))
+    before = _db(mic, out, slice(int(5 * ec.SAMPLE_RATE), int(8 * ec.SAMPLE_RATE)))
+    after = _db(mic, out, slice(int(13 * ec.SAMPLE_RATE), int(18 * ec.SAMPLE_RATE)))
     assert before > 15.0
     assert after >= before - 1.0
 
@@ -593,20 +593,20 @@ def test_a_double_talk_window_does_not_trip_the_divergence_guard():
     """
     mic, out, _, canceller = _cancel_session(talk=(8.0, 12.0), talker=8000)
     assert canceller._resets == 0
-    after = _db(mic, out, slice(int(13 * af.SAMPLE_RATE), int(18 * af.SAMPLE_RATE)))
+    after = _db(mic, out, slice(int(13 * ec.SAMPLE_RATE), int(18 * ec.SAMPLE_RATE)))
     assert after > 15.0, "the filter must still be converged afterwards"
 
 
 def test_a_diverging_filter_is_zeroed():
     """The half that powers *can* judge: an output worse than its input."""
-    canceller = af._EchoCanceller(strength="gentle")
+    canceller = ec._EchoCanceller(strength="gentle")
     rng = np.random.default_rng(5)
-    reference = rng.normal(0, 6000, af.AEC_BLOCK * 80).astype(np.float32)
+    reference = rng.normal(0, 6000, ec.AEC_BLOCK * 80).astype(np.float32)
     for index in range(80):
-        block = slice(index * af.AEC_BLOCK, (index + 1) * af.AEC_BLOCK)
+        block = slice(index * ec.AEC_BLOCK, (index + 1) * ec.AEC_BLOCK)
         # Force the state a diverged filter would be in, then feed it audio.
         canceller._weights += 50.0
-        canceller.process(rng.normal(0, 300, af.AEC_BLOCK).astype(np.float32),
+        canceller.process(rng.normal(0, 300, ec.AEC_BLOCK).astype(np.float32),
                           reference[block])
     assert canceller._resets >= 1
     assert canceller._benefit_db is not None and canceller._benefit_db < 0
@@ -619,10 +619,10 @@ def test_a_measurement_goes_stale_after_enough_unexplained_speech():
     silent since. Fifteen seconds of it *talking* with no measurable echo is a
     different thing: the microphone has stopped hearing the speaker.
     """
-    tracker = af._DelayTracker()
+    tracker = ec._DelayTracker()
     tracker._accept(0.45)
     assert tracker.fresh() is True
-    tracker.note_far_active(af.DELAY_STALE_AFTER_FAR_ACTIVE_S + 1.0)
+    tracker.note_far_active(ec.DELAY_STALE_AFTER_FAR_ACTIVE_S + 1.0)
     assert tracker.fresh() is False
     assert tracker.report()["echo_delay_fresh"] is False
 
@@ -638,7 +638,7 @@ def test_the_reported_erle_ignores_double_talk_blocks():
     """
     mic, out, _, canceller = _cancel_session(seconds=14.0, talk=(11.0, 14.0),
                                              talker=12000)
-    echo_only = slice(int(8 * af.SAMPLE_RATE), int(10.5 * af.SAMPLE_RATE))
+    echo_only = slice(int(8 * ec.SAMPLE_RATE), int(10.5 * ec.SAMPLE_RATE))
     settled = _db(mic, out, echo_only)
     assert settled > 15.0
     assert canceller.erle_db is not None
@@ -655,14 +655,14 @@ def test_the_step_size_stays_under_the_measured_stability_edge():
     diverged filter is worse than no filter at all, so this sits a factor of two
     below the edge rather than taking the last 2 dB.
     """
-    assert af.AEC_MU <= 0.3
+    assert ec.AEC_MU <= 0.3
 
 
 def test_the_suppressor_ramps_instead_of_stepping():
     """A gain that changes every 16 ms would be heard as a click."""
-    canceller = af._EchoCanceller(strength="aggressive")
-    error = np.full(af.AEC_BLOCK, 1000.0, dtype=np.float32)
-    estimate = np.full(af.AEC_BLOCK, 4000.0, dtype=np.float32)
+    canceller = ec._EchoCanceller(strength="aggressive")
+    error = np.full(ec.AEC_BLOCK, 1000.0, dtype=np.float32)
+    estimate = np.full(ec.AEC_BLOCK, 4000.0, dtype=np.float32)
     out = canceller._suppress(error, estimate, far_active=True)
     assert out[0] == pytest.approx(error[0], rel=0.01), "starts at the old gain"
     assert out[-1] < error[-1] * 0.5, "ends at the new one"
@@ -672,8 +672,8 @@ def test_the_suppressor_ramps_instead_of_stepping():
 # ── cancellation through the node ────────────────────────────────────────────
 
 def _cancelling_node(delay=0.45, strength="gentle", measured=True):
-    node = af._AudioFrontendNode('/mic/audio', '/tts/audio', node_suffix='aec',
-                                 mode=af.MODE_CANCEL, removal_strength=strength)
+    node = ec._EchoCancellationNode('/mic/audio', '/tts/audio', node_suffix='aec',
+                                 mode=ec.MODE_CANCEL, removal_strength=strength)
     node.start()
     if measured:
         # The tracker needs seconds of audio to measure; the cancellation path
@@ -695,7 +695,7 @@ def _play_and_listen(node, delay=0.45, seconds=10.0, seed=2, gain=0.5):
     reference = _bursts(seconds, seed=seed)
     echo = np.convolve(reference.astype(np.float32),
                        _room(60, seed) * gain)[:reference.size]
-    shift = int(delay * af.SAMPLE_RATE)
+    shift = int(delay * ec.SAMPLE_RATE)
     mic = np.zeros(reference.size, dtype=np.float32)
     mic[shift:] = echo[:reference.size - shift]
     mic += np.random.default_rng(seed + 3).normal(0, 30, mic.size).astype(np.float32)
@@ -703,9 +703,9 @@ def _play_and_listen(node, delay=0.45, seconds=10.0, seed=2, gain=0.5):
 
     events = []
     for start in range(0, reference.size - REF_CHUNK_SAMPLES + 1, REF_CHUNK_SAMPLES):
-        events.append((start / af.SAMPLE_RATE, 'ref', start, REF_CHUNK_SAMPLES))
+        events.append((start / ec.SAMPLE_RATE, 'ref', start, REF_CHUNK_SAMPLES))
     for start in range(0, mic16.size - MIC_CHUNK_SAMPLES + 1, MIC_CHUNK_SAMPLES):
-        events.append((start / af.SAMPLE_RATE, 'mic', start, MIC_CHUNK_SAMPLES))
+        events.append((start / ec.SAMPLE_RATE, 'mic', start, MIC_CHUNK_SAMPLES))
     events.sort(key=lambda item: (item[0], item[1]))     # ref before mic at a tie
 
     for offset, kind, start, count in events:
@@ -769,7 +769,7 @@ def test_cancelled_chunks_carry_their_own_stamp_and_keep_the_cadence():
     gaps = np.diff(stamps)
     assert np.allclose(gaps, 0.032, atol=1e-6), "no gaps and no overlaps"
     assert stamps[0] >= BASE_T
-    assert stamps[0] <= BASE_T + af.AEC_BLOCK / af.SAMPLE_RATE + 1e-9
+    assert stamps[0] <= BASE_T + ec.AEC_BLOCK / ec.SAMPLE_RATE + 1e-9
     node.retire()
 
 
@@ -784,7 +784,7 @@ def test_the_node_falls_back_to_muting_when_the_coupling_is_lost():
     """
     node = _cancelling_node()
     with node._tracker_lock:
-        node._tracker.note_far_active(af.DELAY_STALE_AFTER_FAR_ACTIVE_S + 1.0)
+        node._tracker.note_far_active(ec.DELAY_STALE_AFTER_FAR_ACTIVE_S + 1.0)
     speech = _bursts(0.032, seed=53).tobytes()
     _say(node, 1.0, BASE_T)
     _hear(node, speech, BASE_T + 0.5)
@@ -798,11 +798,11 @@ def test_the_node_falls_back_to_muting_when_the_coupling_is_lost():
 
 
 def test_switching_into_cancel_mode_starts_from_a_clean_filter():
-    node = af._AudioFrontendNode('/mic/audio', '/tts/audio', node_suffix='sw',
-                                 mode=af.MODE_MUTE)
+    node = ec._EchoCancellationNode('/mic/audio', '/tts/audio', node_suffix='sw',
+                                 mode=ec.MODE_MUTE)
     node.start()
     first = node._aec
-    node.apply_config(mode=af.MODE_CANCEL)
+    node.apply_config(mode=ec.MODE_CANCEL)
     assert node._aec is not first
     assert node._pending == b'' and node._out == b''
     node.retire()
@@ -816,7 +816,7 @@ def test_changing_the_strength_keeps_the_converged_filter():
     assert node._aec._weights is not weights
     assert np.array_equal(node._aec._weights, weights), \
         "the suppressor sits after the filter and shares no state with it"
-    assert node._aec._beta == af.SUPPRESSION_STRENGTHS["aggressive"]
+    assert node._aec._beta == ec.SUPPRESSION_STRENGTHS["aggressive"]
     node.retire()
 
 
@@ -844,7 +844,7 @@ class _FakeTTS:
 
     def dispatch(self, name, args):
         self.calls += 1
-        return {"topic_out": [{"topic": topic, "format": af.AUDIO_FORMAT,
+        return {"topic_out": [{"topic": topic, "format": ec.AUDIO_FORMAT,
                                "desc": ""} for topic in self.topics]}
 
 
@@ -856,13 +856,13 @@ class _BrokenTTS:
 @pytest.fixture
 def plugin():
     executor = _FakeExecutor()
-    instance = af.AudioFrontendPlugin({}, executor, tts=_FakeTTS())
+    instance = ec.EchoCancellationPlugin({}, executor, tts=_FakeTTS())
     yield instance
-    instance.dispatch("audio_frontend", {"action": "stop"})
+    instance.dispatch("echo_cancellation", {"action": "stop"})
 
 
 def test_auto_resolves_the_reference_from_the_tts_plugin(plugin):
-    plugin.dispatch("audio_frontend", {"action": "start", "instance_id": "c1",
+    plugin.dispatch("echo_cancellation", {"action": "start", "instance_id": "c1",
                                        "input_topic": "/mic/audio"})
     node = plugin._nodes["c1"]
     assert node._ref_topic == '/tts/audio'
@@ -870,10 +870,10 @@ def test_auto_resolves_the_reference_from_the_tts_plugin(plugin):
 
 
 def test_auto_with_no_tts_in_this_process_says_so_on_the_card():
-    plugin = af.AudioFrontendPlugin({}, _FakeExecutor(), tts=None)
-    plugin.dispatch("audio_frontend", {"action": "start", "instance_id": "c1",
+    plugin = ec.EchoCancellationPlugin({}, _FakeExecutor(), tts=None)
+    plugin.dispatch("echo_cancellation", {"action": "start", "instance_id": "c1",
                                        "input_topic": "/mic/audio"})
-    info = plugin.dispatch("audio_frontend", {"action": "info", "instance_id": "c1"})
+    info = plugin.dispatch("echo_cancellation", {"action": "info", "instance_id": "c1"})
     assert info["diagnostics"]["robot_voice_topic"] is None
     assert "does not pass through Agent Core" in info["desc"]
     # And it is a passthrough rather than a gate that mutes at random.
@@ -886,8 +886,8 @@ def test_a_broken_tts_does_not_stop_this_card_answering(plugin):
     plugin._tts = _BrokenTTS()
     tools = plugin.get_tools()
     options = tools[0]["configSchema"]["properties"]["robot_voice_topic"]["oneOf"]
-    assert [option["const"] for option in options] == [af.REF_AUTO]
-    assert plugin.dispatch("audio_frontend", {"action": "info"})["state"] == "idle"
+    assert [option["const"] for option in options] == [ec.REF_AUTO]
+    assert plugin.dispatch("echo_cancellation", {"action": "info"})["state"] == "idle"
 
 
 def test_the_dropdown_lists_the_topics_tts_is_publishing_now(plugin):
@@ -895,31 +895,31 @@ def test_the_dropdown_lists_the_topics_tts_is_publishing_now(plugin):
     options = plugin.get_tools()[0]["configSchema"]["properties"][
         "robot_voice_topic"]["oneOf"]
     assert [option["const"] for option in options] == [
-        af.REF_AUTO, '/g1/tts/audio', '/ext/tts/audio']
+        ec.REF_AUTO, '/g1/tts/audio', '/ext/tts/audio']
 
 
 def test_a_configured_topic_stays_selectable_when_its_publisher_is_down():
-    plugin = af.AudioFrontendPlugin({"robot_voice_topic": "/other/box/tts/audio"},
+    plugin = ec.EchoCancellationPlugin({"robot_voice_topic": "/other/box/tts/audio"},
                                     _FakeExecutor(), tts=_FakeTTS(()))
     options = plugin.get_tools()[0]["configSchema"]["properties"][
         "robot_voice_topic"]["oneOf"]
     assert [option["const"] for option in options] == [
-        af.REF_AUTO, "/other/box/tts/audio"]
+        ec.REF_AUTO, "/other/box/tts/audio"]
 
 
 def test_the_module_level_tools_are_not_mutated_by_a_lookup(plugin):
-    before = len(af.TOOLS[0]["configSchema"]["properties"]["robot_voice_topic"]["oneOf"])
+    before = len(ec.TOOLS[0]["configSchema"]["properties"]["robot_voice_topic"]["oneOf"])
     plugin.get_tools()
     plugin.get_tools()
-    after = len(af.TOOLS[0]["configSchema"]["properties"]["robot_voice_topic"]["oneOf"])
+    after = len(ec.TOOLS[0]["configSchema"]["properties"]["robot_voice_topic"]["oneOf"])
     assert before == after == 1
 
 
 def test_changing_the_reference_topic_rebuilds_the_node(plugin):
-    plugin.dispatch("audio_frontend", {"action": "start", "instance_id": "c1",
+    plugin.dispatch("echo_cancellation", {"action": "start", "instance_id": "c1",
                                        "input_topic": "/mic/audio"})
     first = plugin._nodes["c1"]
-    plugin.dispatch("audio_frontend", {"action": "config", "instance_id": "c1",
+    plugin.dispatch("echo_cancellation", {"action": "config", "instance_id": "c1",
                                        "robot_voice_topic": "/other/tts/audio"})
     second = plugin._nodes["c1"]
     # A new node, because a subscription cannot be recreated on a spinning one:
@@ -931,41 +931,41 @@ def test_changing_the_reference_topic_rebuilds_the_node(plugin):
 
 
 def test_changing_the_mode_does_not_rebuild_the_node(plugin):
-    plugin.dispatch("audio_frontend", {"action": "start", "instance_id": "c1",
+    plugin.dispatch("echo_cancellation", {"action": "start", "instance_id": "c1",
                                        "input_topic": "/mic/audio"})
     node = plugin._nodes["c1"]
-    plugin.dispatch("audio_frontend", {"action": "config", "instance_id": "c1",
-                                       "mode": af.MODE_OFF, "mute_tail": "1500ms"})
+    plugin.dispatch("echo_cancellation", {"action": "config", "instance_id": "c1",
+                                       "mode": ec.MODE_OFF, "mute_tail": "1500ms"})
     assert plugin._nodes["c1"] is node
-    assert node._mode == af.MODE_OFF
+    assert node._mode == ec.MODE_OFF
     assert node._tail_s() == pytest.approx(1.5)
 
 
 def test_start_is_idempotent(plugin):
     args = {"action": "start", "instance_id": "c1", "input_topic": "/mic/audio"}
-    plugin.dispatch("audio_frontend", args)
+    plugin.dispatch("echo_cancellation", args)
     node = plugin._nodes["c1"]
-    plugin.dispatch("audio_frontend", args)
+    plugin.dispatch("echo_cancellation", args)
     assert plugin._nodes["c1"] is node
     assert [sub.topic for sub in node.subscriptions].count('/mic/audio') == 1
 
 
 def test_rewiring_the_microphone_replaces_the_node(plugin):
-    plugin.dispatch("audio_frontend", {"action": "start", "instance_id": "c1",
+    plugin.dispatch("echo_cancellation", {"action": "start", "instance_id": "c1",
                                        "input_topic": "/mic/audio"})
     first = plugin._nodes["c1"]
-    plugin.dispatch("audio_frontend", {"action": "start", "instance_id": "c1",
+    plugin.dispatch("echo_cancellation", {"action": "start", "instance_id": "c1",
                                        "input_topic": "/ext_mic/1/audio"})
     second = plugin._nodes["c1"]
     assert second is not first and first.destroyed is True
-    assert second._output_topic == '/ext_mic/1/audio' + af.OUTPUT_SUFFIX
+    assert second._output_topic == '/ext_mic/1/audio' + ec.OUTPUT_SUFFIX
 
 
 def test_stop_disposes_the_node_and_leaves_the_executor_clean(plugin):
-    plugin.dispatch("audio_frontend", {"action": "start", "instance_id": "c1",
+    plugin.dispatch("echo_cancellation", {"action": "start", "instance_id": "c1",
                                        "input_topic": "/mic/audio"})
     node = plugin._nodes["c1"]
-    plugin.dispatch("audio_frontend", {"action": "stop", "instance_id": "c1"})
+    plugin.dispatch("echo_cancellation", {"action": "stop", "instance_id": "c1"})
     assert plugin._nodes == {}
     assert node.destroyed is True
     assert plugin._executor.nodes == []
@@ -984,7 +984,7 @@ def test_a_concurrent_stop_cannot_orphan_a_live_node(plugin):
     def hammer(action):
         for _ in range(40):
             try:
-                plugin.dispatch("audio_frontend",
+                plugin.dispatch("echo_cancellation",
                                 args if action == "start"
                                 else {"action": "stop", "instance_id": "c1"})
             except Exception as error:  # noqa: BLE001
@@ -998,48 +998,48 @@ def test_a_concurrent_stop_cannot_orphan_a_live_node(plugin):
         thread.join()
     assert not errors
 
-    plugin.dispatch("audio_frontend", {"action": "stop"})
+    plugin.dispatch("echo_cancellation", {"action": "stop"})
     assert plugin._nodes == {}
     assert plugin._executor.nodes == []
     live = [instance for instance in _FakeNode.instances
-            if isinstance(instance, af._AudioFrontendNode) and not instance.destroyed]
+            if isinstance(instance, ec._EchoCancellationNode) and not instance.destroyed]
     assert live == [], "every node built must end up destroyed"
 
 
 def test_info_says_nothing_has_been_heard_yet(plugin):
-    plugin.dispatch("audio_frontend", {"action": "start", "instance_id": "c1",
+    plugin.dispatch("echo_cancellation", {"action": "start", "instance_id": "c1",
                                        "input_topic": "/mic/audio"})
-    info = plugin.dispatch("audio_frontend", {"action": "info", "instance_id": "c1"})
+    info = plugin.dispatch("echo_cancellation", {"action": "info", "instance_id": "c1"})
     assert info["diagnostics"]["robot_voice_seen"] is False
     assert "nothing heard yet" in info["desc"]
 
 
 def test_info_flags_a_tail_shorter_than_the_measured_delay(plugin):
-    plugin.dispatch("audio_frontend", {"action": "config", "instance_id": "c1",
+    plugin.dispatch("echo_cancellation", {"action": "config", "instance_id": "c1",
                                        "mute_tail": "300ms"})
-    plugin.dispatch("audio_frontend", {"action": "start", "instance_id": "c1",
+    plugin.dispatch("echo_cancellation", {"action": "start", "instance_id": "c1",
                                        "input_topic": "/mic/audio"})
     node = plugin._nodes["c1"]
     _say(node, 0.3, BASE_T)
     with node._tracker_lock:
         node._tracker._accept(1.05)
 
-    info = plugin.dispatch("audio_frontend", {"action": "info", "instance_id": "c1"})
+    info = plugin.dispatch("echo_cancellation", {"action": "info", "instance_id": "c1"})
     assert info["diagnostics"]["mute_tail_shorter_than_measured_delay"] is True
     assert "shorter than" in info["desc"]
 
 
 def test_info_without_an_instance_reports_the_card(plugin):
-    plugin.dispatch("audio_frontend", {"action": "start", "instance_id": "c1",
+    plugin.dispatch("echo_cancellation", {"action": "start", "instance_id": "c1",
                                        "input_topic": "/mic/audio"})
-    info = plugin.dispatch("audio_frontend", {"action": "info"})
+    info = plugin.dispatch("echo_cancellation", {"action": "info"})
     assert info["state"] == "running"
-    assert info["topic_out"][0]["topic"] == '/mic/audio' + af.OUTPUT_SUFFIX
+    assert info["topic_out"][0]["topic"] == '/mic/audio' + ec.OUTPUT_SUFFIX
     assert info["instances"] == {"c1": {"state": "running"}}
 
 
 def test_an_unknown_action_is_declined_not_answered(plugin):
-    assert plugin.dispatch("audio_frontend", {"action": "speak"}) is None
+    assert plugin.dispatch("echo_cancellation", {"action": "speak"}) is None
 
 
 def test_the_callback_cost_is_reported(plugin):
@@ -1050,7 +1050,7 @@ def test_the_callback_cost_is_reported(plugin):
     3.6 ms for the same callback profiled on its own. Naming it `cpu_*` invited
     exactly the wrong conclusion from the difference.
     """
-    plugin.dispatch("audio_frontend", {"action": "start", "instance_id": "c1",
+    plugin.dispatch("echo_cancellation", {"action": "start", "instance_id": "c1",
                                        "input_topic": "/mic/audio"})
     node = plugin._nodes["c1"]
     speech = _bursts(0.032, seed=21).tobytes()

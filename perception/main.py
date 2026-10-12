@@ -159,16 +159,16 @@ class PerceptionBundle:
                           exc_info=True)
 
         # Built after TTS and holding a handle to it, for the same reason ASR
-        # holds one to speaker_recognition: the audio frontend's reference
+        # holds one to speaker_recognition: the echo cancellation's reference
         # signal *is* the TTS card's audio output, and asking the plugin in this
         # process is what lets `robot_voice_topic: auto` need no configuration
         # at all. The handle is optional — without it `auto` resolves to
         # nothing and the card says so on its face rather than muting at random.
-        if plugins_cfg.get("audio_frontend", {}).get("enabled", True):
-            from plugins.audio_frontend import AudioFrontendPlugin
-            self._plugins.append(AudioFrontendPlugin(
-                plugins_cfg.get("audio_frontend", {}), executor, tts=tts_plugin))
-            log.info("AudioFrontendPlugin loaded (tts=%s)",
+        if plugins_cfg.get("echo_cancellation", {}).get("enabled", True):
+            from plugins.echo_cancellation import EchoCancellationPlugin
+            self._plugins.append(EchoCancellationPlugin(
+                plugins_cfg.get("echo_cancellation", {}), executor, tts=tts_plugin))
+            log.info("EchoCancellationPlugin loaded (tts=%s)",
                      "yes" if tts_plugin else "no")
 
         if plugins_cfg.get("vop", {}).get("enabled", False):

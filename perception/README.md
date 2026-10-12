@@ -1,7 +1,7 @@
 # Perception Stack
 
 Perception plugins running as one MCP HTTP server: speech (`asr`, `tts`,
-`audio_frontend` echo handling), vision (`vop` object detection, `visual_depth`
+`echo_cancellation` echo handling), vision (`vop` object detection, `visual_depth`
 monocular depth, `ocr`, `face_recognition`, `pose` human keypoints + actions,
 `barcode` QR/条码扫码).
 Connects to Agent Core via MCP tool calls and exchanges
@@ -81,7 +81,7 @@ The VAD parameters can be adjusted per ASR canvas card via the instance config (
 
 ---
 
-## Audio Frontend: keeping the robot's own voice out of its microphone
+## Echo Cancellation: keeping the robot's own voice out of its microphone
 
 The robot's TTS reaches its own microphone acoustically, and until this card
 existed nothing in perception removed it. The symptoms did not look like one
@@ -94,7 +94,7 @@ Wire it between the microphone card and everything that consumes microphone
 audio:
 
 ```
-mic ──▶ audio_frontend ──▶ asr
+mic ──▶ echo_cancellation ──▶ asr
                        └──▶ soundevent
 ```
 
@@ -197,7 +197,7 @@ carries that as well at 1/160th of the arithmetic. It runs in
 `mute_while_talking` too, where the gate barely needs it — so that an operator
 can read the robot's real delay off a running card before deciding anything.
 
-What the synthetic sweeps in `tests/test_audio_frontend_plugin.py` establish:
+What the synthetic sweeps in `tests/test_echo_cancellation_plugin.py` establish:
 
 | Condition | Result |
 |---|---|
@@ -3945,7 +3945,7 @@ Three rules that follow, each with a reason:
 |-----------|--------------|--------|
 | Input (mic) | `/{namespace}/mic/audio` or `/{namespace}/ext_mic/{id}/audio` | `audio/pcm-16k` |
 | Output (ASR result) | `{input_topic}/asr` | `data/json` |
-| Output (audio_frontend) | `{input_topic}/clean` | `audio/pcm-16k` |
+| Output (echo_cancellation) | `{input_topic}/clean` | `audio/pcm-16k` |
 | Output (vop) | `{input_topic}/objects` | `data/json` |
 | Output (visual_depth map) | `{input_topic}/visual_depth` | `image/depth-zlib` |
 | Output (visual_depth summary) | `{input_topic}/visual_depth_summary` | `data/json` |
