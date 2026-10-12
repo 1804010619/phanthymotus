@@ -433,10 +433,19 @@ def test_the_output_topic_is_the_input_plus_a_suffix(node):
     assert topic_out[0]["format"] == ec.AUDIO_FORMAT
 
 
-def test_starting_without_a_microphone_is_an_error_not_a_silent_no_op():
+def test_starting_without_a_microphone_is_idle_and_never_an_error():
+    """`error` here stops every other card on the canvas.
+
+    agent-core's start-project rolls the whole project back when any card
+    returns `state: error` (`api/config.py`, "有 card 失败 → 全部回滚"). Measured
+    on Orin 5: a second echo_cancellation card that nobody had wired up made
+    OCR, face recognition, TTS, ASR and the *working* copy of this card all
+    start correctly and then stop one second later. A card waiting to be wired
+    is an ordinary state — tts, ocr and barcode all support a topic-less card.
+    """
     instance = ec._EchoCancellationNode('', '/tts/audio', node_suffix='bare')
     result = instance.start()
-    assert result["state"] == "error"
+    assert result["state"] == "idle"
     assert "microphone" in result["message"]
 
 
@@ -1058,6 +1067,13 @@ def test_a_concurrent_stop_cannot_orphan_a_live_node(plugin):
     live = [instance for instance in _FakeNode.instances
             if isinstance(instance, ec._EchoCancellationNode) and not instance.destroyed]
     assert live == [], "every node built must end up destroyed"
+
+
+def test_an_unwired_card_says_what_it_is_waiting_for(plugin):
+    plugin.dispatch("echo_cancellation", {"action": "start", "instance_id": "c1"})
+    info = plugin.dispatch("echo_cancellation", {"action": "info", "instance_id": "c1"})
+    assert info["state"] == "idle"
+    assert "Not connected to a microphone" in info["desc"]
 
 
 def test_info_says_nothing_has_been_heard_yet(plugin):

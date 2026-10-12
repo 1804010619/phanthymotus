@@ -1135,9 +1135,19 @@ class _EchoCancellationNode(Node):
             if self.state == "running":
                 return self.status()
             if not self._input_topic:
-                return {"state": "error",
-                        "message": "echo_cancellation needs a microphone topic "
-                                   "(connect one on the canvas)"}
+                # Idle, **not** error. A card on the canvas with nothing wired
+                # into it yet is an ordinary state here — tts, ocr and barcode
+                # all support a topic-less card — and reporting `error` has a
+                # consequence far beyond this card: agent-core's start-project
+                # rolls the *whole project* back when any card returns it
+                # (`api/config.py`, "有 card 失败 → 全部回滚"). Measured on Orin 5:
+                # a second, unwired echo_cancellation card made every other card
+                # — OCR, face, TTS, ASR, and the wired copy of this one — start
+                # correctly and then stop one second later, with the reason
+                # visible only in the start-project progress events.
+                return {"state": "idle",
+                        "message": "No microphone connected — draw a line from "
+                                   "the mic card to this one"}
             from audio_msgs.msg import AudioChunk
             if self._pub is None:
                 self._pub = self.create_publisher(AudioChunk, self._output_topic, _AUDIO_QOS)
@@ -1781,6 +1791,8 @@ class EchoCancellationPlugin:
         """
         if node is None:
             return self._DESC
+        if not node._input_topic:
+            return "Not connected to a microphone — draw a line from the mic card"
         if not node._ref_topic:
             if how == "auto:none":
                 return ("No TTS audio to listen for — this robot's speech does not "
