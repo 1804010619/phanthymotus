@@ -118,11 +118,23 @@ _AUDIO_QOS = QoSProfile(
 
 # ── config vocabulary ────────────────────────────────────────────────────────
 
-MODE_OFF = "off"
-MODE_MUTE = "mute_while_talking"
-MODE_CANCEL = "remove_echo"
-MODES = (MODE_OFF, MODE_MUTE, MODE_CANCEL)
-DEFAULT_MODE = MODE_MUTE
+# No mode field, and that is a decision rather than an omission. This card
+# cancels; it does not offer muting as an alternative. Half-duplex muting cannot
+# do the job the card exists for — being interruptible — so offering it as a
+# choice would be offering a setting that fails the requirement, and asking an
+# operator to understand the trade in order to pick the only workable side of
+# it. What remains of muting is two bounded internal behaviours, neither of
+# them a setting:
+#
+#   * the first seconds of the robot's first utterance, before the delay has
+#     been measured. Subtracting an unaligned reference adds noise instead of
+#     removing echo, and passing the audio through means ASR transcribes the
+#     robot — so the microphone is held silent until there is something to align
+#     to. Roughly 3 s of the first sentence, once per session.
+#   * nothing else. When the coupling disappears mid-session the card passes
+#     audio through rather than muting: no measurable echo means there is
+#     nothing to remove, and a permanent mute would be exactly the unacceptable
+#     behaviour this paragraph exists to rule out.
 
 REF_AUTO = "auto"
 DEFAULT_ROBOT_VOICE_TOPIC = REF_AUTO
@@ -137,6 +149,9 @@ MUTE_TAIL_CHOICES: Dict[str, Optional[float]] = {
     "800ms": 0.8,
     "1500ms": 1.5,
 }
+# Also fixed. `auto` follows the delay the card measures for itself, which is
+# the only answer nobody has to look up — and since muting is now a bounded
+# warmup rather than a mode, there is nothing left for an operator to tune here.
 DEFAULT_MUTE_TAIL = MUTE_TAIL_AUTO
 # What `auto` uses before it has measured anything. 0.8 s is the middle of the
 # 0.7-1.2 s measured on G1 — deliberately not the smallest of them, because
@@ -549,6 +564,16 @@ SUPPRESSION_STRENGTHS = {
     "normal":     0.5,
     "aggressive": 1.0,
 }
+# Fixed, not offered on the card. `normal` keeps an interrupting voice 12 dB
+# above the residual — enough for ASR — while removing 5 dB more of the robot
+# than `gentle` does, and that 5 dB is the margin against the robot's own speech
+# reaching ASR. Still overridable from config.yaml or an `action=config` call,
+# which is how we would try `gentle` on a real robot without a rebuild; what it
+# is not is a question put to an operator.
+#
+# The number that could overturn this is not in hand: whether the residual's
+# *absolute* level still trips the VAD needs a real microphone, a real speaker
+# and ASR in the loop.
 DEFAULT_REMOVAL_STRENGTH = "normal"
 # The floor the soft gate may attenuate to. Not zero: a residual gated to
 # silence makes the robot's own voice disappear *and* takes the room with it, so
@@ -890,41 +915,21 @@ TOOLS = [
                     "type": "string",
                     "description": "Microphone AudioChunk topic (required for start)",
                 },
-                "instance_id": {
-                    "type": "string",
-                    "description": "Canvas card id, for multi-instance use",
-                },
+                # `instance_id` is deliberately NOT declared, though every call
+                # carries one. The canvas renders each inputSchema property it
+                # does not recognise as a manual input box on the card — it only
+                # hides `input_topic` (by name pattern) and an `action` whose
+                # values are all system actions — so declaring it put an
+                # "INSTANCE_ID" text field and an 执行 button on the face of the
+                # card, asking an operator to type a canvas id that the canvas
+                # fills in itself (canvas.js, "Inject instance_id from card
+                # identity"). No other plugin here declares it either.
             },
             "required": ["action"],
         },
         "configSchema": {
             "type": "object",
             "properties": {
-                "mode": {
-                    "type": "string",
-                    "title": "How to handle the robot's own voice",
-                    "default": DEFAULT_MODE,
-                    "scope": "instance",
-                    "oneOf": [
-                        {"const": MODE_MUTE,
-                         "title": "Mute the mic while the robot is talking"},
-                        {"const": MODE_CANCEL,
-                         "title": "Remove the robot's voice, keep listening "
-                                  "(people can interrupt it)"},
-                        {"const": MODE_OFF,
-                         "title": "Off — pass the microphone through unchanged"},
-                    ],
-                    "description": (
-                        "Muting is complete and foolproof, but nobody can interrupt "
-                        "the robot mid-sentence: while it talks, the microphone "
-                        "carries nothing. Removing keeps the microphone open the "
-                        "whole time, which is what allows interruption, but it "
-                        "removes 20-28 dB of the robot's voice rather than all of "
-                        "it, and it needs the robot's voice feed below. It falls "
-                        "back to muting until it has measured the delay. 'Off' is "
-                        "for comparing against no processing at all."
-                    ),
-                },
                 "robot_voice_topic": {
                     "type": "string",
                     "title": "Where the robot's own voice comes from",
@@ -945,53 +950,6 @@ TOOLS = [
                         "speaker plays. 'Automatic' is right unless this robot's "
                         "speech never passes through Agent Core (vendor TTS), in "
                         "which case this card cannot tell when it is talking."
-                    ),
-                },
-                "removal_strength": {
-                    "type": "string",
-                    "title": "How hard to scrub",
-                    "default": DEFAULT_REMOVAL_STRENGTH,
-                    "scope": "instance",
-                    "x-show-when": {"mode": [MODE_CANCEL]},
-                    "oneOf": [
-                        {"const": "gentle",
-                         "title": "Gentle — most natural voices, some echo remains"},
-                        {"const": "normal", "title": "Normal"},
-                        {"const": "aggressive",
-                         "title": "Aggressive — least echo, interrupting voices "
-                                  "come out quieter"},
-                    ],
-                    "description": (
-                        "Only affects what happens when somebody talks *while* the "
-                        "robot is talking. Measured against a person speaking over "
-                        "the robot: gentle removes 18 dB of the robot and keeps the "
-                        "person at 18 dB, normal removes 23 and keeps 12, "
-                        "aggressive removes 28 and keeps 7."
-                    ),
-                },
-                "mute_tail": {
-                    "type": "string",
-                    "title": "Keep the mic muted after the robot stops",
-                    "default": DEFAULT_MUTE_TAIL,
-                    "scope": "instance",
-                    "x-show-when": {"mode": [MODE_MUTE, MODE_CANCEL]},
-                    "oneOf": [
-                        {"const": MUTE_TAIL_AUTO,
-                         "title": "Automatic — follow the delay this card measures"},
-                        {"const": "300ms",
-                         "title": "300 ms — speaker plays instantly (USB / analog)"},
-                        {"const": "800ms",
-                         "title": "800 ms — speaker buffers (most robots)"},
-                        {"const": "1500ms",
-                         "title": "1.5 s — heavy buffering or Bluetooth"},
-                    ],
-                    "description": (
-                        "The robot is still audible for a while after its last "
-                        "audio is sent, because the speaker buffers — 0.7-1.2 s on "
-                        "a G1. Too short and the end of the robot's own sentence "
-                        "gets transcribed; too long and the first word of the "
-                        "reply is lost. The card reports the delay it measured in "
-                        "`info()`, which is what 'Automatic' follows."
                     ),
                 },
             },
@@ -1023,8 +981,7 @@ class _EchoCancellationNode(Node):
     """
 
     def __init__(self, input_topic: str, ref_topic: str = '', *,
-                 node_suffix: str = '', mode: str = DEFAULT_MODE,
-                 mute_tail: str = DEFAULT_MUTE_TAIL,
+                 node_suffix: str = '', mute_tail: str = DEFAULT_MUTE_TAIL,
                  removal_strength: str = DEFAULT_REMOVAL_STRENGTH) -> None:
         super().__init__(f"echo_cancellation_{node_suffix}" if node_suffix
                          else "echo_cancellation")
@@ -1037,7 +994,6 @@ class _EchoCancellationNode(Node):
             log.warning("[echo_cancellation] ignoring robot_voice_topic %r: it is the "
                         "microphone topic", ref_topic)
 
-        self._mode = mode if mode in MODES else DEFAULT_MODE
         self._mute_tail = mute_tail if mute_tail in MUTE_TAIL_CHOICES else DEFAULT_MUTE_TAIL
         self._removal_strength = (removal_strength if removal_strength in SUPPRESSION_STRENGTHS
                                   else DEFAULT_REMOVAL_STRENGTH)
@@ -1083,9 +1039,9 @@ class _EchoCancellationNode(Node):
         self._ref_sub = None
 
         log.info("[echo_cancellation] node created: mic=%s -> %s, robot_voice=%s, "
-                 "mode=%s, mute_tail=%s",
+                 "strength=%s",
                  self._input_topic or "(none)", self._output_topic or "(none)",
-                 self._ref_topic or "(none)", self._mode, self._mute_tail)
+                 self._ref_topic or "(none)", self._removal_strength)
 
     # ── lifecycle ────────────────────────────────────────────────────────
 
@@ -1111,8 +1067,8 @@ class _EchoCancellationNode(Node):
                 self._ref_sub = self.create_subscription(
                     AudioChunk, self._ref_topic, self._ref_cb, _AUDIO_QOS)
             self.state = "running"
-            log.info("[echo_cancellation] started: %s -> %s (mode=%s)",
-                     self._input_topic, self._output_topic, self._mode)
+            log.info("[echo_cancellation] started: %s -> %s",
+                     self._input_topic, self._output_topic)
             return self.status()
 
     def request_retire(self) -> None:
@@ -1135,8 +1091,7 @@ class _EchoCancellationNode(Node):
         log.info("[echo_cancellation] stopped: %s", self._input_topic)
         return {"state": "idle"}
 
-    def apply_config(self, mode: Optional[str] = None,
-                     mute_tail: Optional[str] = None,
+    def apply_config(self, mute_tail: Optional[str] = None,
                      removal_strength: Optional[str] = None) -> None:
         """Change the live knobs. Neither needs the node rebuilt.
 
@@ -1146,17 +1101,6 @@ class _EchoCancellationNode(Node):
         so the plugin disposes the node and builds a new one instead.
         """
         with self._node_lock:
-            if mode in MODES and mode != self._mode:
-                self._mode = mode
-                if mode == MODE_CANCEL:
-                    # A filter converged against a path nobody was listening to
-                    # is not worth keeping, and the reframing buffers must not
-                    # carry audio from before the switch.
-                    with self._aec_lock:
-                        self._aec = _EchoCanceller(strength=self._removal_strength)
-                        self._pending = b''
-                        self._out = b''
-                        self._mic_timeline.reset()
             if mute_tail in MUTE_TAIL_CHOICES:
                 self._mute_tail = mute_tail
             if removal_strength in SUPPRESSION_STRENGTHS:
@@ -1266,28 +1210,14 @@ class _EchoCancellationNode(Node):
                 self._stats["mic_gaps"] += 1
             self._last_mic_t = timestamp
 
-        # Fed from the raw microphone, before any muting — measuring the delay
-        # is exactly what this card can do for an operator *while* running in
-        # the mode that does not need it yet.
+        # Fed from the raw microphone, before anything is subtracted from it or
+        # silenced in it.
         with self._tracker_lock:
             self._tracker.add_mic(pcm, timestamp, now)
             if self._tracker.due(now):
                 self._tracker.estimate(now)
 
-        if self._mode == MODE_CANCEL:
-            self._cancel(pcm, message, timestamp)
-        else:
-            muted = False
-            if self._mode == MODE_MUTE:
-                with self._gate_lock:
-                    muted = timestamp < self._mute_until
-                if muted:
-                    # Silence, not a dropped chunk. Downstream VAD treats a gap
-                    # and silence the same way, but a continuous stream keeps
-                    # ASR's "have I ever received audio" check and its pre-roll
-                    # sane, and keeps this card's own gap counter meaningful.
-                    pcm = b'\x00' * len(pcm)
-            self._publish(pcm, message, muted)
+        self._cancel(pcm, message, timestamp)
 
         with self._stats_lock:
             self._process_s += time.perf_counter() - started
@@ -1310,15 +1240,24 @@ class _EchoCancellationNode(Node):
             measured = self._tracker.measured
             fresh = self._tracker.fresh()
         if measured is None or not fresh:
-            # Nothing to align to — subtracting an unaligned reference adds
-            # noise rather than removing echo. Fall back to the gate, which
-            # needs no measurement. `measured is None` is the first seconds
-            # after startup; `not fresh` is the robot having talked for 15 s
-            # with no measurable echo since, i.e. the microphone has stopped
-            # hearing the speaker. The correlation is what tells those apart
-            # from a converged filter being talked over — powers cannot.
-            with self._gate_lock:
-                muted = timestamp < self._mute_until
+            # Nothing to align to, and the two reasons get different treatment.
+            #
+            # `measured is None` is the warmup — the first seconds of the
+            # robot's first utterance. Here the microphone is held silent while
+            # the robot is audible: subtracting an unaligned reference would add
+            # noise, and passing it through means ASR transcribes the robot,
+            # which is the bug this card exists to remove. Bounded, once per
+            # session, and the card says what it is doing.
+            #
+            # `not fresh` is 15 s of the robot talking with no measurable echo
+            # since: the microphone has stopped hearing the speaker. There is
+            # nothing to remove, so the audio passes through. Muting here would
+            # be a permanent half-duplex microphone, which is the one behaviour
+            # this card must not have.
+            muted = False
+            if measured is None:
+                with self._gate_lock:
+                    muted = timestamp < self._mute_until
             with self._stats_lock:
                 self._stats["cancel_waiting_for_delay"] += 1
                 if measured is not None:
@@ -1435,7 +1374,6 @@ class _EchoCancellationNode(Node):
         with self._aec_lock:
             aec_report = self._aec.report()
         result: Dict[str, Any] = {
-            "mode": self._mode,
             "robot_voice_topic": self._ref_topic or None,
             "robot_voice_seen": ref_seen,
             "last_robot_voice_s_ago": (None if not last_ref
@@ -1463,15 +1401,14 @@ class _EchoCancellationNode(Node):
             "callback_wall_ms_per_audio_s": (None if audio_s <= 0
                                              else round(process_s / audio_s * 1000, 2)),
             **report,
-            **(aec_report if self._mode == MODE_CANCEL else {}),
+            **aec_report,
+            "removal_strength": self._removal_strength,
+            "waiting_for_delay": (measured is None),
+            "coupling_lost": (measured is not None) and not fresh,
+            "cancel_chunks_without_a_delay": stats["cancel_waiting_for_delay"],
+            "cancel_resyncs": stats["cancel_resyncs"],
+            "cancel_chunks_after_coupling_lost": stats["cancel_coupling_lost"],
         }
-        if self._mode == MODE_CANCEL:
-            result["removal_strength"] = self._removal_strength
-            result["waiting_for_delay"] = (measured is None) or not fresh
-            result["coupling_lost"] = (measured is not None) and not fresh
-            result["cancel_chunks_without_a_delay"] = stats["cancel_waiting_for_delay"]
-            result["cancel_resyncs"] = stats["cancel_resyncs"]
-            result["cancel_chunks_after_coupling_lost"] = stats["cancel_coupling_lost"]
         # The one comparison nobody can do in their head, spelled out: an
         # explicit tail shorter than the delay the card measured means the end
         # of the robot's own sentence reaches ASR.
@@ -1518,10 +1455,10 @@ class EchoCancellationPlugin:
         self._nodes: Dict[str, _EchoCancellationNode] = {}
         self._instance_configs: Dict[str, Dict[str, Any]] = {}
         self._state_lock = threading.RLock()
-        log.info("[echo_cancellation] plugin init: mode=%s, robot_voice_topic=%s, "
-                 "mute_tail=%s, tts_handle=%s",
-                 self._plugin_cfg.get("mode", DEFAULT_MODE),
+        log.info("[echo_cancellation] plugin init: robot_voice_topic=%s, "
+                 "strength=%s, mute_tail=%s, tts_handle=%s",
                  self._plugin_cfg.get("robot_voice_topic", DEFAULT_ROBOT_VOICE_TOPIC),
+                 self._plugin_cfg.get("removal_strength", DEFAULT_REMOVAL_STRENGTH),
                  self._plugin_cfg.get("mute_tail", DEFAULT_MUTE_TAIL),
                  "yes" if tts is not None else "no")
 
@@ -1638,8 +1575,7 @@ class EchoCancellationPlugin:
             if node is None:
                 continue
             merged = self._merged_cfg(key)
-            node.apply_config(mode=merged.get("mode"),
-                              mute_tail=merged.get("mute_tail"),
+            node.apply_config(mute_tail=merged.get("mute_tail"),
                               removal_strength=merged.get("removal_strength"))
             wanted, _ = self._resolve_ref(merged)
             if wanted != node._ref_topic:
@@ -1667,7 +1603,6 @@ class EchoCancellationPlugin:
             input_topic,
             ref_topic,
             node_suffix=node_key.replace('/', '_').replace('-', '_').strip('_'),
-            mode=str(cfg.get("mode") or DEFAULT_MODE),
             mute_tail=str(cfg.get("mute_tail") or DEFAULT_MUTE_TAIL),
             removal_strength=str(cfg.get("removal_strength")
                                  or DEFAULT_REMOVAL_STRENGTH),
@@ -1765,8 +1700,6 @@ class EchoCancellationPlugin:
         """
         if node is None:
             return self._DESC
-        if node._mode == MODE_OFF:
-            return "Passing the microphone through unchanged (mode: off)"
         if not node._ref_topic:
             if how == "auto:none":
                 return ("No TTS audio to listen for — this robot's speech does not "
@@ -1774,28 +1707,19 @@ class EchoCancellationPlugin:
                         "unchanged")
             return "No robot voice topic set — microphone passed through unchanged"
         diagnostics = node.diagnostics()
-        if node._mode == MODE_CANCEL:
-            if not diagnostics.get("robot_voice_seen"):
-                return (f"Waiting for audio on {node._ref_topic} — nothing heard "
-                        f"yet, so nothing is being removed")
-            if diagnostics.get("coupling_lost"):
-                return ("This microphone has stopped hearing the speaker — "
-                        "muting instead. Check the volume, or use 'mute while "
-                        "talking'")
-            if diagnostics.get("waiting_for_delay"):
-                return ("Muting for now — measuring how late the robot's voice "
-                        "comes back before it can be removed")
-            removed = diagnostics.get("echo_removed_db")
-            if removed is not None:
-                return f"Removing {removed} dB of the robot's own voice"
-            return self._DESC
         if not diagnostics.get("robot_voice_seen"):
-            return (f"Waiting for audio on {node._ref_topic} — nothing heard yet, "
-                    f"so nothing is being muted")
-        if diagnostics.get("mute_tail_shorter_than_measured_delay"):
-            return (f"Mute tail {diagnostics['mute_tail_effective_ms']} ms is shorter "
-                    f"than the {diagnostics['measured_echo_delay_ms']} ms delay "
-                    f"measured — the end of the robot's own speech will get through")
+            return (f"Waiting for audio on {node._ref_topic} — nothing heard "
+                    f"yet, so nothing is being removed")
+        if diagnostics.get("coupling_lost"):
+            return ("This microphone has stopped hearing the speaker, so there "
+                    "is nothing to remove — passing audio through. Check the "
+                    "speaker volume")
+        if diagnostics.get("waiting_for_delay"):
+            return ("Measuring how late the robot's voice comes back — the mic "
+                    "is held silent for the first few seconds of its speech")
+        removed = diagnostics.get("echo_removed_db")
+        if removed is not None:
+            return f"Removing {removed} dB of the robot's own voice"
         return self._DESC
 
     def _do_info(self, instance_id: str, input_topic: str) -> Dict[str, Any]:

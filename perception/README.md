@@ -138,22 +138,33 @@ degrades the card to a passthrough, so `info()` always reports
 `robot_voice_topic`, `robot_voice_seen` and `last_robot_voice_s_ago`, and the
 card's own description says which of the two happened.
 
-### Parameters
-
-Three fields, two of them hidden unless they apply. Every one is answerable
-from something an operator can hear; anything that needs a measurement is
-reported by `info()` instead.
+### One setting
 
 | Field | Choices | Notes |
 |---|---|---|
-| `mode` | `mute_while_talking` (default), `remove_echo`, `off` | Muting is half-duplex and says so: while the robot talks the microphone genuinely carries nothing, so it cannot be interrupted. In exchange it removes 100% of the echo and works on a robot whose speech never reaches Agent Core. `remove_echo` keeps the mic open — which is what allows interruption — and removes 20-28 dB instead of all of it. `off` is for A/B against no processing. |
-| `robot_voice_topic` | `auto` (default), or a live TTS topic | Above. |
-| `mute_tail` | `auto` (default), `300ms`, `800ms`, `1500ms` | How long to keep muting after the robot's last audio frame. Also used by `remove_echo`, which mutes until it has measured the delay. |
-| `removal_strength` | `gentle`, `normal` (default), `aggressive` | `remove_echo` only, and it only changes what happens when somebody talks **while** the robot is talking. |
+| `robot_voice_topic` | `auto` (default), or a live TTS topic | Above. The only thing on the card. |
 
-Deliberately **not** offered: frame size, filter length, adaptation step size,
-double-talk thresholds, and the delay search range. They derive from the fields
-above or stay internal constants.
+**There is no mode, and that is a decision.** The card cancels; it does not
+offer muting as an alternative. Half-duplex muting cannot do the job the card
+exists for — being interruptible — so offering it would be offering a setting
+that fails the requirement, and asking an operator to understand the trade in
+order to pick the only workable side of it.
+
+**There is no "how hard to scrub" and no "mute tail" either**, for the same
+reason in a weaker form: both have a defensible default, and neither is a
+question anybody can answer better from the dashboard than from the
+measurements below. They stay settable from `config.yaml` or an `action=config`
+call, which is how `gentle` would get tried on a real robot without a rebuild —
+what they are not is a question put to an operator.
+
+| Fixed at | Why that value |
+|---|---|
+| `removal_strength: normal` | An interrupting voice stays 12 dB above the residual, which is enough for ASR, while removing 5 dB more of the robot than `gentle` — and that 5 dB is the margin against the robot's own speech reaching ASR. The number that could overturn it is not in hand: whether the residual's *absolute* level still trips the VAD needs a real microphone, a real speaker and ASR in the loop. |
+| `mute_tail: auto` | Follows the delay the card measures for itself. Only applies during the warmup below, so there is nothing left to tune. |
+
+Also deliberately not offered: frame size, filter length, adaptation step size,
+double-talk thresholds, and the delay search range. They derive from the above
+or stay internal constants.
 
 **The "filter tail" knob was planned and then dropped**, which is worth stating
 because it was promised. Once the bulk delay is measured and compensated by
@@ -164,7 +175,27 @@ synthetic room, 64 ms of tail gives 23 dB, 128 ms gives 20, 256 ms gives 18 and
 could act on — would have been wrong advice. It is a 128 ms constant, reported
 as `filter_tail_ms`. The delay *search range* went the same way: it is 1.5 s,
 the measurement costs ~6 ms per second of audio, and 1.5 s covers every robot
-measured, so there is nothing for anybody to decide.
+measured.
+
+**`instance_id` is not declared in the `inputSchema`**, though every call
+carries one. The canvas renders each input property it does not recognise as a
+manual field on the card — it hides `input_topic` by name pattern, and an
+`action` whose values are all system actions — so declaring it put an
+`INSTANCE_ID` text box and an 执行 button on the card's face, asking an operator
+to type a canvas id the canvas fills in itself. No other plugin here declares
+it either.
+
+### The two places muting survives, neither of them a setting
+
+- **Warmup.** Before a delay has been measured there is nothing to align to, so
+  the microphone is held silent while the robot is audible — subtracting an
+  unaligned reference adds noise, and passing the audio through hands ASR the
+  robot's own sentence. It lasts about 3 s into the robot's first utterance,
+  once per session, and the card says what it is doing.
+- **Nothing else.** When the coupling disappears mid-session the card *passes
+  audio through* rather than muting: no measurable echo means there is nothing
+  to remove, and a permanent mute would be exactly the behaviour ruled out
+  above.
 
 ### Why the mute needs a tail, and why `auto` is the default
 
@@ -194,7 +225,7 @@ the sound.
 0-1.5 s lag range, once a second, on a 3 s window. Envelope domain rather than
 waveform: what is being measured is a bulk transport delay, and an envelope
 carries that as well at 1/160th of the arithmetic. It runs in
-`mute_while_talking` too, where the gate barely needs it — so that an operator
+the warmup too, where only the mute tail needs it — so that an operator
 can read the robot's real delay off a running card before deciding anything.
 
 What the synthetic sweeps in `tests/test_echo_cancellation_plugin.py` establish:
@@ -217,7 +248,7 @@ enough for *cancellation* to be worth building (the G1 plays through a vendor
 MCU, which may apply EQ, limiting and resampling we cannot see), and the sample
 clock drift between the microphone and the speaker.
 
-### Cancellation (`remove_echo`)
+### Cancellation
 
 A partitioned-block frequency-domain NLMS filter, 16 ms blocks, 128 ms tail,
 followed by a soft gate on the residual. In numpy, not bound to speexdsp's MDF:
@@ -236,9 +267,10 @@ buffering. Covering that with taps instead would need 5-75x the arithmetic to
 model what is mostly a constant offset — and, per the tail measurements above,
 would cancel *less*.
 
-Until a delay has been measured, `remove_echo` **mutes** instead: subtracting an
+Until a delay has been measured the card **mutes** instead: subtracting an
 unaligned reference adds noise rather than removing echo. The card says so on
-its face while that lasts.
+its face while that lasts, and it lasts about 3 s into the robot's first
+utterance.
 
 Two guards, both earning their place with a measured failure:
 
@@ -260,11 +292,12 @@ Two guards, both earning their place with a measured failure:
 
 **Whether there is coupling worth cancelling is decided by correlation, not by
 powers**, because correlation can tell those two cases apart. The delay tracker
-already measures it, so `remove_echo` requires a *fresh* measurement: one
+already measures it, so cancelling requires a *fresh* measurement: one
 accepted within the last 15 s **of the robot actually talking** (wall clock
 would be wrong — a delay measured an hour ago is still right if the robot has
-been silent since). Without one the card mutes, reports `coupling_lost`, and
-says to check the volume.
+been silent since). Without one the card passes audio
+through, reports `coupling_lost`, and says to check the volume — muting there
+would be the permanent half-duplex microphone this card exists to avoid.
 
 That is also what protects against the no-coupling case, where a canceller makes
 a microphone *worse*: with the reference playing and no echo in the mic, the
@@ -313,8 +346,8 @@ session whose settled phases removed 11.7 and 17.0. A card that says 4 while
 removing 17 is not a diagnostic.
 
 Cost on Orin 5, callback profiled in isolation: **3.8 ms per second of audio**,
-against 3.7 for `mute_while_talking` — the FFT work is almost free next to the
-forwarding. The live `callback_wall_ms_per_audio_s` reads ~91 ms/s, which is GIL
+against 3.7 for the plain forwarding path — the FFT work is almost free next
+to it. The live `callback_wall_ms_per_audio_s` reads ~91 ms/s, which is GIL
 contention in a process running nine other plugins, not CPU (see the cost note
 above). Caching the delay median mattered: it is read once per chunk, and
 `np.median` was a third of this path's cost before.

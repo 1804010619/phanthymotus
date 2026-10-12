@@ -313,6 +313,12 @@ def _hear(node, pcm: bytes, timestamp: float) -> None:
 
 
 def test_the_microphone_is_silenced_while_the_robot_talks(node):
+    """The warmup: before a delay is known there is nothing to align to.
+
+    Not a mode — this ends as soon as the tracker has a measurement, which is a
+    few seconds into the robot's first utterance. Passing the audio through
+    instead would hand ASR the robot's own first sentence.
+    """
     speech = _bursts(0.032, seed=12).tobytes()
     _hear(node, speech, BASE_T)                       # before: untouched
     _say(node, 1.0, BASE_T + 0.1)
@@ -326,6 +332,8 @@ def test_the_microphone_is_silenced_while_the_robot_talks(node):
 
 
 def test_the_mute_outlasts_the_robots_last_frame_by_the_tail(node):
+    """Still true during the warmup: publishing the last frame is not the end
+    of the sound, because the speaker buffers."""
     speech = _bursts(0.032, seed=13).tobytes()
     _say(node, 0.5, BASE_T)
     # The reference ends at BASE_T + 0.5; with a 300 ms tail the gate reopens at
@@ -336,19 +344,6 @@ def test_the_mute_outlasts_the_robots_last_frame_by_the_tail(node):
     published = _published(node)
     assert _silent(published[0]), "still muted inside the tail"
     assert not _silent(published[1]), "mic reopens once the tail has passed"
-
-
-def test_off_mode_passes_the_microphone_through_untouched():
-    instance = ec._EchoCancellationNode('/mic/audio', '/tts/audio',
-                                     node_suffix='off', mode=ec.MODE_OFF)
-    instance.start()
-    speech = _bursts(0.032, seed=14).tobytes()
-    _say(instance, 1.0, BASE_T)
-    _hear(instance, speech, BASE_T + 0.5)
-
-    assert _published(instance) == [speech]
-    assert instance.diagnostics()["muted_fraction"] == 0.0
-    instance.retire()
 
 
 def test_the_published_chunk_keeps_the_input_stamp(node):
@@ -673,7 +668,7 @@ def test_the_suppressor_ramps_instead_of_stepping():
 
 def _cancelling_node(delay=0.45, strength="gentle", measured=True):
     node = ec._EchoCancellationNode('/mic/audio', '/tts/audio', node_suffix='aec',
-                                 mode=ec.MODE_CANCEL, removal_strength=strength)
+                                    removal_strength=strength)
     node.start()
     if measured:
         # The tracker needs seconds of audio to measure; the cancellation path
@@ -773,14 +768,18 @@ def test_cancelled_chunks_carry_their_own_stamp_and_keep_the_cadence():
     node.retire()
 
 
-def test_the_node_falls_back_to_muting_when_the_coupling_is_lost():
-    """Where the no-coupling protection lives now: the node, not the filter.
+def test_a_lost_coupling_passes_audio_through_rather_than_muting_forever():
+    """No measurable echo means there is nothing to remove.
 
-    With the reference playing and no echo in the microphone, the tracker
-    accepts nothing, the measurement goes stale, and cancellation never runs —
-    so the filter is never given the chance to adapt to noise and inject it.
-    Measured before this was true: 18 s of adapting against no coupling left
-    near-end speech 4.5 dB *below* passthrough.
+    Muting here would be a permanently half-duplex microphone, which is the one
+    behaviour this card must not have — it is why muting is not offered as a
+    mode at all. The warmup mute is bounded and ends; this would not.
+
+    It is also where the no-coupling protection lives: with the reference
+    playing and no echo in the mic the tracker accepts nothing, so the filter is
+    never given the chance to adapt to noise and inject it. Measured before that
+    was true: 18 s of adapting against no coupling left near-end speech 4.5 dB
+    *below* passthrough.
     """
     node = _cancelling_node()
     with node._tracker_lock:
@@ -789,22 +788,11 @@ def test_the_node_falls_back_to_muting_when_the_coupling_is_lost():
     _say(node, 1.0, BASE_T)
     _hear(node, speech, BASE_T + 0.5)
 
-    assert _silent(_published(node)[0]), "muted, not cancelled"
+    assert _published(node) == [speech], "passed through, not silenced"
     diagnostics = node.diagnostics()
     assert diagnostics["coupling_lost"] is True
-    assert diagnostics["waiting_for_delay"] is True
+    assert diagnostics["waiting_for_delay"] is False
     assert diagnostics["cancel_chunks_after_coupling_lost"] == 1
-    node.retire()
-
-
-def test_switching_into_cancel_mode_starts_from_a_clean_filter():
-    node = ec._EchoCancellationNode('/mic/audio', '/tts/audio', node_suffix='sw',
-                                 mode=ec.MODE_MUTE)
-    node.start()
-    first = node._aec
-    node.apply_config(mode=ec.MODE_CANCEL)
-    assert node._aec is not first
-    assert node._pending == b'' and node._out == b''
     node.retire()
 
 
@@ -930,17 +918,6 @@ def test_changing_the_reference_topic_rebuilds_the_node(plugin):
     assert second.state == "running"
 
 
-def test_changing_the_mode_does_not_rebuild_the_node(plugin):
-    plugin.dispatch("echo_cancellation", {"action": "start", "instance_id": "c1",
-                                       "input_topic": "/mic/audio"})
-    node = plugin._nodes["c1"]
-    plugin.dispatch("echo_cancellation", {"action": "config", "instance_id": "c1",
-                                       "mode": ec.MODE_OFF, "mute_tail": "1500ms"})
-    assert plugin._nodes["c1"] is node
-    assert node._mode == ec.MODE_OFF
-    assert node._tail_s() == pytest.approx(1.5)
-
-
 def test_start_is_idempotent(plugin):
     args = {"action": "start", "instance_id": "c1", "input_topic": "/mic/audio"}
     plugin.dispatch("echo_cancellation", args)
@@ -1025,8 +1002,10 @@ def test_info_flags_a_tail_shorter_than_the_measured_delay(plugin):
         node._tracker._accept(1.05)
 
     info = plugin.dispatch("echo_cancellation", {"action": "info", "instance_id": "c1"})
+    # Still reported, because `mute_tail` can still be pinned from config.yaml
+    # for an experiment. It no longer has a message on the card's face: with no
+    # knob for it there, nobody could act on one.
     assert info["diagnostics"]["mute_tail_shorter_than_measured_delay"] is True
-    assert "shorter than" in info["desc"]
 
 
 def test_info_without_an_instance_reports_the_card(plugin):
