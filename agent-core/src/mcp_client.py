@@ -38,6 +38,12 @@ registry: dict[str, dict] = {}   # mcp_id → info
 
 # ── ACP: 异步动作完成协议 ──────────────────────────────────────────────────────
 _pending_actions: dict[str, asyncio.Event] = {}   # action_id → Event (set on completion)
+# action_id → 注册时刻。加它只为一件事：主动播报要说「已经等了多久」。
+#
+# 先前没有任何地方记这个，而播报的 prompt 里也没有「现在几点」—— 模型只能拿过程
+# 记录里几条历史时间戳凑，凑出来的「大约等了 25 秒」必然是错的。数要么给对的，
+# 要么不给，不能让它自己算。
+_pending_started: dict[str, float] = {}
 _pending_results: dict[str, dict] = {}            # action_id → completion payload
 _pending_timeouts: dict[str, float] = {}          # action_id → dynamic timeout (seconds)
 _pending_tools: dict[str, str] = {}               # action_id → tool_name (资源冲突检测用)
@@ -62,6 +68,36 @@ def on_action_settled(fn) -> None:
     影响 ACP 本身的解锁。
     """
     _settle_listeners.append(fn)
+
+
+_register_listeners: list = []
+
+
+def on_action_registered(fn) -> None:
+    """注册"一个异步动作开始了"的回调。签名 `fn(action_id, tool, args, resource)`。
+
+    和 `on_action_settled` 对称，存在的理由是**结算时已经查不到这些了**：
+    `_forget_pending` 必须先拆表再通知（见那里的注释），所以超时 / 取消路径上的订阅者
+    拿不到工具名和派发参数。订阅者想知道"这个动作是什么"，只能在它开始的时候记下来。
+
+    参数原样交出去，不做解释。基准测试要从里面认出一段路的目标是哪一站，而参数名
+    各家不同（天轶 `tag_name`、仿真器 `label`）—— 在这里挑一个名字出来，等于把某一家
+    驱动的 schema 焊进 ACP 层。
+    """
+    _register_listeners.append(fn)
+
+
+def _notify_registered(action_id: str, tool: str, args: dict, resource) -> None:
+    for fn in _register_listeners:
+        try:
+            fn(action_id, tool, args, resource)
+        except Exception as e:
+            print(f'[acp] register listener failed: {e}')
+
+
+def pending_result(action_id: str) -> dict | None:
+    """完成回调带回来的 payload。超时 / 取消路径上是 None —— 那条路查 `action_outcome`。"""
+    return _pending_results.get(action_id)
 
 
 def _notify_settled(action_id: str, resource=None) -> None:
@@ -446,11 +482,54 @@ async def _connect_one(mcp_id: str, name: str, url: str, render_hint: str) -> No
         'split_map':     split_map,
         'tool_groups':   tool_groups,
         'input_schemas': input_schemas,
+        # "A full connect has happened for this device." The heartbeat in
+        # api/mcp_manage.py reads this to decide whether to call us, because it
+        # is the *connect* that matters, not any one key it leaves behind —
+        # notably the SSE subscription started just below, which nothing else
+        # sets up. Only set when the connect actually reached the device:
+        # a failed attempt must be retried on the next heartbeat.
+        'connected':     online,
     }
 
     # 3. 后台订阅 SSE 事件流（非阻塞）
     if online:
-        asyncio.create_task(_subscribe_sse(mcp_id, url))
+        _start_sse(mcp_id, url)
+
+
+# mcp_id → 该设备当前的 SSE 订阅 task。
+#
+# 必须有人记着它：`_connect_one` 不止在启动时跑一次，`api/mcp_manage.py` 的心跳
+# 分支在 registry 缺 input_schemas 时也会再调一次。原来每调一次就 create_task 一个
+# 新的订阅循环，而旧的谁也不认识、永远不退出，于是每次心跳泄漏一个 task。
+#
+# 天轶实测：驱动日志里 `GET /mcp/sse → 404` 的速率逐小时递增 39k → 52k → 60k →
+# 67k → 74k 每小时（约 20 req/s），agent-core 一重启立刻归零再重新爬。心跳 30s 一次
+# ⇒ 每小时多 120 个 task，每个退避到 60s 上限 ⇒ 每小时多约 2 req/s，和实测吻合。
+# 这些 404 占了那台机器驱动日志的 98.5%（310262 / 315088 行）。
+_sse_tasks: dict[str, asyncio.Task] = {}
+
+# mcp_id → the sse url we already reported as absent, so "this server has no SSE
+# endpoint" is said once per device rather than once per reconnect. Keyed by url
+# too: a device that moves to a new port deserves to be reported again.
+_sse_absent: dict[str, str] = {}
+
+
+def _start_sse(mcp_id: str, url: str) -> None:
+    """(重)启动一个设备的 SSE 订阅，先取消上一个。"""
+    old = _sse_tasks.pop(mcp_id, None)
+    if old is not None and not old.done():
+        old.cancel()
+    _sse_tasks[mcp_id] = asyncio.create_task(
+        _subscribe_sse(mcp_id, url), name=f'sse:{mcp_id}')
+
+
+def stop_sse(mcp_id: str | None = None) -> None:
+    """取消 SSE 订阅：给 mcp_id 就取消那一个，不给就全部。"""
+    ids = [mcp_id] if mcp_id else list(_sse_tasks)
+    for i in ids:
+        task = _sse_tasks.pop(i, None)
+        if task is not None and not task.done():
+            task.cancel()
 
 
 async def _subscribe_sse(mcp_id: str, url: str) -> None:
@@ -458,16 +537,40 @@ async def _subscribe_sse(mcp_id: str, url: str) -> None:
     sse_url   = url.rstrip('/') + '/sse'
     delay     = 2.0
     timeout   = aiohttp.ClientTimeout(total=None, sock_read=60)
+    # 404 = 这个 server 根本没有 SSE 端点。15 个驱动里只有 4 个实现了 `/mcp/sse`，
+    # 所以这是常态而不是故障，重试多少次都不会变成 200。连着两次就收工，等下一次
+    # `_connect_one`（重连、重新注册）再决定要不要重新订阅。
+    #
+    # 5xx 之类不在此列：那是「现在不行」，退避重试是对的。
+    missing = 0
 
     while True:
         try:
             async with aiohttp.ClientSession(timeout=timeout) as session:
                 async with session.get(sse_url) as resp:
+                    if resp.status == 404:
+                        missing += 1
+                        if missing >= 2:
+                            # Once per device, not once per reconnect. This line
+                            # was the second-biggest source of noise in
+                            # agent-core's own log (206 lines in 1642) because
+                            # `_connect_one` re-ran every 30s — the churn is
+                            # fixed separately, but "this server has no SSE" is
+                            # a standing fact either way and does not improve by
+                            # being repeated.
+                            if _sse_absent.get(mcp_id) != sse_url:
+                                _sse_absent[mcp_id] = sse_url
+                                print(f'[mcp] {mcp_id}: no SSE endpoint at {sse_url} '
+                                      f'(404) — not subscribing')
+                            return
+                        await asyncio.sleep(delay)
+                        continue
                     if resp.status >= 400:
                         await asyncio.sleep(delay)
                         delay = min(delay * 2, 60)
                         continue
                     delay = 2.0
+                    missing = 0
                     async for line in resp.content:
                         line = line.decode().strip()
                         if not line.startswith('data:'):
@@ -871,6 +974,7 @@ async def call_tool(full_name: str, args: dict) -> str:
                 # 记录该 pending 属于哪个工具（用于 barrier 资源冲突判断）
                 _pending_tools[action_id] = tool_name
                 _pending_resources[action_id] = meta.get('resource')
+                _pending_started[action_id] = time.time()
                 _pending_owner[action_id] = current_agent_context.get()
                 # 动态 timeout：有 text 参数时按字数算（合成+播放: 字数/3 + 10s余量），否则用 schema 默认值
                 text_arg = args.get('text', '')
@@ -884,6 +988,9 @@ async def call_tool(full_name: str, args: dict) -> str:
                 _res_txt = ','.join(sorted(_res)) if _res else 'undeclared/exclusive'
                 print(f'[acp] registered pending: {action_id} (tool={tool_name}, '
                       f'timeout={dynamic_timeout:.0f}s, resource={_res_txt})')
+                # 通知订阅者。放在 try 里面、print 后面是有意的：这一段任何一步抛了，
+                # pending 就没建成，也就没有"动作开始了"这回事可通知。
+                _notify_registered(action_id, tool_name, args or {}, meta.get('resource'))
         except (json.JSONDecodeError, IndexError):
             pass
 
@@ -1212,6 +1319,29 @@ async def sync(action_ids: list[str] | None = None, timeout: float = 120,
         return {"status": "cancelled", "pending": [aid for aid, _ in events]}
 
 
+def pending_waits() -> list[dict]:
+    """现在还在等的动作，各等了多久。
+
+    给主动播报用：「已经等了多久」这个数必须由框架给出。播报那次 LLM 调用既看不到
+    当前时刻，也没有 pending 列表 —— 让它自己从历史时间戳里凑，凑出来的就是天轶上
+    那句「大约等了 25 秒」。
+    """
+    now = time.time()
+    out = []
+    for action_id, ev in _pending_actions.items():
+        if ev.is_set():
+            continue
+        started = _pending_started.get(action_id)
+        if not started:
+            continue
+        out.append({
+            'tool': _pending_tools.get(action_id, ''),
+            'seconds': int(now - started),
+            'timeout': int(_pending_timeouts.get(action_id, 0)),
+        })
+    return sorted(out, key=lambda w: -w['seconds'])
+
+
 def get_pending_actions() -> list[str]:
     """返回当前所有 pending action_ids（供 prompt 展示）。"""
     return list(_pending_actions.keys())
@@ -1349,6 +1479,7 @@ async def call_tool_hook(mcp_id: str, tool_name: str, args: dict, *,
             if action_id:
                 resource = meta.get('resource')
                 _pending_actions[action_id] = asyncio.Event()
+                _pending_started[action_id] = time.time()
                 _pending_tools[action_id] = tool_name
                 _pending_resources[action_id] = resource
                 _pending_owner[action_id] = current_agent_context.get()

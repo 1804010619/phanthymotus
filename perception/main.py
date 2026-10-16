@@ -9,6 +9,8 @@ perception/main.py — Perception Stack bundle 统一入口。
   vop              物体检测（YOLOE-26 + TensorRT）
   visual_depth     单目深度（YOLO26-depth + TensorRT）
   ocr              文字识别（RapidOCR + TensorRT）
+  barcode          扫码（zxing-cpp，二维码/条形码，零模型，按需识别）
+  pose             人体关键点与动作分类（COCO-17 + TensorRT，动作为几何规则）
   face_recognition 人脸识别与建库（InsightFace buffalo_sc）
 
 每个插件自带一个 `enabled` 开关，加载失败的插件不会拖垮其余插件 —— 它的卡片
@@ -52,8 +54,12 @@ import rclpy.executors
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(name)s] %(levelname)s %(message)s',
                     datefmt='%H:%M:%S')
 log = logging.getLogger(__name__)
-# suppress noisy third-party loggers
-for _quiet in ('urllib3', 'websockets', 'httpcore', 'httpx'):
+# suppress noisy third-party loggers.
+# pyvips logs six INFO lines per decoded image ("thumbnailing N bytes",
+# "selected loader is ...", "converting to processing space srgb", ...). At a
+# camera's frame rate that is the only thing in the log: measured on Tianyi,
+# ~4 lines/second with every other perception message buried under it.
+for _quiet in ('urllib3', 'websockets', 'httpcore', 'httpx', 'pyvips'):
     logging.getLogger(_quiet).setLevel(logging.WARNING)
 
 # Cap on how much of an MCP argument dict reaches the log. A tool call can carry
@@ -61,6 +67,11 @@ for _quiet in ('urllib3', 'websockets', 'httpcore', 'httpx'):
 # a single log line grows past the point where Docker can frame it — the result
 # side was already capped, the argument side was not.
 _LOG_ARG_CHARS = 500
+
+# How often the register thread says it is still alive when nothing has changed.
+# The heartbeat itself stays at 30s; this only governs how often that fact
+# reaches the log, so "quiet" cannot mean both "healthy" and "thread died".
+REGISTER_ALIVE_INTERVAL_S = 1800.0
 
 
 def _brief(obj) -> str:
@@ -108,11 +119,31 @@ class PerceptionBundle:
         self._plugins: list = []
         plugins_cfg = cfg.get("plugins", {})
 
+        # Built before ASR, and that order is load-bearing: ASR takes a handle
+        # to this plugin so the voiceprint can be computed on the VAD segment it
+        # already cut, concurrently with transcription. The handle is optional —
+        # ASR publishes an identity-free payload when it is absent, which is
+        # what happens when speaker_recognition is disabled or still loading.
+        #
+        # Deliberately *not* guarded the way TTSPlugin is: the constructor here
+        # does no model work (the engine loads single-flight in a background
+        # thread on first use), so there is nothing for it to fail on.
+        speaker_plugin = None
+        if plugins_cfg.get("speaker_recognition", {}).get("enabled", False):
+            from plugins.speaker import SpeakerRecognitionPlugin
+            speaker_plugin = SpeakerRecognitionPlugin(
+                plugins_cfg["speaker_recognition"], executor)
+            self._plugins.append(speaker_plugin)
+            log.info("SpeakerRecognitionPlugin loaded")
+
         if plugins_cfg.get("asr", {}).get("enabled", False):
             from plugins.asr import ASRPlugin
-            self._plugins.append(ASRPlugin(plugins_cfg["asr"], executor))
-            log.info("ASRPlugin loaded")
+            self._plugins.append(
+                ASRPlugin(plugins_cfg["asr"], executor, speaker=speaker_plugin))
+            log.info("ASRPlugin loaded (speaker=%s)",
+                     "yes" if speaker_plugin else "no")
 
+        tts_plugin = None
         if plugins_cfg.get("tts", {}).get("enabled", False):
             from plugins.tts import TTSPlugin
             # Guarded: TTSPlugin validates its engine configuration in the
@@ -120,11 +151,25 @@ class PerceptionBundle:
             # config must not take ASR/VOP/OCR down with it — the tool simply
             # does not appear, which is visible in the dashboard.
             try:
-                self._plugins.append(TTSPlugin(plugins_cfg["tts"], executor))
+                tts_plugin = TTSPlugin(plugins_cfg["tts"], executor)
+                self._plugins.append(tts_plugin)
                 log.info("TTSPlugin loaded")
             except Exception:
                 log.error("TTSPlugin failed to load; continuing without TTS",
                           exc_info=True)
+
+        # Built after TTS and holding a handle to it, for the same reason ASR
+        # holds one to speaker_recognition: the echo cancellation's reference
+        # signal *is* the TTS card's audio output, and asking the plugin in this
+        # process is what lets `robot_voice_topic: auto` need no configuration
+        # at all. The handle is optional — without it `auto` resolves to
+        # nothing and the card says so on its face rather than muting at random.
+        if plugins_cfg.get("echo_cancellation", {}).get("enabled", True):
+            from plugins.echo_cancellation import EchoCancellationPlugin
+            self._plugins.append(EchoCancellationPlugin(
+                plugins_cfg.get("echo_cancellation", {}), executor, tts=tts_plugin))
+            log.info("EchoCancellationPlugin loaded (tts=%s)",
+                     "yes" if tts_plugin else "no")
 
         if plugins_cfg.get("vop", {}).get("enabled", False):
             import re, socket
@@ -158,10 +203,38 @@ class PerceptionBundle:
                 log.error("VideoDepthPerceptionPlugin failed to load; continuing without depth",
                           exc_info=True)
 
+        if plugins_cfg.get("pose", {}).get("enabled", False):
+            import re, socket
+            namespace = plugins_cfg["pose"].get("namespace", "").strip()
+            if not namespace:
+                namespace = re.sub(r"[^a-zA-Z0-9_]", "_", socket.gethostname())
+            from plugins.pose import PosePerceptionPlugin
+            # Guarded like TTSPlugin / VideoDepthPerceptionPlugin: this one needs
+            # a TensorRT engine bundle for the running JetPack line, and a
+            # machine that cannot fetch it must still get ASR/TTS/VOP/OCR. The
+            # card simply does not appear, which is visible in the dashboard.
+            try:
+                self._plugins.append(
+                    PosePerceptionPlugin(plugins_cfg["pose"], namespace, executor)
+                )
+                log.info("PosePerceptionPlugin loaded (namespace=%s)", namespace)
+            except Exception:
+                log.error("PosePerceptionPlugin failed to load; continuing without pose",
+                          exc_info=True)
+
         if plugins_cfg.get("ocr", {}).get("enabled", False):
             from plugins.ocr import OCRPlugin
             self._plugins.append(OCRPlugin(plugins_cfg["ocr"], executor))
             log.info("OCRPlugin loaded")
+
+        if plugins_cfg.get("barcode", {}).get("enabled", False):
+            from plugins.barcode import BarcodeScanPlugin
+            # No try/except and no model: zxing-cpp is imported lazily by
+            # plugins.barcode_runtime on the first scan, so a build missing it
+            # yields a card that reports the reason in `info` rather than a
+            # plugin that fails to load and silently disappears.
+            self._plugins.append(BarcodeScanPlugin(plugins_cfg["barcode"], executor))
+            log.info("BarcodeScanPlugin loaded")
 
         if plugins_cfg.get("soundevent", {}).get("enabled", False):
             from plugins.soundevent import SoundEventPlugin
@@ -559,6 +632,16 @@ def _start_registration(mcp_port: int, name: str, category: str):
     }).encode()
     def _run():
         import time as _t
+        # Log transitions plus a slow keepalive — same reasoning as actucore's
+        # copy. Here it is 92 lines out of 242, on the container whose log is the
+        # first place anyone looks when ASR or TTS misbehaves.
+        #
+        # The slow line exists because edges alone made "healthy" and "the
+        # register thread died" look identical: every "ok" used to double as
+        # proof of life, and dropping it entirely traded one blind spot for
+        # another.
+        healthy = None
+        last_alive = 0.0
         while True:
             try:
                 req = _urllib.Request(
@@ -566,10 +649,20 @@ def _start_registration(mcp_port: int, name: str, category: str):
                     headers={"Content-Type": "application/json"}, method="POST",
                 )
                 with _urllib.urlopen(req, timeout=3, context=_ctx):
-                    log.info(f"[register] heartbeat ok → {agent_core_url}")
+                    now = _t.monotonic()
+                    if healthy is not True:
+                        log.info(f"[register] heartbeat ok → {agent_core_url}"
+                                 + ("" if healthy is None else " (recovered)"))
+                        healthy = True
+                        last_alive = now
+                    elif now - last_alive >= REGISTER_ALIVE_INTERVAL_S:
+                        last_alive = now
+                        log.info(f"[register] still registered → {agent_core_url}")
                 _t.sleep(30)
             except Exception as e:
+                # Every failure is logged: a flapping link is a real symptom.
                 log.warning(f"[register] failed: {e}, retrying in 5s")
+                healthy = False
                 _t.sleep(5)
     threading.Thread(target=_run, daemon=True, name="register").start()
 

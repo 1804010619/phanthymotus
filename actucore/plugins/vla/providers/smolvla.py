@@ -103,6 +103,11 @@ class SmolVLAProvider:
         self._feature_map = dict(entry.get("feature_map")
                                  or config.get("feature_map") or {})
         self._weights = entry.get("weights") or config.get("weights") or {}
+        # Which dataset's statistics un-normalise the action. Only needed by a
+        # checkpoint whose statistics are grouped per dataset — see
+        # `_select_stats`, which refuses to load rather than guess.
+        self._unnorm_key = str(entry.get("unnorm_key")
+                               or config.get("unnorm_key") or "").strip()
         self._vlm_dir = config.get("vlm_dir") or "/models/vla/smolvlm2_500m"
         self._vlm_weights = config.get("vlm_weights") or {}
         # Set by _ensure_backbone when the checkpoint has to be presented with a
@@ -144,6 +149,14 @@ class SmolVLAProvider:
             # `smolvla` is true of every one of them and tells an operator
             # reading `info()` nothing about which weights are loaded.
             "model": self._model or self._config.get("type") or "smolvla",
+            # SmolVLA 的动作是绝对关节角，反归一化之后就是弧度。声明它不是形式：
+            # negotiate 现在会拒绝一个不声明动作空间的模型，因为维度相同不代表空间
+            # 相同（一个 23 维的末端位姿模型和一张 23 维的关节卡片，数字完全吻合）。
+            #
+            # 写成常量而不是从 checkpoint 读，是因为 LeRobot 的 config 里没有这个
+            # 概念 —— 它由**微调数据集**决定，而不是由架构决定。将来出现一个用速度
+            # 或末端位姿微调的 SmolVLA，这里必须跟着改，而那时 negotiate 会先拦住它。
+            "control_mode": "joint_position",
             "action_dim": self._action_dim(),
             "chunk_size": self._chunk_size(),
             "control_hz": float(self._config.get("fps") or 30.0),
@@ -500,7 +513,95 @@ class SmolVLAProvider:
         preprocessor, postprocessor = make_pre_post_processors(
             policy.config, pretrained_path=source,
             preprocessor_overrides={"device_processor": {"device": device}})
+        self._apply_norm_stats(preprocessor, postprocessor)
         return policy, preprocessor, postprocessor
+
+    def _apply_norm_stats(self, *pipelines) -> None:
+        """Point the normalizer steps at one dataset's statistics.
+
+        A no-op for a checkpoint whose statistics are already keyed `action`.
+        Split from `_select_stats` because only these four lines touch LeRobot:
+        the decision is a dict transform and is tested without the library.
+
+        The tensor cache is the part that is easy to miss. `NormalizerProcessorStep`
+        converts `stats` into `_tensor_stats` in `__post_init__`, and `__call__`
+        reads **only** the latter — so assigning `step.stats` alone changes
+        nothing at all, silently, and the un-normalisation stays an identity.
+        """
+        from lerobot.processor.normalize_processor import to_tensor
+
+        for pipeline in pipelines:
+            for step in getattr(pipeline, "steps", []):
+                chosen = self._select_stats(getattr(step, "stats", None), self._unnorm_key)
+                if chosen is None:
+                    continue
+                step.stats = chosen
+                step._tensor_stats = to_tensor(      # noqa: SLF001
+                    chosen, device=step.device, dtype=step.dtype)
+                log.info("smolvla norm stats: using %r → keys %s",
+                         self._unnorm_key, sorted(chosen))
+
+    @staticmethod
+    def _select_stats(stats: dict | None, unnorm_key: str) -> dict | None:
+        """One dataset's statistics, keyed the way the pipeline looks them up.
+
+        Returns None when there is nothing to do — no stats, or already keyed
+        `action`, which is what a checkpoint fine-tuned on one robot looks like.
+
+        ── Why this has to exist ────────────────────────────────────────────
+        `smolvla_base` is a **multi-dataset pretrained base**. Its statistics
+        are grouped by the dataset they came from:
+
+            so100.buffer.action / so100-blue.buffer.action / so100-red.buffer.action
+
+        and the pipeline looks up plain `action`. A miss is not an error in
+        LeRobot: the step simply passes the tensor through. So the policy's
+        normalised output — roughly ±1 — is handed to the descriptor, the
+        limits and the arm, all of which read degrees. Negotiation passes, the
+        message validates, the numbers are wrong by two orders of magnitude,
+        and nothing is logged.
+
+        Measured on Tianyi 2026-09-20, before this fix: the card's output was
+        |max| ≈ 0.9 while `so100`'s own statistics are mean ∈ [-27, 120],
+        std ∈ [19, 59]. Commanding an arm whose joints span tens of degrees to
+        a target near zero is not "a smaller motion" — it drives it to a limit.
+
+        ── Why refusing is the right failure ────────────────────────────────
+        There is no safe default. Picking the wrong group yields well-formed
+        actions of the wrong magnitude, which is exactly the failure this whole
+        negotiation path exists to prevent, so an unset key refuses to load and
+        the card reports the error instead of driving anything.
+
+        This is the same decision OpenVLA calls `unnorm_key`, and the cloud
+        runtime (`phanthymotus-cloud`, runtimes/smolvla) makes it under that
+        same name. The two were compared on the same checkpoint and the same
+        inputs: with the key applied, their sampled action distributions agree
+        to 0.35 of the sampling spread. Without it, one of them is in a
+        different space entirely.
+        """
+        import re
+
+        if not stats or "action" in stats:
+            return None
+        groups = sorted({key.split(".")[0] for key in stats})
+        if not unnorm_key:
+            raise ValueError(
+                f"this checkpoint's normalisation statistics are grouped per "
+                f"dataset ({', '.join(groups)}) and none is named `action`: it is "
+                f"a pretrained base, not a model that can drive an arm as-is. Set "
+                f"`unnorm_key` to one of them, or register a checkpoint fine-tuned "
+                f"on your own data. Left unset, un-normalisation silently becomes "
+                f"an identity: the actions are well-formed and off by two orders "
+                f"of magnitude."
+            )
+        if unnorm_key not in groups:
+            raise ValueError(
+                f"unnorm_key={unnorm_key!r} is not in this checkpoint. "
+                f"Available: {', '.join(groups)}"
+            )
+        prefix = re.compile(rf"^{re.escape(unnorm_key)}\.(?:buffer\.)?")
+        return {prefix.sub("", key): value
+                for key, value in stats.items() if key.startswith(unnorm_key + ".")}
 
     def _resolved_device(self) -> str:
         if self._device != "cuda":

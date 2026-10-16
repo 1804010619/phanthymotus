@@ -9,6 +9,7 @@ import pathlib
 import shutil
 import subprocess
 import sys
+import time
 
 # Fix Python "dual module" bug: start.py runs as __main__, but other modules
 # `import start` which creates a SEPARATE module instance with its own globals.
@@ -191,9 +192,52 @@ def _register_core_mcp(silent=False):
                     'image_file': {'type': 'string', 'format': 'file', 'accept': 'image/*', 'description': '图片文件'},
                 }, 'required': ['action', 'image_file']},
                 'topic_out': [{'topic': '/remote_control/image', 'format': 'image/jpeg'}],
+            },
+            {
+                'name': 'remote_camera',
+                'type': 'sensor',
+                'description': (
+                    'Remote camera — stream a video device attached to the '
+                    'browser as a live image source for the robot. Publishes '
+                    'image/jpeg, the same format the on-robot camera drivers '
+                    'emit, so any vision card accepts it directly.'
+                ),
+                'inputSchema': {'type': 'object', 'properties': {
+                    'action': {'type': 'string', 'enum': ['start', 'stop', 'info'],
+                               'description': 'Action to perform'},
+                }, 'required': ['action']},
+                'configSchema': {
+                    'type': 'object',
+                    'properties': {
+                        'device_id': {
+                            'type': 'string',
+                            'description': 'Video input device',
+                            'format': 'video-input-device',
+                            'scope': 'instance',
+                        },
+                        'fps': {
+                            'type': 'integer', 'minimum': 1, 'maximum': 30,
+                            'default': 12, 'scope': 'instance',
+                            'description': (
+                                'Frames per second. 12 matches the pose card, '
+                                'whose action model classifies a clip rather '
+                                'than a frame. Capped at 30 because each frame '
+                                'is JPEG-encoded on the browser main thread.'),
+                        },
+                        'width': {
+                            'type': 'integer', 'minimum': 160, 'maximum': 1920,
+                            'default': 640, 'scope': 'instance',
+                            'description': ('Long edge in pixels. Scaled to the '
+                                            'camera\'s own aspect ratio, never '
+                                            'stretched.'),
+                        },
+                    },
+                },
+                'topic_out': [{'topic': '/remote_control/camera',
+                               'format': 'image/jpeg'}],
             }
         ],
-        'topic_out': [{'topic': '/decision_core', 'format': 'data/json'}, {'topic': '/remote_control/mic', 'format': 'audio/pcm-16k'}, {'topic': '/remote_control/message', 'format': 'data/json'}, {'topic': '/remote_control/audio', 'format': 'audio/pcm-16k'}, {'topic': '/remote_control/image', 'format': 'image/jpeg'}],
+        'topic_out': [{'topic': '/decision_core', 'format': 'data/json'}, {'topic': '/remote_control/mic', 'format': 'audio/pcm-16k'}, {'topic': '/remote_control/message', 'format': 'data/json'}, {'topic': '/remote_control/audio', 'format': 'audio/pcm-16k'}, {'topic': '/remote_control/image', 'format': 'image/jpeg'}, {'topic': '/remote_control/camera', 'format': 'image/jpeg'}],
         'topic_in': [{'format': 'data/json'}],
     })
 
@@ -395,6 +439,16 @@ async def lifespan(app):
     if _prov:
         print(f'[dds] {_prov}')
 
+    # 上次关机时还在跑的基准测试：那个 asyncio task 已经随进程一起没了，记录却还
+    # 标着「进行中」——面板每次打开都会报一次并不存在的跑动。
+    try:
+        import benchmark_store
+        _stale = benchmark_store.mark_stale_runs()
+        if _stale:
+            print(f'[benchmark] {_stale} 次跑动因重启中断')
+    except Exception as _exc:
+        print(f'[benchmark] 清理中断跑动失败: {_exc}')
+
     # 启动 ROS2 bridge（用于 DDS topic 订阅）
     import ros2_bridge
     _ros2_loop = asyncio.get_running_loop()
@@ -427,6 +481,19 @@ async def lifespan(app):
     # 画布编辑锁：闲置 60s 自动释放（惰性检查兜不住被浏览器节流的后台标签页）
     from api import canvas as canvas_api
     canvas_api.start_editor_sweeper()
+
+    # 出网接口偏好。一次 netplan 重新生成就能把另一张网卡的静态默认路由放回来，
+    # 而它的 metric 可能更低 —— 于是重启之后机器又没有出口了，表现为每一次 LLM
+    # 调用 5 秒超时，而 WiFi 显示已连接、一切正常。在这里重新确立一次。
+    #
+    # 放在线程里跑：它要和 NetworkManager 做几次 D-Bus 往返，最坏情况下还要等一
+    # 次 Reapply，不该挡住启动。没人设置过偏好时它立刻返回。
+    try:
+        from api.network import ensure_preferred_uplink
+        await loop.run_in_executor(None, ensure_preferred_uplink)
+    except Exception as _uplink_error:      # noqa: BLE001
+        # 网络没理顺不该让机器人起不来，那是更坏的结果。
+        print(f'[network] uplink check skipped: {_uplink_error}')
 
     # 启动 DDS topic 订阅（依据 config event.subscribe_topics）
     topics = config.main.get('event', {}).get('subscribe_topics', [])
@@ -575,6 +642,9 @@ app_api.include_router(api.peer.router)
 import api.performance
 app_api.include_router(api.performance.router)
 
+import api.benchmark
+app_api.include_router(api.benchmark.router)
+
 app = fastapi.FastAPI(lifespan=lifespan)
 app.middleware('http')(auth.auth_middleware)
 app.mount('/api', app_api)
@@ -609,6 +679,11 @@ async def acp_complete(request: fastapi.Request):
 
     if not action_id:
         return {'ok': False, 'error': 'action_id required'}
+
+    # 基准测试的事实记录器要原样的这一份。顺序不重要 —— 记录器自己不依赖它，因为
+    # `mark_action_complete` 还有 SSE 那条调用路径根本不经过这个端点。
+    import benchmark_facts
+    benchmark_facts.note_acp_post(body)
 
     # 通道1: 解锁 sync() 等待
     mcp_client.mark_action_complete(action_id, body)
@@ -867,6 +942,76 @@ async def _ws_mic(ws: fastapi.WebSocket):
     except Exception:
         pass
 
+# ── Camera WebSocket endpoint (receive browser JPEG frames, publish to ROS2) ──
+#
+# The visual twin of /ws/mic: a video device on whatever machine has the browser
+# open becomes an image source for the robot. Published as image/jpeg, the
+# format the on-robot camera drivers emit, so no consumer needs a special case.
+_camera_pub = None
+_camera_frame_count = 0
+_camera_ws_connected = False
+# Arrival times of the last few frames, for the achieved-rate figure in `info`.
+# A configured 12 fps and an achieved 1 fps are indistinguishable from a frame
+# counter alone, and the difference decides whether anything temporal can work
+# at all: at 1 fps a track expires between frames and the action model never
+# accumulates the seconds of history it needs.
+_camera_recent: "collections.deque" = __import__("collections").deque(maxlen=30)
+
+
+def _ensure_camera_pub():
+    """Lazily create the ROS2 publisher for /remote_control/camera."""
+    global _camera_pub
+    if _camera_pub is not None:
+        return _camera_pub
+    try:
+        from sensor_msgs.msg import CompressedImage
+        import ros2_bridge
+        node = ros2_bridge._node_main
+        if node:
+            from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
+            # BEST_EFFORT with a shallow queue, like every other image topic in
+            # this project: a late frame is worse than a dropped one, because
+            # the action rules measure velocity between frames and a backlog
+            # delivered in a burst reads as motion that did not happen.
+            qos = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT,
+                             history=HistoryPolicy.KEEP_LAST, depth=2,
+                             durability=DurabilityPolicy.VOLATILE)
+            _camera_pub = node.create_publisher(
+                CompressedImage, "/remote_control/camera", qos)
+    except Exception:
+        pass
+    return _camera_pub
+
+
+@app.websocket('/ws/camera')
+async def _ws_camera(ws: fastapi.WebSocket):
+    """Receive JPEG frames from the browser and republish them on DDS."""
+    global _camera_frame_count, _camera_ws_connected
+    await ws.accept()
+    _camera_ws_connected = True
+    try:
+        _ensure_camera_pub()
+        while True:
+            data = await ws.receive_bytes()
+            if not data or _camera_pub is None:
+                continue
+            from sensor_msgs.msg import CompressedImage
+            msg = CompressedImage()
+            try:
+                msg.header.stamp = ros2_bridge._node_main.get_clock().now().to_msg()
+            except Exception:
+                pass
+            msg.format = "jpeg"
+            msg.data = data
+            _camera_pub.publish(msg)
+            _camera_frame_count += 1
+            _camera_recent.append(time.time())
+    except Exception:
+        pass
+    finally:
+        _camera_ws_connected = False
+
+
 class _HTTPOnlyStaticFiles(fastapi.staticfiles.StaticFiles):
     async def __call__(self, scope, receive, send):
         if scope['type'] != 'http':
@@ -911,6 +1056,76 @@ if __name__ == '__main__':
 
     logging.getLogger('uvicorn.error').addFilter(_SSLCloseFilter())
     logging.getLogger('asyncio').addFilter(_SSLCloseFilter())
+
+    # Drop the dashboard's own polling from the access log.
+    #
+    # An open dashboard re-asks these four every second or two, and on a robot
+    # that has been up for an hour they are half of every line in
+    # `docker logs`. That is not a cosmetic complaint: chasing the LLM 400s on
+    # Tianyi meant reading around 15209 peer 403s and several hundred of these
+    # to find eight lines that mattered.
+    #
+    # **Only successful polls of known paths are dropped.** Anything 4xx/5xx
+    # stays, every other path stays, and every non-access logger is untouched —
+    # a filter that hid a failing request would cost more than the noise does.
+    _QUIET_POLLS = (
+        'GET /api/mcp ',
+        'GET /api/topics/status ',
+        'GET /api/canvas/edit-status',
+        'GET /api/deploying ',
+        'GET /api/auth/verify ',
+        'POST /api/mcp ',            # driver/perception registration heartbeat
+        'POST /api/hooks/fire ',
+    )
+
+    # How often to report what was suppressed, and from where.
+    _SUPPRESSED_REPORT_S = 600.0
+
+    class _AccessPollFilter(logging.Filter):
+        """Drop successful polls, but never drop the *fact* that they happened.
+
+        Suppressing them outright would have cost this project a real find: the
+        leaked SSE subscription in #234 was spotted only because the driver
+        logged every request, and the giveaway was the shape of the volume —
+        39k, 53k, 60k, 67k, 74k per hour, climbing. Filter that away and a
+        runaway client becomes invisible, which is a worse failure than the
+        noise it removes.
+
+        So the lines go and the count stays. Every ten minutes it prints how
+        many were suppressed and the three busiest paths; a number that keeps
+        growing is the same signal the raw lines carried, at 1/1000th the size.
+        """
+
+        def __init__(self):
+            super().__init__()
+            self._counts: dict[str, int] = {}
+            self._last_report = time.monotonic()
+
+        def _maybe_report(self):
+            now = time.monotonic()
+            if now - self._last_report < _SUPPRESSED_REPORT_S or not self._counts:
+                return
+            window = now - self._last_report
+            self._last_report = now
+            total = sum(self._counts.values())
+            top = sorted(self._counts.items(), key=lambda kv: -kv[1])[:3]
+            self._counts = {}
+            detail = ', '.join(f'{p.strip()}×{n}' for p, n in top)
+            print(f'[access] suppressed {total} successful polls in '
+                  f'{window / 60:.0f} min ({total / window:.1f}/s): {detail}')
+
+        def filter(self, record):
+            msg = record.getMessage()
+            if '" 2' not in msg and '" 3' not in msg:
+                return True          # not a 2xx/3xx — always keep
+            hit = next((p for p in _QUIET_POLLS if p in msg), None)
+            if hit is None:
+                return True
+            self._counts[hit] = self._counts.get(hit, 0) + 1
+            self._maybe_report()
+            return False
+
+    logging.getLogger('uvicorn.access').addFilter(_AccessPollFilter())
 
     cert_file, key_file = _ensure_ssl_certs()
     uvicorn.run(app, host='0.0.0.0', port=15678, ws_ping_interval=None,

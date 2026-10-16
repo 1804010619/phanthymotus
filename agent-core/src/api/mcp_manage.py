@@ -3,6 +3,8 @@ import json
 import time
 from typing import Optional
 
+import typing
+
 import aiohttp
 import fastapi
 from pydantic import BaseModel
@@ -287,6 +289,7 @@ def _guess_data_type(tools: list, resources: list, name: str) -> str:
         ('control/joint-torque', ('torque_control', 'joint_torque')),
         ('control/joint-velocity', ('joint_velocity',)),
         ('control/joint',    ('joint', 'joint_position', 'arm', 'servo', 'actuator')),
+        ('control/eef',      ('eef', 'end_effector_pose', 'servo_eef', 'cartesian')),
         ('control/attitude', ('attitude', 'roll', 'pitch', 'yaw', 'setpoint')),
         ('control/waypoint', ('waypoint', 'navigate_to', 'goto')),
         ('control/velocity', ('velocity', 'cmd_vel', 'wheel', 'drive', 'locomotion', 'motion', 'motor')),
@@ -670,6 +673,16 @@ async def _do_ping(mcp_id: str) -> dict:
     tool_meta_map = {}
     split_map = {}
     tool_groups = {}
+    # The raw MCP inputSchema per tool, used by mcp_client for argument
+    # validation and for spotting `format: file` arguments to upload.
+    #
+    # The heartbeat has to compute this, not just preserve it. Merging alone
+    # (the previous commit) stopped it being *erased*, but then nothing ever
+    # refreshed it either: `needs_schemas` is false forever after the first
+    # `_connect_one`, so a driver that changes a tool's inputSchema would be
+    # validated against the old one until agent-core restarted. The churn this
+    # repo just removed had been accidentally serving as that refresh.
+    input_schemas = {}
     for tool in caps['tools']:
         tool_schemas = mcp_client._to_openai_schema(mcp_id, tool)
 
@@ -677,6 +690,7 @@ async def _do_ping(mcp_id: str) -> dict:
             schema = tool_schemas[0]
             schemas[schema['name']] = schema
             raw_input_schema = tool.get('inputSchema') or {}
+            input_schemas[schema['name']] = raw_input_schema
             action_enum = raw_input_schema.get('properties', {}).get('action', {}).get('enum')
             tool_meta_map[schema['name']] = {
                 'type': tool.get('type'),
@@ -689,6 +703,10 @@ async def _do_ping(mcp_id: str) -> dict:
             group = []
             for schema in tool_schemas:
                 schemas[schema['name']] = schema
+                # Split tools validate against the sub-schema's own parameters,
+                # matching what `_connect_one` stores for the same shape.
+                input_schemas[schema['name']] = schema.get(
+                    'parameters', {'type': 'object', 'properties': {}})
                 tool_meta_map[schema['name']] = {
                     'type': tool.get('type'),
                     'action_enum': None,
@@ -707,7 +725,25 @@ async def _do_ping(mcp_id: str) -> dict:
             if tool_name:
                 tool_groups[tool_name] = group
 
-    mcp_client.registry[mcp_id] = {
+    # Merge, never replace. This dict is what the heartbeat knows; anything it
+    # does not know about belongs to `mcp_client._connect_one` and must survive.
+    #
+    # Replacing it dropped `input_schemas` on every heartbeat, and twelve lines
+    # below, `needs_schemas` tests for exactly that key and re-runs
+    # `_connect_one` when it is missing. So every device rebuilt its whole
+    # connection — initialize, tools/list, SSE subscription — once per heartbeat,
+    # for as long as it was registered. The value `_connect_one` wrote never
+    # survived to the next tick.
+    #
+    # That self-sustaining loop is what made the leaked SSE task in #234 grow
+    # linearly: 120 heartbeats an hour, each leaking one immortal polling loop,
+    # each backing off to a 60s poll — +2 req/s per hour, which is the slope
+    # measured on Tianyi. Fixing the leak stopped the growth; this stops the
+    # churn that drove it, and lets an SSE stream actually stay open.
+    #
+    # This is the second key to go missing from this literal — `tool_meta` was
+    # the first. Merging retires the whole class rather than the instance.
+    mcp_client.registry.setdefault(mcp_id, {}).update({
         'name':        target.get('name', mcp_id),
         'url':         url,
         'online':      True,
@@ -717,7 +753,8 @@ async def _do_ping(mcp_id: str) -> dict:
         'tool_meta':   tool_meta_map,
         'split_map':   split_map,
         'tool_groups': tool_groups,
-    }
+        'input_schemas': input_schemas,
+    })
 
     # Register system hooks from x-hooks declarations
     import hooks
@@ -733,10 +770,17 @@ async def _do_ping(mcp_id: str) -> dict:
     if not was_online:
         asyncio.create_task(_restore_saved_configs(mcp_id, url, caps['tools']))
 
-    # Populate mcp_client.registry with schemas for file upload interception and validation
-    # Call _connect_one if registry lacks input_schemas (e.g. after container restart, or first ping)
-    needs_schemas = not mcp_client.registry.get(mcp_id, {}).get('input_schemas')
-    if needs_schemas:
+    # Do a full connect the first time we see this device.
+    #
+    # The trigger is "have we ever connected", not "is `input_schemas` missing".
+    # That older test worked only because the heartbeat erased the key it then
+    # tested for — and now that the heartbeat fills it in a dozen lines above,
+    # the test would be false on the very first ping and `_connect_one` would
+    # never run at all. That matters beyond schemas: **`_connect_one` is the
+    # only thing that starts the SSE subscription**, so a device that registers
+    # by heartbeat alone would silently never get one, and its ACP completion
+    # events would have nowhere to arrive.
+    if not mcp_client.registry.get(mcp_id, {}).get('connected'):
         server_name = caps.get('server_name', mcp_id)
         asyncio.create_task(mcp_client._connect_one(mcp_id, server_name, url, render_hint))
 
@@ -979,8 +1023,22 @@ async def _handle_agentcore_call(req: MCPCallRequest):
 
 
 @router.post('/{mcp_id}/call')
-async def mcp_call_tool(mcp_id: str, req: MCPCallRequest):
-    """Call a tool on an MCP server and return the result."""
+async def mcp_call_tool(mcp_id: str, req: MCPCallRequest,
+                        timeout_s: typing.Optional[float] = None):
+    """Call a tool on an MCP server and return the result.
+
+    `timeout_s` bounds the whole request. **默认仍然是不限时**，而那对 `start`
+    是对的：一张卡片的 `start` 合法地可能要几分钟（actucore 那张 VLA 卡片的
+    provider 构造会下载几个 GB）。
+
+    但对**轮询**类的调用（`info()`）它是错的：那些本该是毫秒级，而一个不回应的
+    MCP 服务器会让调用方永远等下去。真机实测 2026-09-21：perception 的 HTTP 线程
+    被同进程一个空转线程饿死（GIL），accept 队列堆满，于是
+    `_do_start_project_impl()` 挂在一次 `start` 上再不返回，`_start_project_lock`
+    永久为真，之后每次点启动都是 409 —— 除了重启进程没有出路。
+
+    所以超时是**调用方按用途给**的，不在这里定一个对两种用途都不对的默认值。
+    """
     # A paired peer's tool is reached over its signed link, not local HTTP, and this
     # handler builds JSON-RPC itself — so hand it to call_tool, which knows how to
     # route `transport: 'peer'` (peer/mcp_bridge.py). Without this the dashboard has
@@ -1029,6 +1087,73 @@ async def mcp_call_tool(mcp_id: str, req: MCPCallRequest):
                                                'topic_visible': topic_visible,
                                                'ws_connected': _start_mod._mic_ws_connected,
                                                'chunks_received': _start_mod._mic_chunk_count}}
+            return {'code': 200, 'data': None}
+        if req.tool == 'remote_camera':
+            action = req.arguments.get('action', 'start')
+            if action == 'start':
+                # Same self-check shape as remote_mic: the browser is started in
+                # parallel by the frontend, so wait for real frames rather than
+                # declaring success on a publisher that nothing is feeding. A
+                # card that says `running` while no image is flowing is how a
+                # vision pipeline gets debugged from the wrong end.
+                from start import _ensure_camera_pub
+                import start as _start_mod
+                if _ensure_camera_pub() is None:
+                    return {'code': 200, 'data': {
+                        'state': 'error',
+                        'message': 'ROS2 camera publisher not available'}}
+                import asyncio
+                initial = _start_mod._camera_frame_count
+                for _ in range(20):            # 20 x 0.5s = 10s
+                    if _start_mod._camera_frame_count > initial:
+                        return {'code': 200, 'data': {
+                            'state': 'running', 'ws_path': '/ws/camera',
+                            'frames_received': _start_mod._camera_frame_count}}
+                    await asyncio.sleep(0.5)
+                if _start_mod._camera_ws_connected:
+                    # The browser is attached, so frames are imminent — a
+                    # camera takes a moment to warm up and the first JPEG can
+                    # land after this window closes. Reporting `error` here
+                    # made a card that was merely still starting look broken,
+                    # which is how a 10 s race got read as a permanent fault.
+                    return {'code': 200, 'data': {
+                        'state': 'running', 'ws_path': '/ws/camera',
+                        'frames_received': _start_mod._camera_frame_count,
+                        'warning': 'The browser is connected but has not sent a '
+                                   'frame yet. If nothing appears, the camera may '
+                                   'be in use by another application.'}}
+                return {'code': 200, 'data': {
+                    'state': 'error',
+                    'message': 'The browser has not connected. Open the dashboard, '
+                               'allow camera access when prompted, and keep that '
+                               'tab visible — a background tab is throttled to '
+                               '1 frame per second.'}}
+            elif action == 'stop':
+                return {'code': 200, 'data': {'state': 'idle'}}
+            elif action == 'info':
+                import ros2_bridge, start as _start_mod
+                visible = '/remote_control/camera' in ros2_bridge.get_dds_topics()
+                recent = list(_start_mod._camera_recent)
+                achieved = 0.0
+                if len(recent) >= 2 and recent[-1] > recent[0]:
+                    achieved = (len(recent) - 1) / (recent[-1] - recent[0])
+                note = None
+                if achieved and achieved < 4:
+                    note = (f'Only {achieved:.1f} frames/s are arriving. A browser '
+                            f'clamps timers in a background tab to 1 Hz, which '
+                            f'collapses the stream — keep the dashboard tab '
+                            f'visible. Below about 4 fps a tracked person expires '
+                            f'between frames and no activity can be recognised.')
+                return {'code': 200, 'data': {
+                    'state': 'running' if _start_mod._camera_frame_count > 0 else 'idle',
+                    'ws_path': '/ws/camera',
+                    'achieved_fps': round(achieved, 1),
+                    **({'warning': note} if note else {}),
+                    'topic_out': [{'topic': '/remote_control/camera',
+                                   'format': 'image/jpeg'}],
+                    'topic_visible': visible,
+                    'ws_connected': _start_mod._camera_ws_connected,
+                    'frames_received': _start_mod._camera_frame_count}}
             return {'code': 200, 'data': None}
         if req.tool == 'remote_message':
             action = req.arguments.get('action', 'start')
@@ -1154,7 +1279,7 @@ async def mcp_call_tool(mcp_id: str, req: MCPCallRequest):
         raise fastapi.HTTPException(status_code=400, detail='MCP not reachable via HTTP')
 
     headers = {'Content-Type': 'application/json'}
-    timeout = aiohttp.ClientTimeout(total=None)
+    timeout = aiohttp.ClientTimeout(total=timeout_s)
     try:
         async with aiohttp.ClientSession(timeout=timeout) as session:
             # Initialize first (required by MCP protocol)

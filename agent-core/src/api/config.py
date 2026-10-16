@@ -166,11 +166,17 @@ def order_cards_by_dependency(cards, connections):
     return ordered, remaining
 
 
-_start_project_lock = False
+# 正在进行中的那次启动。**是任务句柄，不是布尔标志** —— 见 `_do_start_project`。
+_start_project_task = None
+
+# 整次启动的兜底上限。不是"预期耗时"，是"再久就一定有问题"：`_settle_loading_item`
+# 是 create_task 发出去的，不占这条流程，所以正常情况下这里是秒级；留到 15 分钟是
+# 为了容忍一张卡片在 `start` 里冷下载几个 GB（actucore 的 VLA provider 会）。
+START_PROJECT_TIMEOUT_S = 900
 
 
 async def _do_start_project():
-    """Serializes concurrent callers behind a flag.
+    """Serializes concurrent callers behind the in-flight task.
 
     The frontend's start button used to accept a second click while the first
     start was still in flight (it only flips to "running" after the fetch
@@ -181,16 +187,62 @@ async def _do_start_project():
     *both* streams: extra modals, item updates applied against the wrong
     modal's index, and whichever run errored first called offMotusEvent() on
     both listeners, silently orphaning the other run's still-loading cards.
+
+    ── 为什么是任务句柄而不是一个布尔标志 ───────────────────────────────────
+
+    此前是 `_start_project_lock = True` 加 `try/finally`。那个 `finally` 防的是
+    **抛异常**；它防不住 `await` **挂住**，而挂住时 `finally` 永远轮不到执行，标志
+    位就永久为真 —— 之后每次点启动都是 409，"取消启动"只是前端的，后端纹丝不动，
+    **除了重启进程没有出路**。
+
+    真机实测 2026-09-21（G1）：perception 的 HTTP 服务线程被同进程一个空转线程
+    饿死（GIL 争用，accept 队列 Recv-Q 6 > backlog 5），一次 `tts.start` 再没回来，
+    整个项目启动就此锁死。撞上的是 TTS，但**任何一个 MCP 服务器变慢都走同一条路**。
+
+    换成任务句柄之后三件事同时成立，而且都不依赖"记得清标志位"：
+
+      * 并发判据变成 `task.done()` —— 一个挂住的任务仍然是任务，而超时/取消都会
+        让它 `done()`，所以这个状态**不可能泄漏**。
+      * `asyncio.wait_for` 给整次启动兜底：不管哪个 `await` 挂住都会被取消。
+        这比"给每一次 MCP 调用加超时"更对 —— 后者要逐个审计调用点，而且对
+        `start` 本来就该不限时。
+      * "取消启动"能真的取消：`_cancel_start_project()` 直接 cancel 这个任务。
     """
-    global _start_project_lock
-    if _start_project_lock:
+    global _start_project_task
+    import asyncio as _aio
+
+    task = _start_project_task
+    if task is not None and not task.done():
         print('[start-project] already in progress, ignoring concurrent call')
         return None
-    _start_project_lock = True
+
+    task = _aio.ensure_future(_do_start_project_impl())
+    _start_project_task = task
     try:
-        return await _do_start_project_impl()
-    finally:
-        _start_project_lock = False
+        # wait_for 超时会 cancel 掉 task，于是它变成 done —— 下一次点启动就能进来。
+        return await _aio.wait_for(task, timeout=START_PROJECT_TIMEOUT_S)
+    except _aio.TimeoutError:
+        print(f'[start-project] timed out after {START_PROJECT_TIMEOUT_S}s — '
+              '有 MCP 服务器不回应；已取消本次启动')
+        return False
+    except _aio.CancelledError:
+        # 被 `_cancel_start_project()` 取消。这是操作者的动作，不是失败。
+        print('[start-project] cancelled')
+        return False
+
+
+def _cancel_start_project() -> bool:
+    """取消正在进行中的启动。返回是否真的取消了一个。
+
+    `stop-project` 调它。此前"取消启动"按钮只调 `_do_stop_project()` 去停卡片，
+    而挂住的那个启动协程**继续挂着**，标志位也不清 —— 按钮按下去什么也没发生。
+    """
+    task = _start_project_task
+    if task is None or task.done():
+        return False
+    task.cancel()
+    print('[start-project] cancel requested')
+    return True
 
 
 def payload_of(result) -> dict:
@@ -341,6 +393,17 @@ async def _do_start_project_impl():
 
     LOADING_POLL_S = 3
     LOADING_TIMEOUT_S = 900
+    # `info()` 是只读查询，本该是毫秒级。给它一个短上限，理由不是省时间，是**让
+    # 循环里的 deadline 真的生效**：
+    #
+    #     deadline = time.time() + LOADING_TIMEOUT_S
+    #     while time.time() < deadline:
+    #         await _asyncio.sleep(LOADING_POLL_S)
+    #         info = await mcp_call_tool(...)      # ← 这里挂住
+    #
+    # 那个 `while` 看起来有 15 分钟的超时保护，实际上没有：内层 await 不返回，
+    # 循环就永远不会再判一次条件。**循环里的 deadline 挡不住循环内部的挂起。**
+    INFO_TIMEOUT_S = 10
 
     async def _resolve_and_register(mcp_id: str, tool_name: str, card_id: str,
                                    info_args: dict) -> dict:
@@ -355,8 +418,15 @@ async def _do_start_project_impl():
         info = await mcp_call_tool(mcp_id, MCPCallRequest(
             tool=tool_name, arguments={'action': 'info', 'instance_id': card_id,
                                        **info_args},
-        ))
+        ), timeout_s=INFO_TIMEOUT_S)
         data = payload_of(info)
+        # Kept whole, not just `topic_out`. A card's `info()` is the only place
+        # it describes itself, and a consumer downstream may need more of that
+        # description than its output topics — `camera_info` is the first such
+        # case. Retaining the payload costs nothing here because the call has
+        # already been made; going back for it later would mean a second round
+        # trip, out of dependency order.
+        resolved_info[card_id] = data
         topic_out = data.get('topic_out') or []
         if topic_out:
             resolved_topics[card_id] = topic_out
@@ -383,7 +453,7 @@ async def _do_start_project_impl():
                 info = await mcp_call_tool(mcp_id, MCPCallRequest(
                     tool=tool_name, arguments={'action': 'info', 'instance_id': card_id,
                                                **info_args},
-                ))
+                ), timeout_s=INFO_TIMEOUT_S)
             except Exception as error:
                 print(f'[start-project] {tool_name} info during load failed: {error}')
                 continue
@@ -456,6 +526,9 @@ async def _do_start_project_impl():
     errors = []
     # Resolved topic_out per card (populated after starting sources)
     resolved_topics: dict[str, list] = {}
+    # The whole info() payload per card, same population point. See
+    # `_upstream_camera_info`.
+    resolved_info: dict[str, dict] = {}
 
     def _topic_clash(card_id: str, info: dict):
         """Another card already publishing a topic this one just claimed.
@@ -513,7 +586,8 @@ async def _do_start_project_impl():
             return {}
 
     async def _start_and_resolve(card, input_topic: str = '', input_topics: list = None,
-                                 control_interface: dict = None):
+                                 control_interface: dict = None,
+                                 camera_info: dict = None):
         """Start a card, then call info() to get its resolved topic_out."""
         mcp_id = card.get('mcpId', '')
         tool_name = card.get('toolName', '')
@@ -558,6 +632,13 @@ async def _do_start_project_impl():
             # producer can reconcile against it and refuse — not on `info`,
             # which must stay answerable by a card that has not been given one.
             args['control_interface'] = control_interface
+
+        if camera_info:
+            # The optics behind each input, keyed by topic. Sent on `start` for
+            # the same reason: a consumer adopts it once, before the first
+            # frame, and reports in `info().degraded` what it had to assume when
+            # a source declared nothing.
+            args['camera_info'] = camera_info
 
         try:
             req = MCPCallRequest(tool=tool_name, arguments=args)
@@ -699,10 +780,44 @@ async def _do_start_project_impl():
         # derived topic never resolved in a browser, empty.
         if not topic:
             topic = conn.get('fromTopic') or ''
+        from_card = next((c for c in cards if c.get('id') == from_card_id), None)
         if not topic:
-            from_card = next((c for c in cards if c.get('id') == from_card_id), None)
             topic = _port_topic((from_card or {}).get('topicOut') or [], port_idx)
+        # 最后一条：**设备此刻声称的** topic_out，从 MCP 注册表里按
+        # (mcpId, toolName) 取。放最后，因为前三条更贴近"操作者在画布上看到的那
+        # 条线"，而这一条是"设备现在说它往哪儿发"——两者不一致时应当以画布为准，
+        # 否则一次驱动改动会让一条画好的线悄悄指向别处。
+        #
+        # 但它必须存在，因为前三条在一种情况下**全部为空且都不是错的**：
+        #
+        #   * `resolved_topics` 只有已启动的卡片有 —— 而反馈环（vla → servo_eef
+        #     → vla）里，先启动的那张永远拿不到后启动那张的答案；
+        #   * `fromTopic` 与 `topicOut` 都是**浏览器**的快照，拍摄于画线/拖卡片
+        #     的那一刻。驱动后来补上了 `topic_out.topic`，快照里却没有。
+        #
+        # 真机实测 2026-09-21（G1）：`servo_eef` 补上 topic 之后，agent-core 的注册
+        # 表里已经是 `/ubuntu/servo_eef/state`，而画布快照仍是空的，于是启动失败并
+        # 报「连线缺少 topic: servo_eef → vla，请检查上游卡片是否能报出输出话题」
+        # —— 上游明明是对的，唯一新鲜且权威的那份数据根本没被查。
+        if not topic and from_card:
+            topic = _registry_port_topic(from_card, port_idx)
         return topic
+
+    def _registry_port_topic(from_card: dict, port_idx: int) -> str:
+        """源卡片对应的工具在 MCP 注册表里当前声明的 topic_out[port_idx]。"""
+        # 直接读 `config.main`，不走 `api.mcp_manage` —— 那是同一份数据，而少一个
+        # 跨模块依赖（注册表本来就存在 config 里，`_get_mcp_list` 只是它的读取器）。
+        mcp_id = from_card.get('mcpId') or ''
+        tool_name = from_card.get('toolName') or ''
+        if not mcp_id or not tool_name:
+            return ''
+        for mcp in (config.main.get('services', {}) or {}).get('mcp', []) or []:
+            if mcp.get('id') != mcp_id:
+                continue
+            for tool in mcp.get('tools') or []:
+                if isinstance(tool, dict) and tool.get('name') == tool_name:
+                    return _port_topic(tool.get('topic_out') or [], port_idx)
+        return ''
 
     def _resolve_input_topics(card_id: str) -> tuple[str, list, list]:
         """Resolve input_topic(s) for a card from its inbound connections.
@@ -730,6 +845,46 @@ async def _do_start_project_impl():
         elif len(topics) == 1:
             return topics[0], [], unresolved
         return '', [], unresolved
+
+    def _upstream_camera_info(card_id: str) -> dict:
+        """What this card's sources say about the optics behind each input.
+
+        `{topic: declaration}` — see `phanthymotus-driver/README_dev.md`
+        § Camera Parameters for the format and why it exists.
+
+        **The mirror image of `_downstream_descriptor`, and cheaper.** That one
+        runs against the start order and has to call `info()` itself, because a
+        command producer needs to know about a consumer that has not started.
+        This one runs *with* the order: a card's sources are always started
+        first, so their `info()` answers are already in `resolved_info` and this
+        is a dictionary lookup.
+
+        Keyed by the topic each declaration names, not by position and not by
+        the source card's name. A card may publish several ports and a consumer
+        may have several inputs, so list position means nothing to either side;
+        and naming the upstream card would undo the reason consumers dispatch
+        inputs by what they carry rather than by where they came from.
+
+        A source that declares nothing simply has no entry. That is not a fault
+        — almost no card has heard of this format — and it must never fail a
+        start; the consumer degrades and says so.
+        """
+        out: dict = {}
+        for conn in [c for c in connections if c.get('toCardId') == card_id]:
+            declarations = (resolved_info.get(conn.get('fromCardId')) or {}).get('camera_info')
+            if not isinstance(declarations, list):
+                continue
+            for entry in declarations:
+                if not isinstance(entry, dict):
+                    continue
+                topic = entry.get('topic')
+                # First declaration for a topic wins. Two sources publishing the
+                # same topic is already reported as a clash by `_topic_clash`;
+                # silently taking whichever card started last would make the
+                # optics disagree with the clash message.
+                if topic and topic not in out:
+                    out[topic] = entry
+        return out
 
     async def _downstream_descriptor(card_id: str) -> tuple[dict, str]:
         """The action space of whatever this card's `control/*` output feeds.
@@ -769,7 +924,7 @@ async def _do_start_project_impl():
                 info = await mcp_call_tool(mcp_id, MCPCallRequest(
                     tool=tool_name,
                     arguments={'action': 'info', 'instance_id': target.get('id', '')},
-                ))
+                ), timeout_s=INFO_TIMEOUT_S)
                 # Answering without a descriptor and not answering at all are
                 # different facts, and only the second is a fault: most cards
                 # have never heard of motus.control/1, and a control link to
@@ -857,7 +1012,8 @@ async def _do_start_project_impl():
             continue
 
         await _start_and_resolve(card, input_topic=input_topic, input_topics=input_topics,
-                                 control_interface=descriptor)
+                                 control_interface=descriptor,
+                                 camera_info=_upstream_camera_info(card.get('id', '')))
 
     # 有 card 失败 → 全部回滚，不标记 running
     if errors:
@@ -878,29 +1034,76 @@ async def _do_start_project_impl():
     return True
 
 
-async def _stop_cards(cards) -> int:
-    """Send `stop` to each card's instance. Returns how many calls were made.
+# 每张卡片 `stop` 的死线。
+#
+# `start` 合法地可能要几分钟（下载权重、warmup），`stop` 不是：它是取消，正常是
+# 毫秒级。所以它必须有死线，而且要短 —— 真正要防的不是慢，是**无界**：
+# `mcp_call_tool` 的默认是不限时，于是一个 accept 了却不回应的 MCP 服务器（被同
+# 进程的线程把 GIL 饿死、容器正在重启）会让停止永远挂着。容器内实测：
+# `timeout=None` 对着一个只 accept 不回的端口 25 秒仍未返回；给 5 秒则 5.3 秒失败。
+STOP_CARD_TIMEOUT_S = 5.0
+
+
+async def _stop_cards(cards, progress: bool = False) -> list[dict]:
+    """Send `stop` to each card's instance. Returns one result per card.
 
     `stop` is idempotent — a plugin that is already idle returns
     `{"state": "idle"}` — so this is safe to call on cards that were never
     started.
-    """
-    from api.mcp_manage import mcp_call_tool, MCPCallRequest
 
-    stopped = 0
-    for card in cards:
-        mcp_id = card.get('mcpId', '')
+    **并行，而且每张卡片各自有死线。** 以前是串行 `await`，总耗时是各卡之和，
+    而其中任何一张卡片不回应就卡住后面所有卡片 —— 一台设备坏了，于是别的设备都
+    停不下来，这是最不该有的耦合方向。现在总耗时是 max() 而不是 sum()，坏掉的那
+    张卡片只花掉它自己的 5 秒。
+
+    `progress=True` 时每张卡片有结果就推一条 `project_stop_item`，给界面逐项显示
+    用。removed-card 清理走的是同一个函数但不该推 —— 那不是操作者按下的「停止」。
+    """
+    import asyncio as _aio
+
+    from api.mcp_manage import mcp_call_tool, MCPCallRequest
+    from api.motus_stream import push_event
+
+    targets = [c for c in (cards or [])
+               if c.get('mcpId') and c.get('toolName')]
+    if not targets:
+        return []
+
+    async def stop_one(card: dict) -> dict:
         tool_name = card.get('toolName', '')
-        card_id = card.get('id', '')
-        if not mcp_id or not tool_name:
-            continue
+        entry = {'tool': tool_name, 'mcp_id': card.get('mcpId', ''),
+                 'card_id': card.get('id', ''), 'ok': False, 'error': ''}
         try:
-            req = MCPCallRequest(tool=tool_name, arguments={'action': 'stop', 'instance_id': card_id})
-            await mcp_call_tool(mcp_id, req)
-            stopped += 1
-        except Exception:
-            pass
-    return stopped
+            req = MCPCallRequest(tool=tool_name,
+                                 arguments={'action': 'stop',
+                                            'instance_id': card.get('id', '')})
+            # 死线给两层。`timeout_s` 是给 HTTP 请求的,`wait_for` 是给**这次调用
+            # 整体**的 —— 挂住的地方不一定在 socket 上(注册表查询、锁、一个把
+            # GIL 握死的线程),而停止这条路径的要求是「无论挂在哪都要能回来」。
+            await _aio.wait_for(
+                mcp_call_tool(card.get('mcpId', ''), req,
+                              timeout_s=STOP_CARD_TIMEOUT_S),
+                STOP_CARD_TIMEOUT_S)
+            entry['ok'] = True
+        except _aio.TimeoutError:
+            # 这条消息会被操作者读到，所以说的是**后果**，不是异常类名：一张没能停
+            # 下来的卡片意味着那台设备可能还在跑。
+            entry['error'] = f'无响应（{STOP_CARD_TIMEOUT_S:g}s 死线）'
+        except Exception as error:  # noqa: BLE001
+            entry['error'] = str(error) or type(error).__name__
+        if progress:
+            try:
+                await push_event({'type': 'project_stop_item', 'payload': {
+                    'tool': entry['tool'], 'mcp_id': entry['mcp_id'],
+                    'card_id': entry['card_id'],
+                    'status': 'stopped' if entry['ok'] else 'error',
+                    'message': entry['error'],
+                }})
+            except Exception as error:  # noqa: BLE001 - 显示失败不影响停止
+                print(f'[stop-project] push item failed: {error}')
+        return entry
+
+    return list(await _aio.gather(*(stop_one(c) for c in targets)))
 
 
 async def stop_removed_cards(old_cards, new_cards) -> int:
@@ -923,29 +1126,84 @@ async def stop_removed_cards(old_cards, new_cards) -> int:
     removed = [c for c in (old_cards or []) if c.get('id') and c.get('id') not in live]
     if not removed:
         return 0
-    count = await _stop_cards(removed)
-    print(f'[layout] stopped {count} instance(s) for removed card(s): '
-          f'{", ".join(c.get("id", "") for c in removed)}')
+    results = await _stop_cards(removed)
+    count = sum(1 for r in results if r.get('ok'))
+    print(f'[layout] stopped {count}/{len(results)} instance(s) for removed '
+          f'card(s): {", ".join(c.get("id", "") for c in removed)}')
     return count
 
 
-async def _do_stop_project():
-    """停止所有 canvas cards。"""
-    from api.motus_stream import push_event
+# 正在进行中的设备收尾。再点一次停止不会并发出第二轮 —— 停止是幂等的，但两轮
+# 并行会让界面上的逐项进度互相覆盖。
+_stop_teardown_task = None
 
-    layout = config.main.get('canvas_layout', {})
-    await _stop_cards(layout.get('cards', []))
+
+def teardown_running() -> bool:
+    """设备收尾还在跑吗（给 `/stop-project` 和测试用）。"""
+    task = _stop_teardown_task
+    return task is not None and not task.done()
+
+
+async def _do_stop_project():
+    """停止智能控制。**两段，保证不同。**
+
+    第 1 段 —— 关掉 agent loop。本地一个赋值，≤1ms，不可能失败。
+    第 2 段 —— 设备收尾：逐卡 `stop`，并行、每卡 5s 死线，可能部分失败。
+
+    **顺序以前是反的,而那是个安全问题,不只是体验问题。** 原来先逐卡 stop、最后才
+    把 `project_running` 翻成 False。于是只要有一张卡片的 MCP 不回应（它本来没有
+    死线，见 `_stop_cards`），在那段挂住的时间里 **agent loop 还活着** —— 还会调
+    TTS、还会驱动执行器。操作者按下「停止」要的恰恰是这件事立刻停下来，而界面在
+    那整段时间里没有任何变化,所以他只会再点一次。
+
+    现在第 1 段先做完并立刻广播,界面可以诚实地说「已停止」;第 2 段的结果单独报,
+    因为「agent 不再行动」和「每台设备都已停下」是两件不同的事,合成一个状态必然
+    有一件是假的。
+    """
+    await _do_stop_project_agent()
+    return await _do_stop_project_teardown()
+
+
+async def _do_stop_project_agent() -> None:
+    """第 1 段：关掉 agent loop。一个本地赋值加一次广播,不可能失败。"""
+    from api.motus_stream import push_event
 
     core = config.main.get('core', {})
     core['project_running'] = False
     config.main['core'] = core
     await push_event({'type': 'project_state', 'payload': {'running': False}})
-    print('[stop-project] done')
+    print('[stop-project] agent loop stopped')
+
+
+async def _do_stop_project_teardown() -> list[dict]:
+    """第 2 段：设备收尾。并行、每卡死线、逐项报进度、允许部分失败。"""
+    from api.motus_stream import push_event
+
+    layout = config.main.get('canvas_layout', {})
+    cards = [c for c in (layout.get('cards', []) or [])
+             if c.get('mcpId') and c.get('toolName')]
+    await push_event({'type': 'project_stop_begin', 'payload': {
+        'cards': [{'tool': c.get('toolName', ''), 'mcp_id': c.get('mcpId', ''),
+                   'card_id': c.get('id', '')} for c in cards],
+    }})
+    results = await _stop_cards(cards, progress=True)
+    failed = [r for r in results if not r.get('ok')]
+    await push_event({'type': 'project_stop_done', 'payload': {
+        'stopped': len(results) - len(failed),
+        'total': len(results),
+        'failed': [{'tool': r['tool'], 'card_id': r['card_id'],
+                    'message': r['error']} for r in failed],
+    }})
+    print(f'[stop-project] teardown done: {len(results) - len(failed)}/'
+          f'{len(results)} stopped'
+          + (f', failed: {", ".join(r["tool"] for r in failed)}' if failed else ''))
+    return results
 
 
 @router.post('/start-project')
 async def api_start_project():
-    if _start_project_lock:
+    task = _start_project_task
+    if task is not None and not task.done():
         return fastapi.responses.JSONResponse(
             status_code=409,
             content={'ok': False, 'detail': '启动已在进行中，请稍候'}
@@ -961,8 +1219,37 @@ async def api_start_project():
 
 @router.post('/stop-project')
 async def api_stop_project():
-    await _do_stop_project()
-    return {'ok': True}
+    """停 agent loop,然后在后台收尾设备。
+
+    **这个请求只等第 1 段。** 第 2 段（逐卡 stop）丢进 background task,进度走
+    `project_stop_item` / `project_stop_done`。这样做是因为前端要靠这个响应翻按
+    钮状态:让它等完收尾,就等于让「已停止」这件已经为真的事,被一台坏掉的设备拖
+    着不敢显示 —— 那正是原来点下去什么也不发生的原因。
+    """
+    import asyncio as _aio
+
+    global _stop_teardown_task
+
+    # **先取消在飞的那次启动，再停卡片。** 顺序是有意的：反过来的话被停掉的卡片
+    # 会被那次仍在继续的启动重新拉起来，而操作者看到的是"停了又自己起来了"。
+    cancelled = _cancel_start_project()
+
+    if teardown_running():
+        # 已经在收尾了。不开第二轮：停止本身是幂等的,但两轮并行会让界面上的逐项
+        # 进度互相覆盖。agent loop 此时已经是停的,所以照常回 ok。
+        return {'ok': True, 'cancelled_start': cancelled,
+                'teardown_running': True}
+
+    await _do_stop_project_agent()
+
+    async def _teardown():
+        try:
+            await _do_stop_project_teardown()
+        except Exception as error:  # noqa: BLE001
+            print(f'[stop-project] teardown failed: {error}')
+
+    _stop_teardown_task = _aio.ensure_future(_teardown())
+    return {'ok': True, 'cancelled_start': cancelled, 'teardown_running': True}
 
 
 

@@ -123,6 +123,47 @@ def query_latest(n: int = 20) -> list:
     return result
 
 
+def turns_between(start: float, end: float) -> list:
+    """一个时间窗内的 turn 及其 spans，按时间正序。
+
+    给基准测试的「运行详情」用：spans 里有每次工具调用的**真实起止时刻**，
+    而会话历史只有一轮被写完的时刻。两者相差一整轮的时长 —— 左右两栏于是对不上。
+    """
+    conn = _get_conn()
+    conn.row_factory = sqlite3.Row
+    turns = conn.execute(
+        'SELECT * FROM perf_turns WHERE created_at BETWEEN ? AND ? ORDER BY created_at',
+        (float(start), float(end))).fetchall()
+    result = []
+    for t in turns:
+        td = dict(t)
+        td['spans'] = [dict(s) for s in conn.execute(
+            'SELECT span, component, start_ts, end_ts, duration_ms FROM perf_spans '
+            'WHERE trace_id=? ORDER BY start_ts', (td['turn_id'],)).fetchall()]
+        result.append(td)
+    conn.close()
+    return result
+
+
+def spans_between(start: float, end: float) -> list:
+    """一个时间窗内的 spans，不分 turn。
+
+    和 `turns_between` 的区别是**不按轮分组**：基准测试的指标要算的是「这段时间里推理
+    一共占了多久、工具重叠了多少」，分组反而要再摊平一次。
+
+    按 `start_ts` 筛而不是 `created_at` —— 后者是写入时刻，一轮结束才写，用它筛会把
+    运行末尾那几轮整个漏掉。
+    """
+    conn = _get_conn()
+    conn.row_factory = sqlite3.Row
+    rows = conn.execute(
+        'SELECT span, component, start_ts, end_ts, duration_ms FROM perf_spans '
+        'WHERE start_ts BETWEEN ? AND ? ORDER BY start_ts',
+        (float(start), float(end))).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
 def query_spans(trace_id: str) -> list:
     """返回单个 turn 的全部 spans。"""
     conn = _get_conn()

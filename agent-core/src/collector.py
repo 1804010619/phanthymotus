@@ -32,6 +32,39 @@ _bg_buffer: deque = deque()          # P=0 事件（按节奏送 bg subagent）
 _bg_last_accepted: dict[str, float] = {}  # per-source throttle for bg
 _BG_THROTTLE_INTERVAL = 1.0
 
+# 「仪表型」与「日志型」P=0 事件的区别，以及为什么必须区分。
+#
+# 这条管道原本只服务仪表读数：SOC、温度、电压、IMU。对它们「最新值取代旧值」是
+# 正确的 —— 一秒内来两条电量，你只想要后一条。所以 _bg_buffer_add 在节流窗口内
+# **替换**同 source 的最后一条，而 _format_bg_batch 只渲染 evs[-1]。
+#
+# 对话不是仪表读数，是日志。每一条都带独立的信息，丢掉一条就永久丢掉了。把
+# KWS 未触发的话语送进这条管道时，两个机制叠在一起的效果是：间隔小于 1 秒的第二
+# 句话覆盖掉第一句，而就算攒下了 N 条，送到 subagent 面前的也只有最后一条 ——
+# 一场 30 秒的旁人对话到它那里是最后半句话。
+#
+# 判定靠事件自己声明 `log_type: true`，而不是猜 source 名字：发事件的那一侧知道
+# 自己是读数还是话语，而 source 字符串是 topic 路径，拼不出这个语义。
+_LOG_TYPE_FLAG = 'log_type'
+# 日志型 source 在一个批次里最多渲染多少条。上界是防一场长对话把 bg subagent 的
+# context 吃光；超出时**说出来**丢了多少，而不是静默截断 —— 静默截断读起来就像
+# 「这段时间只说了这么多」。
+_BG_LOG_TYPE_MAX_PER_SOURCE = 12
+
+
+def _is_log_type(ev: dict) -> bool:
+    """这条事件是日志（每条都要保留）还是仪表读数（只要最新值）？"""
+    payload = ev.get('payload')
+    if isinstance(payload, dict) and payload.get(_LOG_TYPE_FLAG):
+        return True
+    text = ev.get('text', '')
+    if text and text.startswith('{'):
+        try:
+            return bool(_json.loads(text).get(_LOG_TYPE_FLAG))
+        except (ValueError, TypeError):
+            return False
+    return False
+
 # ── 共享状态 ──────────────────────────────────────────────────────────────────
 _busy: bool = False
 _cancel_event: asyncio.Event | None = None
@@ -122,6 +155,69 @@ def _extract_asr_text_field(ev: dict) -> str:
         except (ValueError, TypeError):
             pass
     return text
+
+
+# 活动流里要显示的字段。speaker_similarity / coherence / 各种 ts 不在内：它们是
+# 质量与排查信息，一行日志放不下，而 payload 原样在 raw_input_info 里查得到。
+_ASR_BACKGROUND_SHOWN_FIELDS = (
+    'speaker_name', 'speaker_id', 'lang', 'emotion', 'audio_event',
+)
+
+
+def _asr_background_entry(ev: dict) -> dict | None:
+    """这条 P=0 事件是不是「旁边听到的话」—— 是就返回活动流要显示的内容。
+
+    判断同时看 payload 里的 `background` 标记和 source 里的 `asr_background`，
+    因为这两个来源在实现上是独立的：标记由 perception 写进 JSON，topic 名由画布
+    的连线决定。只认其中一个，就会在另一端改动时静默停止显示 —— 而「活动流里少
+    了一类东西」是没人会收到报告的那种故障。
+    """
+    source = ev.get('source', '')
+    text = ev.get('text', '')
+    data: dict = {}
+    if isinstance(text, str) and text.startswith('{'):
+        try:
+            data = _json.loads(text)
+        except (ValueError, TypeError):
+            data = {}
+    if not isinstance(data, dict):
+        data = {}
+    if not data.get('background') and 'asr_background' not in source.lower():
+        return None
+    spoken = data.get('text') if data else None
+    if not spoken and isinstance(text, str) and not text.startswith('{'):
+        spoken = text
+    if not (spoken or '').strip():
+        return None
+    entry = {'text': spoken, 'source': source}
+    for key in _ASR_BACKGROUND_SHOWN_FIELDS:
+        value = data.get(key)
+        if value:
+            entry[key] = value
+    return entry
+
+
+async def _push_asr_background(ev: dict) -> None:
+    """把旁人说的那句话推到 /ws/motus。
+
+    **只有 ASR 的背景事件进活动流，不是所有 P=0 事件。** P=0 里绝大多数是电量、
+    温度、IMU 这类读数，它们每秒都在来；全推进去等于把活动流冲掉，而活动流的用处
+    恰恰是「能一眼看完」。
+
+    推送点在 `_bg_buffer_add` **之后、但不依赖它的任何判断**：bg subagent 可能被
+    节流窗口合掉、或被 `_bg_buffer_has_substance` 判为没有内容而根本不 spawn，那
+    句话就只在 DDS 上存在过。能看见机器人听到了什么，是这个功能的全部目的。
+
+    永不抛：显示用的东西不能影响事件分流。
+    """
+    entry = _asr_background_entry(ev)
+    if entry is None:
+        return
+    try:
+        from api.motus_stream import push_event
+        await push_event({'type': 'asr_background', 'payload': entry})
+    except Exception as error:  # noqa: BLE001 - 显示失败不影响处理
+        print(f'[collector] push asr_background failed: {error}')
 
 
 def _pending_has_same_asr_text(asr_text: str) -> bool:
@@ -448,20 +544,63 @@ def _slim_event_text(text: str) -> str:
         if key in data:
             del data[key]
             changed = True
-    # ACP 完成事件：去掉 result 中的冗余内容（LLM 已知自己发出了什么）
+    # ACP 完成事件：成功时 result 基本是回声（LLM 知道自己发出了什么），去掉；
+    # **失败时留着** —— 见 `_slim_acp_result`。
     if data.get('type') == 'action_complete' and 'result' in data:
-        del data['result']
+        slimmed = _slim_acp_result(data.get('status'), data['result'])
+        if slimmed is None:
+            del data['result']
+        else:
+            data['result'] = slimmed
         changed = True
     if not changed:
         return text
     return _json.dumps(data, ensure_ascii=False)
 
 
+# 一条失败原因能有多长。超了就截断并写明截了 —— 不写明，LLM 会把半句话当成全部。
+_ACP_RESULT_CHARS = 600
+
+# 成功时也值得留的那几个：它们是**量**，不是回声。LLM 发出的是「去 A」，回来的
+# 「走了 12.4 m、用了 31 秒」它猜不到，而下一步要不要调整节奏就看这个。
+_ACP_KEEP_ON_SUCCESS = ('elapsed_s', 'distance_m', 'duration_s')
+
+
+def _slim_acp_result(status, result):
+    """送进 LLM 的那份 `result`。返回 None 表示整块去掉。
+
+    **失败的那一份必须原样留下。** 原先这里无条件 `del data['result']`，理由写的是
+    「LLM 已知自己发出了什么」—— 对回声字段成立，对 `reason` 不成立，而 `reason` 恰恰
+    是它唯一不可能知道的东西。于是真机上一次导航失败送到 LLM 面前就只剩
+
+        {"type": "action_complete", "action_id": "navi_…", "status": "failed"}
+
+    「目标丢失」和「被挡住十几秒动不了」在这行字里长得一模一样，而这两件事该做的
+    下一步完全相反：前者要转头重新找，后者要换条路或者叫人。驱动一直把原因放在
+    `result.reason` 里，是这一步把它扔了。
+
+    不按字段名挑，因为每个驱动的 result 形状都不一样 —— 挑一份名单出来，等于把某一家
+    的 schema 焊进这里，而漏掉的那家会**静默**地少一条原因。只限长度。
+    """
+    if not isinstance(result, dict) or not result:
+        return None
+    if str(status or 'completed') == 'completed':
+        kept = {k: result[k] for k in _ACP_KEEP_ON_SUCCESS if k in result}
+        return kept or None
+    text = _json.dumps(result, ensure_ascii=False)
+    if len(text) <= _ACP_RESULT_CHARS:
+        return result
+    return {'truncated': f'result 超过 {_ACP_RESULT_CHARS} 字，以下为前半部分',
+            'head': text[:_ACP_RESULT_CHARS]}
+
+
 def _format_priority_batch(events: list[dict]) -> str:
     """格式化 P>0 事件为 XML（精简 perf 字段后的文本）。"""
     parts = []
     for ev in events:
-        ts = datetime.datetime.fromtimestamp(ev['ts']).strftime('%Y-%m-%dT%H:%M:%S')
+        # 和 <status time=...> 必须是同一套钟 —— 见 prompt.format_ts 的注释。
+        import prompt
+        ts = prompt.format_ts(ev['ts'])
         channel = _infer_channel(ev)
         source = ev.get('source', '')
         text = _slim_event_text(ev.get('text', ''))
@@ -472,24 +611,39 @@ def _format_priority_batch(events: list[dict]) -> str:
 # ── 内部：P=0 管道 ────────────────────────────────────────────────────────────
 
 def _bg_buffer_add(ev: dict):
-    """将 P=0 事件加入 bg buffer（per-source throttle）。"""
+    """将 P=0 事件加入 bg buffer。
+
+    仪表型走 per-source 节流 + 替换（只要最新值）；日志型一律追加（每条都带独立
+    信息，替换就是永久丢数据）。见 _is_log_type 上面的注释。
+    """
     source = ev.get('source', 'unknown')
     now = ev.get('ts', time.time())
-    last_ts = _bg_last_accepted.get(source, 0)
 
-    if now - last_ts < _BG_THROTTLE_INTERVAL:
-        # 替换同 source 最后一条
-        for i in range(len(_bg_buffer) - 1, -1, -1):
-            if _bg_buffer[i].get('source') == source:
-                _bg_buffer[i] = ev
-                return
-    _bg_last_accepted[source] = now
-    _bg_buffer.append(ev)
+    if _is_log_type(ev):
+        _bg_buffer.append(ev)
+    else:
+        last_ts = _bg_last_accepted.get(source, 0)
+        if now - last_ts < _BG_THROTTLE_INTERVAL:
+            # 替换同 source 最后一条
+            for i in range(len(_bg_buffer) - 1, -1, -1):
+                if (_bg_buffer[i].get('source') == source
+                        and not _is_log_type(_bg_buffer[i])):
+                    _bg_buffer[i] = ev
+                    return
+        _bg_last_accepted[source] = now
+        _bg_buffer.append(ev)
 
-    # FIFO 限制
+    # FIFO 限制。日志型优先被保留：仪表读数的旧值本来就没用（下一条就覆盖了），
+    # 而丢掉一句话是不可逆的。所以满了先扔最老的仪表型，只有全是日志型时才扔
+    # 最老的日志。
     max_window = config.main.get('event', {}).get('llm', {}).get('collector_max_window', 20)
     while len(_bg_buffer) > max_window:
-        _bg_buffer.popleft()
+        for index, item in enumerate(_bg_buffer):
+            if not _is_log_type(item):
+                del _bg_buffer[index]
+                break
+        else:
+            _bg_buffer.popleft()
 
 
 def _format_bg_batch(events: list[dict]) -> str:
@@ -501,7 +655,22 @@ def _format_bg_batch(events: list[dict]) -> str:
 
     parts = []
     for source, evs in groups.items():
-        ts = datetime.datetime.fromtimestamp(evs[-1]['ts']).strftime('%Y-%m-%dT%H:%M:%S')
+        import prompt
+        ts = prompt.format_ts(evs[-1]['ts'])
+        if _is_log_type(evs[-1]):
+            # 日志型：全部渲染，每条带自己的时间戳。只给最后一条等于把一段对话
+            # 砍成最后半句，而 subagent 要判断的恰恰是这段里发生了什么。
+            shown = evs[-_BG_LOG_TYPE_MAX_PER_SOURCE:]
+            lines = [f'[{prompt.format_ts(e["ts"])}] {e.get("text", "")}'
+                     for e in shown]
+            body = '\n'.join(lines)
+            if len(evs) > len(shown):
+                # 说出来丢了多少。静默截断读起来就像「这段时间只说了这么多」。
+                body = (f'(更早的 {len(evs) - len(shown)} 条已省略)\n{body}')
+            parts.append(
+                f'<source name="{source}" count="{len(evs)}" ts="{ts}">\n'
+                f'{body}\n</source>')
+            continue
         last_text = evs[-1].get('text', '')
         if len(evs) == 1:
             parts.append(f'<source name="{source}" ts="{ts}">\n{last_text}\n</source>')
@@ -560,18 +729,28 @@ async def _route_to_bg_subagent(batch: list[dict]) -> bool:
         from subagent.protocol import SubagentSpec, P_LOW
         spec = SubagentSpec(
             goal=(
-                '[bg] 后台监控：快速分析传感器数据，结合主代理上下文判断重要性。\n'
+                '[bg] 后台监控：快速分析传感器读数**与听到的话**，结合主代理上下文判断重要性。\n'
                 '\n'
                 '## 行为要求\n'
                 '- 直接阅读 JSON 数据做判断，不要用 PythonExec 分析\n'
                 '- 只在有明确理由时才用 memory_recall（如需对比历史基线），不要盲目搜索\n'
                 '- 收到数据后 1-2 轮内必须做出决策（report 或 finish）\n'
                 '\n'
-                '## 判断规则\n'
+                '## 判断规则（传感器读数）\n'
                 '- 状态变化与主代理活跃任务直接相关 → subagent_report(progress=变化描述, urgent=true)\n'
                 '- 安全/硬件异常 → subagent_report(progress=告警, urgent=true)\n'
                 '- 首次收到新类型数据或有意义的变化 → subagent_report(progress=摘要)\n'
                 '- 无显著变化 → subagent_finish\n'
+                '\n'
+                '## 判断规则（听到的话 —— 带 speaker_* 字段的条目）\n'
+                '这些是机器人**在旁边听到、但没有被叫到**的对话。没人在跟你说话，所以不要回应，\n'
+                '也不要因为「有人说话了」就上报 —— 上报的门槛是内容，不是存在。\n'
+                '- 提到机器人该做或该停的事（间接指令、对它的抱怨）→ subagent_report(urgent=true)\n'
+                '- 与主代理当前活跃任务相关的信息（地点、时间、人名、变更）→ subagent_report\n'
+                '- 值得记住的事实（某人的身份、偏好、约定）→ subagent_report(progress=那条事实)\n'
+                '- 闲聊，与机器人和任务都无关 → subagent_finish\n'
+                '上报时**写下原话的要点和是谁说的**，不要只写「听到了一段对话」——\n'
+                '主代理看不到原始数据，你的 progress 就是它能拿到的全部。\n'
             ),
             priority=P_LOW,
             model=bg_config.get('bg_model'),
@@ -579,6 +758,10 @@ async def _route_to_bg_subagent(batch: list[dict]) -> bool:
             max_rounds=10,
             timeout_s=3600,
             context_seed=message,
+            # 这个 agent 的交付物就是判断本身 —— 它被 tool_deny 挡掉了所有会动的
+            # 工具（上一行），能做的只有 subagent_report / subagent_finish。所以
+            # 「只调用了记账类工具」对它是正常完成，不是「报告成功却没干活」。
+            deliverable='report',
         )
         await _manager_instance.spawn(spec)
 
@@ -612,12 +795,60 @@ def _infer_channel(ev: dict) -> str:
 
 # ── 主循环 ────────────────────────────────────────────────────────────────────
 
+_gated_since: float | None = None
+_gated_count: int = 0
+
+
+def _note_gated(source: str) -> None:
+    global _gated_since, _gated_count
+    _gated_count += 1
+    if _gated_since is None:
+        _gated_since = time.time()
+        print(f'[collector] 智能控制未启动，事件不处理（首条来自 {source}）')
+
+
+def _note_ungated() -> None:
+    global _gated_since, _gated_count
+    if _gated_since is None:
+        return
+    print(f'[collector] 智能控制已启动，恢复处理事件'
+          f'（停用期间丢弃 {_gated_count} 条，历时 {int(time.time() - _gated_since)}s）')
+    _gated_since, _gated_count = None, 0
+
+
+def project_running() -> bool:
+    """「开始智能控制」按下了没有。
+
+    这个标志此前**不控制任何东西** —— `start.py` 里只在不自动启动时把上次的残留清成
+    False，然后 `collector.start()` 和 `run_forever()` 照样无条件起跑。于是容器一起来，
+    已有的 DDS 订阅与 MCP SSE 就开始往 event_bus 灌，P=0 的那些进 bg buffer，每秒一批、
+    每批 spawn 一个后台 subagent —— 没人点过「开始」，机器人对着一台冰箱持续烧 token。
+    天轶上一天 3668 个 turn 就是这么来的。
+    """
+    return bool((config.main.get('core') or {}).get('project_running', False))
+
+
 async def _drain_loop():
     """持续从 event_bus 消费事件，按 priority 分流到两个管道。"""
     ring_size = config.main.get('event', {}).get('llm', {}).get('source_ring_size', 50)
     while True:
         ev = await event_bus.dequeue()
         source = ev.get('source', 'unknown')
+
+        # 没启动就什么都不该跑。
+        #
+        # 这里**丢弃**而不是攒着：不取的话 event_bus 会一直涨，点下「开始」的瞬间几
+        # 小时的传感器数据会一次性砸进来。所以照常取、直接扔，并把 bg buffer 也清掉
+        # —— 停着的这段时间里的读数，启动时再看已经没有意义了。
+        #
+        # 丢弃必须**出声**。一个不响应的机器人和一个坏掉的机器人从外面看一模一样，
+        # 而「为什么不理我」是排查时最贵的那类问题。所以进入和离开丢弃状态各说一次，
+        # 并顺带报一下这期间扔了多少条。
+        if not project_running():
+            _note_gated(source)
+            _bg_buffer.clear()
+            continue
+        _note_ungated()
 
         _extract_perf_timestamps(ev)
         priority = _extract_priority(ev)
@@ -698,14 +929,26 @@ async def _drain_loop():
         else:
             # ── P=0: 送 bg buffer ──
             _bg_buffer_add(ev)
+            # 旁人说的话还要进活动流 —— 见 _push_asr_background 里为什么只有它进。
+            await _push_asr_background(ev)
 
 
 def _bg_buffer_has_substance(batch: list[dict]) -> bool:
-    """检查事件批次是否包含有意义的传感器数据。空文本或无数值的事件不值得 spawn bg_monitor。"""
+    """这批事件值不值得 spawn 一个 bg subagent。
+
+    仪表型靠「有没有数值字段」判断，这对 SOC/温度/电压/IMU 是对的。
+
+    日志型**不能**这么判断：一句话的 payload 里恰好有 speaker_similarity 这类
+    数字，所以它是「偶然」通过的，而一句没有任何数字的话（没认出说话人、没带
+    时长）会被判为没有内容而丢掉。日志型只要有文本就算有内容 —— 它本来就是被
+    明确标记为「每条都重要」的那类事件。
+    """
     for ev in batch:
         text = ev.get('text', '').strip()
         if not text:
             continue
+        if _is_log_type(ev):
+            return True
         if text.startswith('{'):
             try:
                 data = _json.loads(text)
@@ -725,6 +968,9 @@ async def _bg_trigger_loop():
     while True:
         interval = config.main.get('event', {}).get('llm', {}).get('trigger_interval_ms', 1000) / 1000.0
         await asyncio.sleep(interval)
+        if not project_running():
+            _bg_buffer.clear()
+            continue
         if not _bg_buffer:
             continue
         batch = list(_bg_buffer)
@@ -732,7 +978,18 @@ async def _bg_trigger_loop():
         # 只在 buffer 含有实质性传感器数据时才路由到 bg subagent
         if not _bg_buffer_has_substance(batch):
             continue
-        await _route_to_bg_subagent(batch)
+        try:
+            await _route_to_bg_subagent(batch)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            # 一个坏批次不能把整个后台监控打死。这个 task 是 ensure_future 出来的、
+            # 没有人 await，所以异常逃出 while True 之后只会在日志里留一行
+            # "Task exception was never retrieved"，而传感器路由就此永久停摆 ——
+            # 从外面看和"最近没有传感器事件"一模一样。天轶上 `get_recent_context_rich`
+            # 的 TypeError 就是这样让后台静默了 40 分钟，直到容器重启。
+            print(f'[collector] bg routing failed, skipping this batch '
+                  f'({type(e).__name__}: {e})')
 
 
 def start():

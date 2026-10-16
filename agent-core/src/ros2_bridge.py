@@ -75,6 +75,24 @@ def _spin_loop() -> None:
         try:
             _executor.spin_once(timeout_sec=0.05)
         except Exception as e:
+            # 上下文没了就收工，不要接着敲。
+            #
+            # `rcl_shutdown()` 不一定是 `stop()` 调的 —— 别的组件（插件 teardown、
+            # 关机路径里的另一个模块）也会让 context 失效，而那时 `_running` 还是
+            # True。原来这里只是 sleep(0.1) 再试，于是变成每秒 10 次打印同一行
+            # `failed to create timer: the given context is not valid`，而 context
+            # 是不会自己变回有效的。天轶实测：每次关机刷 100 行左右，日志里累计 876 行。
+            #
+            # 判据用 `rclpy.ok()` 而不是匹配错误文本：文本是 rcl 的实现细节，会随
+            # 版本变；`ok()` 问的正是「这个 context 还能用吗」。
+            try:
+                context_dead = not rclpy.ok()
+            except Exception:
+                context_dead = True
+            if context_dead:
+                print('[ros2_bridge] rcl context is gone — spin loop exiting',
+                      file=sys.stderr, flush=True)
+                return
             print(f'[ros2_bridge] spin error: {e}', file=sys.stderr, flush=True)
             import time as _t
             _t.sleep(0.1)  # avoid tight loop on persistent errors
@@ -205,7 +223,20 @@ def _resolve_msg_type(fmt: str):
         except ImportError:
             pass
         return None
-    if fmt in ('json', 'data/json') or fmt.startswith('sensor/') or fmt.startswith('data/'):
+    # `control/*` is the command stream an execution model sends to a driver
+    # (motus.control/1); `state/*` is what a driver reports about itself
+    # (motus.odom/1 and friends). Both are JSON inside a std_msgs/String, like
+    # the perception cards — spec in phanthymotus-driver/README_dev.md.
+    #
+    # Neither prefix used to be in this table, and the only consequence was one
+    # line on stderr: an unresolved format means the subscription is silently
+    # abandoned, so the topic stays registered in inspection, the producer keeps
+    # publishing at 10 Hz, and the canvas data-flow panel is empty for ever.
+    # That was navi on r1_sz — subscribing with rclpy received the commands
+    # while the panel showed nothing.
+    if (fmt in ('json', 'data/json') or fmt.startswith('sensor/')
+            or fmt.startswith('data/') or fmt.startswith('control/')
+            or fmt.startswith('state/')):
         try:
             from std_msgs.msg import String
             return String
