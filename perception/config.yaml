@@ -76,7 +76,7 @@ plugins:
       asr_kws_threshold: 0.3
 
   tts:
-    enabled: true
+    enabled: false
     engine: mms-th
     backend: trt
     model_dir: /models/mms-th
@@ -245,7 +245,7 @@ plugins:
   # enabled-but-unwired card costs nothing. On an 8 GB Orin the binding
   # constraint is memory, not GPU time.
   pose:
-    enabled: true
+    enabled: false
     namespace: ""       # auto-detect from hostname if empty
     # `s` rather than `n`. Keypoint precision is not cosmetic here, it is the
     # input to the action rules: a noisy wrist breaks the reversal count that
@@ -364,7 +364,7 @@ plugins:
     fall_settle_s: 1.0
 
   ocr:
-    enabled: false
+    enabled: true
     provider: rapidocr
     model_dir: /models/ocr/ppocrv6-small-trt
     device_id: 0
@@ -396,7 +396,7 @@ plugins:
   # formats 是给这里用的逃生口：写死一组 symbology 名（如 [DataMatrix]），
   # 非空时压过 scan_mode。卡片和 LLM 都看不到它，因为名字跨镜像不通用。
   barcode:
-    enabled: true
+    enabled: false
     scan_mode: all
     formats: []
     try_rotate: true
@@ -411,7 +411,7 @@ plugins:
     max_text_chars: 2048
 
   soundevent:
-    enabled: true
+    enabled: false
   # 把机器人自己的 TTS 从麦克风里拿掉。接在麦克风卡和 ASR 卡之间，不是 ASR 的
   # 一个开关 —— soundevent 也直接订麦克风，声纹又跑在 ASR 切出来的段上，装在
   # ASR 里面只治 ASR 一家。详见 plugins/echo_cancellation.py 的模块文档。
@@ -419,7 +419,7 @@ plugins:
   # 默认开着：这张卡不加载任何模型、不占显存，没被拖到画布上连线时什么都不做。
   # 关掉它只是让卡片从侧边栏消失 —— 而真正的代价是没人发现它存在。
   echo_cancellation:
-    enabled: true
+    enabled: false
     # auto = 问本进程里的 TTS 插件它正在发哪个 topic。几乎总是对的；只有 TTS 在
     # 别的容器里才需要在这里写死一个 topic 名（写死的值在卡片下拉框里也保留）。
     # 这是卡片上**唯一**的设置项。
@@ -440,7 +440,7 @@ plugins:
     # mute_tail: auto
 
   speaker_recognition:
-    enabled: true
+    enabled: false
     # 3D-Speaker CAM++, 200k speakers, 中英双语, 192-d, 28 MB, Apache-2.0.
     # 走 sherpa-onnx 自带的那份 ONNX Runtime —— 和 ASR/TTS 同一份，所以不会触发
     # plugins/face_runtime.py 记录的双 ORT 冲突，也不需要 face 那套子进程隔离。
