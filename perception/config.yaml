@@ -15,7 +15,7 @@ file_intake:
 
 plugins:
   asr:
-    enabled: false
+    enabled: true
     # Matches the configSchema default. SenseVoice on CPU is also the faster of
     # the two int8 options (RTF 14.2x vs 9.1x for streaming paraformer) and has
     # the largest gpu upside (fp16).
@@ -32,7 +32,7 @@ plugins:
     # the process never returns. On a 7.4 GB Orin already running vop + OCR +
     # TTS that is enough to run the box out of memory, so cpu is the default
     # even on images that could use the GPU. Numbers in utils/onnx_provider.py.
-    device: cpu
+    device: gpu
     num_threads: 2   # cpu only; 4 buys ~1.2-1.5x. Ignored on gpu.
     # Decode 1 s of silence after the model loads. On gpu the first inference
     # costs ~1.7 s (lazy kernels, cuDNN autotune, memory pool) against a 58 ms
@@ -364,7 +364,7 @@ plugins:
     fall_settle_s: 1.0
 
   ocr:
-    enabled: true
+    enabled: false
     provider: rapidocr
     model_dir: /models/ocr/ppocrv6-small-trt
     device_id: 0
