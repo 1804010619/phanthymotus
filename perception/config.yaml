@@ -440,7 +440,7 @@ plugins:
     # mute_tail: auto
 
   speaker_recognition:
-    enabled: false
+    enabled: true
     # 3D-Speaker CAM++, 200k speakers, 中英双语, 192-d, 28 MB, Apache-2.0.
     # 走 sherpa-onnx 自带的那份 ONNX Runtime —— 和 ASR/TTS 同一份，所以不会触发
     # plugins/face_runtime.py 记录的双 ORT 冲突，也不需要 face 那套子进程隔离。
