@@ -15,7 +15,7 @@ file_intake:
 
 plugins:
   asr:
-    enabled: true
+    enabled: false
     # Matches the configSchema default. SenseVoice on CPU is also the faster of
     # the two int8 options (RTF 14.2x vs 9.1x for streaming paraformer) and has
     # the largest gpu upside (fp16).
@@ -139,7 +139,7 @@ plugins:
     language: th
 
   vop:
-    enabled: false
+    enabled: true
     namespace: ""       # auto-detect from hostname if empty
     # Runs a prebuilt TensorRT engine. `yolov8s-worldv2` still resolves here for
     # cards saved before the switch, but the engine it loads is this one.
