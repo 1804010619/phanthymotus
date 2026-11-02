@@ -76,7 +76,7 @@ plugins:
       asr_kws_threshold: 0.3
 
   tts:
-    enabled: false
+    enabled: true
     engine: mms-th
     backend: trt
     model_dir: /models/mms-th
@@ -139,7 +139,7 @@ plugins:
     language: th
 
   vop:
-    enabled: true
+    enabled: false
     namespace: ""       # auto-detect from hostname if empty
     # Runs a prebuilt TensorRT engine. `yolov8s-worldv2` still resolves here for
     # cards saved before the switch, but the engine it loads is this one.
