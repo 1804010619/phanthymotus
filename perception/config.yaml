@@ -15,7 +15,7 @@ file_intake:
 
 plugins:
   asr:
-    enabled: false
+    enabled: true
     # Matches the configSchema default. SenseVoice on CPU is also the faster of
     # the two int8 options (RTF 14.2x vs 9.1x for streaming paraformer) and has
     # the largest gpu upside (fp16).
@@ -76,7 +76,7 @@ plugins:
       asr_kws_threshold: 0.3
 
   tts:
-    enabled: true
+    enabled: false
     engine: mms-th
     backend: trt
     model_dir: /models/mms-th
