@@ -18,10 +18,10 @@ plugins:
   phanthy_music:
     # 没有别的键了：曲库连接内置在卡片里，超时是实现细节，音量和自动续播是动作
     # （set_volume / set_autoplay）不是配置。duck_gain 在 audio_mixer 那边。
-    enabled: true
+    enabled: false
 
   audio_mixer:
-    enabled: true
+    enabled: false
     # auto = 问本进程里的 TTS 插件它在发哪个话题。接到本卡的其余输入都算背景音乐。
     speech_topics: auto
     duck_gain: 0.15
@@ -30,7 +30,7 @@ plugins:
     background_gain: 100
 
   asr:
-    enabled: true
+    enabled: false
     # Matches the configSchema default. SenseVoice on CPU is also the faster of
     # the two int8 options (RTF 14.2x vs 9.1x for streaming paraformer) and has
     # the largest gpu upside (fp16).
@@ -91,7 +91,7 @@ plugins:
       asr_kws_threshold: 0.3
 
   tts:
-    enabled: true
+    enabled: false
     engine: vits2-zh-en
     backend: trt
     model_dir: /models/vits2
@@ -154,7 +154,7 @@ plugins:
     language: en-us
 
   vop:
-    enabled: true
+    enabled: false
     namespace: ""       # auto-detect from hostname if empty
     # Runs a prebuilt TensorRT engine. `yolov8s-worldv2` still resolves here for
     # cards saved before the switch, but the engine it loads is this one.
@@ -385,7 +385,7 @@ plugins:
     fall_settle_s: 1.0
 
   ocr:
-    enabled: true
+    enabled: false
     provider: rapidocr
     model_dir: /models/ocr/ppocrv6-small-trt
     device_id: 0
@@ -417,7 +417,7 @@ plugins:
   # formats 是给这里用的逃生口：写死一组 symbology 名（如 [DataMatrix]），
   # 非空时压过 scan_mode。卡片和 LLM 都看不到它，因为名字跨镜像不通用。
   barcode:
-    enabled: true
+    enabled: false
     scan_mode: all
     formats: []
     try_rotate: true
@@ -432,7 +432,7 @@ plugins:
     max_text_chars: 2048
 
   soundevent:
-    enabled: true
+    enabled: false
   # 把机器人自己的 TTS 从麦克风里拿掉。接在麦克风卡和 ASR 卡之间，不是 ASR 的
   # 一个开关 —— soundevent 也直接订麦克风，声纹又跑在 ASR 切出来的段上，装在
   # ASR 里面只治 ASR 一家。详见 plugins/echo_cancellation.py 的模块文档。
@@ -440,7 +440,7 @@ plugins:
   # 默认开着：这张卡不加载任何模型、不占显存，没被拖到画布上连线时什么都不做。
   # 关掉它只是让卡片从侧边栏消失 —— 而真正的代价是没人发现它存在。
   echo_cancellation:
-    enabled: true
+    enabled: false
     # auto = 问本进程里的 TTS 插件它正在发哪个 topic。几乎总是对的；只有 TTS 在
     # 别的容器里才需要在这里写死一个 topic 名（写死的值在卡片下拉框里也保留）。
     # 这是卡片上**唯一**的设置项。
@@ -461,7 +461,7 @@ plugins:
     # mute_tail: auto
 
   speaker_recognition:
-    enabled: true
+    enabled: false
     # 3D-Speaker CAM++, 200k speakers, 中英双语, 192-d, 28 MB, Apache-2.0.
     # 走 sherpa-onnx 自带的那份 ONNX Runtime —— 和 ASR/TTS 同一份，所以不会触发
     # plugins/face_runtime.py 记录的双 ORT 冲突，也不需要 face 那套子进程隔离。
@@ -537,7 +537,7 @@ plugins:
     # 模型（否则第一句话要多等 1-2 秒），stop 会停止给语音附加身份、也停止建新声纹。
 
   face_recognition:
-    enabled: true
+    enabled: false
     # Which detector+recogniser pair to run. The registry is
     # plugins/face_runtime.FACE_MODELS and the card offers it as a dropdown:
     #
@@ -684,7 +684,7 @@ plugins:
     # 这不是驱动卡：它消费 perception 自己的 VOP/深度，跨机器人复用；
     # 不控制机器人，不判断能不能过去。尺寸是当前视角的可见外廓，不是完整
     # 三维长宽高；没有测到就输出 null/没有看见。
-    enabled: true
+    enabled: false
     topic: /perception/measure/state
     view_topic: /perception/measure/view
     # 留空 = 从 depth 话题推导同一台相机的彩色话题：
