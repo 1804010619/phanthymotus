@@ -863,8 +863,40 @@ FACE_MODEL_FILES = {
 }
 
 
+# SCRFD-2.5G-BNKPS + EdgeFace-S-GAMMA-0.5, the second `plugins/face_runtime.FACE_MODELS`
+# row. Re-hosted on COS for the same reason as buffalo_sc, and in one more case: the
+# EdgeFace ONNX does not exist upstream at all. Idiap publish PyTorch weights only, so
+# the ONNX here is our own export (`anjith2006/edgeface`, fp32, opset 17), which makes
+# COS the only place it can come from.
+FACE_SCRFD25G_BASE = os.environ.get(
+    "FACE_SCRFD25G_MODEL_BASE_URL", f"{COS_BASE}/face/scrfd25g_edgeface_s"
+)
+# Pinned against the **COS copies, re-downloaded and re-hashed after upload**, so these
+# are the bytes a robot will actually receive — not the bytes that were uploaded.
+FACE_SCRFD25G_FILES = {
+    # insightface scrfd_2.5g_bnkps, re-hosted from `hsuyabc/scrfd_2.5g_bnkps.onnx` on
+    # HuggingFace; this size/hash is also that repo's LFS oid, so the re-host is
+    # verifiable against upstream. 9 outputs, strides 8/16/32, 2 anchors, 5 keypoints —
+    # the same wire format det_500m has, checked against plugins/scrfd_decode.py.
+    "scrfd_2.5g_bnkps.onnx": {
+        "size": 3290207,
+        "sha256": "bc24bb349491481c3ca793cf89306723162c280cb284c5a5e49df3760bf5c2ce",
+    },
+    # EdgeFace-S-GAMMA-0.5 (Idiap, CVPR-W 2023), 3.65M params, 112x112 -> 512-d.
+    # Exported by us from the upstream PyTorch weights and checked against the
+    # reference implementation (worst cosine 0.9999999 over 8 inputs). Single-file:
+    # the weights are inlined rather than split into an `.onnx.data` companion, so
+    # there is one artifact to pin and one to fetch.
+    "edgeface_s_gamma_05.onnx": {
+        "size": 14811229,
+        "sha256": "10f2c9998879869a190b9bc3858ad59e9891ac1c79d4a8b4ffed866c06def2c0",
+    },
+}
+
+
 FACE_MODEL_BUNDLES = {
     "face": (FACE_MODEL_BASE, FACE_MODEL_FILES),
+    "scrfd25g_edgeface_s": (FACE_SCRFD25G_BASE, FACE_SCRFD25G_FILES),
 }
 
 
@@ -872,10 +904,10 @@ def ensure_face_model(model_dir: str, bundle: str = "face",
                       progress_cb=None) -> dict[str, str]:
     """Ensure a face detection + recognition ONNX pair is present.
 
-    `bundle` selects which pinned set to fetch, so a second model added to
+    `bundle` selects which pinned set to fetch, so each model added to
     `plugins/face_runtime.FACE_MODELS` brings its own sizes and hashes rather than
-    reusing these. One entry today; the parameter exists so adding the second does not
-    have to touch the call site.
+    reusing another's. The name comes from that row's `bundle` key, resolved by
+    `face_bundle_for`, so adding a model does not touch any call site.
     """
     spec = FACE_MODEL_BUNDLES.get(bundle)
     if spec is None:
@@ -1032,26 +1064,36 @@ def _merge_tree(source: str, destination: str) -> None:
 #
 # Each archive carries the frontend the engines need, unpacked to the layout
 # frontend/release_paths.py expects: engines/<family>/*.plan, config.json,
-# frontend_data/, tn_cache/ (compiled WeText TN FSTs) and nltk_data/ (cmudict +
-# perceptron tagger — shipped precisely so the container never has to call
-# nltk.download() at runtime). Upstream is
-# modelscope.cn/models/Starlight777/VITS2-ZH-EN-Male-16k at revision
-# 14954122c4baf4e80b44436c4b2b167e38db4103; the runtime-required files of that
-# revision were repacked per family and mirrored to COS, so devices pull one
-# 60 MB file from the same host as every other model here. The fp32 ONNX graphs
-# the plans were built from are not included — they are build inputs, not
-# runtime files.
+# frontend_data/ (including external_lexicon.json, the compiled pronunciation
+# dictionary — see tools/vits2_prepare_external_lexicon.py), tn_cache/
+# (compiled WeText TN FSTs) and nltk_data/ (cmudict + perceptron tagger —
+# shipped precisely so the container never has to call nltk.download() at
+# runtime).
+#
+# The engines are the lc1_male_v6_frontend_146k release (PR #341), whose TN
+# graphs carry the business regression set the frontend's number/unit readers
+# were tuned against. Upstream is modelscope.cn/models/lanxijiang/TTSV4_Ch_Eng
+# at revision e67fccc9fa0c2bd8848dcf93221e18bb3fa4f205 (engines, TN) and
+# 275f343e89d9cef520c829e9fff3e950354b9b12 (dictionary); only the
+# runtime-required files were repacked per family and mirrored to COS, so
+# devices pull one ~60 MB file from the same host as every other model here.
+# The ONNX graphs, reference samples and smoke script in the upstream archives
+# are build inputs, not runtime files.
+#
+# The archive names carry "v6" so they never collide with the earlier
+# Starlight777 release: a robot upgrading from it re-verifies and re-extracts
+# over the same directory, which _merge_tree overwrites file by file.
 VITS2_MODEL_BASE = os.environ.get("VITS2_MODEL_BASE_URL", COS_BASE)
 VITS2_MODEL_ARCHIVES = {
     "jp61": {
-        "archive": "vits2-zh-en-male-16k-tensorrt-jp61-trt10.4-orin.tar.gz",
-        "size": 61834952,
-        "sha256": "f04ab439588cd3106ccd245f64af548199ba888d31627827c07ac28368225805",
+        "archive": "vits2-zh-en-male-16k-v6-tensorrt-jp61-trt10.4-orin.tar.gz",
+        "size": 60568382,
+        "sha256": "528c31640bd1ff360341559ee550cbd8057cd527b7ba8140a014e9fe20e639ca",
     },
     "jp511": {
-        "archive": "vits2-zh-en-male-16k-tensorrt-jp511-trt8.5-orin.tar.gz",
-        "size": 62994881,
-        "sha256": "01ffce0516f1a68f3fcedce6ff9caff784f428a1d09da2d760fcba599116e8c7",
+        "archive": "vits2-zh-en-male-16k-v6-tensorrt-jp511-trt8.5-orin.tar.gz",
+        "size": 62549149,
+        "sha256": "317c108357788e7e9d2c227348a72268866d169d25c9c9ee49eedc47d69ed191",
     },
 }
 
@@ -1485,6 +1527,44 @@ def _ensure_vision_bundle(
         f"{kind}/{key}", model_dir, entry["base_url"], entry["files"],
         progress_cb=progress_cb,
     )
+
+
+DEPTHART_MODEL_BUNDLES = {
+    "jp511": {
+        "base_url": "https://modelscope.cn/models/Flame4pd/depthart-metric-s-jp61-trt/resolve/ce158696ba8a5a6cee919b851a879825ea700eea/dynamic-k-v1/jp511",
+        "files": {
+            "depthart.engine": {
+                "size": 19746652,
+                "sha256": "8df5520b57cc4bd6fa98680db6313fec0b8482894cc65bd9532d172fe764942d"
+            },
+            "libdepthart_selective_scan_trt.so": {
+                "size": 1426464,
+                "sha256": "d2bfb2d2697bea76bf2927d4505ccf01fe387f5b69a62c2257e3d2e9f340d4db"
+            }
+        }
+    },
+    "jp61": {
+        "base_url": "https://modelscope.cn/models/Flame4pd/depthart-metric-s-jp61-trt/resolve/ce158696ba8a5a6cee919b851a879825ea700eea/dynamic-k-v1/jp61",
+        "files": {
+            "depthart.engine": {
+                "size": 20422476,
+                "sha256": "6bcd24a11b1383f359cedf76a2f6e112f2a0ecf3ec23656a1cc99ae3e3b83038"
+            },
+            "libdepthart_selective_scan_trt.so": {
+                "size": 1259096,
+                "sha256": "6d76307585ffe615db8e620f1826550f086197e9e834236e03565043eb413c35"
+            }
+        }
+    }
+}
+
+
+def ensure_depthart_model(model_dir: str = "/models/depthart", family: str | None = None,
+                          progress_cb=None) -> dict[str, str]:
+    """Download the dynamic-K engine and paired plugin for the runtime TensorRT."""
+    key = select_bundle_family(DEPTHART_MODEL_BUNDLES, family)
+    return _ensure_vision_bundle("depthart", DEPTHART_MODEL_BUNDLES,
+                                 os.path.join(model_dir, key), key, progress_cb)
 
 
 def ensure_vop_model(model_dir: str, family: str | None = None,

@@ -120,17 +120,31 @@ def _register_core_mcp(silent=False):
                 'configSchema': {
                     'type': 'object',
                     'properties': {
-                        'llm_url':   {'type': 'string', 'description': 'LLM API URL'},
-                        'llm_key':   {'type': 'string', 'description': 'LLM API Key', 'format': 'password'},
-                        'llm_model': {'type': 'string', 'description': 'LLM 模型名称'},
-                        'trigger_interval_ms': {'type': 'integer', 'description': '采集触发间隔（毫秒）', 'default': 1000},
-                        'think_mode': {'type': 'boolean', 'description': 'Think mode (enables deep reasoning, disable for faster response)', 'default': False},
-                        'vision_input': {'type': 'boolean', 'description': '模型支持图片输入（关闭时图片只以文件信息形式给模型，不内联图像内容）', 'default': False},
-                        'auto_narration': {'type': 'boolean', 'description': '自动播报：模型长时间不出声时，由系统自动生成一句进展汇报并通过已注册的语音/灯效等输出播报给用户', 'default': True},
-                        'narration_silence_seconds': {'type': 'integer', 'description': '主动播报：距上次对用户说话多少秒后自动汇报一次进展（0 = 关闭）', 'default': 15, 'x-show-when': {'auto_narration': 'true'}},
+                        # 云端或本机，二选一。选本机不挑具体模型 —— 用 ModelHub 当前加载的那个，
+                        # 换模型在 ModelHub 的模型管理里做。见 modelhub_link.py。
+                        # 云端 URL / Key / 模型在选本机时隐藏但照样保存（x-keep-when-hidden），切回来不用重填。
+                        # 取值 'cloud' | 'modelhub'。不写 enum：表单渲染器见到 enum 就画成下拉，
+                        # 轮不到 format 那条分支
+                        'llm_source': {'type': 'string', 'format': 'llm-source', 'default': 'cloud',
+                                       'title': '大模型'},
+                        'llm_url':   {'type': 'string', 'description': 'LLM API URL',
+                                      'x-show-when': {'llm_source': 'cloud'}, 'x-keep-when-hidden': True,
+                                      'x-required-when': {'llm_source': 'cloud'}},
+                        'llm_key':   {'type': 'string', 'description': 'LLM API Key', 'format': 'password',
+                                      'x-show-when': {'llm_source': 'cloud'}, 'x-keep-when-hidden': True,
+                                      'x-required-when': {'llm_source': 'cloud'}},
+                        'llm_model': {'type': 'string', 'description': 'LLM 模型名称',
+                                      'x-show-when': {'llm_source': 'cloud'}, 'x-keep-when-hidden': True},
+                        # 搜索和用哪个大模型无关：本机模型也可能要联网拿外部信息，所以两种都显示。
+                        # 选 none 时 WebSearch 不进模型的工具表（event.desktop.search_configured）。
                         'search_type': {'type': 'string', 'description': '搜索引擎', 'enum': ['none', 'baidu_search'], 'default': 'none'},
                         'search_base_url': {'type': 'string', 'description': '搜索服务 URL (带 /v1)', 'x-show-when': {'search_type': 'baidu_search'}},
                         'search_api_key': {'type': 'string', 'description': '搜索服务 API Key', 'format': 'password', 'x-show-when': {'search_type': 'baidu_search'}},
+                        'trigger_interval_ms': {'type': 'integer', 'description': '采集触发间隔（毫秒）', 'default': 1000},
+                        'think_mode': {'type': 'boolean', 'description': '思考模式：开启后模型会先推理再回答，但只给各家支持的最低推理档位（延迟仍高于关闭）；关闭则完全不推理，响应最快', 'default': False},
+                        'vision_input': {'type': 'boolean', 'description': '模型支持图片输入（关闭时图片只以文件信息形式给模型，不内联图像内容）', 'default': False},
+                        'auto_narration': {'type': 'boolean', 'description': '自动播报：模型长时间不出声时，由系统自动生成一句进展汇报并通过已注册的语音/灯效等输出播报给用户', 'default': True},
+                        'narration_silence_seconds': {'type': 'integer', 'description': '主动播报：距上次对用户说话多少秒后自动汇报一次进展（0 = 关闭）', 'default': 15, 'x-show-when': {'auto_narration': 'true'}},
                     },
                     'required': ['llm_url', 'llm_key']
                 },
@@ -230,6 +244,25 @@ def _register_core_mcp(silent=False):
                             'description': ('Long edge in pixels. Scaled to the '
                                             'camera\'s own aspect ratio, never '
                                             'stretched.'),
+                        },
+                        # No default, deliberately. See
+                        # `remote_camera_declaration`: a guessed focal length
+                        # does not break a metric-depth consumer, it makes it
+                        # publish wrong metres silently.
+                        'camera_fov_deg': {
+                            'type': 'number', 'minimum': 1, 'exclusiveMaximum': 180,
+                            'scope': 'instance',
+                            'title': 'Horizontal field of view (deg)',
+                            'description': (
+                                '镜头的水平视场角，整个视场不是一半。填了之后这张卡才会'
+                                '声明相机内参（motus.camera/1），需要内参的卡片（如 '
+                                'visual_depth 的 DepthART 模型）才能用它；留空就什么也'
+                                '不声明，那些卡片会拒绝启动并说明原因 —— 这是故意的，'
+                                '浏览器不提供焦距，猜一个会让深度静悄悄地错。\n\n'
+                                '从设备规格里查（常见 webcam 60–78 度，手机主摄约 '
+                                '65–75 度）。这是标称值不是标定：数字变焦、防抖裁切都会'
+                                '改变实际视场，所以接上之后用 visual_depth 的 calibrate '
+                                '量一次已知距离，把剩下的尺度误差去掉。'),
                         },
                     },
                 },
@@ -428,6 +461,11 @@ async def lifespan(app):
     # 日志 —— 「为什么这个组件不显示在驱动市场」全靠这一行排查。
     import hostarch
     print(f'[startup] host facets: acc_arch={hostarch.acc_arch()} cpu_arch={hostarch.cpu_arch()}')
+
+    # 上一次 agent-core 升级留下的 restart helper 容器：等它结束、记下结果、删掉。
+    # 后台跑 —— 它这时可能还在对本进程做 compose up，不能等它
+    import api.system as _system_api
+    loop.run_in_executor(None, _system_api.cleanup_restart_helper)
 
     # Put the DDS profile in place *before* anything creates a participant —
     # FastDDS reads it once, at first participant creation, so provisioning it
@@ -685,17 +723,22 @@ async def acp_complete(request: fastapi.Request):
     import benchmark_facts
     benchmark_facts.note_acp_post(body)
 
+    # **必须在 mark_action_complete 之前问**：一个并发的 barrier 随时可能把这一项
+    # 回收掉，回收之后 _pending_silent 里就查不到了，于是一句「播完了」的回执会被
+    # 当成新消息唤醒一个 turn。
+    silent = mcp_client.completion_is_silent(action_id)
+
     # 通道1: 解锁 sync() 等待
     mcp_client.mark_action_complete(action_id, body)
 
     # 通道2: 进 event_bus → steering 注入 LLM
     import event_bus
+    _event = {'type': 'action_complete', 'action_id': action_id,
+              'status': status, 'result': result, 'silent': silent}
     await event_bus.enqueue(
         source=f'acp:{action_id}',
-        text=json.dumps({'type': 'action_complete', 'action_id': action_id,
-                         'status': status, 'result': result}, ensure_ascii=False),
-        payload={'type': 'action_complete', 'action_id': action_id,
-                 'status': status, 'result': result},
+        text=json.dumps(_event, ensure_ascii=False),
+        payload=dict(_event),
     )
 
     return {'ok': True, 'action_id': action_id}
@@ -956,6 +999,9 @@ _camera_ws_connected = False
 # at all: at 1 fps a track expires between frames and the action model never
 # accumulates the seconds of history it needs.
 _camera_recent: "collections.deque" = __import__("collections").deque(maxlen=30)
+# The frame shape the browser actually settled on lives in remote_camera,
+# with the code that reads and uses it.
+import remote_camera
 
 
 def _ensure_camera_pub():
@@ -1005,6 +1051,11 @@ async def _ws_camera(ws: fastapi.WebSocket):
             msg.data = data
             _camera_pub.publish(msg)
             _camera_frame_count += 1
+            # Re-read periodically, not once: the operator can change the card's
+            # `width`, and a declaration describing the previous resolution is
+            # worse than none — K is in pixels.
+            if remote_camera.frame_size() is None or _camera_frame_count % 30 == 0:
+                remote_camera.note_frame(data)
             _camera_recent.append(time.time())
     except Exception:
         pass

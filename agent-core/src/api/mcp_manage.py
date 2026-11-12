@@ -888,7 +888,14 @@ async def _handle_agentcore_call(req: MCPCallRequest):
             config.main['event'] = event_cfg
             for t in all_topics:
                 topic_subscriber.subscribe(t)
-        return {'code': 200, 'data': f'subscribed to {all_topics}' if all_topics else 'started'}
+        data = {'subscribed': all_topics}
+        if req.tool == 'decision_core':
+            # 大模型不可用就别报「已就绪」：state=error 让这次启动回滚并显示原因，
+            # loading（本机模型还在加载）由启动流程轮询 info 直到就绪
+            import modelhub_link
+            state, message = await modelhub_link.llm_readiness(force=True)
+            data.update(state=state, message=message)
+        return {'code': 200, 'data': data}
 
     elif action == 'stop':
         event_cfg = config.main.get('event', {})
@@ -919,7 +926,11 @@ async def _handle_agentcore_call(req: MCPCallRequest):
         topic_in_list = [{'topic': t, 'format': 'data/json'} for t in sub_topics] if sub_topics else [{'topic': '', 'format': 'data/json'}]
         # 延迟 import：event.llm 拉起整个 agent loop，模块顶层导入会成环。
         from event.llm import _narration_thresholds
+        import modelhub_link
+        # 大模型能不能用。启动时本机模型还在加载的话，启动流程靠轮询这里等它就绪
+        llm_state, llm_message = await modelhub_link.llm_readiness()
         return {'code': 200, 'data': {
+            'state': llm_state, 'message': llm_message,
             'description': '决策核心 — 接收多路 DDS 输入，LLM 推理后执行动作',
             'topic_in': topic_in_list,
             'topic_out': [{'topic': '/decision_core', 'format': 'data/json'}],
@@ -940,9 +951,13 @@ async def _handle_agentcore_call(req: MCPCallRequest):
         llm_key = req.arguments.get('llm_key', '')
         llm_model = req.arguments.get('llm_model', '')
         think_mode = req.arguments.get('think_mode', False)
-        if llm_url and llm_key:
+        # 'cloud' / 'modelhub' / 'modelhub:<model>'。没带这个键的老配置就是云端。
+        import modelhub_link
+        llm_source = req.arguments.get('llm_source') or modelhub_link.SOURCE_CLOUD
+        if (llm_url and llm_key) or modelhub_link.is_local(llm_source):
             client_cfg = config.main.get('client', {})
-            client_cfg['llm'] = [{'url': llm_url, 'key': llm_key, 'model': llm_model, 'think_mode': think_mode}]
+            client_cfg['llm'] = modelhub_link.client_entries(
+                llm_source, llm_url, llm_key, llm_model, think_mode)
             config.main['client'] = client_cfg
 
             # Mirror into services.llm as well. The dashboard has two places
@@ -962,8 +977,9 @@ async def _handle_agentcore_call(req: MCPCallRequest):
                 # Preserve fields this card does not expose rather than
                 # dropping them; think_mode is set here, others are not.
                 'think_mode': think_mode,
+                'source': llm_source,
                 **{k: v for k, v in existing_llm.items()
-                   if k not in ('url', 'key', 'model', 'think_mode')},
+                   if k not in ('url', 'key', 'model', 'think_mode', 'source')},
             }
             config.main['services'] = services_cfg
 
@@ -1131,8 +1147,17 @@ async def mcp_call_tool(mcp_id: str, req: MCPCallRequest,
             elif action == 'stop':
                 return {'code': 200, 'data': {'state': 'idle'}}
             elif action == 'info':
-                import ros2_bridge, start as _start_mod
+                import ros2_bridge, start as _start_mod, remote_camera as _remote_camera
                 visible = '/remote_control/camera' in ros2_bridge.get_dds_topics()
+                # `info` is in _SYSTEM_ACTIONS_NO_CONFIG, so the saved config is
+                # not replayed before it — read it here. Either row may hold the
+                # key: older UI builds saved without filtering by scope.
+                _inst = req.arguments.get('instance_id', '')
+                _cfg = {**(config.main.get(f'tool_config:{mcp_id}:remote_camera') or {}),
+                        **((config.main.get(
+                            f'tool_config:{mcp_id}:remote_camera:{_inst}') or {})
+                           if _inst else {})}
+                declaration = _remote_camera.declaration(_cfg)
                 recent = list(_start_mod._camera_recent)
                 achieved = 0.0
                 if len(recent) >= 2 and recent[-1] > recent[0]:
@@ -1153,6 +1178,12 @@ async def mcp_call_tool(mcp_id: str, req: MCPCallRequest,
                                    'format': 'image/jpeg'}],
                     'topic_visible': visible,
                     'ws_connected': _start_mod._camera_ws_connected,
+                    # What the optics are, when anyone has said. Consumers read
+                    # this off `info()` — `api/config.py:_upstream_camera_info`
+                    # collects it from a card's sources and hands it to the
+                    # consumer's `start`. Empty unless a field of view has been
+                    # configured; see `start.remote_camera_declaration`.
+                    **({'camera_info': declaration} if declaration else {}),
                     'frames_received': _start_mod._camera_frame_count}}
             return {'code': 200, 'data': None}
         if req.tool == 'remote_message':
@@ -1372,6 +1403,18 @@ async def mcp_call_tool(mcp_id: str, req: MCPCallRequest,
                 error  = data.get('error')
                 if error:
                     return {'code': 500, 'message': error.get('message', 'Tool call error'), 'data': None}
+                if result.get('isError'):
+                    # An MCP-level error used to fall through and be returned as
+                    # an ordinary result, so a tool that said it had failed was
+                    # read as having succeeded. Surface it as one -- but keep the
+                    # content: limx/tron2 answers errors as structured JSON, and
+                    # a renderer or an ACP path that needs the detail would
+                    # otherwise be left with a truncated sentence.
+                    content = result.get('content') or []
+                    message = '\n'.join(str(item.get('text', '')) for item in content
+                                        if isinstance(item, dict) and item.get('type') == 'text')
+                    return {'code': 500, 'message': message[:1000] or 'Tool call error',
+                            'data': content or None}
                 # Auto-register any instance-specific topics returned by the tool
                 content_items = result.get('content') or []
                 if isinstance(content_items, list):

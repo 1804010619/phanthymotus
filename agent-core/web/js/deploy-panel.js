@@ -11,7 +11,7 @@ import { startDeploy } from './deploy-progress.js';
 let _overlay  = null;
 let _polling  = null;
 
-let _catalog  = { core: [], perception: [], actucore: [], driver: [] };
+let _catalog  = { core: [], perception: [], actucore: [], modelhub: [], driver: [] };
 
 // Fallback descriptions, used when resource-center didn't supply one
 const _CAT_DESC = {
@@ -20,6 +20,7 @@ const _CAT_DESC = {
   // field existed, and the two saying different things is worse than either.
   perception: '感知套件 — 语音：ASR 语音识别 + TTS 语音合成 + VAD 静音检测 + 唤醒词检测；视觉：物体检测 + 单目深度 + OCR 文字识别 + 人脸识别',
   actucore:   '执行模型层 — VLA 策略 / 导航 / 抓取 / locomotion / 全身控制',
+  modelhub:   '本机大模型服务 — LLM（vLLM），OpenAI 兼容接口 :15741',
 };
 let _statuses = {};   // driver_id → { running, status, running_image, image, last_deploy }
 
@@ -135,6 +136,18 @@ function _open() {
   _polling = setInterval(_loadStatuses, 5000);
 }
 
+/**
+ * 从别处直接打开部署面板的某一页 —— 决策核心选「本机」而这台机器没装 ModelHub 时，
+ * 提示里的「去安装」按钮用它把人带到驱动市场，并预先搜好。
+ */
+export function openDeployPanel({ tab = 'my-services', query = '' } = {}) {
+  const search = document.getElementById('marketplace-search');
+  if (search) search.value = query;
+  _activeFilter = null;
+  _open();
+  _switchTab(tab);
+}
+
 function _close() {
   _overlay.classList.add('hidden');
   clearInterval(_polling);
@@ -231,6 +244,7 @@ function _renderMyServices() {
     ...(_catalog.core || []).map(it => ({ ...it, _cat: 'core' })),
     ...(_catalog.perception || []).map(it => ({ ...it, _cat: 'perception' })),
     ...(_catalog.actucore || []).map(it => ({ ...it, _cat: 'actucore' })),
+    ...(_catalog.modelhub || []).map(it => ({ ...it, _cat: 'modelhub' })),
     ...(_catalog.driver || []).map(it => ({ ...it, _cat: 'driver' })),
   ];
 
@@ -469,6 +483,7 @@ function _renderMarketplace() {
   const allItems = [
     ...(_catalog.perception || []).map(it => ({ ...it, _cat: 'perception' })),
     ...(_catalog.actucore || []).map(it => ({ ...it, _cat: 'actucore' })),
+    ...(_catalog.modelhub || []).map(it => ({ ...it, _cat: 'modelhub' })),
     ...(_catalog.driver || []).map(it => ({ ...it, _cat: 'driver' })),
   ];
 
@@ -498,7 +513,8 @@ function _renderMarketplace() {
       const model = (it.model || '').toLowerCase();
       const provider = (it.provider || '').toLowerCase();
       const name = (it.name || '').toLowerCase();
-      return model.includes(q) || provider.includes(q) || name.includes(q);
+      // 类别也算：搜 modelhub / perception 能找到那一类，不管镜像起的是什么名字
+      return model.includes(q) || provider.includes(q) || name.includes(q) || it._cat === q;
     });
   }
 
@@ -825,6 +841,9 @@ const _ACC_LABEL = {
   'jetson-jp4': 'JetPack 4',
   'jetson-jp5': 'JetPack 5',
   'jetson-jp6': 'JetPack 6',
+  'jetson-jp7': 'JetPack 7',
+  'jetson-jp7.1': 'JetPack 7.1',
+  'jetson-jp7.2': 'JetPack 7.2',
   'agnostic':   '通用',
   'none':       '无 NVIDIA 加速器',
 };

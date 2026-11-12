@@ -42,6 +42,63 @@ Chunks smaller than 1 024 bytes are **silently discarded** by the VAD. This is t
 
 > **Why 512 samples?** The Silero VAD model requires at least one 512-sample window to compute a speech probability. WebRTC VAD requires 480-sample (30 ms) frames. Both backends use 512 samples as the minimum chunk size.
 
+### Wake Direction Timing
+
+Connect Bumi's `sensor/sound-direction` output
+(`/<namespace>/sound_direction`) to ASR's sound-direction input, and
+its microphone to the `audio/pcm-16k` input. The direction port remains a
+specific sensor type, not `data/json`: an ordinary JSON card cannot supply it.
+Like the existing `sensor/pose2d` card, its ROS transport is `std_msgs/String`
+with a structured payload. Core needs no change: its generic `sensor/*`
+transport already carries the message, without compiling a custom direction
+interface or starting the sensor.
+
+The payload has `state: "fresh"`, the exact `angle_deg`, and
+`angle_convention: "robot_front_0_left_positive_ccw"` (front 0°, left positive,
+right negative), plus
+`audio_window_start_us` / `audio_window_end_us`. Driver publishes `no_event` after
+activity stops and `stale` if a valid observation expires. Neither state clears
+ASR's capture history: a transcription can finish after the event expires.
+ASR ignores a direction observation with a missing or different convention.
+Its existing recognition result reports `speaker_direction_state` and, when
+valid, `speaker_direction` as a single string such as
+`"115°, robot_front_0_left_positive_ccw"`. The matched capture window is
+reported as `speaker_direction_window_start_us` /
+`speaker_direction_window_end_us`. The angle refers to the start of the wake
+word, not the full utterance. Unknown and disconnected directions report only
+`speaker_direction_state: "unknown"` or `"no_input"`.
+
+`AudioChunk.header.stamp` must be the Unix capture time of the chunk's first
+sample. Direction windows use the same clock in microseconds. ASR reports an
+unknown wake direction when the audio stamp is missing or either capture
+window is untrusted. Confirm clock alignment on the robot before relying on
+direction results.
+
+For this migration, upgrade Driver and Perception together. Remove/re/add the
+direction and ASR cards and reconnect them — a saved card keeps its old
+`topicIn` list and never gains the second input. The canvas type remains
+`sensor/sound-direction`. ASR picks its direction input by topic name: the
+connection whose topic has a `sound_direction` segment is the direction source,
+every other input is audio, so connection order does not choose the audio
+source. Keep that name — renaming the driver output breaks the binding.
+Direction payloads appear in the monitor as plain data; they are not rendered
+as JSON.
+
+SenseVoice, Parakeet and X-ASR retain the recognizer's token timestamps from
+the same decode. ASR maps the matched wake word's text boundary to a timed
+token and adds its offset to the utterance's capture start before selecting
+direction windows. This supports filler and other speech before a custom wake
+word. Token timing must be finite, ordered, inside the original audio, and
+consistent with the recognized text; a wake boundary inside an indivisible
+token is unavailable. If timing is unavailable, a wake word at the utterance
+start can use the VAD onset; a spoken prefix returns `unknown`. Recognition
+and wake triggering continue normally. Check token timing accuracy on the
+robot; the timestamps do not establish the physical alignment error by themselves.
+Direction history keeps up to 60 seconds / 1201 events, covering a 30-second
+VAD segment plus queueing margin at Bumi's maximum 20 Hz publication rate.
+The worker snapshots history before transcription, so later direction events
+cannot evict a wake window while that utterance is being decoded.
+
 ### Common Pitfalls
 
 #### External USB mic (ALSA, 48 kHz native rate)
@@ -2255,13 +2312,248 @@ enrols new people from a photo, the live stream, or a batch package.
 
 ### Models
 
-InsightFace **buffalo_sc**, the smallest pack that still ships landmarks (alignment
-needs them):
+Two detector+recogniser pairs, selected by `model` on the card (registry:
+`plugins/face_runtime.FACE_MODELS`). **`scrfd25g_edgeface_s` is the default**, at
+`match_threshold` 0.55 — see the table below for why that number and not 0.35.
+
+`buffalo_sc` — the previous default. InsightFace's smallest pack that still ships
+landmarks (alignment needs them):
 
 | File | Size | Role |
 |------|------|------|
 | `det_500m.onnx` | 2.5 MB | SCRFD-500M-BNKPS — detection + 5 keypoints |
 | `w600k_mbf.onnx` | 13 MB | ArcFace MobileFaceNet — 512-d embedding |
+
+`scrfd25g_edgeface_s` — the default. A bigger detector and a stronger recogniser,
+same contract:
+
+| File | Size | Role |
+|------|------|------|
+| `scrfd_2.5g_bnkps.onnx` | 3.3 MB | SCRFD-2.5G-BNKPS — detection + 5 keypoints |
+| `edgeface_s_gamma_05.onnx` | 15 MB | EdgeFace-S-GAMMA-0.5 — 512-d embedding |
+
+Measured over a 100-image LFW sample (4849 impostor pairs, 2 genuine pairs), both
+pairs detected 99 of the 100 faces:
+
+| | impostor p99 | impostor max | genuine | margin | `match_threshold` |
+|---|---|---|---|---|---|
+| `buffalo_sc` | 0.158 | 0.323 | 0.52 / 0.71 | +0.199 | 0.35 |
+| `scrfd25g_edgeface_s` | 0.246 | 0.450 | 0.70 / 0.88 | +0.252 | 0.55 |
+
+EdgeFace separates identities better, but its whole similarity distribution sits
+higher — which is why **`match_threshold` is per-model** and why reusing 0.35 on
+the second pair puts four of those impostor pairs over the line. Leave the key out
+of config to get the configured model's recommended value; an explicit value still
+wins, so a hand-tuned robot keeps its number.
+
+**Adding a third pair is a row in `FACE_MODELS`, not a plugin.** What a candidate
+has to satisfy: the detector emits **nine** outputs (score/bbox/kps for strides
+8/16/32, 2 anchors) because `plugins/scrfd_decode.py` decodes exactly that and
+alignment needs the landmarks; the recogniser takes 112x112 and returns 512-d,
+because every stored sample and FaceDB row is that. Pre/post-processing is
+*shared* — RGB `(x-127.5)/128` into the detector, RGB `(x-127.5)/127.5` into the
+recogniser — so a model with different normalisation does not belong in the table,
+it belongs behind a branch in `embed()`. All of this is asserted at load time
+rather than discovered as bad embeddings, and
+`tests/test_face_models_registry.py` pins the table-level invariants.
+
+**Each model keeps its own roster, and switching means re-enrolling.** Embeddings
+from different networks are not comparable, so `IdentityDB._load` refuses a store
+written by another model rather than silently confusing people, and already-stored
+samples are never re-embedded.
+
+That refusal is right, but with one shared default it fired on the act of *selecting*
+a second model — the card went to `state: error` and the only way out was inventing a
+`db_dir` by hand. So `db_dir` is resolved per model (`face_db_dir_for`):
+`buffalo_sc` **pins `/models/face_db`** and any model without a pin gets
+`/models/face_db-<model>`. An explicit `db_dir` different from the default pins it
+and disables the suffix. The refusal stays as a backstop against pointing a model at
+a foreign store.
+
+The pin lives on buffalo_sc's row and **not** on "whichever model is the default",
+which matters now that the default has moved: keying it on `DEFAULT_FACE_MODEL`
+would hand the new default a store written by buffalo_sc — recreating the very
+`state: error` above — and orphan the real roster behind a `face_db-buffalo_sc` path
+nothing looks at. `tests/test_face_models_registry.py` pins exactly that.
+
+> **Upgrading an existing robot changes what it recognises.** The default moved to
+> `scrfd25g_edgeface_s`, and the roster moves with it, so a robot that had people
+> enrolled comes up with an **empty** roster and recognises nobody until they are
+> re-enrolled. Nothing is destroyed — selecting `buffalo_sc` on the card brings the
+> old roster back intact — but the upgrade itself is silent apart from
+> `database.persons` dropping to 0. There is no migration, and § Why there is no
+> migration explains why not.
+
+So switching is **not destructive** and switching back restores the previous roster
+intact. But the newly selected model **starts empty and recognises nobody** until
+people are re-enrolled, which no amount of plumbing can avoid — the old embeddings
+are in the wrong space. `info()`'s `database.persons` and `database.db_dir` say
+which roster is loaded, so an empty one does not read as lost people.
+
+#### Why there is no migration
+
+The obvious ask is a backfill: carry the roster across a model switch so nobody has
+to be re-enrolled. It cannot be done from what is on disk, and the reason is worth
+stating once so it is not re-proposed.
+
+An identity is stored as a 512-d embedding. An embedding is only meaningful inside
+the network that produced it — there is no transform from ArcFace's space to
+EdgeFace's, learned or otherwise, because the two were trained independently and
+their axes mean nothing to each other. So the stored rows cannot be converted.
+
+The other route is to re-embed the original faces, and **the database keeps no
+imagery to re-embed from**. That is deliberate, not an oversight: a face DB is three
+files — `persons.json`, `embeddings-<n>.npy`, `visits.jsonl` — and
+`config.yaml`'s `image_input` block says it outright, *"an upload is a transfer, not
+storage: enrolling a face leaves an embedding behind and never the photograph."*
+`/models/uploads` holds registration photos for `retention_days` (7) but it is a
+transfer buffer keyed by upload, not by person, and stream-enrolled people never had
+a photo there at all. It is not a roster.
+
+So the two things that *would* make a switch free both have to be decided before
+enrolment, not after:
+
+| Approach | What it costs | What it buys |
+|---|---|---|
+| Store the aligned 112x112 crop per sample — **implemented**, `store_sample_crops: true` | ~6 KB/sample JPEG (≈24 MB at 500 people x 8). Keeps face imagery on disk, bounded and deleted with its sample | Re-embedding under *any* future model, offline, with nobody present |
+| Embed under every installed model at enrolment | Both models resident; enrolment latency x N; an IdentityDB schema change that also lands on voiceprints | Instant lossless switching between *those* models only |
+| Dual-model transition window | Both models resident during migration; each person must appear once | Migrates an *existing* roster automatically: match with the old model to recover the name, enrol that name under the new one |
+
+The third is the only one that helps a roster that already exists, because it
+recovers the identity from the old model while the person is in frame rather than
+from storage.
+
+**The first is now implemented**, so this is the last switch that has to be painful.
+Every sample enrolled from here on stores the aligned crop it was embedded from
+under `<db_dir>/samples/<sample_id>.jpg`, and `stats()` reports
+`samples_with_artifact` against `samples` so the shortfall on an older roster is
+visible rather than discovered at switch time. `IdentityDB.sample_artifacts()` is
+the surface a re-embedding pass reads.
+
+Two things about that storage are load-bearing:
+
+- **Crops are keyed by a stable sample id, never by row index.** Rows get reindexed
+  by the max-samples trim, by `forget`, by capacity eviction and by the orphan
+  filter on load; a crop filed under an index would, after any of those, be served
+  up as a different person's face — which is worse than having no crop, because it
+  is wrong rather than absent. Ids come from a counter that only ever increases and
+  is restored from disk, so a retired id can never be handed to a new sample and
+  adopt its file.
+- **Files are written before the commit and swept after it**, the same ordering and
+  for the same reason as the embeddings file: a crash then leaves an unreferenced
+  file, which the next commit removes, rather than a referenced id with nothing
+  behind it.
+
+For a roster enrolled *before* this existed — which includes every robot deployed
+to date — there is still nothing to re-embed, so the cheap path applies:
+auto-enrolment re-learns people as they appear, and only **named** people need
+their name re-attached. On the Orin 5 rig that was 4 names out of 44 identities.
+
+#### Migrating a roster
+
+Migration is automatic and has **exactly one entry point**: `auto_migrate_roster`,
+the background pass described below. There is no action to call.
+
+There used to be a `reembed_from` action for triggering it by hand. It is removed,
+and the reason is worth keeping: `agent-core`'s `_to_openai_schema` splits **every**
+`x-action-params` entry into an LLM-callable function, unconditionally — there is no
+allowlist and no way to mark one as internal. `canvas_binding.is_bound` then matches
+sub-tools by prefix, so they inherit the parent card's binding. The upshot was that
+a maintenance operation which blocks for tens of seconds became a tool in the
+robot's own toolbox, on a `processor` card where an ACP barrier would wait for it.
+Nobody needed to migrate by hand, so the action was the wrong side of that trade.
+
+**It is neither an overwrite nor an extra column.** Each model owns its own
+database, so this reads the source, re-embeds, and writes into the *target's*
+store, leaving the source byte-for-byte intact — which is what makes it safe to
+retry and trivial to abandon: if the migrated roster is worse, select the old model
+again and the original is still there, untouched.
+
+A single database with one embedding column per model was the alternative, and is
+worse here for three independent reasons. `dim` is a per-database property and a
+future recogniser need not be 512-d. `IdentityDB` is deliberately
+modality-agnostic and shared with voiceprints, so widening its schema for
+face-specific multi-model rows taxes a module with no stake in it. And every
+`match()` would then have to choose a column — which is exactly the "matching
+across two networks does not fail, it silently confuses identities" failure the
+model check exists to prevent.
+
+Carried across: `person_id` (so `visits.jsonl` stays attributable), name, profile,
+named/unnamed, and `registered_at` — resetting that would make everybody look newly
+met against a visit log that disagrees.
+
+**Each model's vectors live in that model's own database, not in a shared column
+that gets rewritten.** This is what makes switching cheap: every `(crop, model)`
+pair is embedded **once** and kept in that model's store permanently, so going
+A -> B -> A recomputes nothing — A's roster is still sitting there, complete. Only
+a genuinely new model costs a pass. Within a model, the content-hash check below
+makes a repeat pass a no-op too, so the guarantee is exactly-once per pair rather
+than once-per-switch.
+
+**It runs in the background at startup, and does not gate service.** When
+`auto_migrate_roster` is true (the default) the engine loader publishes the engine
+first and *then* starts the pass on a daemon thread: recognition answers
+immediately against whatever is in the roster and recognises more people as the
+pass proceeds. `IdentityDB` takes its `RLock` per call, so a `match()` at frame
+rate and an `add()` from the migration interleave safely. Progress is in `info()`
+under `migration` (`state`, `persons_done`, `persons_total`, `samples_done`), which
+matters because a roster that is still filling looks exactly like one that is
+simply empty.
+
+The source is chosen automatically: the other model with the most re-embeddable
+samples, named in the log rather than guessed silently — with more than two rows in
+`FACE_MODELS` "the other one" stops being well defined. A config change or a stop
+bumps the load generation and the pass notices within one person and stops, rather
+than keeping on writing into a database the plugin has moved on from.
+
+Selecting a different `model` by itself migrates nothing beyond that automatic
+pass — it swaps which database is in use.
+
+**Turning `auto_migrate_roster` off means no migration at all**, now that the manual
+action is gone: changing model then requires re-enrolling every person. That is a
+legitimate choice for a deployment that does not want the background writes, but it
+is the whole cost, not a reduced one.
+
+The work is dominated by one decode-plus-embed per stored crop, measured at
+**6.6 ms** (EdgeFace-S, laptop CPU, 2 threads):
+
+| roster | crops | embedding time alone |
+|---|---|---|
+| 45 persons x 1 | 45 | ~0.3 s |
+| 100 persons x 4 | 400 | ~2.6 s |
+| 500 persons x 8 | 4000 | ~26 s |
+
+Add one `persons.json` + full-matrix rewrite per person on top. A maxed-out 500x8
+roster is therefore ~30-60 s of work — which is exactly why it runs with nobody
+waiting on it. `info()`'s `migration.persons_done` against `persons_total` is how
+you watch it; there is no synchronous form to time out.
+
+**Re-running is idempotent, including at sample level.** Crops this person already
+has here are skipped, keyed on content — the stored bytes are the source crop
+verbatim, so no provenance column is needed and the same face arriving by two
+routes collapses too. So restarting perception, or coming back to a model later,
+re-embeds nothing.
+
+That distinction is load-bearing and was a real defect first: without the content
+check a second pass re-embedded the same crops and *appended* them, taking one
+person from 5 samples to 8 with three duplicates. Once that fills
+`max_samples_per_person`, the oldest-first trim starts evicting the genuinely new
+captures made since the migration — the migration eating real data. The original
+test asserted only that the person *count* was unchanged, which it was, the whole
+time it was happening.
+
+What it cannot do is invent crops. Samples enrolled before `store_sample_crops`
+have nothing to re-embed and are simply left behind — `migration.persons_total`
+counts only the people that *can* move, against `source_crops` for the samples that
+had one, so the shortfall is visible rather than a surprise. One corrupt crop, or
+one person that fails, is logged and skipped rather than abandoning the pass.
+
+The embedding step deliberately **skips detection and alignment**
+(`FaceService.embed_aligned`). The stored crop is already aligned, so re-detecting
+would at best apply a second similarity transform on top of the first and at worst
+find no face at all — a 112x112 image letterboxed to 640x640 is not what SCRFD was
+trained on. Re-embedding has to put the new network on the *same pixels* the old one
+saw, or the migrated embedding is not comparable to a fresh capture of that person.
 
 Both run on the **standalone `onnxruntime`**, which is a second, independent ONNX
 Runtime from the one compiled into the sherpa-onnx wheel (ASR/TTS reach only that
@@ -2362,6 +2654,28 @@ be pinned, and the robots have no reliable route to GitHub. To refresh, download
 (`prisma/articles/upload-figs.js` cannot do it — it only accepts image extensions
 and forces its own key shape), then re-download from COS and paste the *verified*
 `size`/`sha256` into `FACE_MODEL_FILES`.
+
+`scrfd25g_edgeface_s` lives at `public/face/scrfd25g_edgeface_s/`
+(`FACE_SCRFD25G_BASE`, pins in `FACE_SCRFD25G_FILES`) and its two halves come from
+different places:
+
+- **The detector** is insightface's own `scrfd_2.5g_bnkps`, re-hosted from
+  `hsuyabc/scrfd_2.5g_bnkps.onnx` on HuggingFace. Its pinned size and SHA256 are
+  that repo's LFS oid, so the re-host is verifiable against upstream.
+- **The recogniser ONNX does not exist upstream.** Idiap publish EdgeFace as
+  PyTorch weights only, so this file is *our* export from `anjith2006/edgeface` —
+  fp32, opset 17, single-file (weights inlined, no `.onnx.data` companion), one
+  input `(batch,3,112,112)` and one output `(batch,512)`. It was checked against
+  the reference implementation before upload: worst cosine 0.9999999 over 8
+  inputs. Re-exporting is therefore the only way to refresh it, and a new export
+  means a new hash.
+- **Not the INT8 export.** On the same graph it measured no faster at all (16.0 ms
+  vs 15.7 ms p50, 2 threads) while moving the embedding by cosine 0.84 — it buys
+  disk in exchange for an unvalidated recogniser. If someone wants it, validate it
+  against a real face set first and give it its own row and threshold.
+
+Either way the rule is the same as everywhere else: **re-download from COS and pin
+the hash of what came back**, not of what you uploaded.
 
 ### The person record: `name` vs `profile`
 
@@ -2514,7 +2828,9 @@ is a coin flip, and enrolling one would spend an `unknown-N` slot forever on a
 smear that never matches anything again. Relax `min_face_px` / `blur_min` if you
 want identities at greater distance.
 
-`match_threshold` defaults to **0.35**. Measured separations on this model, same
+`match_threshold` defaults to the configured model's value — **0.35** for
+`buffalo_sc`, **0.55** for `scrfd25g_edgeface_s`; see § Models for how those were
+measured and why they differ. Measured separations on `buffalo_sc`, same
 photo transformed: same face at half resolution **0.983**, same face +35
 brightness **0.979**, a different person **-0.108**. Real same-person /
 different-photo scores sit well below the first two, so **tune this against your own
@@ -2698,10 +3014,116 @@ transcribed and TTS still speaks with the card running.
 
 ## Vision: `vop` (detection) and `visual_depth` (depth)
 
-Both run a **prebuilt TensorRT engine** fetched as a pinned bundle
+By default, both run a **prebuilt TensorRT engine** fetched as a pinned bundle
 (`utils/model_downloader.py` → `ensure_vop_model` / `ensure_depth_model`), the
 same distribution shape OCR uses. Neither loads a `.pt` at runtime, and neither
 falls back to PyTorch if the bundle is missing — it fails loudly instead.
+
+### Optional DepthART backend
+
+`visual_depth` also supports DepthART Metric-S. Select **Depth model** in the
+shared tool configuration after stopping all depth instances; loading remains
+lazy. The default is still YOLO26-N Depth. Frame rate and calibration remain
+per-camera settings. This integration uses the existing Agent Core form without
+Core changes: the model selector shows `yolo` / `depthart`, and calibration fields
+remain visible rather than conditionally hidden. Leave a/b at 1/0 when not using
+manual calibration.
+
+DepthART downloads a pinned engine and SelectiveScan plugin on first use,
+selected from the runtime TensorRT family. Files are size/SHA256 verified and
+cached under `/models/depthart/jp511` or `/models/depthart/jp61`; concurrent
+processes reuse the shared downloader lock. Download progress is exposed through
+the loading status. Selecting the model or calling info/config does not download.
+The fixed release is the `dynamic-k-v1` directory of
+`Flame4pd/depthart-metric-s-jp61-trt`, revision
+`ce158696ba8a5a6cee919b851a879825ea700eea`; despite the repository name it includes
+both JP5/TRT8.5.2.2 and JP6/TRT10.4 Orin artifacts.
+
+For custom provisioning, set both `depthart_engine_path` and
+`depthart_plugin_path` (or `DEPTHART_ENGINE_PATH` and `DEPTHART_PLUGIN_PATH`).
+A partial override fails explicitly. JP5/JP6 artifacts are not interchangeable.
+There is no startup compilation or fallback to another model on download failure.
+
+Supply actual `motus.camera/1` intrinsics through the upstream camera declaration
+for streams, or explicitly for photos. Photos can inherit a running instance's
+bound declaration but cannot replace it. Unbound on-demand instances require a
+declaration on every photo.
+
+**A declaration with no `K` is valid, and R1 is the case.** The spec carries
+`half_fov_rad` because a tape measure produces an angle directly and no `K` at
+all, and its reference declaration is exactly that — `/ubuntu/camera/main`
+declares `K: null`, `half_fov_rad: 0.888`, `source: measured`. So `K` is read
+when present and derived from `half_fov_rad` when not (`fx = (w/2)/tan(half)`,
+principal point at centre), which keeps the spec's precedence: when both are
+present `K` wins, because a matrix is solved from many observations while the
+angle beside it is usually a tape measure. `fy` comes from `half_fov_v_rad`
+when declared and assumes square pixels when it is not — it **cannot** be
+derived from the aspect ratio, which is why the declared field exists.
+
+Reading only `K` rejected the canonical camera of the robot this project is
+built around, with `camera_info must contain a nine-value K`.
+
+What this does not fix on that lens: a pinhole `K` is an approximation at ~102
+degrees with `distortion_model: unknown` and `D: null`, and `tan` overstates
+the lateral offset towards the edges. Expect DepthART to need site calibration
+there, as YOLO does (`cal_b: -0.9753`, a factor of 2.65).
+
+#### The engine canvas is fixed, so an off-aspect source is centre-cropped
+
+The engine's input binding is static — `DepthARTSession.input_size` is read off
+the engine itself, 864x480 for the pinned bundle — so every frame has to become
+exactly that tensor. Runtime K does not make the canvas dynamic.
+
+Rounding the cover-resize to a multiple of 32 admits a **band** of ratios, not
+just 1.8: 16:9 and 16:10 sources go in untouched. Anything outside the band is
+**centre-cropped** to fit, and `prepare_image` folds the crop into K — the
+principal point moves, the focal lengths do not. A vertical crop therefore costs
+nothing on the horizontal axis, which is the axis a camera's `half_fov_rad`
+describes and the one an avoidance corridor is computed from. A 4:3 source gives
+up 26% of its height, 16:10 gives up 7%. `DepthARTSession.infer` logs the crop
+once per engine; past `MAX_CROP_FRACTION` (half the frame) it is refused
+instead, naming the ratio to feed it.
+
+**It is not stretched, and that is the whole point.** Resizing 640x480 into
+864x480 is one line and silently wrong: it squashes the world horizontally by
+1.35x while K still says the pixels are square, and DepthART derives its metric
+scale *from* K — so the card would publish confidently wrong numbers on a topic
+whose contract is metres. Letterboxing would keep the field of view instead, at
+the cost of feeding the network grey bars it never saw in training, whose depth
+would then have to be masked. Rebuilding the engine for another canvas is the
+only thing that removes the limit outright, and that is an artifact problem.
+
+**Known gap:** the declaration this card *publishes* (`camera_info.inherit`)
+rescales the upstream K as though the stage only resized, so after a crop its
+vertical terms (`fy`, `cy`) describe more of the scene than the depth map
+actually covers. The horizontal terms and `half_fov_rad` stay correct, and
+`half_fov_v_rad` is `null`, so nothing reads the wrong number today — but a
+consumer that starts using vertical geometry would be misled. Folding the crop
+through `inherit` is the fix.
+
+#### One calibration pair, cleared when the model changes
+
+A log-affine fit is two numbers. They are `cal_a`/`cal_b`, there is one pair,
+and there is no field recording which model it belongs to — a per-model pair and
+a provenance marker are the same mistake in two shapes: both make the operator
+responsible for matching a number to a model, and that bookkeeping is exactly
+what goes wrong.
+
+What makes one pair safe is that **switching `backend` clears it**, because a
+fit does not transfer between models: on r1_sz's ultra-wide lens YOLO needs
+`cal_b: -0.9753`, a factor of 2.65, correcting a fixed-K model's guess at a 102°
+lens — not an error DepthART makes, since DepthART is handed the real `K`.
+DepthART's own residual there has not been measured.
+
+The clearing is not new; it is what #286 did. What is new is that it is **loud**:
+the `config` response and `info()` both carry a note saying the calibration was
+cleared and why, and it is logged. On r1_bj the same clearing happened silently,
+the canvas persisted the cleared row, and the card ran `model-default` on a 102°
+lens with nothing to say so. The stripping was never the defect — the silence was.
+
+So the sequence after a model change is: recalibrate with `calibrate`, then put
+the returned `cal_a`/`cal_b` into the card's config. Until you do, `info()`
+reports `model-default` and distances are the engine's own fit.
 
 ### Why TensorRT *directly*, and not through ultralytics
 
@@ -4140,3 +4562,37 @@ difference.
 
 Measured on jp6.1 (Python 3.10.12, pytest 8.3.3): 175 passed / 1 failed with
 autoload on, **176 passed** with it off.
+
+## `measure` 卡片
+
+物体可见尺寸测量。消费 VOP 的 `data/json` 和一路 `image/depth-zlib`，输出：
+
+```text
+/perception/measure/state   data/json   当前对象、距离、可见宽高
+/perception/measure/view    image/jpeg  相机画面 + bbox + W×H 标签
+```
+
+它属于 Perception，不属于驱动：读的是 VOP/深度，不控制电机。相机彩色流由 depth
+话题推导（Bumi：`/camera/color`；G1：`/camera/rgb`），不需要在画布上把同一个 camera
+节点再接一次；需要覆盖时在 `config.yaml` 设置 `measure.camera_topic`。
+
+尺寸是**当前视角的可见外框**，不是完整三维长宽高。`clipped=true` 表示 bbox 贴边，
+数值只是下限；没有有效深度或没有检测到目标时不猜，输出 `null` 或空 `objects`。
+
+常用动作：
+
+- `read`：当前帧对象，可按 `target` 过滤；回答“现在这个多大”用它；
+- `info`：当前状态 + 最近活跃对象的紧凑 session 摘要；
+- `history`：有界、节流的历史记录；
+- `reset_session`：清空摘要/历史；
+- `config`：改 rate、置信度、深度分位、平滑窗口等。
+
+`view` 用 OpenCV 绘制（和这个镜像里现有的相机/姿态卡同一套栈），默认 5 Hz，
+`view_hz: 0` 关闭。`info` 的 `topic_out` 会声明两个输出口；查看图像用画布的
+「查看数据流」或 Monitor，不需要额外的 viewer 卡片。
+
+测试：
+
+```bash
+PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest perception/tests/test_measure_*.py -q
+```

@@ -21,7 +21,10 @@ import config
 
 def find_tool(mcp_id: str, tool_name: str) -> dict:
     """The tool object for mcp_id:tool_name, or {} (tools may be bare strings)."""
-    mcps = config.main.get('services', {}).get('mcp', []) or []
+    # `or {}` on both hops, not just the inner one: a config row can hold a
+    # literal null, and `.get(key, {})` does not apply its default to a stored
+    # None. Reached from the stop path now, which must never raise.
+    mcps = (config.main.get('services') or {}).get('mcp') or []
     target = next((m for m in mcps if m.get('id') == mcp_id), None)
     for tool in (target or {}).get('tools', []) or []:
         if isinstance(tool, dict) and tool.get('name') == tool_name:
@@ -64,7 +67,26 @@ def missing_required_config(tool_obj: dict, merged_cfg: dict) -> list[str]:
     return [
         key for key in (schema.get('required') or [])
         if key in props and merged_cfg.get(key) in (None, '')
+        and required_applies(props, key, merged_cfg)
     ]
+
+
+def required_applies(props: dict, key: str, cfg: dict) -> bool:
+    """`x-required-when: {field: value | [values]}` 收窄一个 required 字段的适用条件。
+
+    decision_core 的云端 URL / Key 只在「大模型」选了云端时必填 —— 选本机模型时它们
+    是后备，留空也该能启动。控制字段没存值时按它的 default 算。
+    """
+    cond = (props.get(key) or {}).get('x-required-when')
+    if not cond:
+        return True
+    for ctrl, want in cond.items():
+        actual = cfg.get(ctrl)
+        if actual in (None, ''):
+            actual = (props.get(ctrl) or {}).get('default', '')
+        if actual not in (want if isinstance(want, list) else [want]):
+            return False
+    return True
 
 
 def plan_config_calls(tool_obj: dict, saved_shared: dict, saved_instance: dict,

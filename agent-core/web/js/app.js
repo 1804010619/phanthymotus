@@ -121,7 +121,7 @@ async function fetchTopicStatuses() {
 }
 
 // Priority order for update banner display
-const _UPDATE_PRIORITY = ['core', 'perception', 'actucore', 'driver'];
+const _UPDATE_PRIORITY = ['core', 'perception', 'actucore', 'modelhub', 'driver'];
 
 async function checkForUpdate() {
   try {
@@ -330,6 +330,7 @@ function _initResetModal() {
     const body = {
       restart_services: restartServices,
       chat_history: document.getElementById('reset-chat-history')?.checked || false,
+      tasks: document.getElementById('reset-tasks')?.checked || false,
       system_prompt: document.getElementById('reset-system-prompt')?.checked || false,
       identity: document.getElementById('reset-identity')?.checked || false,
       memory: document.getElementById('reset-memory')?.checked || false,

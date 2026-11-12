@@ -4,9 +4,10 @@
  * Tools with configSchema show config status and config button.
  */
 
-import { isProjectRunning, addCardFromSidebar, ensureEdit, isEditor } from './canvas.js';
+import { isProjectRunning, addCardFromSidebar, ensureEdit, isEditor, cardsForTool } from './canvas.js';
 import { isMobile, closeSidebarMobile } from './mobile.js';
 import { makeQrField, isDisplayOnly } from './qr-field.js';
+import { openDeployPanel } from './deploy-panel.js';
 
 /**
  * 分区图标。
@@ -18,6 +19,7 @@ import { makeQrField, isDisplayOnly } from './qr-field.js';
  *   agentcore  芯片 —— 做决定的那颗核
  *   perception 眼睛 —— 这一层负责"接收"
  *   actucore   闪电 —— 这一层负责"动"
+ *   modelhub   立方体 —— 本机跑的大模型（LLM/VLM），给决策核心提供推理
  *   driver     插头 —— 通往某台具体硬件的那根线
  *
  * driver 的颜色继续表示在线状态（原来由圆点承担），所以侧栏收起成窄条时，一眼
@@ -33,6 +35,8 @@ const ICONS = {
   perception: `<svg ${_ICON_ATTRS}><path d="M2.5 12S6 5.8 12 5.8 21.5 12 21.5 12 18 18.2 12 18.2 2.5 12 2.5 12z"/>` +
     `<circle cx="12" cy="12" r="2.6"/></svg>`,
   actucore: `<svg ${_ICON_ATTRS}><path d="M13.2 2.5 5 13.8h5.6L9.8 21.5 18 10.2h-5.6l.8-7.7z"/></svg>`,
+  modelhub: `<svg ${_ICON_ATTRS}><path d="M12 2.8 20.2 7.4v9.2L12 21.2 3.8 16.6V7.4z"/>` +
+    `<path d="M3.8 7.4 12 12l8.2-4.6M12 12v9.2"/></svg>`,
   driver: `<svg ${_ICON_ATTRS}><path d="M9 2.8v5.4M15 2.8v5.4"/>` +
     `<path d="M5.6 8.2h12.8v3.2a6.4 6.4 0 0 1-12.8 0V8.2z"/><path d="M12 17.8v3.4"/></svg>`,
 };
@@ -131,10 +135,12 @@ export function renderSidebar(mcps, topicStatuses = {}) {
   const drivers = allMcps.filter(m => m.category === 'driver' && m.online === true);
   const perceptions = allMcps.filter(m => m.category === 'perception' && m.online === true);
   const actucores = allMcps.filter(m => m.category === 'actucore' && m.online === true);
+  const modelhubs = allMcps.filter(m => m.category === 'modelhub' && m.online === true);
 
   _scroll.innerHTML = '';
 
-  if (!controllers.length && !drivers.length && !perceptions.length && !actucores.length) {
+  if (!controllers.length && !drivers.length && !perceptions.length && !actucores.length
+      && !modelhubs.length) {
     _scroll.appendChild(_empty);
     return;
   }
@@ -156,6 +162,14 @@ export function renderSidebar(mcps, topicStatuses = {}) {
   if (actucores.length) {
     _scroll.appendChild(_buildMergedSection(actucores, {
       cls: 'sidebar-section-actucore', icon: ICONS.actucore, iconCls: 'actucore', label: '执行',
+    }));
+  }
+
+  // ModelHub section
+  if (modelhubs.length) {
+    _scroll.appendChild(_buildMergedSection(modelhubs, {
+      cls: 'sidebar-section-modelhub', icon: ICONS.modelhub, iconCls: 'modelhub', label: '模型',
+      consoleEntries: true,
     }));
   }
 
@@ -204,7 +218,7 @@ function _buildSection(mcp) {
  * grouped by tool type. Used for perception and actucore, which each may be
  * served by more than one container but read as a single layer in the sidebar.
  */
-function _buildMergedSection(mcps, { cls, icon, iconCls = '', label }) {
+function _buildMergedSection(mcps, { cls, icon, iconCls = '', label, consoleEntries = false }) {
   const section = document.createElement('div');
   section.className = `sidebar-section ${cls}`;
 
@@ -232,9 +246,18 @@ function _buildMergedSection(mcps, { cls, icon, iconCls = '', label }) {
   const grid = document.createElement('div');
   grid.className = `sidebar-tool-list${useChip ? ' chip-mode' : ''}`;
 
+  // 有运维页的常驻服务（ModelHub）列在最前，不挂「ACTUATOR」这类分组标签 ——
+  // 它是一个入口，不是一张能连线的执行卡
+  if (consoleEntries) {
+    for (const tool of allTools.filter(t => t.inputSchema?.['x-workbench'])) {
+      grid.appendChild(_buildConsoleEntry(tool._mcp, tool));
+    }
+  }
+  const rest = consoleEntries ? allTools.filter(t => !t.inputSchema?.['x-workbench']) : allTools;
+
   // Group and render
   const groups = {};
-  for (const tool of allTools) {
+  for (const tool of rest) {
     const t = tool.type || '';
     (groups[t] = groups[t] || []).push(tool);
   }
@@ -310,6 +333,64 @@ function _buildSubgroupLabel(type, count) {
   return label;
 }
 
+/** Does the sidebar still own this tool's configuration?
+ *
+ * Only while the tool has no card on the canvas. Once a card exists that card's
+ * dialog sets everything, tool-level fields included, and a second entry point
+ * is how one card's settings and another's drift apart — the split across two
+ * dialogs is how r1_bj ended up with a YOLO fit selected under DepthART.
+ *
+ * **One function because there were two copies of this test.** The gear on the
+ * chip and the status on the tool card each recomputed it, I gated only the
+ * second, and the chip went on opening the dialog I had just removed. Two
+ * copies of a rule that must agree is the bug, not the symptom.
+ */
+function sidebarOwnsConfig(mcpId, tool) {
+  const schema = typeof tool === 'object' ? tool.configSchema : null;
+  if (!schema) return false;
+  const props = Object.values(schema.properties || {});
+  if (!props.some(def => def.scope !== 'instance')) return false;   // nothing to set here
+
+  // **Only step aside if the card can actually take over.** A card's dialog
+  // exists only when the tool has instance-scope fields (`canvas.js`, the
+  // `hasInstanceFields` test that renders the gear). A tool whose settings are
+  // all shared — `loco_servo`, whose config is `dry_run`, `rotate_only` and
+  // `require_standing` — gets no dialog on its card, so hiding the sidebar
+  // entry for it removed the only way to reach those settings. On R1 that put
+  // `dry_run` out of reach, which is not a cosmetic field on a chassis.
+  if (!props.some(def => def.scope === 'instance')) return true;
+
+  return cardsForTool(mcpId, tool.name).length === 0;
+}
+
+/**
+ * ModelHub 这类常驻服务在侧边栏是一个入口，不是可以拖上画布的卡片。
+ *
+ * 它不跟着智能控制起停（start/stop 只是查状态），决策核心也是自己找到它、
+ * 不靠画布连线 —— 放上画布唯一的用处是能点开运维页，而那一步本身就是绕路。
+ * 点这里直接打开模型管理，开启控制前后都能用。
+ */
+function _buildConsoleEntry(mcp, tool) {
+  const entry = document.createElement('button');
+  entry.type = 'button';
+  entry.className = 'sidebar-console-entry';
+  entry.dataset.mcpId = mcp.id;
+  entry.dataset.toolName = tool.name;
+  const title = tool.inputSchema['x-workbench'].title || '模型管理';
+  entry.innerHTML = `
+    <span class="console-entry-name">${_esc(title)}</span>
+    <span class="console-entry-desc">下载、启动、对话、性能测试、监控</span>`;
+  entry.addEventListener('click', async () => {
+    try {
+      const { openToolConsole } = await import('./workbench.js');
+      await openToolConsole(mcp.id, tool);
+    } catch (err) {
+      alert(`打不开${title}：${err.message}`);
+    }
+  });
+  return entry;
+}
+
 function _buildChip(mcp, tool) {
   const chip = document.createElement('div');
   const toolType = tool.type || '';
@@ -322,7 +403,7 @@ function _buildChip(mcp, tool) {
 
   // Config button for tools with shared fields
   const configSchema = typeof tool === 'object' ? tool.configSchema : null;
-  const hasSharedFields = configSchema && Object.values(configSchema.properties || {}).some(def => def.scope !== 'instance');
+  const hasSharedFields = sidebarOwnsConfig(mcp.id, tool);
   const configKey = `${mcp.id}:${tool.name}`;
   // 「已配置」只看会产生输入的字段。纯展示字段（二维码）永远不保存任何值，
   // 把它算进来的话，一个只声明了二维码的工具会永久挂着未配置的警告三角。
@@ -432,8 +513,19 @@ function _buildToolCard(mcp, tool) {
 
   const configSchema = typeof tool === 'object' ? tool.configSchema : null;
   const configKey = `${mcp.id}:${tool.name}`;
-  // Only tools with shared (non-instance-scope) fields need sidebar-level configuration
-  const hasSharedFields = configSchema && Object.values(configSchema.properties || {}).some(def => def.scope !== 'instance');
+  // Only tools with shared (non-instance-scope) fields need sidebar-level
+  // configuration — **and only while the tool has no card on the canvas.**
+  //
+  // Once a card exists, that card's dialog sets everything, tool-level fields
+  // included, so keeping this entry would leave two places to change one
+  // setting. That is not merely redundant: per-camera numbers are only
+  // meaningful against the shared model they were measured on, and splitting
+  // the two across dialogs is how r1_bj ended up with a YOLO fit selected
+  // under DepthART.
+  //
+  // It is not removed outright because a tool with no card still has to be
+  // configurable — ASR's url/key has to be set before placing one.
+  const hasSharedFields = sidebarOwnsConfig(mcp.id, tool);
   // 见 _buildChip 里同名变量的注释：纯展示字段不算「要配置的东西」
   const needsInput = hasSharedFields && Object.values(configSchema.properties || {})
     .some(def => def.scope !== 'instance' && !isDisplayOnly(def));
@@ -657,10 +749,209 @@ export function hasSharedRequired(configSchema) {
   return required.some(k => props[k] && props[k].scope !== 'instance');
 }
 
+/**
+ * decision_core 的「大模型」：云端或本机，二选一。
+ *
+ * 选本机时不挑具体模型 —— 用 ModelHub 当前加载的那个，换模型在模型管理里做。
+ * 所以这里只显示一行状态：现在跑的是哪个模型、上下文多长；用不了时说清楚为什么、
+ * 去哪里处理。状态打开时现查，ModelHub 那边刚加载好的模型不用重启 agent-core。
+ *
+ * 值放在一个隐藏 input 上（带 data-key），切换时派发 change —— 保存按 [data-key]
+ * 收值、x-show-when 按它的 value 判断，和其他字段走同一条路。
+ */
+const _LLM_SOURCES = [
+  { value: 'cloud',    label: '云端' },
+  { value: 'modelhub', label: '本机' },
+];
+
+/** 没装 ModelHub 时，按这台机器能不能装，给一句该怎么办。 */
+function _modelhubInstallHint(install) {
+  if (install.available) {
+    return { canInstall: true,
+             text: '本机模型由 ModelHub 提供。装好后在模型管理里下载并启动一个模型，这里会自动用上。' };
+  }
+  if (install.reason === 'unsupported') {
+    return { unsupported: true,
+             text: '本机模型由 ModelHub 提供，它目前只支持 Jetson Thor（JetPack 7）。这台机器请用云端模型。' };
+  }
+  if (install.reason === 'not_published') {
+    return { text: '部署列表里还没有这台机器能用的 ModelHub 版本，请管理员先发布。现在请先用云端模型。' };
+  }
+  return { text: '本机模型由 ModelHub 提供，请先在「设置 → 部署」里安装。' };
+}
+
+/** 「打开模型管理」：运维页叠在设置框上面打开，关掉后回到这里，状态自动刷新。 */
+let _refreshLlmStatus = null;
+function _openConsoleButton(label) {
+  const b = document.createElement('button');
+  b.type = 'button';
+  b.className = 'llm-source-action';
+  b.textContent = label;
+  b.addEventListener('click', async () => {
+    try {
+      const { openModelConsole } = await import('./workbench.js');
+      await openModelConsole(() => _refreshLlmStatus?.());
+    } catch (err) {
+      alert(`打不开模型管理：${err.message}`);
+    }
+  });
+  return b;
+}
+
+function _installModelhubButton() {
+  const b = document.createElement('button');
+  b.type = 'button';
+  b.className = 'llm-source-action';
+  b.textContent = '去部署里安装 ModelHub';
+  b.addEventListener('click', () => {
+    // 先关掉配置框：部署面板是另一个 modal，叠在上面会把两个框的按钮搅在一起
+    document.getElementById('tool-config-overlay')?.classList.add('hidden');
+    openDeployPanel({ tab: 'marketplace', query: 'modelhub' });
+  });
+  return b;
+}
+
+function _llmSourceInput(key, saved) {
+  const wrap = document.createElement('div');
+  wrap.className = 'llm-source';
+
+  const input = document.createElement('input');
+  input.type = 'hidden';
+  input.dataset.key = key;
+  input.value = saved === 'modelhub' ? 'modelhub' : 'cloud';
+
+  const seg = document.createElement('div');
+  seg.className = 'llm-source-seg';
+  seg.setAttribute('role', 'radiogroup');
+  seg.setAttribute('aria-label', '大模型');
+
+  const status = document.createElement('div');
+  status.className = 'llm-source-status';
+  status.setAttribute('aria-live', 'polite');
+  // 操作放在状态框外面：框里只说「现在是什么情况」，按钮是对整个 ModelHub 的操作，
+  // 放进框里会读成「对这个模型做点什么」
+  const actions = document.createElement('div');
+  actions.className = 'llm-source-actions';
+
+  const buttons = _LLM_SOURCES.map(({ value, label }) => {
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.className = 'llm-source-opt';
+    b.dataset.value = value;
+    b.setAttribute('role', 'radio');
+    b.textContent = label;
+    b.addEventListener('click', () => select(value));
+    seg.appendChild(b);
+    return b;
+  });
+
+  let local = null;     // 最近一次查到的本机状态
+  function select(value) {
+    input.value = value;
+    for (const b of buttons) {
+      const on = b.dataset.value === value;
+      b.classList.toggle('active', on);
+      b.setAttribute('aria-checked', on ? 'true' : 'false');
+    }
+    renderStatus();
+    input.dispatchEvent(new Event('change'));
+  }
+
+  function renderStatus() {
+    status.hidden = actions.hidden = input.value !== 'modelhub';
+    if (status.hidden) return;
+    status.innerHTML = '';
+    actions.innerHTML = '';
+    const dot = document.createElement('span');
+    dot.className = 'llm-source-dot';
+    const main = document.createElement('div');
+    main.className = 'llm-source-main';
+    const note = document.createElement('div');
+    note.className = 'llm-source-note';
+    let action = null;
+    if (!local) {
+      dot.dataset.state = 'pending';
+      main.textContent = '正在查本机模型…';
+    } else if (local.state === 'ready') {
+      dot.dataset.state = 'ready';
+      main.textContent = local.title;
+      if (local.context_tokens) {
+        const ctx = document.createElement('span');
+        ctx.className = 'llm-source-ctx';
+        ctx.textContent = `上下文 ${Math.round(local.context_tokens / 1000)}k`;
+        main.appendChild(ctx);
+      }
+      note.textContent = 'ModelHub 当前加载的模型。换模型在模型管理里操作，这里自动跟上。';
+      action = _openConsoleButton('打开模型管理');
+    } else if (local.state === 'absent') {
+      // 没装不是故障：灰点。说清楚本机模型从哪来、这台机器上该怎么办
+      dot.dataset.state = 'off';
+      const how = _modelhubInstallHint(local.install || {});
+      // 装不了的机器别说「还没装」—— 那句话暗示装上就行
+      main.textContent = how.unsupported ? '这台机器用不了本机模型' : '这台机器还没装 ModelHub';
+      note.textContent = how.text;
+      if (how.canInstall) action = _installModelhubButton();
+    } else if (local.state === 'unreachable') {
+      dot.dataset.state = 'down';
+      main.textContent = 'ModelHub 没有回应';
+      note.textContent = '它已经装了，但现在不在线。到「设置 → 部署 → 我的服务」看看它是否在运行。';
+    } else if (local.state === 'error') {
+      dot.dataset.state = 'down';
+      main.textContent = `${local.title || '本机模型'} 启动失败`;
+      note.textContent = local.message || '';
+      action = _openConsoleButton('打开模型管理');
+    } else if (local.state === 'loading') {
+      dot.dataset.state = 'loading';
+      main.textContent = (local.title || '本机模型') + ' 正在加载';
+      note.textContent = local.message || '';
+      action = _openConsoleButton('打开模型管理');
+    } else if (local.downloaded === 0) {
+      // 装了 ModelHub 但一个模型都没下载：要做的是「下载」，不是「启动」
+      dot.dataset.state = 'off';
+      main.textContent = 'ModelHub 里还没有模型';
+      note.textContent = '先在模型管理里下载一个模型并启动，这里会自动用上。';
+      action = _openConsoleButton('去模型管理下载模型');
+    } else {
+      dot.dataset.state = 'off';
+      main.textContent = local.downloaded
+        ? `已下载 ${local.downloaded} 个模型，还没有启动`
+        : 'ModelHub 还没有启动模型';
+      note.textContent = '在模型管理里启动一个模型，这里会自动用上。';
+      action = _openConsoleButton('去模型管理启动模型');
+    }
+    status.append(dot, main);
+    if (note.textContent) status.appendChild(note);
+    if (action) actions.appendChild(action);
+    actions.hidden = !action;
+  }
+
+  wrap.append(input, seg, status, actions);
+  select(input.value);
+
+  const load = () => fetch('/api/config/local-llm')
+    .then(r => r.json())
+    .then(json => {
+      local = (json && json.data) || { state: 'unreachable', message: '查不到本机模型。' };
+      // 没装 ModelHub 时「本机」照样能点：点了才看得到为什么不能用、该怎么办。
+      // 置灰 + 悬停提示在触屏和 Safari 上等于什么都没说。
+      renderStatus();
+    })
+    .catch(() => {
+      local = { state: 'unreachable', message: '查不到本机模型，检查 agent-core 是否在线。' };
+      renderStatus();
+    });
+  _refreshLlmStatus = () => { local = null; renderStatus(); load(); };
+  load();
+  return wrap;
+}
+
 // ── Tool config modal (shared fields only) ────────────────────────────────────
 
 export async function openToolConfigModal(mcpId, toolName, configSchema) {
-  if (isProjectRunning()) {
+  // 决策核心例外：大模型、播报这些设置保存后从下一次请求起生效，不用停掉控制。
+  // 以前一律要先停，于是「开了才发现大模型没配」就得停掉、配好、再开一次。
+  const liveEditable = mcpId === 'agentcore' && toolName === 'decision_core';
+  if (isProjectRunning() && !liveEditable) {
     alert('Stop agent before modifying');
     return;
   }
@@ -691,7 +982,7 @@ export async function openToolConfigModal(mcpId, toolName, configSchema) {
 
     const label = document.createElement('label');
     label.className = 'tool-config-label';
-    label.textContent = `${def.title || def.description || key}${required.includes(key) ? ' *' : ''}`;
+    label.textContent = `${def.title || def.description || key}${required.includes(key) && !def['x-required-when'] ? ' *' : ''}`;
 
     let input;
     if (def.oneOf && Array.isArray(def.oneOf)) {
@@ -745,6 +1036,8 @@ export async function openToolConfigModal(mcpId, toolName, configSchema) {
       input = _mediaDeviceInput(
         def.format === 'video-input-device' ? 'videoinput' : 'audioinput',
         key, savedValues[key] || '');
+    } else if (def.format === 'llm-source') {
+      input = _llmSourceInput(key, savedValues[key] ?? def.default ?? 'cloud');
     } else if (def.format === 'channel-select') {
       input = document.createElement('select');
       input.className = 'tool-config-input';
@@ -849,7 +1142,8 @@ export async function openToolConfigModal(mcpId, toolName, configSchema) {
       if (!input.value.trim()) continue;
       // Skip fields hidden by x-show-when (their parent .tool-config-field has display:none)
       const fieldWrapper = input.closest('.tool-config-field');
-      if (fieldWrapper && fieldWrapper.style.display === 'none') continue;
+      if (fieldWrapper && fieldWrapper.style.display === 'none'
+          && !(props[input.dataset.key] || {})['x-keep-when-hidden']) continue;
       try {
         values[input.dataset.key] = _readConfigValue(input, props[input.dataset.key]);
       } catch (err) {
@@ -991,6 +1285,37 @@ export async function openInstanceConfigModal(mcpId, toolName, instanceId, confi
   const configKey = `${mcpId}:${toolName}:${instanceId}`;
   const savedValues = _toolConfigs[configKey] || {};
 
+  // **The card's dialog can set everything, so there is never a second place
+  // you have to go.** Tool-level fields render here too, as real inputs, in a
+  // labelled group above the per-camera ones; on save they are split by scope
+  // and written to their own row.
+  //
+  // The split itself is real and stays — `visual_depth`'s `backend` selects one
+  // engine per process while `fps` and the calibration are per camera — but
+  // making the operator visit two dialogs to configure one card was the part
+  // that cost us. It is also not merely inconvenient: `cal_a`/`cal_b` are a fit
+  // measured against a particular depth model, and `backend` says which model
+  // is running, so editing them apart is how r1_bj ended up with a YOLO fit
+  // selected under DepthART — a factor of 2.65 on every distance.
+  //
+  // Labelled loudly because the consequence is unusual: this one group is
+  // shared, so changing it here changes it for every other card on the same
+  // tool. The sidebar keeps its own copy of these fields, which is still the
+  // only way to configure a tool that has no card on the canvas yet.
+  const sharedKeys = Object.keys(props).filter(k => props[k].scope !== 'instance');
+  let sharedHost = null;
+  if (sharedKeys.length) {
+    const box = document.createElement('div');
+    box.className = 'tool-config-shared-group';
+    const heading = document.createElement('div');
+    heading.className = 'tool-config-shared-heading';
+    heading.textContent = '工具级设置 — 改这里会同时影响这个工具的所有卡片';
+    box.appendChild(heading);
+    bodyEl.appendChild(box);
+    sharedHost = box;
+  }
+  const sharedSaved = _toolConfigs[`${mcpId}:${toolName}`] || {};
+
   // Expert settings go in a fold. A card whose every tuning knob is laid out
   // flat is a card nobody can configure: the pose card reached 26 fields, each
   // labelled with its own paragraph of rationale, and finding `fps` in it meant
@@ -1012,8 +1337,10 @@ export async function openInstanceConfigModal(mcpId, toolName, instanceId, confi
 
   let hasFields = false;
   for (const [key, def] of Object.entries(props)) {
-    // Only show instance-scope fields
-    if (def.scope !== 'instance') continue;
+    const isShared = def.scope !== 'instance';
+    if (isShared && !sharedHost) continue;
+    // Shared keys live in the tool-level row, not this instance's.
+    const vals = isShared ? sharedSaved : savedValues;
     hasFields = true;
 
     const label = document.createElement('label');
@@ -1022,7 +1349,7 @@ export async function openInstanceConfigModal(mcpId, toolName, instanceId, confi
     // were one field, so a description written to explain a trade-off became
     // the label and the form turned into an essay. A schema with no title
     // still falls back to its description, as before.
-    label.textContent = `${def.title || def.description || key}${required.includes(key) ? ' *' : ''}`;
+    label.textContent = `${def.title || def.description || key}${required.includes(key) && !def['x-required-when'] ? ' *' : ''}`;
 
     let input;
     if (def.oneOf && Array.isArray(def.oneOf)) {
@@ -1037,15 +1364,15 @@ export async function openInstanceConfigModal(mcpId, toolName, instanceId, confi
         const option = document.createElement('option');
         option.value = item.const ?? '';
         option.textContent = item.title || String(item.const);
-        if (String(savedValues[key]) === String(item.const)) option.selected = true;
+        if (String(vals[key]) === String(item.const)) option.selected = true;
         input.appendChild(option);
       }
-      if (savedValues[key] != null) input.value = savedValues[key];
+      if (vals[key] != null) input.value = vals[key];
     } else if (def.enum && Array.isArray(def.enum)) {
       input = document.createElement('select');
       input.className = 'tool-config-input';
       input.dataset.key = key;
-      const effectiveValue = savedValues[key] ?? def.default ?? '';
+      const effectiveValue = vals[key] ?? def.default ?? '';
       if (!effectiveValue) {
         const placeholder = document.createElement('option');
         placeholder.value = '';
@@ -1070,17 +1397,19 @@ export async function openInstanceConfigModal(mcpId, toolName, instanceId, confi
       optFalse.value = 'false'; optFalse.textContent = 'No';
       input.appendChild(optTrue);
       input.appendChild(optFalse);
-      input.value = (savedValues[key] != null ? String(savedValues[key]) : String(def.default ?? 'false'));
+      input.value = (vals[key] != null ? String(vals[key]) : String(def.default ?? 'false'));
     } else if (def.format === 'audio-input-device'
                || def.format === 'video-input-device') {
       input = _mediaDeviceInput(
         def.format === 'video-input-device' ? 'videoinput' : 'audioinput',
-        key, savedValues[key] || '');
+        key, vals[key] || '');
+    } else if (def.format === 'llm-source') {
+      input = _llmSourceInput(key, savedValues[key] ?? def.default ?? 'cloud');
     } else if (def.format === 'channel-select') {
       input = document.createElement('select');
       input.className = 'tool-config-input';
       input.dataset.key = key;
-      const saved = savedValues[key] || '';
+      const saved = vals[key] || '';
       const loadingOpt = document.createElement('option');
       loadingOpt.value = '';
       loadingOpt.textContent = 'Loading channels...';
@@ -1111,7 +1440,7 @@ export async function openInstanceConfigModal(mcpId, toolName, instanceId, confi
       // 只读展示，不挂 data-key —— 保存时按 [data-key] 收集，所以它不会进配置值
       input = makeQrField(key, def);
     } else if (_isStructuredField(def)) {
-      input = _makeStructuredInput(key, def, savedValues[key]);
+      input = _makeStructuredInput(key, def, vals[key]);
     } else {
       input = document.createElement('input');
       input.className = 'tool-config-input';
@@ -1119,7 +1448,7 @@ export async function openInstanceConfigModal(mcpId, toolName, instanceId, confi
       input.type = def.format === 'password' ? 'password' : (def.type === 'number' || def.type === 'integer' ? 'number' : 'text');
       if (def.type === 'number' || def.type === 'integer') input.step = 'any';
       input.placeholder = def.default != null ? String(def.default) : '';
-      input.value = savedValues[key] != null ? savedValues[key] : (def.default != null ? def.default : '');
+      input.value = vals[key] != null ? vals[key] : (def.default != null ? def.default : '');
     }
 
     // Help text, only when there is a separate title to help — otherwise the
@@ -1131,7 +1460,7 @@ export async function openInstanceConfigModal(mcpId, toolName, instanceId, confi
       help.textContent = def.description;
     }
 
-    const host = def.advanced ? advancedHost() : bodyEl;
+    const host = isShared ? sharedHost : (def.advanced ? advancedHost() : bodyEl);
     host.appendChild(label);
     host.appendChild(input);
     if (help) host.appendChild(help);
@@ -1154,7 +1483,8 @@ export async function openInstanceConfigModal(mcpId, toolName, instanceId, confi
       if (!input.value.trim()) continue;
       // Skip fields hidden by x-show-when (their parent .tool-config-field has display:none)
       const fieldWrapper = input.closest('.tool-config-field');
-      if (fieldWrapper && fieldWrapper.style.display === 'none') continue;
+      if (fieldWrapper && fieldWrapper.style.display === 'none'
+          && !(props[input.dataset.key] || {})['x-keep-when-hidden']) continue;
       try {
         values[input.dataset.key] = _readConfigValue(input, props[input.dataset.key]);
       } catch (err) {
@@ -1163,23 +1493,39 @@ export async function openInstanceConfigModal(mcpId, toolName, instanceId, confi
       }
     }
 
-    try {
-      const resp = await fetch(`/api/canvas/tool-config/${encodeURIComponent(mcpId)}/${encodeURIComponent(toolName)}/${encodeURIComponent(instanceId)}`, {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(values),
-      });
-      if (!resp.ok) {
-        alert(`配置保存失败 (HTTP ${resp.status})`);
-        return;
-      }
-    } catch (err) {
-      alert('配置保存失败: ' + err.message);
-      console.error('[config] instance save failed:', err);
-      return;
+    // Split by declared scope: each row only ever receives the keys it owns.
+    // A merged payload is rejected outright by plugins that keep one engine per
+    // process — see agent-core/src/tool_config.py, which is the same contract
+    // the start path applies.
+    const instanceValues = {}, sharedValues = {};
+    for (const [key, value] of Object.entries(values)) {
+      ((props[key] && props[key].scope !== 'instance') ? sharedValues : instanceValues)[key] = value;
     }
 
-    _toolConfigs[configKey] = values;
+    const base = `/api/canvas/tool-config/${encodeURIComponent(mcpId)}/${encodeURIComponent(toolName)}`;
+    const writes = [[`${base}/${encodeURIComponent(instanceId)}`, instanceValues, configKey]];
+    // Only when the dialog actually offered shared fields, so a tool without
+    // them cannot have its tool-level row overwritten with {} from here.
+    if (sharedKeys.length) writes.push([base, sharedValues, `${mcpId}:${toolName}`]);
+
+    for (const [url, body, cacheKey] of writes) {
+      try {
+        const resp = await fetch(url, {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body),
+        });
+        if (!resp.ok) {
+          alert(`配置保存失败 (HTTP ${resp.status})`);
+          return;
+        }
+      } catch (err) {
+        alert('配置保存失败: ' + err.message);
+        console.error('[config] save failed:', url, err);
+        return;
+      }
+      _toolConfigs[cacheKey] = body;
+    }
     close();
   };
 

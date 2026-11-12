@@ -14,6 +14,21 @@ file_intake:
   retention_days: 7
 
 plugins:
+  # Advertised when enabled; canvas start only creates the PCM path, never plays a song.
+  phanthy_music:
+    # 没有别的键了：曲库连接内置在卡片里，超时是实现细节，音量和自动续播是动作
+    # （set_volume / set_autoplay）不是配置。duck_gain 在 audio_mixer 那边。
+    enabled: true
+
+  audio_mixer:
+    enabled: true
+    # auto = 问本进程里的 TTS 插件它在发哪个话题。接到本卡的其余输入都算背景音乐。
+    speech_topics: auto
+    duck_gain: 0.15
+    duck_ramp_ms: 200
+    duck_hold_ms: 300
+    background_gain: 100
+
   asr:
     enabled: true
     # Matches the configSchema default. SenseVoice on CPU is also the faster of
@@ -32,7 +47,7 @@ plugins:
     # the process never returns. On a 7.4 GB Orin already running vop + OCR +
     # TTS that is enough to run the box out of memory, so cpu is the default
     # even on images that could use the GPU. Numbers in utils/onnx_provider.py.
-    device: gpu
+    device: cpu
     num_threads: 2   # cpu only; 4 buys ~1.2-1.5x. Ignored on gpu.
     # Decode 1 s of silence after the model loads. On gpu the first inference
     # costs ~1.7 s (lazy kernels, cuDNN autotune, memory pool) against a 58 ms
@@ -76,10 +91,10 @@ plugins:
       asr_kws_threshold: 0.3
 
   tts:
-    enabled: false
-    engine: mms-th
+    enabled: true
+    engine: vits2-zh-en
     backend: trt
-    model_dir: /models/mms-th
+    model_dir: /models/vits2
     # vits2-zh-en and mms-th support 0 only. For kokoro-multi this is an index
     # *within* the selected language — 0 is that language's first voice — so the
     # voice moves with `language` and cannot end up mismatched with it. The global
@@ -121,7 +136,7 @@ plugins:
     # CUDA provider falls back per node on quantised ops), so it carries its own
     # default in ENGINE_DEVICE_DEFAULTS — gpu. An explicit `cpu` here would apply
     # to every engine and quietly override that.
-    device: gpu
+    device: cpu
     # kokoro-multi only: pronunciation language. One of en-us, en-gb, zh, ja, es,
     # fr, it, pt-br, hi — every language Kokoro v1.0 has voices for. Read per
     # generate() call, so changing it costs nothing.
@@ -136,10 +151,10 @@ plugins:
     #
     # Only en-us / en-gb / zh have been listened to — sherpa-onnx documents English
     # and Chinese as this model's supported pair, so the rest are best-effort.
-    language: th
+    language: en-us
 
   vop:
-    enabled: false
+    enabled: true
     namespace: ""       # auto-detect from hostname if empty
     # Runs a prebuilt TensorRT engine. `yolov8s-worldv2` still resolves here for
     # cards saved before the switch, but the engine it loads is this one.
@@ -180,6 +195,12 @@ plugins:
   # Was `vdp:` for one release; main.py still reads that spelling from a
   # config.yaml already on a machine, and the tool answers to `vdp_*` too.
   visual_depth:
+    # Shared model selection (change only while stopped). Missing files download
+    # on first use. DepthART needs camera_info intrinsics; paths below are optional
+    # paired overrides for an explicitly provisioned engine and plugin.
+    backend: yolo
+    depthart_engine_path: ""
+    depthart_plugin_path: ""
     # Monocular depth. On by default, so the card is there to wire up without
     # editing a file on the robot first.
     #
@@ -188,7 +209,7 @@ plugins:
     # loaded lazily on the first `start`, so an enabled-but-unwired card costs
     # nothing; the cost appears once something actually subscribes. On a tight
     # machine that does not consume depth, set this to false.
-    enabled: false
+    enabled: true
     namespace: ""       # auto-detect from hostname if empty
     fps: 2
     # Output is METRES. ultralytics bakes its metric fit into the exported
@@ -245,7 +266,7 @@ plugins:
   # enabled-but-unwired card costs nothing. On an 8 GB Orin the binding
   # constraint is memory, not GPU time.
   pose:
-    enabled: false
+    enabled: true
     namespace: ""       # auto-detect from hostname if empty
     # `s` rather than `n`. Keypoint precision is not cosmetic here, it is the
     # input to the action rules: a noisy wrist breaks the reversal count that
@@ -364,7 +385,7 @@ plugins:
     fall_settle_s: 1.0
 
   ocr:
-    enabled: false
+    enabled: true
     provider: rapidocr
     model_dir: /models/ocr/ppocrv6-small-trt
     device_id: 0
@@ -396,7 +417,7 @@ plugins:
   # formats 是给这里用的逃生口：写死一组 symbology 名（如 [DataMatrix]），
   # 非空时压过 scan_mode。卡片和 LLM 都看不到它，因为名字跨镜像不通用。
   barcode:
-    enabled: false
+    enabled: true
     scan_mode: all
     formats: []
     try_rotate: true
@@ -411,7 +432,7 @@ plugins:
     max_text_chars: 2048
 
   soundevent:
-    enabled: false
+    enabled: true
   # 把机器人自己的 TTS 从麦克风里拿掉。接在麦克风卡和 ASR 卡之间，不是 ASR 的
   # 一个开关 —— soundevent 也直接订麦克风，声纹又跑在 ASR 切出来的段上，装在
   # ASR 里面只治 ASR 一家。详见 plugins/echo_cancellation.py 的模块文档。
@@ -419,7 +440,7 @@ plugins:
   # 默认开着：这张卡不加载任何模型、不占显存，没被拖到画布上连线时什么都不做。
   # 关掉它只是让卡片从侧边栏消失 —— 而真正的代价是没人发现它存在。
   echo_cancellation:
-    enabled: false
+    enabled: true
     # auto = 问本进程里的 TTS 插件它正在发哪个 topic。几乎总是对的；只有 TTS 在
     # 别的容器里才需要在这里写死一个 topic 名（写死的值在卡片下拉框里也保留）。
     # 这是卡片上**唯一**的设置项。
@@ -516,12 +537,47 @@ plugins:
     # 模型（否则第一句话要多等 1-2 秒），stop 会停止给语音附加身份、也停止建新声纹。
 
   face_recognition:
-    enabled: false
+    enabled: true
+    # Which detector+recogniser pair to run. The registry is
+    # plugins/face_runtime.FACE_MODELS and the card offers it as a dropdown:
+    #
+    #   buffalo_sc           SCRFD-500M + ArcFace MobileFaceNet   2.5 + 13 MB
+    #   scrfd25g_edgeface_s  SCRFD-2.5G  + EdgeFace-S-GAMMA-0.5   3.3 + 15 MB
+    #
+    # `scrfd25g_edgeface_s` is the more accurate pair — measured over a 100-image
+    # LFW sample it separates identities by +0.252 against buffalo_sc's +0.199,
+    # and both detectors found 99 of the 100 faces. It is **not** the default, and
+    # that is deliberate: embeddings from different networks are not comparable, so
+    # every already-registered person has to be re-enrolled under the new model.
+    #
+    # Each model keeps its **own roster** (see `db_dir`), so switching is not
+    # destructive and switching back restores the old one intact — but the new
+    # model starts empty and recognises nobody until people are re-enrolled. Check
+    # `database.persons` in the card's info to see which roster is loaded.
+    #
+    # Leave `match_threshold` unset when changing this — the default follows the
+    # model (0.35 / 0.55). A threshold copied across models is wrong in whichever
+    # direction the embedding space moved.
+    #
+    # **Changing this on a robot that already has a roster is a one-way door for
+    # that roster**: the default db_dir moves with the model, so the robot comes up
+    # recognising nobody until its people are re-enrolled. The old roster is not
+    # destroyed — selecting buffalo_sc again restores it intact.
+    model: scrfd25g_edgeface_s
     # InsightFace buffalo_sc: SCRFD-500M detector + ArcFace MobileFaceNet.
     # Plain ONNX, so one bundle serves both JetPack lines and x86 dev hosts.
+    # Left at the buffalo_sc path, which `model` overrides when it names another
+    # pair — set this only to point at a local copy of the weights.
     model_dir: /models/face/buffalo_sc
     # The only host-mounted writable path in this container is /models (see
     # perception/deploy/service.yml), so the identity database lives under it.
+    # The identity store. Per **model**, not per plugin: this value is the one
+    # `buffalo_sc` uses, and any other model gets `/models/face_db-<model>` so that
+    # selecting it starts its own roster instead of being refused against this one
+    # (IdentityDB refuses a store written by another model — that stays, as a
+    # backstop). Setting this to anything other than the value below pins it
+    # explicitly and disables the per-model suffix. See
+    # plugins/face_runtime.face_db_dir_for.
     db_dir: /models/face_db
     # auto | cpu | gpu. auto (the default) uses the GPU when the installed
     # onnxruntime offers a CUDA/TensorRT provider and falls back to cpu when it
@@ -536,11 +592,17 @@ plugins:
     warmup: true
     det_size: [640, 640]
     det_thresh: 0.5
-    # Cosine similarity between L2-normalised ArcFace embeddings. 0.35 is a
-    # starting point for w600k_mbf, NOT a measured value — raise it if the
-    # robot confuses people, lower it if it fails to recognise them, and record
-    # what you saw. Editable from the card.
-    match_threshold: 0.35
+    # Cosine similarity between L2-normalised embeddings. Raise it if the robot
+    # confuses people, lower it if it fails to recognise them, and record what you
+    # saw. Editable from the card.
+    #
+    # 0.55 is the **scrfd25g_edgeface_s** scale, matching the `model` above. A
+    # threshold belongs to the embedding space, not to the plugin: buffalo_sc wants
+    # 0.35, and carrying 0.55 over to it would only ever fail to recognise people
+    # (the safe direction), while carrying 0.35 the other way put four impostor
+    # pairs out of 4849 over the line in the LFW sample. Delete this key to take
+    # whichever value the configured `model` recommends.
+    match_threshold: 0.55
     # Quality gate. A face below either bound is reported with person_id: null
     # rather than matched or auto-enrolled: matching a blurred 30 px face is a
     # coin flip, and enrolling one wastes an unknown-N slot forever.
@@ -559,6 +621,31 @@ plugins:
     # people are never evicted. Editable from the card.
     unknown_capacity: 500
     max_samples_per_person: 8
+    # Keep the aligned 112x112 crop each sample was embedded from, under
+    # `<db_dir>/samples/`. This is **the only thing that makes a model switch
+    # migratable**: an embedding means nothing outside the network that produced
+    # it, so without the crop a new model can only be populated by re-enrolling
+    # everyone by hand (see README § "Why there is no migration").
+    #
+    # It is face imagery on disk, which the rest of this system deliberately avoids
+    # keeping — `image_input` above discards registration photos after
+    # retention_days. The difference is that this is bounded: at most
+    # max_samples_per_person x (unknown_capacity + named) crops at ~6 KB, so ~24 MB
+    # at the defaults, and crops are deleted with their sample. Set false for a
+    # deployment that must not retain any face image; the cost is that the next
+    # model change starts from an empty roster.
+    store_sample_crops: true
+    # 引擎加载后在后台把另一个模型的花名册迁移过来：读它存的人脸切图，用当前模型重算
+    # embedding，写进当前模型自己的库。**不阻塞**——引擎先发布并开始识别，花名册边
+    # 跑边补，认得出的人越来越多；进度看 info 的 migration 字段。
+    #
+    # 每个 (切图, 模型) 只算一次并永久存在该模型自己的库里，所以来回切模型不会重算。
+    #
+    # **这是唯一的迁移入口。** 曾经还有一个 `reembed_from` 动作可以手动触发，已删除：
+    # 没有人需要手动迁移，而它的代价是被无条件拆成一个 LLM 可调用的工具（agent-core
+    # 对 x-action-params 里每一项都这么做），于是一个会阻塞几十秒的运维操作进了机器人
+    # 的工具箱。关掉这个开关就等于不迁移，换模型后需要重新录入每个人。
+    auto_migrate_roster: true
     # Visit log (visits.jsonl): one continuous appearance is one record, not
     # one per frame. A visit is closed and written only after the person has
     # been absent for visit_gap_s; 10 minutes stops somebody turning their head
@@ -589,3 +676,37 @@ plugins:
     # Detection rate: how many detections per second. Fractional is the point —
     # 0.5 means once every two seconds; 0 means every frame the camera sends.
     detect_fps: 1.0
+
+  measure:
+    # 物体可见宽高测量：接 VOP 的 data/json 和一路米制深度图，输出距离、
+    # 可见宽高，并可把 bbox/尺寸画到相机 JPEG 上。
+    #
+    # 这不是驱动卡：它消费 perception 自己的 VOP/深度，跨机器人复用；
+    # 不控制机器人，不判断能不能过去。尺寸是当前视角的可见外廓，不是完整
+    # 三维长宽高；没有测到就输出 null/没有看见。
+    enabled: true
+    topic: /perception/measure/state
+    view_topic: /perception/measure/view
+    # 留空 = 从 depth 话题推导同一台相机的彩色话题：
+    # Bumi: /camera/depth -> /camera/color
+    # G1:   /camera/depth -> /camera/rgb
+    camera_topic: ""
+    view_hz: 5
+    rate_hz: 5
+    max_objects: 8
+    min_confidence: 0.3
+    depth_percentile: 25
+    max_depth_m: 20.0
+    max_obs_age_ms: 500
+    stable_frames: 5
+    stable_min: 3
+    track_timeout_ms: 2000
+    match_distance_norm: 0.15
+    history_size: 200
+    record_interval_ms: 1000
+    record_min_delta_m: 0.01
+    only_stable: true
+    summary_max_objects: 5
+    # 没有 camera_info 时的兜底；留空 = 不猜，只输出距离。
+    half_fov_rad: null
+    half_fov_v_rad: null
