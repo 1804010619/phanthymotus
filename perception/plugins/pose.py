@@ -533,12 +533,14 @@ class _PoseNode(Node):
     def _image_cb(self, msg: CompressedImage):
         now = time.monotonic()
         if now - self._last_inference_time < self._frame_interval:
+            log.info(f"_intake_dropped")
             return
         self._last_inference_time = now
         # Drop the old frame if the queue is full (no backpressure).
         try:
             self._frame_queue.put_nowait(msg.data)
         except queue.Full:
+            log.info(f"_queue_dropped")
             try:
                 self._frame_queue.get_nowait()
             except queue.Empty:
@@ -563,6 +565,7 @@ class _PoseNode(Node):
                     np.frombuffer(jpeg_bytes, np.uint8), cv2.IMREAD_COLOR
                 )
                 if frame is None:
+                    log.info(f"_decode_failed")
                     continue
                 outputs, meta = self._model.infer(frame)
                 boxes, scores, keypoints = decode_poses(
